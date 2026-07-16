@@ -712,6 +712,141 @@ fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
 }
 
 #[test]
+fn file_version_relation_is_directional_revalidated_and_path_free_in_history() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("private-versions");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let older_path = scope_path.join("private-roadmap-v1.MD");
+    let newer_path = scope_path.join("private-roadmap_V2.md");
+    let older_content = b"private older roadmap";
+    let newer_content = b"private newer roadmap with different bytes";
+    std::fs::write(&older_path, older_content).expect("older should write");
+    std::fs::write(&newer_path, newer_content).expect("newer should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let scope_arg = scope.id.to_string();
+    let canonical_older = std::fs::canonicalize(&older_path).expect("older should canonicalize");
+    let canonical_newer = std::fs::canonicalize(&newer_path).expect("newer should canonicalize");
+    let older_arg = canonical_older
+        .to_str()
+        .expect("older path should be UTF-8");
+    let newer_arg = canonical_newer
+        .to_str()
+        .expect("newer path should be UTF-8");
+    let suggested = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "version",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_arg,
+            "--first",
+            newer_arg,
+            "--second",
+            older_arg,
+        ])
+        .output()
+        .expect("deskgraph relation version should start");
+    assert!(suggested.status.success());
+    let candidate: serde_json::Value =
+        serde_json::from_slice(&suggested.stdout).expect("candidate should be JSON");
+    assert_eq!(
+        candidate["api_version"],
+        "deskgraph.file-version-candidate.v1"
+    );
+    assert_eq!(candidate["kind"], "version");
+    assert_eq!(candidate["state"], "suggested");
+    assert_eq!(
+        candidate["evidence"]["signal_kind"],
+        "explicit_numeric_suffix"
+    );
+    assert_eq!(candidate["evidence"]["base_key"], "private-roadmap");
+    assert_eq!(candidate["evidence"]["extension_key"], "md");
+    assert_eq!(candidate["evidence"]["older_version"], 1);
+    assert_eq!(candidate["evidence"]["newer_version"], 2);
+    assert_eq!(candidate["evidence"]["confidence_basis_points"], 9_000);
+    assert_eq!(candidate["older"]["display_path"], older_arg);
+    assert_eq!(candidate["newer"]["display_path"], newer_arg);
+    assert_eq!(candidate["latest_decision"], serde_json::Value::Null);
+
+    let relation_arg = candidate["relation_id"]
+        .as_i64()
+        .expect("relation id should exist")
+        .to_string();
+    let verified = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "version-verify",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+        ])
+        .output()
+        .expect("deskgraph relation version verify should start");
+    assert!(verified.status.success());
+    let verified_json: serde_json::Value =
+        serde_json::from_slice(&verified.stdout).expect("verification should be JSON");
+    assert_eq!(verified_json["relation_id"], candidate["relation_id"]);
+    assert_eq!(verified_json["state"], "suggested");
+
+    let list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args(["relation", "list", "--database", database_arg])
+        .output()
+        .expect("deskgraph relation list should start");
+    assert!(list.status.success());
+    let summaries: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("relation list should be JSON");
+    assert_eq!(summaries[0]["relation_id"], candidate["relation_id"]);
+    assert_eq!(summaries[0]["kind"], "version");
+    assert_eq!(summaries[0]["state"], "suggested");
+    assert_eq!(summaries[0]["verification_required"], true);
+    assert!(summaries[0].get("older").is_none());
+    assert!(summaries[0].get("newer").is_none());
+    assert!(summaries[0].get("evidence").is_none());
+
+    assert_eq!(
+        std::fs::read(&older_path).expect("older should remain"),
+        older_content
+    );
+    assert_eq!(
+        std::fs::read(&newer_path).expect("newer should remain"),
+        newer_content
+    );
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    for output in [&suggested, &verified, &list] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for secret in [
+            "private-versions",
+            "private-roadmap",
+            "private-roadmap-v1.MD",
+            "private-roadmap_V2.md",
+            older_arg,
+            newer_arg,
+            database_arg,
+            "private older roadmap",
+            "private newer roadmap with different bytes",
+        ] {
+            assert!(!stderr.contains(secret));
+            assert!(!list_stdout.contains(secret));
+        }
+        assert!(
+            stderr
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+    }
+}
+
+#[test]
 fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

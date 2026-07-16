@@ -13,7 +13,8 @@ use deskgraph_extractors::{
 use deskgraph_projects::{
     check_exact_duplicate_at, decide_exact_duplicate_at, decide_project_candidate_at,
     folder_profile_at, project_candidate_at, propose_project_at,
-    recent_file_relation_candidates_at, recent_project_candidates_at, verify_exact_duplicate_at,
+    recent_file_relation_candidates_at, recent_project_candidates_at, suggest_file_version_at,
+    verify_exact_duplicate_at, verify_file_version_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
@@ -308,6 +309,24 @@ enum RelationCommand {
     List {
         #[arg(long)]
         database: PathBuf,
+    },
+    /// Suggest a directional version relation from two explicit numeric filename suffixes.
+    Version {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long)]
+        first: PathBuf,
+        #[arg(long)]
+        second: PathBuf,
+    },
+    /// Revalidate one filename-version relation and append an immutable observation.
+    VersionVerify {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        relation: i64,
     },
 }
 
@@ -881,6 +900,43 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 let candidates =
                     recent_file_relation_candidates_at(&database).map_err(|error| error.code())?;
                 emit_json(&candidates, "file_relation_candidate_list_read")
+            }
+            RelationCommand::Version {
+                database,
+                scope,
+                first,
+                second,
+            } => {
+                let candidate = suggest_file_version_at(&database, scope, &first, &second)
+                    .map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "file_version_candidate_suggested",
+                    relation_id = candidate.relation_id,
+                    scope_id = candidate.older.scope_id,
+                    older_node_id = candidate.older.node_id,
+                    newer_node_id = candidate.newer.node_id,
+                    older_version = candidate.evidence.older_version,
+                    newer_version = candidate.evidence.newer_version,
+                    state = ?candidate.state
+                );
+                Ok(())
+            }
+            RelationCommand::VersionVerify { database, relation } => {
+                let candidate =
+                    verify_file_version_at(&database, relation).map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "file_version_candidate_verified",
+                    relation_id = candidate.relation_id,
+                    scope_id = candidate.older.scope_id,
+                    older_node_id = candidate.older.node_id,
+                    newer_node_id = candidate.newer.node_id,
+                    older_version = candidate.evidence.older_version,
+                    newer_version = candidate.evidence.newer_version,
+                    state = ?candidate.state
+                );
+                Ok(())
             }
         },
         Command::Fixture { command } => match command {

@@ -6,9 +6,10 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use deskgraph_database::{ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase};
 use deskgraph_domain::{
-    FileRelationCandidate, FileRelationCandidateSummary, FileRelationDecisionKind, FolderProfile,
-    ProjectCandidate, ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal,
-    ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
+    FileRelationCandidate, FileRelationCandidateSummary, FileRelationDecisionKind,
+    FileVersionCandidate, FolderProfile, ProjectCandidate, ProjectCandidateSummary,
+    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator, parse_explicit_file_version_name,
 };
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
@@ -42,6 +43,10 @@ pub enum ProjectError {
     RelationContentDiffers,
     RelationComparisonTimedOut,
     RelationPathDecodeFailed,
+    VersionNameUnsupported,
+    VersionBaseMismatch,
+    VersionExtensionMismatch,
+    VersionNumberEqual,
 }
 
 impl ProjectError {
@@ -69,6 +74,10 @@ impl ProjectError {
             Self::RelationContentDiffers => "file_relation_content_differs",
             Self::RelationComparisonTimedOut => "file_relation_comparison_timed_out",
             Self::RelationPathDecodeFailed => "file_relation_path_decode_failed",
+            Self::VersionNameUnsupported => "file_version_name_unsupported",
+            Self::VersionBaseMismatch => "file_version_base_mismatch",
+            Self::VersionExtensionMismatch => "file_version_extension_mismatch",
+            Self::VersionNumberEqual => "file_version_number_equal",
         }
     }
 }
@@ -252,6 +261,63 @@ pub fn recent_file_relation_candidates_at(
         .map_err(Into::into)
 }
 
+pub fn suggest_file_version_at(
+    database_path: &Path,
+    scope_id: i64,
+    first_path: &Path,
+    second_path: &Path,
+) -> Result<FileVersionCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    suggest_file_version(&mut database, scope_id, first_path, second_path)
+}
+
+pub fn suggest_file_version(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    first_path: &Path,
+    second_path: &Path,
+) -> Result<FileVersionCandidate, ProjectError> {
+    let canonical_root = validated_scope_root(database, scope_id)?;
+    let first = open_relation_source(database, scope_id, &canonical_root, first_path, None)?;
+    let second = open_relation_source(database, scope_id, &canonical_root, second_path, None)?;
+    analyze_and_record_file_version(database, first, second)
+}
+
+pub fn verify_file_version_at(
+    database_path: &Path,
+    relation_id: i64,
+) -> Result<FileVersionCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    verify_file_version(&mut database, relation_id)
+}
+
+pub fn verify_file_version(
+    database: &mut ManifestDatabase,
+    relation_id: i64,
+) -> Result<FileVersionCandidate, ProjectError> {
+    let (first_snapshot, second_snapshot) = database.file_version_sources(relation_id)?;
+    let canonical_root = validated_scope_root(database, first_snapshot.scope_id)?;
+    let first_path = path_from_raw(&first_snapshot.path_raw)
+        .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
+    let second_path = path_from_raw(&second_snapshot.path_raw)
+        .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
+    let first = open_relation_source(
+        database,
+        first_snapshot.scope_id,
+        &canonical_root,
+        &first_path,
+        Some(first_snapshot.node_id),
+    )?;
+    let second = open_relation_source(
+        database,
+        second_snapshot.scope_id,
+        &canonical_root,
+        &second_path,
+        Some(second_snapshot.node_id),
+    )?;
+    analyze_and_record_file_version(database, first, second)
+}
+
 fn open_relation_source(
     database: &ManifestDatabase,
     scope_id: i64,
@@ -324,19 +390,7 @@ fn compare_and_record(
         return Err(ProjectError::RelationContentDiffers);
     }
     compare_exact_bytes(&mut left.file, &mut right.file, left.snapshot.size_bytes)?;
-    let canonical_root = validated_scope_root(database, left.snapshot.scope_id)?;
-    validate_canonical_path_state(&canonical_root, &left.path)?;
-    validate_canonical_path_state(&canonical_root, &right.path)?;
-    let left_metadata = left
-        .file
-        .metadata()
-        .map_err(|_| ProjectError::RelationSourceReadFailed)?;
-    let right_metadata = right
-        .file
-        .metadata()
-        .map_err(|_| ProjectError::RelationSourceReadFailed)?;
-    validate_open_snapshot(&left.file, &left.path, &left.snapshot, &left_metadata)?;
-    validate_open_snapshot(&right.file, &right.path, &right.snapshot, &right_metadata)?;
+    revalidate_open_relation_sources(database, &left, &right)?;
 
     let (left_snapshot, right_snapshot) = if left.snapshot.node_id < right.snapshot.node_id {
         (&left.snapshot, &right.snapshot)
@@ -346,6 +400,62 @@ fn compare_and_record(
     database
         .record_exact_duplicate_candidate(left_snapshot, right_snapshot)
         .map_err(Into::into)
+}
+
+fn analyze_and_record_file_version(
+    database: &mut ManifestDatabase,
+    first: OpenRelationSource,
+    second: OpenRelationSource,
+) -> Result<FileVersionCandidate, ProjectError> {
+    if first.snapshot.node_id == second.snapshot.node_id
+        || (first.snapshot.identity_kind == second.snapshot.identity_kind
+            && first.snapshot.identity_key == second.snapshot.identity_key)
+    {
+        return Err(ProjectError::RelationSameFileIdentity);
+    }
+    let first_name = first
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(parse_explicit_file_version_name)
+        .ok_or(ProjectError::VersionNameUnsupported)?;
+    let second_name = second
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(parse_explicit_file_version_name)
+        .ok_or(ProjectError::VersionNameUnsupported)?;
+    if first_name.base_key != second_name.base_key {
+        return Err(ProjectError::VersionBaseMismatch);
+    }
+    if first_name.extension_key != second_name.extension_key {
+        return Err(ProjectError::VersionExtensionMismatch);
+    }
+    if first_name.version == second_name.version {
+        return Err(ProjectError::VersionNumberEqual);
+    }
+    revalidate_open_relation_sources(database, &first, &second)?;
+    database
+        .record_file_version_candidate(&first.snapshot, &second.snapshot)
+        .map_err(Into::into)
+}
+
+fn revalidate_open_relation_sources(
+    database: &ManifestDatabase,
+    first: &OpenRelationSource,
+    second: &OpenRelationSource,
+) -> Result<(), ProjectError> {
+    let canonical_root = validated_scope_root(database, first.snapshot.scope_id)?;
+    validate_canonical_path_state(&canonical_root, &first.path)?;
+    validate_canonical_path_state(&canonical_root, &second.path)?;
+    for source in [first, second] {
+        let metadata = source
+            .file
+            .metadata()
+            .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+        validate_open_snapshot(&source.file, &source.path, &source.snapshot, &metadata)?;
+    }
+    Ok(())
 }
 
 fn compare_exact_bytes(
@@ -531,7 +641,8 @@ mod tests {
     use super::*;
     use deskgraph_domain::{
         FileRelationCandidateState, FileRelationComparisonKind, FileRelationCreator,
-        FileRelationDecisionKind, FolderFileCategory, ProjectCandidateState,
+        FileRelationDecisionKind, FileRelationKind, FileVersionSignalKind, FolderFileCategory,
+        ProjectCandidateState,
     };
     use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
 
@@ -944,6 +1055,91 @@ mod tests {
         let stale = verify_exact_duplicate(&mut database, candidate.relation_id)
             .expect_err("changed source should invalidate verification");
         assert_eq!(stale.code(), "file_relation_source_metadata_changed");
+    }
+
+    #[test]
+    fn file_version_candidate_is_explicit_directional_and_revalidated() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("versions");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let first_path = scope_path.join("企劃-v1.MD");
+        let second_path = scope_path.join("企劃_V2.md");
+        let same_version_path = scope_path.join("企劃.v1.md");
+        let other_base_path = scope_path.join("其他-v3.md");
+        let other_extension_path = scope_path.join("企劃-v3.txt");
+        let unsupported_path = scope_path.join("企劃-final.md");
+        std::fs::write(&first_path, b"old revision").expect("first should write");
+        std::fs::write(&second_path, b"new revision with different bytes")
+            .expect("second should write");
+        std::fs::write(&same_version_path, b"same ordinal").expect("same should write");
+        std::fs::write(&other_base_path, b"other base").expect("other base should write");
+        std::fs::write(&other_extension_path, b"other extension")
+            .expect("other extension should write");
+        std::fs::write(&unsupported_path, b"unsupported").expect("unsupported should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        let canonical_first =
+            std::fs::canonicalize(&first_path).expect("first should canonicalize");
+        let canonical_second =
+            std::fs::canonicalize(&second_path).expect("second should canonicalize");
+
+        let candidate =
+            suggest_file_version(&mut database, scope.id, &canonical_second, &canonical_first)
+                .expect("explicit numeric versions should create a candidate");
+        assert_eq!(candidate.kind, FileRelationKind::Version);
+        assert_eq!(candidate.state, FileRelationCandidateState::Suggested);
+        assert_eq!(
+            candidate.evidence.signal_kind,
+            FileVersionSignalKind::ExplicitNumericSuffix
+        );
+        assert_eq!(candidate.evidence.base_key, "企劃");
+        assert_eq!(candidate.evidence.extension_key, "md");
+        assert_eq!(candidate.evidence.older_version, 1);
+        assert_eq!(candidate.evidence.newer_version, 2);
+        assert_eq!(candidate.evidence.confidence_basis_points, 9_000);
+        assert_eq!(candidate.evidence.model_version, None);
+        assert_eq!(candidate.latest_decision, None);
+        assert_eq!(
+            candidate.older.display_path,
+            canonical_first.to_string_lossy()
+        );
+        assert_eq!(
+            candidate.newer.display_path,
+            canonical_second.to_string_lossy()
+        );
+
+        let verified = verify_file_version(&mut database, candidate.relation_id)
+            .expect("current names and identities should verify");
+        assert_eq!(verified.relation_id, candidate.relation_id);
+        let summaries = database
+            .recent_file_relation_candidates()
+            .expect("history should load");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].kind, FileRelationKind::Version);
+        assert_eq!(summaries[0].state, FileRelationCandidateState::Suggested);
+        assert!(summaries[0].verification_required);
+
+        for (path, expected_code) in [
+            (&same_version_path, "file_version_number_equal"),
+            (&other_base_path, "file_version_base_mismatch"),
+            (&other_extension_path, "file_version_extension_mismatch"),
+            (&unsupported_path, "file_version_name_unsupported"),
+        ] {
+            let canonical = std::fs::canonicalize(path).expect("fixture should canonicalize");
+            let error = suggest_file_version(&mut database, scope.id, &canonical_first, &canonical)
+                .expect_err("ambiguous evidence must not create a version relation");
+            assert_eq!(error.code(), expected_code);
+        }
+
+        std::fs::write(&second_path, b"changed after scan").expect("second should change");
+        let stale = verify_file_version(&mut database, candidate.relation_id)
+            .expect_err("changed metadata must invalidate live verification");
+        assert_eq!(stale.code(), "file_relation_source_metadata_changed");
+        assert_eq!(
+            std::fs::read(&first_path).expect("first should remain"),
+            b"old revision"
+        );
     }
 
     #[test]

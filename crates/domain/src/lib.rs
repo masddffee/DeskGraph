@@ -17,13 +17,14 @@ pub use health::{
 };
 pub use manifest::{AuthorizedScope, ManifestStats, ScanJobProgress, ScanReport, ScanStatus};
 pub use project::{
-    FileRelationCandidate, FileRelationCandidateState, FileRelationCandidateSummary,
-    FileRelationComparisonKind, FileRelationCreator, FileRelationDecision,
-    FileRelationDecisionCreator, FileRelationDecisionKind, FileRelationEndpoint,
-    FileRelationEvidence, FileRelationKind, FolderCategoryCount, FolderFileCategory, FolderProfile,
-    ProjectCandidate, ProjectCandidateState, ProjectCandidateSummary, ProjectDecision,
-    ProjectDecisionCreator, ProjectDecisionKind, ProjectSignal, ProjectSignalKind,
-    ProjectSuggestion, ProjectSuggestionCreator,
+    ExplicitFileVersionName, FileRelationCandidate, FileRelationCandidateState,
+    FileRelationCandidateSummary, FileRelationComparisonKind, FileRelationCreator,
+    FileRelationDecision, FileRelationDecisionCreator, FileRelationDecisionKind,
+    FileRelationEndpoint, FileRelationEvidence, FileRelationKind, FileVersionCandidate,
+    FileVersionEvidence, FileVersionSignalKind, FolderCategoryCount, FolderFileCategory,
+    FolderProfile, ProjectCandidate, ProjectCandidateState, ProjectCandidateSummary,
+    ProjectDecision, ProjectDecisionCreator, ProjectDecisionKind, ProjectSignal, ProjectSignalKind,
+    ProjectSuggestion, ProjectSuggestionCreator, parse_explicit_file_version_name,
 };
 pub use search::{
     SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,

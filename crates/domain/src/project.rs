@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +141,7 @@ impl ProjectCandidateSummary {
 #[serde(rename_all = "snake_case")]
 pub enum FileRelationKind {
     ExactDuplicate,
+    Version,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -209,6 +213,93 @@ impl FileRelationEvidence {
     pub const PROVIDER_VERSION: &str = "1";
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileVersionSignalKind {
+    ExplicitNumericSuffix,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileVersionEvidence {
+    pub signal_kind: FileVersionSignalKind,
+    pub base_key: String,
+    pub extension_key: String,
+    pub older_version: u32,
+    pub newer_version: u32,
+    pub confidence_basis_points: u16,
+    pub observed_at_unix_ms: i64,
+    pub created_by: FileRelationCreator,
+    pub provider_id: &'static str,
+    pub provider_version: &'static str,
+    pub model_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExplicitFileVersionName {
+    pub base_key: String,
+    pub extension_key: String,
+    pub version: u32,
+}
+
+#[must_use]
+pub fn parse_explicit_file_version_name(file_name: &str) -> Option<ExplicitFileVersionName> {
+    let path = Path::new(file_name);
+    if path.file_name()?.to_str()? != file_name {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let (base, version) = split_explicit_version_stem(stem)?;
+    let base = base.trim();
+    if base.is_empty() || split_explicit_version_stem(base).is_some() {
+        return None;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let base_key = normalized_version_name_component(base);
+    let extension_key = normalized_version_name_component(extension);
+    if base_key.is_empty() || base_key.len() > 1_024 || extension_key.len() > 64 {
+        return None;
+    }
+    Some(ExplicitFileVersionName {
+        base_key,
+        extension_key,
+        version,
+    })
+}
+
+fn split_explicit_version_stem(stem: &str) -> Option<(&str, u32)> {
+    const MARKERS: [&str; 8] = ["-v", "-V", "_v", "_V", " v", " V", ".v", ".V"];
+    let (marker_index, marker) = MARKERS
+        .iter()
+        .filter_map(|marker| stem.rfind(marker).map(|index| (index, *marker)))
+        .max_by_key(|(index, _)| *index)?;
+    let digits = &stem[marker_index + marker.len()..];
+    if digits.is_empty()
+        || digits.len() > 6
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    let version = digits.parse::<u32>().ok()?;
+    if !(1..=999_999).contains(&version) {
+        return None;
+    }
+    Some((&stem[..marker_index], version))
+}
+
+fn normalized_version_name_component(value: &str) -> String {
+    let nfc = value.nfc().collect::<String>();
+    nfc.to_lowercase().nfc().collect()
+}
+
+impl FileVersionEvidence {
+    pub const PROVIDER_ID: &str = "deskgraph.filename-version";
+    pub const PROVIDER_VERSION: &str = "1";
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileRelationCandidate {
     pub api_version: &'static str,
@@ -223,6 +314,22 @@ pub struct FileRelationCandidate {
 
 impl FileRelationCandidate {
     pub const API_VERSION: &str = "deskgraph.file-relation-candidate.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileVersionCandidate {
+    pub api_version: &'static str,
+    pub relation_id: i64,
+    pub kind: FileRelationKind,
+    pub state: FileRelationCandidateState,
+    pub older: FileRelationEndpoint,
+    pub newer: FileRelationEndpoint,
+    pub evidence: FileVersionEvidence,
+    pub latest_decision: Option<FileRelationDecision>,
+}
+
+impl FileVersionCandidate {
+    pub const API_VERSION: &str = "deskgraph.file-version-candidate.v1";
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -371,5 +478,63 @@ mod tests {
         assert!(value.get("display_path").is_none());
         assert!(value.get("left").is_none());
         assert!(value.get("right").is_none());
+    }
+
+    #[test]
+    fn file_version_candidate_is_directional_explainable_and_model_free() {
+        let endpoint = |node_id: i64, path: &str| FileRelationEndpoint {
+            scope_id: 1,
+            node_id,
+            location_id: node_id + 10,
+            display_path: path.to_string(),
+            size_bytes: 4,
+            modified_unix_ns: Some(5),
+        };
+        let candidate = FileVersionCandidate {
+            api_version: FileVersionCandidate::API_VERSION,
+            relation_id: 1,
+            kind: FileRelationKind::Version,
+            state: FileRelationCandidateState::Suggested,
+            older: endpoint(2, "/scope/企劃-v1.md"),
+            newer: endpoint(3, "/scope/企劃-v2.md"),
+            evidence: FileVersionEvidence {
+                signal_kind: FileVersionSignalKind::ExplicitNumericSuffix,
+                base_key: "企劃".to_string(),
+                extension_key: "md".to_string(),
+                older_version: 1,
+                newer_version: 2,
+                confidence_basis_points: 9_000,
+                observed_at_unix_ms: 6,
+                created_by: FileRelationCreator::SystemRule,
+                provider_id: FileVersionEvidence::PROVIDER_ID,
+                provider_version: FileVersionEvidence::PROVIDER_VERSION,
+                model_version: None,
+            },
+            latest_decision: None,
+        };
+        let value = serde_json::to_value(candidate).expect("candidate should serialize");
+        assert_eq!(value["kind"], "version");
+        assert_eq!(value["state"], "suggested");
+        assert_eq!(value["evidence"]["signal_kind"], "explicit_numeric_suffix");
+        assert_eq!(value["evidence"]["confidence_basis_points"], 9_000);
+        assert_eq!(value["evidence"]["created_by"], "system_rule");
+        assert_eq!(value["evidence"]["model_version"], serde_json::Value::Null);
+        assert_eq!(value["latest_decision"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn explicit_file_version_names_are_conservative_and_unicode_normalized() {
+        let first =
+            parse_explicit_file_version_name("企劃-v1.MD").expect("explicit version should parse");
+        let second =
+            parse_explicit_file_version_name("企劃_V2.md").expect("uppercase marker should parse");
+        assert_eq!(first.base_key, second.base_key);
+        assert_eq!(first.extension_key, "md");
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 2);
+        assert!(parse_explicit_file_version_name("企劃-final.md").is_none());
+        assert!(parse_explicit_file_version_name("企劃-v01.md").is_none());
+        assert!(parse_explicit_file_version_name("企劃-v1-v2.md").is_none());
+        assert!(parse_explicit_file_version_name("folder/企劃-v2.md").is_none());
     }
 }
