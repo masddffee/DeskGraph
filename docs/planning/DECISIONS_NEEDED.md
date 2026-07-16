@@ -4,7 +4,7 @@ Last reviewed: 2026-07-16
 
 ## Blocking now
 
-D-012 must be resolved before the next M4 slice persists Project membership/correction state; it does not block the current derived Folder Profile or safe work in other milestones. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
+D-013 must be resolved before M4 introduces cross-root learned scoring or merge/split semantics; it does not block deterministic related/duplicate/version work or safe work in other milestones. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
 
 ## Open decisions
 
@@ -21,7 +21,7 @@ D-012 must be resolved before the next M4 slice persists Project membership/corr
 | D-009 | Embedding model/runtime                                     | M3/M9                                 | Multilingual, int8, license, checksum, memory, model-removal support                         | Deterministic lexical retrieval remains required                           |
 | D-010 | Product trademark/name clearance and reverse-DNS identifier | Before signed release                 | DeskGraph availability and legal review                                                      | Development identifier only; no trademark claim                            |
 | D-011 | Exact Office ZIP/XML dependency feature set                  | M2 Office provider                    | Candidate `zip 8.6.0` no-default plus minimal stored/DEFLATE read support and `quick-xml 0.41.0` no-default must pass isolated closure, license, RustSec, API, and platform gates | Proposed ADR-014 only; do not add either dependency until the evidence gate passes |
-| D-012 | Durable Project candidate, correction, and feedback model    | Next M4 persistence slice             | Stable Project identity; candidate/accepted/rejected/merged/split lifecycle; append-only correction provenance; deterministic feedback weighting and rescore boundaries | ADR-018 profiles remain derived suggestions only; persist no membership edge until this decision is accepted |
+| D-013 | Cross-root Project learning and merge/split semantics        | Later M4 scoring and correction slice | Whether/how accepted or rejected roots influence different candidates; merge/split identity and reversal events; explainable bounds and evaluation corpus | Feedback affects only the exact stable root; no cross-root score adjustment, merge, split, or automatic membership |
 
 ## Decisions made in M0
 
@@ -77,4 +77,7 @@ D-012 must be resolved before the next M4 slice persists Project membership/corr
 - Deterministic direct-child markers may create an explainable Project Suggestion only. README is supporting provenance, not a sufficient strong marker; no heuristic creates `belongs_to` or automatic membership.
 - Every suggestion carries basis-point confidence, provenance, completed-scan observation time, `system_rule` creator, fixed provider/version and `model_version: null`.
 - Explicit Folder Profile responses may return the selected folder path; structured logs omit paths and member names.
-- D-012 remains open before persisted Project/edge candidates or correction feedback. No embedding, vector runtime, model, API, or external dependency is selected by this slice.
+- D-012 is resolved by ADR-019 for durable Project root candidates and exact-root correction. No embedding, vector runtime, model, API, or external dependency is selected by this slice.
+- Project root identities, deterministic suggestion observations/signals, and user feedback events are immutable/append-only. Same-decision retries are idempotent; an opposite decision appends a correction.
+- A rejected root remains rejected on later proposals with the same stable identity, and an accepted root remains accepted. This is exact-root feedback only and creates no file membership edge.
+- D-013 remains open for cross-root learning and merge/split behavior; the default is no inferred influence beyond the root the user explicitly corrected.

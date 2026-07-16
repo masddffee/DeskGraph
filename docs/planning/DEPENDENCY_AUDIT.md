@@ -96,7 +96,7 @@ The first M5 slice adds only the local path-based `deskgraph-transactions` works
 
 ## M4 folder-profile dependency decision
 
-The first M4 slice adds only the local path-based `deskgraph-projects` workspace crate. Runtime code reuses the audited database and domain layers plus Rust standard library; scanner and `tempfile` are test-only. No registry package, graph library, embedding/vector runtime, model, API, network client, shell, Python, Docker, Ollama, or native runtime was added. ADR-018 deliberately uses deterministic manifest facts and fixed marker rules before any future dependency-backed similarity signal.
+The M4 Folder Profile slice adds only the local path-based `deskgraph-projects` workspace crate. The later Project root candidate migration, database/domain/service/CLI correction flow, and ADR-019 add no registry package. Runtime code reuses the audited database and domain layers plus Rust standard library; scanner and `tempfile` are test-only, and `serde_json` is an already-resolved test dependency. `Cargo.lock` remains at 488 packages. No graph library, embedding/vector runtime, model, API, network client, shell, Python, Docker, Ollama, or native runtime was added. ADR-018/ADR-019 deliberately use deterministic current manifest facts, fixed marker rules, immutable evidence, and append-only exact-root feedback before any future dependency-backed similarity or learned scoring signal.
 
 ## GitHub Actions
 

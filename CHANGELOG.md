@@ -31,3 +31,5 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 - Narrow Desktop rename-preview IPC and a validated UI with explicit before/after paths, nine passed policy checks, path-free recent history, loading/empty/error states, and no execute control.
 - Bounded, read-only Folder Profiles derived from current authorized manifest locations with deterministic category facts and fail-closed 100,000-entry limits.
 - Explainable, model-free Project Suggestions from direct project markers with basis-point confidence, complete marker provenance, observation time, creator/provider/version metadata, README-only rejection, privacy-aware CLI output, and no automatic membership edge.
+- Durable Project root candidates keyed by stable manifest identity with immutable rule observations, normalized signals, database-side current-evidence validation, and append-only user feedback.
+- Privacy-aware `project propose`, `decide`, `status`, and path-free `list` CLI flows with idempotent repeated decisions, opposite-decision correction sequences, rejected-root suppression, and no automatic file membership or filesystem action.

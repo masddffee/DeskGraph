@@ -8,15 +8,15 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 ## Current state
 
-The repository is implementing M2 Content Intelligence plus bounded M3 lexical, M4 folder-profile, M5 rename-preview, and M6 watch-reconciliation slices while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, report graph statistics, and search current local paths and active extracted text. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
+The repository is implementing M2 Content Intelligence plus bounded M3 lexical, M4 project-graph, M5 rename-preview, and M6 watch-reconciliation slices while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, report graph statistics, and search current local paths and active extracted text. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
 The current content slices can extract bounded UTF-8 from an explicitly selected, already-scanned text, Markdown, source-code, or text-layer PDF file. They revalidate the authorized scope, manifest snapshot, and actual open-file identity; store only provenance-bearing `untrusted_extracted_text` chunks; support durable cancellation/recovery; and atomically preserve the prior complete version on failure. PDF extraction uses a strictly bounded, path-free Rust adapter, rejects encrypted PDFs, ignores active content and attachments, and records page/fragment provenance instead of fabricated byte offsets.
 
 The current search slice uses bundled SQLite FTS5 trigram indexes for Traditional Chinese and English substring queries of 3–256 Unicode characters. It requires no embedding or model, returns bounded text snippets, filters out stale chunks and absent locations, and explains whether filename/path, extracted text, or both matched. Scope, source, extension, and modified-time filters plus a synthetic 10k p50/p95/index-size baseline pass locally. One- and two-character queries, project/folder filters, vector semantic search, hybrid fusion, representative/100k/8 GB evaluation, and cross-platform evidence remain open.
 
-The current M4 slice derives bounded Folder Profiles from the current authorized manifest and can suggest a project from direct deterministic markers such as `Cargo.toml` or `package.json`. Every suggestion exposes confidence, provenance, observation time, and its fixed rule provider; it never creates automatic membership and requires no model. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
+The current M4 slices derive bounded Folder Profiles from the current authorized manifest and can persist a correctable Project root candidate from direct deterministic markers such as `Cargo.toml` or `package.json`. Every observation exposes confidence, provenance, observation time, and its fixed rule provider; explicit user accept/reject decisions are append-only and same-decision retries are idempotent. A rejected stable root remains rejected until an opposite explicit correction. Acceptance never creates automatic file membership and requires no model. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
 
-DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, persisted Project/edge relations and corrections, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, Project file-membership and related/duplicate/version relations, cross-root learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -110,7 +110,27 @@ cargo run -p deskgraph-cli -- folder profile \
   --path /absolute/path/to/test-folder
 ```
 
-The explicit response contains the selected canonical folder path, aggregate direct/descendant counts, category counts, and any marker-based Project Suggestion. The computation reads only current manifest locations, stops at 100,000 descendants, and returns no partial profile on overflow. Structured logs omit the selected path and descendant names. A suggestion is not a Project node or membership edge; correction, clustering, related/duplicate/version relations, retrieval filters, and the Project UI remain unimplemented.
+The explicit response contains the selected canonical folder path, aggregate direct/descendant counts, category counts, and any marker-based Project Suggestion. The computation reads only current manifest locations, stops at 100,000 descendants, and returns no partial profile on overflow. Structured logs omit the selected path and descendant names.
+
+Persist and explicitly correct a Project root candidate without assigning file membership:
+
+```bash
+cargo run -p deskgraph-cli -- project propose \
+  --database ./deskgraph-dev.sqlite3 \
+  --scope 1 \
+  --path /absolute/path/to/test-folder
+cargo run -p deskgraph-cli -- project decide \
+  --database ./deskgraph-dev.sqlite3 \
+  --project 1 \
+  --decision reject
+cargo run -p deskgraph-cli -- project status \
+  --database ./deskgraph-dev.sqlite3 \
+  --project 1
+cargo run -p deskgraph-cli -- project list \
+  --database ./deskgraph-dev.sqlite3
+```
+
+`propose` re-derives and validates current manifest evidence before persistence; it does not accept the candidate. Only `decide` appends an explicit `accepted` or `rejected` user event. Repeating the current decision is idempotent, while an opposite decision appends the next correction sequence. Explicit propose/decide/status responses may contain the current root path; `project list` and structured logs remain path-free. Acceptance confirms only the stable root candidate: file membership, cross-root learning, merge/split, related/duplicate/version relations, retrieval filters, and the Project UI remain unimplemented.
 
 Exercise the durable watch-reconciliation core with an explicit hint:
 

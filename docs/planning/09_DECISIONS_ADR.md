@@ -175,3 +175,10 @@ Status：Accepted。Folder Profile 從目前 `present` manifest locations 有界
 
 Canonical detail：
 `docs/architecture/adr/0018-derived-folder-profiles-and-project-suggestions.md`。
+
+## ADR-019 — Append-only Project candidates and user feedback
+
+Status：Accepted。Project root 以 `(scope_id, root_folder_node_id)` 取得穩定候選 identity；suggestion observations/signals 不可變，使用者 accept/reject 以 append-only event 更正。Rejected 的同一 root 後續仍為 rejected，且 Accept 不會自動建立 file membership。
+
+Canonical detail：
+`docs/architecture/adr/0019-append-only-project-candidates-and-user-feedback.md`。

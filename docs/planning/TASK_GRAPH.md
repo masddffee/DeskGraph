@@ -90,8 +90,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 5 — M4 context graph
 
-- Current: ADR-018 and a read-only CLI slice derive bounded Folder Profiles from current manifest identities; fixed direct-child markers create explainable, model-free Project Suggestions with confidence/provenance/time/creator/provider and no membership edge. README-only, nested/sibling, entry-limit and log-redaction behavior pass locally.
-- Next: accept D-012 and persist Project/edge candidates plus correction lifecycle; add related/similar/duplicate/version signals, confirmation/reject/merge/split, feedback-rescoring evaluation, retrieval filters, and a backend-owned Project page.
+- Current: ADR-018 derives bounded Folder Profiles from current manifest identities, and ADR-019 persists stable Project root candidates with immutable deterministic observations/signals plus append-only explicit accept/reject feedback. README-only, invented/stale evidence, idempotent retry, opposite-decision correction, rejected-root suppression, entry-limit and log/list-redaction behavior pass locally. Acceptance creates no file membership edge.
+- Next: add deterministic related/duplicate/version candidates with provenance and current-data invalidation, then define file-membership correction and evaluation. Resolve D-013 before cross-root learned scoring or merge/split; add retrieval filters and a backend-owned Project page only after those source-of-truth contracts pass.
 - Exit with explainable low-confidence behavior and correction feedback evidence.
 
 ### Step 6 — M5 transaction safety

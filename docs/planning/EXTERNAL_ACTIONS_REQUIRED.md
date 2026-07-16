@@ -62,7 +62,7 @@ pnpm check
 pnpm --filter @deskgraph/desktop tauri build --no-bundle
 ```
 
-Windows evidence must include junction/reparse and hidden/system scanner fixtures, open-handle extraction identity, cancellation/interrupted recovery, text/Markdown/code extraction, bounded text-layer PDF extraction with page provenance and adversarial fixtures, Folder Profile separator/marker/limit behavior with path-free logs, and a privacy-safe Desktop/CLI smoke. A successful Rust-only cross-check on macOS is not a substitute.
+Windows evidence must include junction/reparse and hidden/system scanner fixtures, open-handle extraction identity, cancellation/interrupted recovery, text/Markdown/code extraction, bounded text-layer PDF extraction with page provenance and adversarial fixtures, Folder Profile separator/marker/limit behavior, Project candidate migration/current-evidence validation, append-only accept/reject idempotency/correction, rejected-root suppression, path-free logs/list behavior, and a privacy-safe Desktop/CLI smoke. A successful Rust-only cross-check on macOS is not a substitute.
 
 ## Public release and launch accounts (needed in M10)
 
