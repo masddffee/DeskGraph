@@ -13,6 +13,7 @@ path = "src/main.rs"
 clap.workspace = true
 deskgraph-database = { path = "../../crates/database" }
 deskgraph-domain = { path = "../../crates/domain" }
+deskgraph-extractors = { path = "../../crates/extractors" }
 deskgraph-scanner = { path = "../../crates/scanner" }
 deskgraph-telemetry = { path = "../../crates/telemetry" }
 serde.workspace = true

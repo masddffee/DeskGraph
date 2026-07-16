@@ -1,5 +1,8 @@
 use std::process::Command;
 
+use deskgraph_database::ManifestDatabase;
+use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
+
 #[test]
 fn health_command_emits_privacy_safe_json() {
     let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
@@ -46,4 +49,68 @@ fn incomplete_command_fails_with_usage_without_a_stack_trace() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Usage:"));
     assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn extraction_command_emits_counts_without_paths_or_content() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("authorized-private");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let source_path = scope_path.join("private-notes.md");
+    let private_text = "不可出現在 CLI 輸出的私人內容";
+    std::fs::write(&source_path, private_text).expect("fixture should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    let node_id = database
+        .node_id_for_path_key(
+            scope.id,
+            &comparison_key(
+                &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+            ),
+        )
+        .expect("node lookup should pass")
+        .expect("source node should exist");
+    drop(database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "extract",
+            "start",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+            "--scope",
+            &scope.id.to_string(),
+            "--node",
+            &node_id.to_string(),
+        ])
+        .output()
+        .expect("deskgraph extract should start");
+
+    assert!(output.status.success());
+    let progress: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(progress["status"], "completed");
+    assert_eq!(progress["provider_id"], "deskgraph.utf8-text");
+    assert!(progress["chunk_count"].as_u64().unwrap_or_default() > 0);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in [
+        private_text,
+        "private-notes.md",
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        source_path.to_str().expect("source path should be UTF-8"),
+    ] {
+        assert!(!stdout.contains(secret));
+        assert!(!stderr.contains(secret));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
 }

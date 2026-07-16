@@ -3,7 +3,12 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use deskgraph_database::ManifestDatabase;
-use deskgraph_domain::{ScanJobProgress, collect_health};
+use deskgraph_domain::{ExtractionJobProgress, ScanJobProgress, collect_health};
+use deskgraph_extractors::{
+    ExtractionLimits, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
+    extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
+    run_extraction_job_at,
+};
 use deskgraph_scanner::{
     authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_batch,
     run_scan_job_to_terminal, scan_scope,
@@ -41,6 +46,11 @@ enum Command {
     Scan {
         #[command(subcommand)]
         command: ScanCommand,
+    },
+    /// Extract bounded local text from an already scanned file.
+    Extract {
+        #[command(subcommand)]
+        command: ExtractCommand,
     },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
@@ -132,6 +142,66 @@ enum ScanCommand {
         database: PathBuf,
         #[arg(long)]
         job: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtractCommand {
+    /// Create and complete one bounded extraction in the foreground.
+    Start {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long)]
+        node: i64,
+    },
+    /// Create a durable extraction job without opening the source file.
+    Create {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long)]
+        node: i64,
+    },
+    /// Run one queued extraction job to a terminal state.
+    Run {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// Read durable progress without returning paths or extracted text.
+    Status {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// List the 20 most recent privacy-safe extraction job summaries.
+    List {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Request durable cancellation; a running provider stops between bounded work units.
+    Cancel {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// Revalidate the source and make an interrupted job runnable.
+    Resume {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// Read aggregate local extraction counts without paths or text.
+    Stats {
+        #[arg(long)]
+        database: PathBuf,
     },
 }
 
@@ -258,6 +328,56 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 emit_scan_progress(&progress, "metadata_scan_resumed")
             }
         },
+        Command::Extract { command } => match command {
+            ExtractCommand::Start {
+                database,
+                scope,
+                node,
+            } => {
+                let created = create_extraction_job_at(&database, scope, node)
+                    .map_err(|error| error.code())?;
+                let progress =
+                    run_extraction_job_at(&database, created.job_id, ExtractionLimits::default())
+                        .map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "content_extraction_runner_stopped")
+            }
+            ExtractCommand::Create {
+                database,
+                scope,
+                node,
+            } => {
+                let progress = create_extraction_job_at(&database, scope, node)
+                    .map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "content_extraction_created")
+            }
+            ExtractCommand::Run { database, job } => {
+                let progress = run_extraction_job_at(&database, job, ExtractionLimits::default())
+                    .map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "content_extraction_runner_stopped")
+            }
+            ExtractCommand::Status { database, job } => {
+                let progress = extraction_job_at(&database, job).map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "content_extraction_status_read")
+            }
+            ExtractCommand::List { database } => {
+                let jobs = recent_extraction_jobs_at(&database).map_err(|error| error.code())?;
+                emit_json(&jobs, "content_extraction_list_read")
+            }
+            ExtractCommand::Cancel { database, job } => {
+                let progress =
+                    cancel_extraction_job_at(&database, job).map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "content_extraction_cancel_requested")
+            }
+            ExtractCommand::Resume { database, job } => {
+                let progress =
+                    resume_extraction_job_at(&database, job).map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "content_extraction_resumed")
+            }
+            ExtractCommand::Stats { database } => {
+                let stats = extraction_stats_at(&database).map_err(|error| error.code())?;
+                emit_json(&stats, "content_extraction_stats_read")
+            }
+        },
         Command::Fixture { command } => match command {
             FixtureCommand::Generate {
                 path,
@@ -337,6 +457,26 @@ fn emit_scan_progress(progress: &ScanJobProgress, event: &'static str) -> Result
     Ok(())
 }
 
+fn emit_extraction_progress(
+    progress: &ExtractionJobProgress,
+    event: &'static str,
+) -> Result<(), &'static str> {
+    print_json(progress)?;
+    info!(
+        event = event,
+        scope_id = progress.scope_id,
+        node_id = progress.node_id,
+        job_id = progress.job_id,
+        status = ?progress.status,
+        source_bytes = progress.source_bytes,
+        output_bytes = progress.output_bytes,
+        chunk_count = progress.chunk_count,
+        elapsed_ms = progress.elapsed_ms,
+        cancel_requested = progress.cancel_requested
+    );
+    Ok(())
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<(), &'static str> {
     let json = serde_json::to_string_pretty(value).map_err(|_| "response_serialization_failed")?;
     println!("{json}");
@@ -357,6 +497,7 @@ mod tests {
     fn scan_requires_an_explicit_database_and_scope() {
         assert!(Cli::try_parse_from(["deskgraph", "scan", "start"]).is_err());
         assert!(Cli::try_parse_from(["deskgraph", "scan", "run"]).is_err());
+        assert!(Cli::try_parse_from(["deskgraph", "extract", "start"]).is_err());
     }
 
     #[test]
@@ -438,6 +579,46 @@ mod tests {
                 .status,
             deskgraph_domain::ScanStatus::Completed
         );
+    }
+
+    #[test]
+    fn bounded_extraction_runs_through_cli_handler() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("authorized");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let source_path = scope_path.join("notes.md");
+        std::fs::write(&source_path, "# DeskGraph\n本機 local-first context\n")
+            .expect("fixture should write");
+        let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
+        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        scan_scope(&mut manifest, scope.id).expect("scope should scan");
+        let node_id = manifest
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("source node should exist");
+        drop(manifest);
+
+        execute(Cli {
+            command: Command::Extract {
+                command: ExtractCommand::Start {
+                    database: database.clone(),
+                    scope: scope.id,
+                    node: node_id,
+                },
+            },
+        })
+        .expect("extraction should pass");
+
+        let manifest = ManifestDatabase::open(&database).expect("database should reopen");
+        let stats = manifest.extraction_stats().expect("stats should load");
+        assert_eq!(stats.extracted_file_count, 1);
+        assert!(stats.active_chunk_count > 0);
     }
 
     #[test]
