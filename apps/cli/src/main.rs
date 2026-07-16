@@ -11,8 +11,8 @@ use deskgraph_extractors::{
     run_extraction_job_at,
 };
 use deskgraph_projects::{
-    decide_project_candidate_at, folder_profile_at, project_candidate_at, propose_project_at,
-    recent_project_candidates_at,
+    check_exact_duplicate_at, decide_project_candidate_at, folder_profile_at, project_candidate_at,
+    propose_project_at, recent_project_candidates_at, verify_exact_duplicate_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
@@ -137,6 +137,11 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Check and revalidate bounded deterministic file-relation candidates.
+    Relation {
+        #[command(subcommand)]
+        command: RelationCommand,
+    },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
         #[command(subcommand)]
@@ -251,6 +256,28 @@ enum ProjectCommand {
     List {
         #[arg(long)]
         database: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RelationCommand {
+    /// Compare two explicit scanned files byte-for-byte and suggest an exact duplicate relation.
+    Duplicate {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long)]
+        left: PathBuf,
+        #[arg(long)]
+        right: PathBuf,
+    },
+    /// Revalidate one exact duplicate relation against current files and append an observation.
+    Verify {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        relation: i64,
     },
 }
 
@@ -760,6 +787,43 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 let candidates =
                     recent_project_candidates_at(&database).map_err(|error| error.code())?;
                 emit_json(&candidates, "project_candidate_list_read")
+            }
+        },
+        Command::Relation { command } => match command {
+            RelationCommand::Duplicate {
+                database,
+                scope,
+                left,
+                right,
+            } => {
+                let candidate = check_exact_duplicate_at(&database, scope, &left, &right)
+                    .map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "file_relation_duplicate_checked",
+                    relation_id = candidate.relation_id,
+                    scope_id = candidate.left.scope_id,
+                    left_node_id = candidate.left.node_id,
+                    right_node_id = candidate.right.node_id,
+                    compared_bytes = candidate.evidence.compared_bytes,
+                    state = ?candidate.state
+                );
+                Ok(())
+            }
+            RelationCommand::Verify { database, relation } => {
+                let candidate =
+                    verify_exact_duplicate_at(&database, relation).map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "file_relation_duplicate_verified",
+                    relation_id = candidate.relation_id,
+                    scope_id = candidate.left.scope_id,
+                    left_node_id = candidate.left.node_id,
+                    right_node_id = candidate.right.node_id,
+                    compared_bytes = candidate.evidence.compared_bytes,
+                    state = ?candidate.state
+                );
+                Ok(())
             }
         },
         Command::Fixture { command } => match command {

@@ -1,18 +1,47 @@
 use std::fmt;
-use std::path::Path;
+use std::fs::{self, File, Metadata};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use deskgraph_database::{DatabaseError, FolderProfileFacts, ManifestDatabase};
+use deskgraph_database::{ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase};
 use deskgraph_domain::{
-    FolderProfile, ProjectCandidate, ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal,
-    ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
+    FileRelationCandidate, FolderProfile, ProjectCandidate, ProjectCandidateSummary,
+    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator,
 };
+use deskgraph_identity::{
+    IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
+    platform_identity, platform_identity_for_open_file,
+};
+use deskgraph_scanner::{ScannerError, validated_scope_root};
 
 const DEFAULT_ENTRY_LIMIT: u64 = 100_000;
+const MAX_EXACT_DUPLICATE_BYTES: u64 = 64 * 1024 * 1024;
+const DUPLICATE_BUFFER_BYTES: usize = 64 * 1024;
+const DUPLICATE_COMPARE_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum ProjectError {
     Database(DatabaseError),
+    Scanner(ScannerError),
     SuggestionUnavailable,
+    RelationPathMustBeAbsolute,
+    RelationSourceUnavailable,
+    RelationSourceSymlinkOrReparseDenied,
+    RelationSourceOutsideScope,
+    RelationSourceMustBeFile,
+    RelationSourceIdentityUnavailable,
+    RelationSourceIdentityChanged,
+    RelationSourceMetadataChanged,
+    RelationSourceOpenFailed,
+    RelationSourceReadFailed,
+    RelationSourceEmpty,
+    RelationSourceTooLarge,
+    RelationSameFileIdentity,
+    RelationContentDiffers,
+    RelationComparisonTimedOut,
+    RelationPathDecodeFailed,
 }
 
 impl ProjectError {
@@ -20,7 +49,26 @@ impl ProjectError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Database(error) => error.code(),
+            Self::Scanner(error) => error.code(),
             Self::SuggestionUnavailable => "project_suggestion_unavailable",
+            Self::RelationPathMustBeAbsolute => "file_relation_path_must_be_absolute",
+            Self::RelationSourceUnavailable => "file_relation_source_unavailable",
+            Self::RelationSourceSymlinkOrReparseDenied => {
+                "file_relation_source_symlink_or_reparse_denied"
+            }
+            Self::RelationSourceOutsideScope => "file_relation_source_outside_scope",
+            Self::RelationSourceMustBeFile => "file_relation_source_must_be_file",
+            Self::RelationSourceIdentityUnavailable => "file_relation_source_identity_unavailable",
+            Self::RelationSourceIdentityChanged => "file_relation_source_identity_changed",
+            Self::RelationSourceMetadataChanged => "file_relation_source_metadata_changed",
+            Self::RelationSourceOpenFailed => "file_relation_source_open_failed",
+            Self::RelationSourceReadFailed => "file_relation_source_read_failed",
+            Self::RelationSourceEmpty => "file_relation_source_empty",
+            Self::RelationSourceTooLarge => "file_relation_source_too_large",
+            Self::RelationSameFileIdentity => "file_relation_same_file_identity",
+            Self::RelationContentDiffers => "file_relation_content_differs",
+            Self::RelationComparisonTimedOut => "file_relation_comparison_timed_out",
+            Self::RelationPathDecodeFailed => "file_relation_path_decode_failed",
         }
     }
 }
@@ -37,6 +85,18 @@ impl From<DatabaseError> for ProjectError {
     fn from(error: DatabaseError) -> Self {
         Self::Database(error)
     }
+}
+
+impl From<ScannerError> for ProjectError {
+    fn from(error: ScannerError) -> Self {
+        Self::Scanner(error)
+    }
+}
+
+struct OpenRelationSource {
+    path: PathBuf,
+    snapshot: ActionSourceRecord,
+    file: File,
 }
 
 pub fn folder_profile_at(
@@ -105,6 +165,264 @@ pub fn recent_project_candidates_at(
     ManifestDatabase::open(database_path)?
         .recent_project_candidates()
         .map_err(Into::into)
+}
+
+pub fn check_exact_duplicate_at(
+    database_path: &Path,
+    scope_id: i64,
+    left_path: &Path,
+    right_path: &Path,
+) -> Result<FileRelationCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    check_exact_duplicate(&mut database, scope_id, left_path, right_path)
+}
+
+pub fn check_exact_duplicate(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    left_path: &Path,
+    right_path: &Path,
+) -> Result<FileRelationCandidate, ProjectError> {
+    let canonical_root = validated_scope_root(database, scope_id)?;
+    let left = open_relation_source(database, scope_id, &canonical_root, left_path, None)?;
+    let right = open_relation_source(database, scope_id, &canonical_root, right_path, None)?;
+    compare_and_record(database, left, right)
+}
+
+pub fn verify_exact_duplicate_at(
+    database_path: &Path,
+    relation_id: i64,
+) -> Result<FileRelationCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    verify_exact_duplicate(&mut database, relation_id)
+}
+
+pub fn verify_exact_duplicate(
+    database: &mut ManifestDatabase,
+    relation_id: i64,
+) -> Result<FileRelationCandidate, ProjectError> {
+    let (left_snapshot, right_snapshot) = database.exact_duplicate_sources(relation_id)?;
+    let canonical_root = validated_scope_root(database, left_snapshot.scope_id)?;
+    let left_path = path_from_raw(&left_snapshot.path_raw)
+        .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
+    let right_path = path_from_raw(&right_snapshot.path_raw)
+        .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
+    let left = open_relation_source(
+        database,
+        left_snapshot.scope_id,
+        &canonical_root,
+        &left_path,
+        Some(left_snapshot.node_id),
+    )?;
+    let right = open_relation_source(
+        database,
+        right_snapshot.scope_id,
+        &canonical_root,
+        &right_path,
+        Some(right_snapshot.node_id),
+    )?;
+    compare_and_record(database, left, right)
+}
+
+fn open_relation_source(
+    database: &ManifestDatabase,
+    scope_id: i64,
+    canonical_root: &Path,
+    requested_path: &Path,
+    expected_node_id: Option<i64>,
+) -> Result<OpenRelationSource, ProjectError> {
+    if !requested_path.is_absolute() {
+        return Err(ProjectError::RelationPathMustBeAbsolute);
+    }
+    let link_metadata = fs::symlink_metadata(requested_path)
+        .map_err(|_| ProjectError::RelationSourceUnavailable)?;
+    if is_symlink_or_reparse_point(&link_metadata) {
+        return Err(ProjectError::RelationSourceSymlinkOrReparseDenied);
+    }
+    if !link_metadata.is_file() {
+        return Err(ProjectError::RelationSourceMustBeFile);
+    }
+    let canonical_path =
+        fs::canonicalize(requested_path).map_err(|_| ProjectError::RelationSourceUnavailable)?;
+    if canonical_path == canonical_root || !canonical_path.starts_with(canonical_root) {
+        return Err(ProjectError::RelationSourceOutsideScope);
+    }
+    if comparison_key(requested_path) != comparison_key(&canonical_path) {
+        return Err(ProjectError::RelationSourceSymlinkOrReparseDenied);
+    }
+    validate_canonical_path_state(canonical_root, &canonical_path)?;
+    let snapshot = database
+        .action_source_for_path_key(scope_id, &comparison_key(&canonical_path))
+        .map_err(|error| match error {
+            DatabaseError::ActionSourceNotFound => ProjectError::RelationSourceUnavailable,
+            other => ProjectError::Database(other),
+        })?;
+    if expected_node_id.is_some_and(|expected| expected != snapshot.node_id) {
+        return Err(ProjectError::RelationSourceIdentityChanged);
+    }
+    validate_path_snapshot(&canonical_path, &snapshot, &link_metadata)?;
+    let file = File::open(&canonical_path).map_err(|_| ProjectError::RelationSourceOpenFailed)?;
+    let open_metadata = file
+        .metadata()
+        .map_err(|_| ProjectError::RelationSourceOpenFailed)?;
+    validate_open_snapshot(&file, &canonical_path, &snapshot, &open_metadata)?;
+    Ok(OpenRelationSource {
+        path: canonical_path,
+        snapshot,
+        file,
+    })
+}
+
+fn compare_and_record(
+    database: &mut ManifestDatabase,
+    mut left: OpenRelationSource,
+    mut right: OpenRelationSource,
+) -> Result<FileRelationCandidate, ProjectError> {
+    if left.snapshot.node_id == right.snapshot.node_id
+        || (left.snapshot.identity_kind == right.snapshot.identity_kind
+            && left.snapshot.identity_key == right.snapshot.identity_key)
+    {
+        return Err(ProjectError::RelationSameFileIdentity);
+    }
+    if left.snapshot.size_bytes == 0 || right.snapshot.size_bytes == 0 {
+        return Err(ProjectError::RelationSourceEmpty);
+    }
+    if left.snapshot.size_bytes > MAX_EXACT_DUPLICATE_BYTES
+        || right.snapshot.size_bytes > MAX_EXACT_DUPLICATE_BYTES
+    {
+        return Err(ProjectError::RelationSourceTooLarge);
+    }
+    if left.snapshot.size_bytes != right.snapshot.size_bytes {
+        return Err(ProjectError::RelationContentDiffers);
+    }
+    compare_exact_bytes(&mut left.file, &mut right.file, left.snapshot.size_bytes)?;
+    let canonical_root = validated_scope_root(database, left.snapshot.scope_id)?;
+    validate_canonical_path_state(&canonical_root, &left.path)?;
+    validate_canonical_path_state(&canonical_root, &right.path)?;
+    let left_metadata = left
+        .file
+        .metadata()
+        .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+    let right_metadata = right
+        .file
+        .metadata()
+        .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+    validate_open_snapshot(&left.file, &left.path, &left.snapshot, &left_metadata)?;
+    validate_open_snapshot(&right.file, &right.path, &right.snapshot, &right_metadata)?;
+
+    let (left_snapshot, right_snapshot) = if left.snapshot.node_id < right.snapshot.node_id {
+        (&left.snapshot, &right.snapshot)
+    } else {
+        (&right.snapshot, &left.snapshot)
+    };
+    database
+        .record_exact_duplicate_candidate(left_snapshot, right_snapshot)
+        .map_err(Into::into)
+}
+
+fn compare_exact_bytes(
+    left: &mut File,
+    right: &mut File,
+    expected_bytes: u64,
+) -> Result<(), ProjectError> {
+    let started = Instant::now();
+    let mut remaining = expected_bytes;
+    let mut left_buffer = vec![0_u8; DUPLICATE_BUFFER_BYTES];
+    let mut right_buffer = vec![0_u8; DUPLICATE_BUFFER_BYTES];
+    while remaining > 0 {
+        if started.elapsed() > DUPLICATE_COMPARE_DEADLINE {
+            return Err(ProjectError::RelationComparisonTimedOut);
+        }
+        let chunk = usize::try_from(remaining.min(DUPLICATE_BUFFER_BYTES as u64))
+            .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+        left.read_exact(&mut left_buffer[..chunk])
+            .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+        right
+            .read_exact(&mut right_buffer[..chunk])
+            .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+        if left_buffer[..chunk] != right_buffer[..chunk] {
+            return Err(ProjectError::RelationContentDiffers);
+        }
+        remaining -= u64::try_from(chunk).map_err(|_| ProjectError::RelationSourceReadFailed)?;
+    }
+    let mut left_extra = [0_u8; 1];
+    let mut right_extra = [0_u8; 1];
+    let left_extra = left
+        .read(&mut left_extra)
+        .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+    let right_extra = right
+        .read(&mut right_extra)
+        .map_err(|_| ProjectError::RelationSourceReadFailed)?;
+    if left_extra != 0 || right_extra != 0 {
+        return Err(ProjectError::RelationSourceMetadataChanged);
+    }
+    if started.elapsed() > DUPLICATE_COMPARE_DEADLINE {
+        return Err(ProjectError::RelationComparisonTimedOut);
+    }
+    Ok(())
+}
+
+fn validate_path_snapshot(
+    path: &Path,
+    snapshot: &ActionSourceRecord,
+    metadata: &Metadata,
+) -> Result<(), ProjectError> {
+    if snapshot.identity_kind == "path_fallback" {
+        return Err(ProjectError::RelationSourceIdentityUnavailable);
+    }
+    let identity = platform_identity(path, metadata, IdentityNodeKind::File)
+        .map_err(|_| ProjectError::RelationSourceIdentityUnavailable)?;
+    if identity.kind != snapshot.identity_kind || identity.key != snapshot.identity_key {
+        return Err(ProjectError::RelationSourceIdentityChanged);
+    }
+    validate_metadata(snapshot, metadata)
+}
+
+fn validate_canonical_path_state(canonical_root: &Path, path: &Path) -> Result<(), ProjectError> {
+    let link_metadata =
+        fs::symlink_metadata(path).map_err(|_| ProjectError::RelationSourceUnavailable)?;
+    if is_symlink_or_reparse_point(&link_metadata) {
+        return Err(ProjectError::RelationSourceSymlinkOrReparseDenied);
+    }
+    let current = fs::canonicalize(path).map_err(|_| ProjectError::RelationSourceUnavailable)?;
+    if current == canonical_root || !current.starts_with(canonical_root) {
+        return Err(ProjectError::RelationSourceOutsideScope);
+    }
+    if comparison_key(&current) != comparison_key(path) {
+        return Err(ProjectError::RelationSourceSymlinkOrReparseDenied);
+    }
+    Ok(())
+}
+
+fn validate_open_snapshot(
+    file: &File,
+    path: &Path,
+    snapshot: &ActionSourceRecord,
+    metadata: &Metadata,
+) -> Result<(), ProjectError> {
+    let identity = platform_identity_for_open_file(file, path, metadata, IdentityNodeKind::File)
+        .map_err(|_| ProjectError::RelationSourceIdentityUnavailable)?;
+    if identity.kind != snapshot.identity_kind || identity.key != snapshot.identity_key {
+        return Err(ProjectError::RelationSourceIdentityChanged);
+    }
+    validate_metadata(snapshot, metadata)
+}
+
+fn validate_metadata(
+    snapshot: &ActionSourceRecord,
+    metadata: &Metadata,
+) -> Result<(), ProjectError> {
+    if metadata.len() != snapshot.size_bytes
+        || modified_unix_ns(metadata) != snapshot.modified_unix_ns
+    {
+        return Err(ProjectError::RelationSourceMetadataChanged);
+    }
+    Ok(())
+}
+
+fn modified_unix_ns(metadata: &Metadata) -> Option<i64> {
+    let duration = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(duration.as_nanos()).ok()
 }
 
 fn folder_profile_with_limit(
@@ -183,7 +501,10 @@ fn project_signal(kind: ProjectSignalKind) -> ProjectSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deskgraph_domain::{FolderFileCategory, ProjectCandidateState};
+    use deskgraph_domain::{
+        FileRelationCandidateState, FileRelationComparisonKind, FileRelationCreator,
+        FolderFileCategory, ProjectCandidateState,
+    };
     use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
 
     struct Fixture {
@@ -392,5 +713,209 @@ mod tests {
                 .expect("summaries should load")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn exact_duplicate_candidate_is_bounded_durable_and_order_independent() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("duplicates");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let left_path = scope_path.join("private-left.txt");
+        let right_path = scope_path.join("private-right.txt");
+        let private_bytes = b"private exact duplicate bytes";
+        std::fs::write(&left_path, private_bytes).expect("left should write");
+        std::fs::write(&right_path, private_bytes).expect("right should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
+        let canonical_right =
+            std::fs::canonicalize(&right_path).expect("right should canonicalize");
+
+        let candidate =
+            check_exact_duplicate(&mut database, scope.id, &canonical_left, &canonical_right)
+                .expect("identical files should create a candidate");
+        assert_eq!(candidate.state, FileRelationCandidateState::Suggested);
+        assert!(candidate.left.node_id < candidate.right.node_id);
+        assert_eq!(
+            candidate.evidence.comparison_kind,
+            FileRelationComparisonKind::ByteForByte
+        );
+        assert_eq!(
+            candidate.evidence.compared_bytes,
+            u64::try_from(private_bytes.len()).expect("fixture size should fit")
+        );
+        assert_eq!(candidate.evidence.confidence_basis_points, 10_000);
+        assert_eq!(
+            candidate.evidence.created_by,
+            FileRelationCreator::SystemRule
+        );
+        assert_eq!(candidate.evidence.model_version, None);
+        assert_eq!(candidate.evidence.bounded_max_bytes, 64 * 1024 * 1024);
+
+        let swapped =
+            check_exact_duplicate(&mut database, scope.id, &canonical_right, &canonical_left)
+                .expect("reversed input should reuse the relation");
+        assert_eq!(swapped.relation_id, candidate.relation_id);
+        let verified = verify_exact_duplicate(&mut database, candidate.relation_id)
+            .expect("current relation should verify");
+        assert_eq!(verified.relation_id, candidate.relation_id);
+        assert_eq!(
+            std::fs::read(&left_path).expect("left should remain"),
+            private_bytes
+        );
+        assert_eq!(
+            std::fs::read(&right_path).expect("right should remain"),
+            private_bytes
+        );
+    }
+
+    #[test]
+    fn duplicate_check_rejects_different_same_identity_and_stale_sources() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("duplicate-errors");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let left_path = scope_path.join("left.bin");
+        let right_path = scope_path.join("right.bin");
+        let different_path = scope_path.join("different.bin");
+        let outside_path = directory.path().join("outside.bin");
+        std::fs::write(&left_path, b"same-length!").expect("left should write");
+        std::fs::write(&right_path, b"same-length!").expect("right should write");
+        std::fs::write(&different_path, b"diff-length?").expect("different should write");
+        std::fs::write(&outside_path, b"same-length!").expect("outside should write");
+        #[cfg(unix)]
+        let hard_link_path = {
+            let path = scope_path.join("left-hard-link.bin");
+            std::fs::hard_link(&left_path, &path).expect("hard link should create");
+            path
+        };
+        #[cfg(unix)]
+        let symlink_alias = {
+            let path = scope_path.join("scope-alias");
+            std::os::unix::fs::symlink(&scope_path, &path).expect("scope alias should create");
+            path
+        };
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
+        let canonical_right =
+            std::fs::canonicalize(&right_path).expect("right should canonicalize");
+        let canonical_different =
+            std::fs::canonicalize(&different_path).expect("different should canonicalize");
+        let canonical_outside =
+            std::fs::canonicalize(&outside_path).expect("outside should canonicalize");
+        #[cfg(unix)]
+        let canonical_hard_link =
+            std::fs::canonicalize(&hard_link_path).expect("hard link should canonicalize");
+
+        let different = check_exact_duplicate(
+            &mut database,
+            scope.id,
+            &canonical_left,
+            &canonical_different,
+        )
+        .expect_err("different bytes should not create a relation");
+        assert_eq!(different.code(), "file_relation_content_differs");
+        let same_identity =
+            check_exact_duplicate(&mut database, scope.id, &canonical_left, &canonical_left)
+                .expect_err("the same stable file is not a duplicate");
+        assert_eq!(same_identity.code(), "file_relation_same_file_identity");
+        #[cfg(unix)]
+        {
+            let hard_link = check_exact_duplicate(
+                &mut database,
+                scope.id,
+                &canonical_left,
+                &canonical_hard_link,
+            )
+            .expect_err("hard-link aliases are one stable file");
+            assert_eq!(hard_link.code(), "file_relation_same_file_identity");
+            let canonical_scope =
+                std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
+            let aliased_right = canonical_scope
+                .join(
+                    symlink_alias
+                        .file_name()
+                        .expect("symlink alias should have a name"),
+                )
+                .join("right.bin");
+            let symlink =
+                check_exact_duplicate(&mut database, scope.id, &canonical_left, &aliased_right)
+                    .expect_err("symlinked parent traversal must fail closed");
+            assert_eq!(
+                symlink.code(),
+                "file_relation_source_symlink_or_reparse_denied"
+            );
+        }
+        let outside =
+            check_exact_duplicate(&mut database, scope.id, &canonical_left, &canonical_outside)
+                .expect_err("an outside path must fail before manifest lookup");
+        assert_eq!(outside.code(), "file_relation_source_outside_scope");
+        let relative = check_exact_duplicate(
+            &mut database,
+            scope.id,
+            Path::new("left.bin"),
+            &canonical_right,
+        )
+        .expect_err("relative paths are ambiguous and must fail");
+        assert_eq!(relative.code(), "file_relation_path_must_be_absolute");
+
+        let candidate =
+            check_exact_duplicate(&mut database, scope.id, &canonical_left, &canonical_right)
+                .expect("initial identical files should create a candidate");
+        std::fs::write(&right_path, b"changed").expect("right should change");
+        let stale = verify_exact_duplicate(&mut database, candidate.relation_id)
+            .expect_err("changed source should invalidate verification");
+        assert_eq!(stale.code(), "file_relation_source_metadata_changed");
+    }
+
+    #[test]
+    fn duplicate_check_rejects_empty_and_oversized_files_before_reading() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("duplicate-limits");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let empty_left = scope_path.join("empty-left.bin");
+        let empty_right = scope_path.join("empty-right.bin");
+        std::fs::write(&empty_left, []).expect("empty left should write");
+        std::fs::write(&empty_right, []).expect("empty right should write");
+        let large_left = scope_path.join("large-left.bin");
+        let large_right = scope_path.join("large-right.bin");
+        File::create(&large_left)
+            .expect("large left should create")
+            .set_len(MAX_EXACT_DUPLICATE_BYTES + 1)
+            .expect("large left should resize");
+        File::create(&large_right)
+            .expect("large right should create")
+            .set_len(MAX_EXACT_DUPLICATE_BYTES + 1)
+            .expect("large right should resize");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        let canonical_empty_left =
+            std::fs::canonicalize(&empty_left).expect("empty left should canonicalize");
+        let canonical_empty_right =
+            std::fs::canonicalize(&empty_right).expect("empty right should canonicalize");
+        let canonical_large_left =
+            std::fs::canonicalize(&large_left).expect("large left should canonicalize");
+        let canonical_large_right =
+            std::fs::canonicalize(&large_right).expect("large right should canonicalize");
+
+        let empty = check_exact_duplicate(
+            &mut database,
+            scope.id,
+            &canonical_empty_left,
+            &canonical_empty_right,
+        )
+        .expect_err("empty files should be excluded");
+        assert_eq!(empty.code(), "file_relation_source_empty");
+        let large = check_exact_duplicate(
+            &mut database,
+            scope.id,
+            &canonical_large_left,
+            &canonical_large_right,
+        )
+        .expect_err("oversized files should be excluded before comparison");
+        assert_eq!(large.code(), "file_relation_source_too_large");
     }
 }

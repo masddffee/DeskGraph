@@ -134,6 +134,73 @@ impl ProjectCandidateSummary {
     pub const API_VERSION: &str = "deskgraph.project-candidate-summary.v1";
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRelationKind {
+    ExactDuplicate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRelationCandidateState {
+    Suggested,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRelationComparisonKind {
+    ByteForByte,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRelationCreator {
+    SystemRule,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileRelationEndpoint {
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub location_id: i64,
+    pub display_path: String,
+    pub size_bytes: u64,
+    pub modified_unix_ns: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileRelationEvidence {
+    pub comparison_kind: FileRelationComparisonKind,
+    pub compared_bytes: u64,
+    pub confidence_basis_points: u16,
+    pub observed_at_unix_ms: i64,
+    pub created_by: FileRelationCreator,
+    pub provider_id: &'static str,
+    pub provider_version: &'static str,
+    pub model_version: Option<String>,
+    pub bounded_max_bytes: u64,
+}
+
+impl FileRelationEvidence {
+    pub const PROVIDER_ID: &str = "deskgraph.byte-equality";
+    pub const PROVIDER_VERSION: &str = "1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileRelationCandidate {
+    pub api_version: &'static str,
+    pub relation_id: i64,
+    pub kind: FileRelationKind,
+    pub state: FileRelationCandidateState,
+    pub left: FileRelationEndpoint,
+    pub right: FileRelationEndpoint,
+    pub evidence: FileRelationEvidence,
+}
+
+impl FileRelationCandidate {
+    pub const API_VERSION: &str = "deskgraph.file-relation-candidate.v1";
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderProfile {
     pub api_version: &'static str,
@@ -198,5 +265,43 @@ mod tests {
         assert_eq!(value["state"], "rejected");
         assert!(value.get("display_path").is_none());
         assert!(value.get("suggestion").is_none());
+    }
+
+    #[test]
+    fn exact_duplicate_candidate_is_explicit_explainable_and_model_free() {
+        let endpoint = |node_id: i64, path: &str| FileRelationEndpoint {
+            scope_id: 1,
+            node_id,
+            location_id: node_id + 10,
+            display_path: path.to_string(),
+            size_bytes: 4,
+            modified_unix_ns: Some(5),
+        };
+        let candidate = FileRelationCandidate {
+            api_version: FileRelationCandidate::API_VERSION,
+            relation_id: 1,
+            kind: FileRelationKind::ExactDuplicate,
+            state: FileRelationCandidateState::Suggested,
+            left: endpoint(2, "/scope/private-left.txt"),
+            right: endpoint(3, "/scope/private-right.txt"),
+            evidence: FileRelationEvidence {
+                comparison_kind: FileRelationComparisonKind::ByteForByte,
+                compared_bytes: 4,
+                confidence_basis_points: 10_000,
+                observed_at_unix_ms: 6,
+                created_by: FileRelationCreator::SystemRule,
+                provider_id: FileRelationEvidence::PROVIDER_ID,
+                provider_version: FileRelationEvidence::PROVIDER_VERSION,
+                model_version: None,
+                bounded_max_bytes: 64 * 1024 * 1024,
+            },
+        };
+        let value = serde_json::to_value(candidate).expect("candidate should serialize");
+        assert_eq!(value["kind"], "exact_duplicate");
+        assert_eq!(value["state"], "suggested");
+        assert_eq!(value["evidence"]["comparison_kind"], "byte_for_byte");
+        assert_eq!(value["evidence"]["confidence_basis_points"], 10_000);
+        assert_eq!(value["evidence"]["created_by"], "system_rule");
+        assert_eq!(value["evidence"]["model_version"], serde_json::Value::Null);
     }
 }

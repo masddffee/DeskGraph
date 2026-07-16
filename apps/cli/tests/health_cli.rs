@@ -486,6 +486,127 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
 }
 
 #[test]
+fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("private-duplicates");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let left_path = scope_path.join("private-left.bin");
+    let right_path = scope_path.join("private-right.bin");
+    let private_content = b"private duplicate local context";
+    std::fs::write(&left_path, private_content).expect("left should write");
+    std::fs::write(&right_path, private_content).expect("right should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let scope_arg = scope.id.to_string();
+    let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
+    let canonical_right = std::fs::canonicalize(&right_path).expect("right should canonicalize");
+    let left_arg = canonical_left.to_str().expect("left path should be UTF-8");
+    let right_arg = canonical_right
+        .to_str()
+        .expect("right path should be UTF-8");
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "duplicate",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_arg,
+            "--left",
+            left_arg,
+            "--right",
+            right_arg,
+        ])
+        .output()
+        .expect("deskgraph relation duplicate should start");
+    assert!(duplicate.status.success());
+    let candidate: serde_json::Value =
+        serde_json::from_slice(&duplicate.stdout).expect("candidate should be JSON");
+    assert_eq!(
+        candidate["api_version"],
+        "deskgraph.file-relation-candidate.v1"
+    );
+    assert_eq!(candidate["kind"], "exact_duplicate");
+    assert_eq!(candidate["state"], "suggested");
+    assert_eq!(candidate["evidence"]["comparison_kind"], "byte_for_byte");
+    assert_eq!(candidate["evidence"]["confidence_basis_points"], 10_000);
+    assert_eq!(
+        candidate["evidence"]["compared_bytes"],
+        u64::try_from(private_content.len()).expect("fixture size should fit")
+    );
+    assert_eq!(
+        candidate["evidence"]["model_version"],
+        serde_json::Value::Null
+    );
+    let returned_paths = [
+        candidate["left"]["display_path"]
+            .as_str()
+            .expect("left path should exist"),
+        candidate["right"]["display_path"]
+            .as_str()
+            .expect("right path should exist"),
+    ];
+    assert!(returned_paths.contains(&canonical_left.to_string_lossy().as_ref()));
+    assert!(returned_paths.contains(&canonical_right.to_string_lossy().as_ref()));
+
+    let relation_arg = candidate["relation_id"]
+        .as_i64()
+        .expect("relation id should exist")
+        .to_string();
+    let verified = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "verify",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+        ])
+        .output()
+        .expect("deskgraph relation verify should start");
+    assert!(verified.status.success());
+    let verified_json: serde_json::Value =
+        serde_json::from_slice(&verified.stdout).expect("verification should be JSON");
+    assert_eq!(verified_json["relation_id"], candidate["relation_id"]);
+    assert_eq!(verified_json["state"], "suggested");
+
+    assert_eq!(
+        std::fs::read(&left_path).expect("left should remain"),
+        private_content
+    );
+    assert_eq!(
+        std::fs::read(&right_path).expect("right should remain"),
+        private_content
+    );
+    for output in [&duplicate, &verified] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for secret in [
+            "private-duplicates",
+            "private-left.bin",
+            "private-right.bin",
+            left_arg,
+            right_arg,
+            database_arg,
+            "private duplicate local context",
+        ] {
+            assert!(!stderr.contains(secret));
+        }
+        assert!(
+            stderr
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+    }
+}
+
+#[test]
 fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

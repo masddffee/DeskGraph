@@ -805,6 +805,7 @@ version = "0.1.0"
 dependencies = [
  "deskgraph-database",
  "deskgraph-domain",
+ "deskgraph-identity",
  "deskgraph-scanner",
  "serde_json",
  "tempfile",
