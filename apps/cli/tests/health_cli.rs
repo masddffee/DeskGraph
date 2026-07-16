@@ -246,3 +246,103 @@ fn watch_observe_persists_path_free_progress_without_logging_the_hint() {
             .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
     );
 }
+
+#[test]
+fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("authorized-actions");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let source_path = scope_path.join("private-draft.txt");
+    let destination_path = scope_path.join("private-final.txt");
+    std::fs::write(&source_path, "private local action fixture").expect("fixture should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "organize",
+            "rename-preview",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+            "--scope",
+            &scope.id.to_string(),
+            "--source",
+            source_path.to_str().expect("source path should be UTF-8"),
+            "--new-name",
+            "private-final.txt",
+        ])
+        .output()
+        .expect("deskgraph rename preview should start");
+
+    assert!(output.status.success());
+    let preview: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(preview["api_version"], "deskgraph.action-plan.v1");
+    assert_eq!(preview["operation"], "rename");
+    assert_eq!(preview["state"], "previewed");
+    let canonical_source = std::fs::canonicalize(&source_path).expect("source should canonicalize");
+    let canonical_destination = canonical_source
+        .parent()
+        .expect("source should have parent")
+        .join("private-final.txt");
+    assert_eq!(
+        preview["source_path"],
+        canonical_source.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        preview["destination_path"],
+        canonical_destination.to_string_lossy().as_ref()
+    );
+    assert_eq!(preview["policy"]["decision"], "allowed");
+    assert_eq!(preview["journal_sequence"], 1);
+    assert!(source_path.exists());
+    assert!(!destination_path.exists());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in [
+        "private-draft.txt",
+        "private-final.txt",
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        source_path.to_str().expect("source path should be UTF-8"),
+    ] {
+        assert!(!stderr.contains(secret));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+
+    let list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "organize",
+            "list",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+        ])
+        .output()
+        .expect("deskgraph action list should start");
+    assert!(list.status.success());
+    let summaries: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("summary stdout should be JSON");
+    assert_eq!(summaries[0]["plan_id"], preview["plan_id"]);
+    assert!(summaries[0].get("source_path").is_none());
+    assert!(summaries[0].get("destination_path").is_none());
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    let list_stderr = String::from_utf8_lossy(&list.stderr);
+    for secret in [
+        "private-draft.txt",
+        "private-final.txt",
+        canonical_source.to_str().expect("source should be UTF-8"),
+    ] {
+        assert!(!list_stdout.contains(secret));
+        assert!(!list_stderr.contains(secret));
+    }
+}

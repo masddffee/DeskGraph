@@ -1,0 +1,16 @@
+[package]
+name = "deskgraph-transactions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+deskgraph-database = { path = "../database" }
+deskgraph-domain = { path = "../domain" }
+deskgraph-identity = { path = "../identity" }
+deskgraph-scanner = { path = "../scanner" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

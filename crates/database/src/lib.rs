@@ -4,9 +4,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskgraph_domain::{
-    AuthorizedScope, ExtractionJobProgress, ExtractionStats, ExtractionStatus, ManifestStats,
-    ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress, WatchEventReason,
-    WatchEventStatus,
+    ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
+    ActionPlanSummary, ActionPolicyReport, AuthorizedScope, ExtractionJobProgress, ExtractionStats,
+    ExtractionStatus, ManifestStats, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
+    WatchEventReason, WatchEventStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -41,6 +42,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "watch_reconciliation",
         sql: include_str!("../../../migrations/0006_watch_reconciliation.sql"),
     },
+    Migration {
+        version: 7,
+        name: "action_plan_preview",
+        sql: include_str!("../../../migrations/0007_action_plan_preview.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -49,6 +55,7 @@ const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_MATCH_BYTES: usize = 1024;
 const MAX_SEARCH_CANDIDATES_PER_SOURCE: u32 = 100;
 const MAX_WATCH_PATH_BYTES: usize = 64 * 1024;
+const MAX_ACTION_PATH_BYTES: usize = 64 * 1024;
 
 struct Migration {
     version: i64,
@@ -191,6 +198,38 @@ pub struct ExtractableFile {
     pub modified_unix_ns: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionSourceRecord {
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub location_id: i64,
+    pub path_raw: Vec<u8>,
+    pub path_key: String,
+    pub display_path: String,
+    pub identity_kind: String,
+    pub identity_key: Vec<u8>,
+    pub size_bytes: u64,
+    pub modified_unix_ns: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ActionPlanWrite<'a> {
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub source_location_id: i64,
+    pub source_path_raw: &'a [u8],
+    pub source_path_key: &'a str,
+    pub source_display_path: &'a str,
+    pub destination_path_raw: &'a [u8],
+    pub destination_path_key: &'a str,
+    pub destination_display_path: &'a str,
+    pub source_identity_kind: &'a str,
+    pub source_identity_key: &'a [u8],
+    pub source_size_bytes: u64,
+    pub source_modified_unix_ns: Option<i64>,
+    pub execution_strategy: ActionExecutionStrategy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentChunkProvenanceWrite {
     ByteRange {
@@ -266,6 +305,10 @@ pub enum DatabaseError {
     WatchEventNotFound,
     InvalidWatchEventState,
     WatchInputInvalid,
+    ActionSourceNotFound,
+    ActionPlanNotFound,
+    ActionPlanInputInvalid,
+    ActionSourceSnapshotChanged,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -295,6 +338,10 @@ impl DatabaseError {
             Self::WatchEventNotFound => "watch_event_not_found",
             Self::InvalidWatchEventState => "invalid_watch_event_state",
             Self::WatchInputInvalid => "watch_input_invalid",
+            Self::ActionSourceNotFound => "action_source_not_found",
+            Self::ActionPlanNotFound => "action_plan_not_found",
+            Self::ActionPlanInputInvalid => "action_plan_input_invalid",
+            Self::ActionSourceSnapshotChanged => "action_source_snapshot_changed",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -1923,6 +1970,144 @@ impl ManifestDatabase {
         })
     }
 
+    pub fn action_source_for_path_key(
+        &self,
+        scope_id: i64,
+        path_key: &str,
+    ) -> Result<ActionSourceRecord, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT l.scope_id, l.node_id, l.id, l.path_raw, l.path_key, l.display_path, \
+                        n.identity_kind, n.identity_key, f.size_bytes, f.modified_unix_ns \
+                 FROM locations l \
+                 JOIN nodes n ON n.id = l.node_id AND n.kind = 'file' \
+                 JOIN files f ON f.node_id = l.node_id \
+                 WHERE l.scope_id = ?1 AND l.path_key = ?2 AND l.present = 1",
+                params![scope_id, path_key],
+                |row| {
+                    Ok(ActionSourceRecord {
+                        scope_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        path_raw: row.get(3)?,
+                        path_key: row.get(4)?,
+                        display_path: row.get(5)?,
+                        identity_kind: row.get(6)?,
+                        identity_key: row.get(7)?,
+                        size_bytes: row_u64(row, 8)?,
+                        modified_unix_ns: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::ActionSourceNotFound)
+    }
+
+    pub fn create_rename_action_plan(
+        &mut self,
+        plan: ActionPlanWrite<'_>,
+    ) -> Result<ActionPlanPreview, DatabaseError> {
+        validate_action_plan_write(&plan)?;
+        let source_size = to_i64(plan.source_size_bytes)?;
+        let created_at = unix_ms()?;
+        let execution_strategy = action_execution_strategy_str(plan.execution_strategy);
+        let transaction = self.connection.transaction()?;
+        let snapshot_matches: i64 = transaction.query_row(
+            "SELECT COUNT(*) \
+             FROM locations l \
+             JOIN nodes n ON n.id = l.node_id AND n.kind = 'file' \
+             JOIN files f ON f.node_id = l.node_id \
+             WHERE l.id = ?1 AND l.scope_id = ?2 AND l.node_id = ?3 AND l.present = 1 \
+               AND l.path_raw = ?4 AND l.path_key = ?5 AND l.display_path = ?6 \
+               AND n.identity_kind = ?7 AND n.identity_key = ?8 \
+               AND f.size_bytes = ?9 AND f.modified_unix_ns IS ?10",
+            params![
+                plan.source_location_id,
+                plan.scope_id,
+                plan.node_id,
+                plan.source_path_raw,
+                plan.source_path_key,
+                plan.source_display_path,
+                plan.source_identity_kind,
+                plan.source_identity_key,
+                source_size,
+                plan.source_modified_unix_ns,
+            ],
+            |row| row.get(0),
+        )?;
+        if snapshot_matches != 1 {
+            return Err(DatabaseError::ActionSourceSnapshotChanged);
+        }
+        transaction.execute(
+            "INSERT INTO action_plans( \
+                api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
+                source_location_id, source_path_raw, source_path_key, source_display_path, \
+                destination_path_raw, destination_path_key, destination_display_path, \
+                source_identity_kind, source_identity_key, source_size_bytes, \
+                source_modified_unix_ns, created_at_unix_ms \
+             ) VALUES ( \
+                'deskgraph.action-plan.v1', 'deskgraph.action-policy.v1', 'rename', ?1, ?2, ?3, \
+                ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15 \
+             )",
+            params![
+                execution_strategy,
+                plan.scope_id,
+                plan.node_id,
+                plan.source_location_id,
+                plan.source_path_raw,
+                plan.source_path_key,
+                plan.source_display_path,
+                plan.destination_path_raw,
+                plan.destination_path_key,
+                plan.destination_display_path,
+                plan.source_identity_kind,
+                plan.source_identity_key,
+                source_size,
+                plan.source_modified_unix_ns,
+                created_at,
+            ],
+        )?;
+        let plan_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO action_plan_events(plan_id, sequence, event_kind, created_at_unix_ms) \
+             VALUES (?1, 1, 'preview_created', ?2)",
+            params![plan_id, created_at],
+        )?;
+        transaction.commit()?;
+        self.action_plan(plan_id)
+    }
+
+    pub fn action_plan(&self, plan_id: i64) -> Result<ActionPlanPreview, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT p.id, p.operation, p.scope_id, p.node_id, p.source_display_path, \
+                        p.destination_display_path, p.execution_strategy, p.created_at_unix_ms, \
+                        MAX(e.sequence) \
+                 FROM action_plans p \
+                 JOIN action_plan_events e ON e.plan_id = p.id \
+                 WHERE p.id = ?1 \
+                 GROUP BY p.id",
+                [plan_id],
+                action_plan_from_row,
+            )
+            .optional()?
+            .ok_or(DatabaseError::ActionPlanNotFound)
+    }
+
+    pub fn recent_action_plans(&self) -> Result<Vec<ActionPlanSummary>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.id, p.operation, p.scope_id, p.node_id, p.execution_strategy, \
+                    p.created_at_unix_ms, MAX(e.sequence) \
+             FROM action_plans p \
+             JOIN action_plan_events e ON e.plan_id = p.id \
+             GROUP BY p.id \
+             ORDER BY p.id DESC \
+             LIMIT 20",
+        )?;
+        let rows = statement.query_map([], action_plan_summary_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn node_id_for_path_key(
         &self,
         scope_id: i64,
@@ -1937,6 +2122,102 @@ impl ManifestDatabase {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn validate_action_plan_write(plan: &ActionPlanWrite<'_>) -> Result<(), DatabaseError> {
+    let paths_valid = !plan.source_path_raw.is_empty()
+        && plan.source_path_raw.len() <= MAX_ACTION_PATH_BYTES
+        && !plan.source_path_key.is_empty()
+        && plan.source_path_key.len() <= MAX_ACTION_PATH_BYTES
+        && !plan.source_display_path.is_empty()
+        && plan.source_display_path.len() <= MAX_ACTION_PATH_BYTES
+        && !plan.destination_path_raw.is_empty()
+        && plan.destination_path_raw.len() <= MAX_ACTION_PATH_BYTES
+        && !plan.destination_path_key.is_empty()
+        && plan.destination_path_key.len() <= MAX_ACTION_PATH_BYTES
+        && !plan.destination_display_path.is_empty()
+        && plan.destination_display_path.len() <= MAX_ACTION_PATH_BYTES;
+    if plan.scope_id <= 0
+        || plan.node_id <= 0
+        || plan.source_location_id <= 0
+        || !paths_valid
+        || plan.source_path_raw == plan.destination_path_raw
+        || plan.source_display_path == plan.destination_display_path
+        || plan.source_identity_kind.is_empty()
+        || plan.source_identity_kind.len() > 128
+        || plan.source_identity_key.is_empty()
+        || plan.source_identity_key.len() > 4096
+    {
+        return Err(DatabaseError::ActionPlanInputInvalid);
+    }
+    Ok(())
+}
+
+fn action_execution_strategy_str(strategy: ActionExecutionStrategy) -> &'static str {
+    match strategy {
+        ActionExecutionStrategy::Direct => "direct",
+        ActionExecutionStrategy::CaseOnlyStaged => "case_only_staged",
+    }
+}
+
+fn action_execution_strategy_from_str(
+    stored: &str,
+) -> Result<ActionExecutionStrategy, rusqlite::Error> {
+    match stored {
+        "direct" => Ok(ActionExecutionStrategy::Direct),
+        "case_only_staged" => Ok(ActionExecutionStrategy::CaseOnlyStaged),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn action_operation_from_str(stored: &str) -> Result<ActionOperation, rusqlite::Error> {
+    match stored {
+        "rename" => Ok(ActionOperation::Rename),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn action_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPlanPreview> {
+    let operation = action_operation_from_str(&row.get::<_, String>(1)?)?;
+    let execution_strategy = action_execution_strategy_from_str(&row.get::<_, String>(6)?)?;
+    let journal_sequence = row_u64(row, 8)?;
+    if journal_sequence != 1 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(ActionPlanPreview {
+        api_version: ActionPlanPreview::API_VERSION,
+        plan_id: row.get(0)?,
+        operation,
+        state: ActionPlanState::Previewed,
+        scope_id: row.get(2)?,
+        node_id: row.get(3)?,
+        source_path: row.get(4)?,
+        destination_path: row.get(5)?,
+        execution_strategy,
+        policy: ActionPolicyReport::rename_allowed(),
+        journal_sequence,
+        created_at_unix_ms: row.get(7)?,
+    })
+}
+
+fn action_plan_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPlanSummary> {
+    let operation = action_operation_from_str(&row.get::<_, String>(1)?)?;
+    let execution_strategy = action_execution_strategy_from_str(&row.get::<_, String>(4)?)?;
+    let journal_sequence = row_u64(row, 6)?;
+    if journal_sequence != 1 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(ActionPlanSummary {
+        api_version: ActionPlanSummary::API_VERSION,
+        plan_id: row.get(0)?,
+        operation,
+        state: ActionPlanState::Previewed,
+        scope_id: row.get(2)?,
+        node_id: row.get(3)?,
+        execution_strategy,
+        journal_sequence,
+        created_at_unix_ms: row.get(5)?,
+    })
 }
 
 fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventRecord> {
@@ -2525,6 +2806,100 @@ mod tests {
                 .expect("stats should load")
                 .completed_scan_count,
             0
+        );
+    }
+
+    #[test]
+    fn action_preview_and_first_journal_event_commit_atomically_and_are_immutable() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let source = database
+            .action_source_for_path_key(scope_id, "/scope/file.txt")
+            .expect("action source should load");
+        assert_eq!(source.node_id, node_id);
+        let preview = database
+            .create_rename_action_plan(ActionPlanWrite {
+                scope_id,
+                node_id,
+                source_location_id: source.location_id,
+                source_path_raw: &source.path_raw,
+                source_path_key: &source.path_key,
+                source_display_path: &source.display_path,
+                destination_path_raw: b"/scope/renamed.txt",
+                destination_path_key: "/scope/renamed.txt",
+                destination_display_path: "/scope/renamed.txt",
+                source_identity_kind: &source.identity_kind,
+                source_identity_key: &source.identity_key,
+                source_size_bytes: source.size_bytes,
+                source_modified_unix_ns: source.modified_unix_ns,
+                execution_strategy: ActionExecutionStrategy::Direct,
+            })
+            .expect("preview and journal should persist");
+
+        assert_eq!(preview.state, ActionPlanState::Previewed);
+        assert_eq!(preview.journal_sequence, 1);
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM action_plan_events WHERE plan_id = ?1",
+                    [preview.plan_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("journal should count"),
+            1
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE action_plans SET destination_display_path = '/scope/other.txt' WHERE id = ?1",
+                    [preview.plan_id],
+                )
+                .is_err(),
+            "immutable plan update must fail"
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM action_plan_events WHERE plan_id = ?1",
+                    [preview.plan_id],
+                )
+                .is_err(),
+            "append-only journal delete must fail"
+        );
+    }
+
+    #[test]
+    fn database_rejects_action_plan_when_manifest_snapshot_does_not_match() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let source = database
+            .action_source_for_path_key(scope_id, "/scope/file.txt")
+            .expect("action source should load");
+        let error = database
+            .create_rename_action_plan(ActionPlanWrite {
+                scope_id,
+                node_id,
+                source_location_id: source.location_id,
+                source_path_raw: &source.path_raw,
+                source_path_key: &source.path_key,
+                source_display_path: &source.display_path,
+                destination_path_raw: b"/scope/renamed.txt",
+                destination_path_key: "/scope/renamed.txt",
+                destination_display_path: "/scope/renamed.txt",
+                source_identity_kind: &source.identity_kind,
+                source_identity_key: &source.identity_key,
+                source_size_bytes: source.size_bytes + 1,
+                source_modified_unix_ns: source.modified_unix_ns,
+                execution_strategy: ActionExecutionStrategy::Direct,
+            })
+            .expect_err("database boundary must reject stale snapshot");
+        assert!(matches!(error, DatabaseError::ActionSourceSnapshotChanged));
+        assert!(
+            database
+                .recent_action_plans()
+                .expect("summaries should load")
+                .is_empty()
         );
     }
 

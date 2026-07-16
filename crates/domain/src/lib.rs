@@ -1,9 +1,14 @@
+mod action;
 mod extraction;
 mod health;
 mod manifest;
 mod search;
 mod watch;
 
+pub use action::{
+    ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
+    ActionPlanSummary, ActionPolicyCheck, ActionPolicyDecision, ActionPolicyReport,
+};
 pub use extraction::{ExtractionJobProgress, ExtractionStats, ExtractionStatus};
 pub use health::{
     ComponentHealth, HealthReport, LifecycleState, PlatformHealth, PrivacyHealth, ProviderHealth,

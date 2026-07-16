@@ -15,6 +15,7 @@ use deskgraph_scanner::{
     run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
+use deskgraph_transactions::{action_plan_at, create_rename_preview_at, recent_action_plans_at};
 use deskgraph_watcher::{
     WatchPolicy, advance_watch_event_at, observe_watch_path_at, recent_watch_events_at,
     watch_event_at,
@@ -101,6 +102,11 @@ enum Command {
         #[command(subcommand)]
         command: WatchCommand,
     },
+    /// Create and inspect durable organization previews. No filesystem action is exposed.
+    Organize {
+        #[command(subcommand)]
+        command: OrganizeCommand,
+    },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
         #[command(subcommand)]
@@ -134,6 +140,33 @@ enum WatchCommand {
         event: i64,
     },
     /// List the 20 most recent path-free durable event states.
+    List {
+        #[arg(long)]
+        database: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OrganizeCommand {
+    /// Validate and durably journal a same-folder file rename preview without renaming anything.
+    RenamePreview {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        new_name: String,
+    },
+    /// Read one explicit before/after preview by its durable plan ID.
+    Status {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        plan: i64,
+    },
+    /// List the 20 most recent path-free plan summaries.
     List {
         #[arg(long)]
         database: PathBuf,
@@ -527,6 +560,26 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             WatchCommand::List { database } => {
                 let events = recent_watch_events_at(&database).map_err(|error| error.code())?;
                 emit_json(&events, "watch_event_list_read")
+            }
+        },
+        Command::Organize { command } => match command {
+            OrganizeCommand::RenamePreview {
+                database,
+                scope,
+                source,
+                new_name,
+            } => {
+                let preview = create_rename_preview_at(&database, scope, &source, &new_name)
+                    .map_err(|error| error.code())?;
+                emit_json(&preview, "rename_preview_created")
+            }
+            OrganizeCommand::Status { database, plan } => {
+                let preview = action_plan_at(&database, plan).map_err(|error| error.code())?;
+                emit_json(&preview, "action_plan_status_read")
+            }
+            OrganizeCommand::List { database } => {
+                let plans = recent_action_plans_at(&database).map_err(|error| error.code())?;
+                emit_json(&plans, "action_plan_list_read")
             }
         },
         Command::Fixture { command } => match command {

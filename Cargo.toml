@@ -9,6 +9,7 @@ members = [
   "crates/retrieval",
   "crates/scanner",
   "crates/telemetry",
+  "crates/transactions",
   "crates/watcher",
   "tools/search-benchmark",
 ]
