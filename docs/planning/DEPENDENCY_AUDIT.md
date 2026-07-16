@@ -25,6 +25,22 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 | Prettier | Build | 3.9.5 | `prettier.io`, npm, `prettier/prettier` | Repository formatting check passes | MIT | Development only; planning/prompts are excluded to preserve the supplied SSOT text |
 | cargo-audit | Audit tool, not shipped | 0.22.2 | crates.io, `docs.rs/cargo-audit`, `rustsec/rustsec` | RustSec official project; requires Rust 1.88+; local audit executed | Apache-2.0 OR MIT | Installed outside the project and not added to the application dependency graph |
 
+## M1 selected dependencies
+
+| Dependency | Scope | Selected version | Official source / API evidence | Maintenance and platform evidence | License | Security and decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| `rusqlite` / `libsqlite3-sys` | Runtime | 0.40.1 / 0.38.1 | crates.io, `docs.rs/rusqlite`, `rusqlite/rusqlite`; official examples confirm `Connection`, transactions, batch pragmas, and the `bundled` feature | Current crates.io release inspected on 2026-07-16; upstream supports Rust desktop targets through SQLite and `cc` | MIT | Disable rusqlite defaults and enable only `bundled`; avoids an unknown system SQLite and the default WASM backend. Manifest migrations are embedded and checksummed. |
+| `unicode-normalization` | Runtime | 0.1.25 | crates.io, `docs.rs/unicode-normalization`, `unicode-rs/unicode-normalization` | Current crates.io release inspected on 2026-07-16; pure Rust and platform-independent | MIT OR Apache-2.0 | NFC comparison keys reduce canonically equivalent path duplicates. This is not a security substitute for canonical scope validation. |
+| `windows-sys` | Windows runtime only | 0.61.2 | crates.io, Microsoft `microsoft/windows-rs`, generated Windows API docs; verified signatures for `CreateFileW`, `GetFileInformationByHandle`, `CloseHandle`, and `BY_HANDLE_FILE_INFORMATION` | Current crates.io release inspected on 2026-07-16; Microsoft-maintained; Rust 1.71 minimum; Windows-only target dependency | MIT OR Apache-2.0 | Enable only `Win32_Foundation`, `Win32_Security`, and `Win32_Storage_FileSystem`. Unsafe calls stay in one identity adapter; metadata-only access uses shared handles and deterministic close. |
+| `clap` | CLI runtime | 4.6.2 | crates.io, `docs.rs/clap`, `clap-rs/clap`; official derive and nested subcommand examples inspected | Current crates.io release inspected on 2026-07-16; Rust 1.85 minimum; pure Rust CLI parser | MIT OR Apache-2.0 | Schema-derived CLI rejects ambiguous input and supports future M1 job controls without custom parsing. |
+| `tempfile` | Tests/bench fixtures only | 3.27.0 | crates.io, `docs.rs/tempfile`, `Stebalien/tempfile` | Current crates.io release inspected on 2026-07-16; Rust 1.63 minimum; cross-platform | MIT OR Apache-2.0 | Dev-only fixture isolation. Never used by product runtime or as a permanent-delete product capability. |
+
+### M1 dependency verification notes
+
+- Rust 1.97 `std::os::windows::fs::MetadataExt::{volume_serial_number,file_index,number_of_links}` was compiled against `x86_64-pc-windows-msvc` and rejected with `E0658 windows_by_handle`; it is not a viable stable implementation.
+- The selected Microsoft binding exposes the required stable Win32 APIs. Windows CI must compile and run identity fixtures before M1 can be considered cross-platform verified.
+- `rusqlite` currently defaults to `cache` and `ffi-sqlite-wasm-rs`; DeskGraph explicitly opts out of defaults and selects bundled native SQLite.
+
 ## GitHub Actions
 
 Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2 is pinned to `11bd71901bbe5b1630ceea73d27597364c9af683`; `actions/setup-node` v6.4.0 is pinned to `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e`. CI permissions default to `contents: read`, and no secrets are exposed to fork pull requests. Remote execution evidence remains blocked until the GitHub repository exists.
@@ -42,11 +58,12 @@ Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2
 
 - Execute frozen installs and all checks in remote macOS, Windows, and Linux CI.
 - Revisit native transitive dependencies, redistribution notices, and R-016 when packaging begins.
-- Audit every SQLite, OCR, embedding, vector, model, archive, PDF, and Office dependency separately before M1/M2/M3/M9 adoption.
+- Re-run the Rust dependency and license audit after the M1 lockfile changes.
+- Audit every OCR, embedding, vector, model, archive, PDF, and Office dependency separately before M2/M3/M9 adoption.
 
 ## Rejected or deferred at M0
 
-- No database crate: M0 reports the database honestly as `not_initialized`; SQLite begins in M1 after migration and binding evaluation.
+- M0 intentionally had no database crate. M1 adopts the audited SQLite binding above; the health contract may report it ready only after initialization succeeds.
 - No OCR, vector, embedding, or LLM runtime: they are not needed for the foundation slice.
 - No Tauri filesystem, shell, HTTP, opener, or updater plugin: M0 health requires none of those capabilities.
 - No telemetry/crash SDK: privacy and governance decision is unresolved.

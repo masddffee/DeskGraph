@@ -89,3 +89,17 @@ Revisit：
 
 Canonical detail：
 `docs/architecture/adr/0008-project-license.md`。
+
+## ADR-010 — Manifest store and file identity
+
+Decision：
+M1 使用 bundled SQLite，並將 graph node identity 與 path location 分離。Unix 使用 device/inode；Windows 使用官方 `windows-sys` 的 volume serial/file index；所有路徑仍受 canonical authorized scope 約束。
+
+Why：
+
+- Path-only identity 無法安全處理 Move 與 Hard Link。
+- Rust 1.97 的 Windows metadata accessor 仍不穩定。
+- Initial Scan、Watch Reconcile 與 Transaction Engine 需要共同的持久化 identity source of truth。
+
+Canonical detail：
+`docs/architecture/adr/0010-manifest-store-and-file-identity.md`。
