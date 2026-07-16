@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
-    AuthorizedScope, ExtractionJobProgress, ExtractionStats, HealthReport, ManifestStats,
-    ScanJobProgress, SearchFilters, SearchResponse, WatchEventProgress,
-    collect_health_with_manifest,
+    ActionPlanPreview, ActionPlanSummary, AuthorizedScope, ExtractionJobProgress, ExtractionStats,
+    HealthReport, ManifestStats, ScanJobProgress, SearchFilters, SearchResponse,
+    WatchEventProgress, collect_health_with_manifest,
 };
 use deskgraph_extractors::{
     extraction_stats_at as read_extraction_stats_at,
@@ -15,6 +15,7 @@ use deskgraph_scanner::{
     authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
+use deskgraph_transactions::{create_rename_preview_at, recent_action_plans_at};
 use deskgraph_watcher::recent_watch_events_at as read_recent_watch_events_at;
 use tauri::{Manager, State};
 use tracing::info;
@@ -109,6 +110,35 @@ fn recent_content_extractions(
 #[tauri::command]
 fn recent_watch_events(state: State<'_, ManifestState>) -> Result<Vec<WatchEventProgress>, String> {
     recent_watch_events_for_database(&state.database_path).map_err(str::to_string)
+}
+
+#[tauri::command]
+fn create_rename_preview(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    source_path: String,
+    new_name: String,
+) -> Result<ActionPlanPreview, String> {
+    let preview = create_rename_preview_for_database(
+        &state.database_path,
+        scope_id,
+        Path::new(&source_path),
+        &new_name,
+    )
+    .map_err(str::to_string)?;
+    info!(
+        event = "rename_preview_created",
+        plan_id = preview.plan_id,
+        scope_id = preview.scope_id,
+        node_id = preview.node_id,
+        execution_strategy = ?preview.execution_strategy
+    );
+    Ok(preview)
+}
+
+#[tauri::command]
+fn recent_action_plans(state: State<'_, ManifestState>) -> Result<Vec<ActionPlanSummary>, String> {
+    recent_action_plans_for_database(&state.database_path).map_err(str::to_string)
 }
 
 #[tauri::command]
@@ -218,6 +248,20 @@ fn recent_watch_events_for_database(path: &Path) -> Result<Vec<WatchEventProgres
     read_recent_watch_events_at(path).map_err(|error| error.code())
 }
 
+fn create_rename_preview_for_database(
+    database_path: &Path,
+    scope_id: i64,
+    source_path: &Path,
+    new_name: &str,
+) -> Result<ActionPlanPreview, &'static str> {
+    create_rename_preview_at(database_path, scope_id, source_path, new_name)
+        .map_err(|error| error.code())
+}
+
+fn recent_action_plans_for_database(path: &Path) -> Result<Vec<ActionPlanSummary>, &'static str> {
+    recent_action_plans_at(path).map_err(|error| error.code())
+}
+
 fn search_local_at(
     path: &Path,
     query: &str,
@@ -293,6 +337,8 @@ pub fn run() {
             content_extraction_stats,
             recent_content_extractions,
             recent_watch_events,
+            create_rename_preview,
+            recent_action_plans,
             search_local,
             pause_manifest_scan,
             resume_manifest_scan
@@ -473,6 +519,47 @@ mod tests {
                 .unwrap_or_default()
                 .contains("專案脈絡")
         );
+    }
+
+    #[test]
+    fn rename_preview_helper_changes_no_file_and_history_is_path_free() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-actions-private");
+        let source_path = scope_path.join("private-draft.md");
+        let destination_path = scope_path.join("private-final.md");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(&source_path, "private action text").expect("file should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope =
+            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+
+        let preview = create_rename_preview_for_database(
+            &database_path,
+            scope.id,
+            &source_path,
+            "private-final.md",
+        )
+        .expect("preview should create");
+        assert_eq!(preview.state, deskgraph_domain::ActionPlanState::Previewed);
+        assert!(source_path.exists());
+        assert!(!destination_path.exists());
+        let explicit_payload =
+            serde_json::to_string(&preview).expect("explicit preview should serialize");
+        assert!(explicit_payload.contains("private-draft.md"));
+        assert!(explicit_payload.contains("private-final.md"));
+
+        let summary_payload = serde_json::to_string(
+            &recent_action_plans_for_database(&database_path)
+                .expect("path-free plan history should load"),
+        )
+        .expect("plan summaries should serialize");
+        assert!(summary_payload.contains("deskgraph.action-plan-summary.v1"));
+        assert!(!summary_payload.contains("private-draft.md"));
+        assert!(!summary_payload.contains("private-final.md"));
+        assert!(!summary_payload.contains(scope_path.to_string_lossy().as_ref()));
     }
 
     #[test]

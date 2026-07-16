@@ -2,6 +2,13 @@ import { useEffect, useState } from 'react';
 
 import { lifecycleLabel, loadHealthReport, type HealthReport } from './health';
 import {
+  createRenamePreview,
+  loadRecentActionPlans,
+  type ActionPlanPreview,
+  type ActionPlanSummary,
+  type ActionPolicyCheck,
+} from './action';
+import {
   loadExtractionStats,
   loadRecentExtractions,
   type ExtractionJobProgress,
@@ -38,6 +45,7 @@ type ReadyState = {
   extraction: ExtractionStats;
   extractionJobs: ExtractionJobProgress[];
   watchEvents: WatchEventProgress[];
+  actionPlans: ActionPlanSummary[];
 };
 type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
 type ActionState =
@@ -49,6 +57,11 @@ type SearchState =
   | { kind: 'idle' }
   | { kind: 'working' }
   | { kind: 'ready'; response: SearchResponse }
+  | { kind: 'error'; message: string };
+type RenamePreviewState =
+  | { kind: 'idle' }
+  | { kind: 'working' }
+  | { kind: 'ready'; preview: ActionPlanPreview }
   | { kind: 'error'; message: string };
 
 interface StatusRowProps {
@@ -76,7 +89,7 @@ function Metric({ label, value }: { label: string; value: number }) {
 }
 
 async function loadDashboard(): Promise<ReadyState> {
-  const [report, manifest, scopes, jobs, extraction, extractionJobs, watchEvents] =
+  const [report, manifest, scopes, jobs, extraction, extractionJobs, watchEvents, actionPlans] =
     await Promise.all([
       loadHealthReport(),
       loadManifestStatus(),
@@ -85,6 +98,7 @@ async function loadDashboard(): Promise<ReadyState> {
       loadExtractionStats(),
       loadRecentExtractions(),
       loadRecentWatchEvents(),
+      loadRecentActionPlans(),
     ]);
   return {
     kind: 'ready',
@@ -95,6 +109,7 @@ async function loadDashboard(): Promise<ReadyState> {
     extraction,
     extractionJobs,
     watchEvents,
+    actionPlans,
   };
 }
 
@@ -183,6 +198,18 @@ function watchStatusLabel(event: WatchEventProgress): string {
   return watchReasonLabel(event.reason);
 }
 
+function actionPolicyCheckLabel(check: ActionPolicyCheck): string {
+  if (check === 'explicit_authorized_scope') return 'Inside the selected authorized folder';
+  if (check === 'present_manifest_file') return 'Current scanned file';
+  if (check === 'canonical_source_contained') return 'Canonical source stays in scope';
+  if (check === 'source_identity_matches') return 'Platform identity matches the manifest';
+  if (check === 'read_only_handle_identity_matches') return 'Read-only open handle matches';
+  if (check === 'portable_single_component_name') return 'Portable one-part filename';
+  if (check === 'same_canonical_parent') return 'Same canonical parent folder';
+  if (check === 'destination_contained') return 'Destination stays in scope';
+  return 'Destination is available';
+}
+
 export default function App() {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
@@ -195,6 +222,10 @@ export default function App() {
   const [searchModifiedSince, setSearchModifiedSince] = useState('');
   const [searchModifiedBefore, setSearchModifiedBefore] = useState('');
   const [searchState, setSearchState] = useState<SearchState>({ kind: 'idle' });
+  const [renameScopeId, setRenameScopeId] = useState<number | null>(null);
+  const [renameSourcePath, setRenameSourcePath] = useState('');
+  const [renameNewName, setRenameNewName] = useState('');
+  const [renameState, setRenameState] = useState<RenamePreviewState>({ kind: 'idle' });
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
@@ -252,17 +283,28 @@ export default function App() {
   }
 
   async function refreshManifest() {
-    const [manifest, scopes, jobs, extraction, extractionJobs, watchEvents] = await Promise.all([
-      loadManifestStatus(),
-      loadAuthorizedScopes(),
-      loadRecentScanJobs(),
-      loadExtractionStats(),
-      loadRecentExtractions(),
-      loadRecentWatchEvents(),
-    ]);
+    const [manifest, scopes, jobs, extraction, extractionJobs, watchEvents, actionPlans] =
+      await Promise.all([
+        loadManifestStatus(),
+        loadAuthorizedScopes(),
+        loadRecentScanJobs(),
+        loadExtractionStats(),
+        loadRecentExtractions(),
+        loadRecentWatchEvents(),
+        loadRecentActionPlans(),
+      ]);
     setState((current) =>
       current.kind === 'ready'
-        ? { ...current, manifest, scopes, jobs, extraction, extractionJobs, watchEvents }
+        ? {
+            ...current,
+            manifest,
+            scopes,
+            jobs,
+            extraction,
+            extractionJobs,
+            watchEvents,
+            actionPlans,
+          }
         : current,
     );
   }
@@ -412,6 +454,34 @@ export default function App() {
       setSearchState({
         kind: 'error',
         message: 'Search stopped safely. Try a shorter query or refresh the local manifest.',
+      });
+    }
+  }
+
+  async function submitRenamePreview() {
+    const sourcePath = renameSourcePath.trim();
+    if (renameScopeId === null) {
+      setRenameState({ kind: 'error', message: 'Choose the authorized folder first.' });
+      return;
+    }
+    if (!sourcePath || !renameNewName) {
+      setRenameState({
+        kind: 'error',
+        message: 'Enter the current absolute file path and one proposed filename.',
+      });
+      return;
+    }
+    setRenameState({ kind: 'working' });
+    try {
+      const preview = await createRenamePreview(renameScopeId, sourcePath, renameNewName);
+      const actionPlans = await loadRecentActionPlans();
+      setState((current) => (current.kind === 'ready' ? { ...current, actionPlans } : current));
+      setRenameState({ kind: 'ready', preview });
+    } catch {
+      setRenameState({
+        kind: 'error',
+        message:
+          'Preview denied safely. Rescan a changed file, verify the authorized folder, and choose an unused portable filename.',
       });
     }
   }
@@ -624,6 +694,141 @@ export default function App() {
                 ))}
               </ol>
             ) : null}
+          </section>
+
+          <section className="panel panel--actions" aria-labelledby="actions-title">
+            <div className="panel-heading panel-heading--wrap">
+              <div>
+                <p className="panel-kicker">Safe organization preview</p>
+                <h2 id="actions-title">Review a rename without changing the file</h2>
+                <p>
+                  DeskGraph revalidates the selected scope, current manifest snapshot, file
+                  identity, read-only open handle, proposed name, and destination before it journals
+                  a preview.
+                </p>
+              </div>
+              <span className="connected-indicator connected-indicator--pending">
+                Preview only · no execute
+              </span>
+            </div>
+
+            <form
+              className="rename-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submitRenamePreview();
+              }}
+            >
+              <label>
+                Authorized folder
+                <select
+                  value={renameScopeId ?? ''}
+                  onChange={(event) =>
+                    setRenameScopeId(event.target.value ? Number(event.target.value) : null)
+                  }
+                >
+                  <option value="">Choose a scanned folder</option>
+                  {state.scopes.map((scope) => (
+                    <option key={scope.id} value={scope.id}>
+                      Scope {scope.id} · {scope.display_path}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Current absolute file path
+                <input
+                  value={renameSourcePath}
+                  onChange={(event) => setRenameSourcePath(event.target.value)}
+                  placeholder="/authorized/folder/draft.md"
+                  autoComplete="off"
+                  spellCheck="false"
+                />
+              </label>
+              <label>
+                Proposed filename only
+                <input
+                  value={renameNewName}
+                  onChange={(event) => setRenameNewName(event.target.value)}
+                  placeholder="final.md"
+                  autoComplete="off"
+                  spellCheck="false"
+                  maxLength={255}
+                />
+              </label>
+              <button type="submit" disabled={renameState.kind === 'working'}>
+                {renameState.kind === 'working' ? 'Validating safely…' : 'Create durable preview'}
+              </button>
+            </form>
+
+            {renameState.kind === 'error' ? (
+              <p className="action-message action-message--error" role="alert">
+                {renameState.message}
+              </p>
+            ) : null}
+
+            {renameState.kind === 'ready' ? (
+              <div className="rename-preview" role="status" aria-label="Validated rename preview">
+                <div className="rename-preview-heading">
+                  <div>
+                    <strong>Plan {renameState.preview.plan_id} · validated preview</strong>
+                    <span>
+                      {renameState.preview.execution_strategy === 'case_only_staged'
+                        ? 'Case-only rename requires a staged future executor.'
+                        : 'Direct rename strategy recorded for a future executor.'}
+                    </span>
+                  </div>
+                  <span className="status-pill status-pill--ok">No file changed</span>
+                </div>
+                <div className="rename-paths">
+                  <div>
+                    <span>Before</span>
+                    <code>{renameState.preview.source_path}</code>
+                  </div>
+                  <div>
+                    <span>After</span>
+                    <code>{renameState.preview.destination_path}</code>
+                  </div>
+                </div>
+                <ul className="policy-checks" aria-label="Passed policy checks">
+                  {renameState.preview.policy.checks.map((check) => (
+                    <li key={check}>{actionPolicyCheckLabel(check)}</li>
+                  ))}
+                </ul>
+                <p className="content-empty">
+                  This plan is journaled but cannot execute. Recovery and Undo do not exist yet, so
+                  DeskGraph exposes no action button.
+                </p>
+              </div>
+            ) : null}
+
+            <div className="action-history-heading">
+              <strong>Recent path-free preview history</strong>
+              <span>{state.actionPlans.length} plans</span>
+            </div>
+            {state.actionPlans.length === 0 ? (
+              <p className="content-empty">
+                No organization preview has been journaled. Files cannot be changed from this app.
+              </p>
+            ) : (
+              <ol className="action-plan-list">
+                {state.actionPlans.slice(0, 5).map((plan) => (
+                  <li key={plan.plan_id}>
+                    <div>
+                      <strong>Rename preview {plan.plan_id}</strong>
+                      <span>
+                        Scope {plan.scope_id} · node {plan.node_id}
+                      </span>
+                    </div>
+                    <span>
+                      {plan.execution_strategy === 'case_only_staged'
+                        ? 'Case-only staged'
+                        : 'Direct · previewed'}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            )}
           </section>
 
           <section className="panel panel--watch" aria-labelledby="watch-title">

@@ -19,6 +19,7 @@ deskgraph-extractors = { path = "../../../crates/extractors" }
 deskgraph-retrieval = { path = "../../../crates/retrieval" }
 deskgraph-scanner = { path = "../../../crates/scanner" }
 deskgraph-telemetry = { path = "../../../crates/telemetry" }
+deskgraph-transactions = { path = "../../../crates/transactions" }
 deskgraph-watcher = { path = "../../../crates/watcher" }
 tauri.workspace = true
 tracing.workspace = true
