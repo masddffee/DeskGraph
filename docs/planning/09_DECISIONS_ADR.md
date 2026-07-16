@@ -133,3 +133,45 @@ Why：
 
 Canonical detail：
 `docs/architecture/adr/0012-bounded-extraction-provider-contract.md`。
+
+## ADR-013 — Bounded PDF text with structural provenance
+
+Status：Accepted。PDF 僅由受控、限額、無 path capability 的 provider 讀取；page/fragment provenance 不偽造 byte offsets。
+
+Canonical detail：
+`docs/architecture/adr/0013-bounded-pdf-text-and-structural-provenance.md`。
+
+## ADR-014 — Allowlisted OOXML parts
+
+Status：Proposed，尚未接受。ZIP/XML dependency closure、license、RustSec、平台與 adversarial fixture 證據完成前不得實作或加入 dependency。
+
+Canonical detail：
+`docs/architecture/adr/0014-allowlisted-ooxml-parts-proposal.md`。
+
+## ADR-015 — SQLite FTS5 trigram lexical baseline
+
+Status：Accepted。以 bundled SQLite 的 FTS5 trigram 作為無模型、可說明且有界的 metadata/content lexical baseline；不宣稱已具備 vector 或 hybrid semantic search。
+
+Canonical detail：
+`docs/architecture/adr/0015-sqlite-fts5-lexical-baseline.md`。
+
+## ADR-016 — Durable watch hints and atomic reconciliation
+
+Status：Accepted。Watcher event 僅是 untrusted hint；scope、stability 與 open-handle identity 驗證通過後，才由既有 resumable scanner 原子 reconcile manifest。
+
+Canonical detail：
+`docs/architecture/adr/0016-durable-watch-hints-and-reconciliation.md`。
+
+## ADR-017 — Immutable rename preview and first journal event
+
+Status：Accepted。同資料夾檔案 Rename 僅能建立 immutable Preview 與 atomic append-only sequence-1 journal event；尚無 executor、recovery 或 Undo。
+
+Canonical detail：
+`docs/architecture/adr/0017-immutable-rename-preview-and-journal.md`。
+
+## ADR-018 — Derived folder profiles and project suggestions
+
+Status：Accepted。Folder Profile 從目前 `present` manifest locations 有界、唯讀地即時計算；規則式 Project 結果只能是含 confidence/provenance/observed time/creator/provider 的 suggestion，不建立自動 membership。
+
+Canonical detail：
+`docs/architecture/adr/0018-derived-folder-profiles-and-project-suggestions.md`。

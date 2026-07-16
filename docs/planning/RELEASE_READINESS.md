@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-16
 
-Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical, M5 rename-preview, and M6 durable watch-core slices, while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
+Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical, M4 folder-profile, M5 rename-preview, and M6 durable watch-core slices, while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
@@ -16,7 +16,7 @@ Overall status: **not release-ready**. Local implementation is in M2 with parall
 | Extraction and OCR formats                     | In progress        | Text/Markdown/code and bounded text-layer PDF providers, durable cancellation, tagged provenance, atomic untrusted chunks, corrupt/encrypted/active-content/decompression fixtures pass locally; Office, image metadata, OCR, Windows runtime, 8 GB residency, and remaining corpora remain |
 | zh-TW and English                              | In progress        | Built-in UTF-8 extraction has exact byte-offset mixed zh-TW/English fixtures; PDF ToUnicode fixture extracts both with page provenance; OCR and retrieval evaluation sets remain |
 | Metadata/FTS/vector/hybrid retrieval           | In progress        | Offline path/content FTS5, bounded scope/type/date/source filters, deterministic explanations, CLI/Desktop and synthetic 10k p50/p95/index-size baseline pass locally; project/folder filters, vectors, embeddings, hybrid fusion, real/100k/8 GB evaluation and cross-platform/live-UI evidence remain |
-| Project/folder/related/duplicate/version graph | Not started        | Provenance, correction, evaluation                       |
+| Project/folder/related/duplicate/version graph | In progress        | Bounded manifest-derived Folder Profile and deterministic marker-based Project Suggestion expose confidence/provenance/time/creator/provider with no model or membership edge; persisted Project/edges, related/duplicate/version signals, correction feedback, evaluation and Project UI remain |
 | Smart Inbox and explainable classification     | Not started        | UI states and safe suggestion behavior                   |
 | Rename/move preview                            | In progress        | Same-folder file rename CLI/Desktop preview, canonical scope/identity/open-handle/portable-name/conflict policy, before/after UI, nine explanations and path-free history pass locally; Move, folders, execution UI, fresh Windows/live-UI evidence remain |
 | Journal, crash recovery, undo                  | In progress        | Plan plus `preview_created` event commit atomically and reject mutation/deletion; no execution journal states, fault injection, recovery, rollback, or Undo yet |
@@ -45,6 +45,10 @@ The text/Markdown/code and text-layer PDF slices are safe to exercise with test 
 ## M3 lexical local readiness note
 
 The FTS5 baseline is safe to exercise on test scopes: search is read-only, stays in bundled SQLite, accepts bounded quoted queries of at least three Unicode characters, caps candidates/results/snippets, excludes absent locations and stale chunks, and exposes fixed ranking explanations. Scope, match-source, extension, and modified-time filters are validated twice and echoed after normalization. User-invoked CLI/Desktop results intentionally return authorized paths and bounded untrusted snippets; ordinary logs omit query/path/text. A reproducible 10k synthetic macOS arm64 baseline records p50/p95/max and FTS bytes. This is not an M3 or release claim: graph-backed project/folder filters, vector/embedding providers, hybrid/semantic behavior, representative/100k/8 GB/RSS/thermal evaluation, short-query strategy, live Desktop interaction, and remote platform runtime remain open.
+
+## M4 folder-profile local readiness note
+
+The first Folder Profile is safe to exercise on a test folder after a completed scan: it reads only current locations already inside the explicit manifest scope, streams a maximum of 100,000 descendants, fails without a partial profile on overflow, and performs no filesystem mutation or inference call. Direct project markers create only a versioned, explainable `system_rule` suggestion; README alone is insufficient and no `belongs_to` edge is written. The explicit CLI response includes the selected folder path, while structured logs omit it and all member names. This is not M4 or release completion: persisted Project/edge candidates, entities/topics, related/similar/duplicate/version relations, user correction and scoring feedback, retrieval integration, Project UI, scale/memory and cross-platform evidence remain open.
 
 ## M6 watch-core local readiness note
 

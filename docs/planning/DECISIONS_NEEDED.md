@@ -4,7 +4,7 @@ Last reviewed: 2026-07-16
 
 ## Blocking now
 
-No product decision blocks local M0 implementation. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
+D-012 must be resolved before the next M4 slice persists Project membership/correction state; it does not block the current derived Folder Profile or safe work in other milestones. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
 
 ## Open decisions
 
@@ -21,6 +21,7 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 | D-009 | Embedding model/runtime                                     | M3/M9                                 | Multilingual, int8, license, checksum, memory, model-removal support                         | Deterministic lexical retrieval remains required                           |
 | D-010 | Product trademark/name clearance and reverse-DNS identifier | Before signed release                 | DeskGraph availability and legal review                                                      | Development identifier only; no trademark claim                            |
 | D-011 | Exact Office ZIP/XML dependency feature set                  | M2 Office provider                    | Candidate `zip 8.6.0` no-default plus minimal stored/DEFLATE read support and `quick-xml 0.41.0` no-default must pass isolated closure, license, RustSec, API, and platform gates | Proposed ADR-014 only; do not add either dependency until the evidence gate passes |
+| D-012 | Durable Project candidate, correction, and feedback model    | Next M4 persistence slice             | Stable Project identity; candidate/accepted/rejected/merged/split lifecycle; append-only correction provenance; deterministic feedback weighting and rescore boundaries | ADR-018 profiles remain derived suggestions only; persist no membership edge until this decision is accepted |
 
 ## Decisions made in M0
 
@@ -69,3 +70,11 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - A preview requires canonical explicit scope containment, a strong manifest identity, matching size/modified time, a matching read-only open handle, a portable single-component target name, and a conflict-free destination.
 - Plan plus sequence-1 `preview_created` event commit atomically; both tables reject update/delete. Explicit preview/status may return before/after paths, while logs and recent-plan summaries remain path-free.
 - No executor, move, rollback, recovery, undo, or Desktop execution control may be added until their append-only state machine and fault-injection acceptance are defined and pass.
+
+## Decisions made while entering M4
+
+- Folder Profiles are read-only, on-demand derivations from current `present` manifest locations and are bounded to 100,000 descendants; overflow fails without a partial result (ADR-018).
+- Deterministic direct-child markers may create an explainable Project Suggestion only. README is supporting provenance, not a sufficient strong marker; no heuristic creates `belongs_to` or automatic membership.
+- Every suggestion carries basis-point confidence, provenance, completed-scan observation time, `system_rule` creator, fixed provider/version and `model_version: null`.
+- Explicit Folder Profile responses may return the selected folder path; structured logs omit paths and member names.
+- D-012 remains open before persisted Project/edge candidates or correction feedback. No embedding, vector runtime, model, API, or external dependency is selected by this slice.

@@ -85,12 +85,13 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 ### Step 4 — M3 retrieval
 
 - Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, bounded scope/type/date/source filters, CLI/Desktop entry points, and a reproducible synthetic 10k p50/p95/index-size report are verified locally; this is not 100k, real-corpus, 8 GB, or cross-platform evidence.
-- Next: connect project/folder filters after M4 establishes their identities, extend benchmark/evaluation coverage, then audit a vector adapter/provider before semantic or hybrid implementation.
+- Next: connect project/folder filters only after M4 persists their source-of-truth identities/correction state, extend benchmark/evaluation coverage, then audit a vector adapter/provider before semantic or hybrid implementation.
 - Exit with no-model deterministic fallback and zh-TW/English evaluation.
 
 ### Step 5 — M4 context graph
 
-- Build folder profiles, duplicates/versions, related files, project discovery, provenance, user correction.
+- Current: ADR-018 and a read-only CLI slice derive bounded Folder Profiles from current manifest identities; fixed direct-child markers create explainable, model-free Project Suggestions with confidence/provenance/time/creator/provider and no membership edge. README-only, nested/sibling, entry-limit and log-redaction behavior pass locally.
+- Next: accept D-012 and persist Project/edge candidates plus correction lifecycle; add related/similar/duplicate/version signals, confirmation/reject/merge/split, feedback-rescoring evaluation, retrieval filters, and a backend-owned Project page.
 - Exit with explainable low-confidence behavior and correction feedback evidence.
 
 ### Step 6 — M5 transaction safety
