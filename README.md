@@ -95,6 +95,8 @@ cargo run -p deskgraph-cli -- search \
 
 Search is an explicit content-returning operation: its stdout intentionally contains matching authorized paths and bounded snippets for the user who requested them. Structured stderr logs omit the query, paths, filenames, and snippets. Omit `--scope` to search all scopes in this local database; `--limit` accepts 1–50. Queries shorter than three Unicode characters fail closed instead of scanning the corpus.
 
+The reproducible synthetic lexical benchmark and the latest local evidence are documented under [benchmarks](benchmarks/README.md). The checked-in 10k result is a macOS arm64 development baseline, not an 8 GB or cross-platform release claim.
+
 Start the desktop application:
 
 ```bash

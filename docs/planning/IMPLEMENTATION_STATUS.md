@@ -33,7 +33,7 @@ One M3 vertical slice now runs end to end. Transactional SQLite FTS5 trigram ind
 | Acceptance criterion                                     | Status             | Evidence / blocker                                                         |
 | -------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------- |
 | Monorepo established                                     | Verified locally   | Rust workspace, pnpm workspace, Tauri/React desktop, CLI, and both lockfiles |
-| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 80 tests pass        |
+| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 82 tests pass        |
 | TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 13 Vitest tests, and Vite build pass            |
 | ADR template                                             | Verified locally   | `docs/architecture/adr/0000-template.md`                                   |
 | Root and nested AGENTS instructions                      | Verified locally   | Root plus Desktop, scanner, extractor, and transaction safety instructions |
@@ -57,7 +57,7 @@ One M3 vertical slice now runs end to end. Transactional SQLite FTS5 trigram ind
 
 - No GitHub repository/remote and invalid GitHub authentication: remote Issues, Releases, and CI results do not exist.
 - Signing, notarization, clean Windows/macOS VM validation, and launch accounts are external later-stage requirements.
-- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The current 484-package lock differs only by one local workspace retrieval crate after the 483-package PDF state, but the post-PDF full-lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
+- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The current 485-package lock adds only local workspace retrieval and benchmark packages after the 483-package PDF state, but the post-PDF full-lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
 - Windows open-handle file-identity adapter compiles for `x86_64-pc-windows-msvc`, but complete scanner/extractor cross-checks cannot be produced on this macOS host because bundled SQLite needs a Windows C/MSVC toolchain. Remote Windows CI remains required.
 - Local 10k timing and idempotency are measured, but peak RSS sampling was denied by the restricted runner and its escalation reviewer was unavailable due tool quota. This does not block code work; the 8 GB release gate remains open.
 
@@ -100,7 +100,7 @@ One M3 vertical slice now runs end to end. Transactional SQLite FTS5 trigram ind
 
 ## Next handoff
 
-Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate before accepting ADR-014 or implementing Office; do not add the ZIP/XML candidates while the isolated closure and audit evidence is unavailable. In parallel, continue `prompts/04_HYBRID_SEARCH.md` from the verified lexical slice with a reproducible corpus, p50/p95 and index-size benchmark, then bounded filters; vector/embedding candidates remain unselected. Image metadata and OCR remain separate provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI.
+Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate before accepting ADR-014 or implementing Office; do not add the ZIP/XML candidates while the isolated closure and audit evidence is unavailable. In parallel, continue `prompts/04_HYBRID_SEARCH.md` from the verified lexical slice and synthetic 10k baseline with bounded type/date/source filters, then extend the benchmark to 100k, representative corpora, peak RSS and remote platforms; vector/embedding candidates remain unselected. Image metadata and OCR remain separate provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI.
 
 ## M3 acceptance checklist
 
@@ -116,7 +116,7 @@ Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate 
 | Desktop search UI | Verified locally except live smoke | Narrow read-only Tauri command, strict TypeScript parser, query/scope form, loading/empty/error/results, visible explanations and untrusted-text label; Vite/Tauri release builds pass |
 | Vector semantic search and embedding cache | Not started | D-007/D-009 open; dependency, model, license, checksum, memory, unload, and multilingual evidence required |
 | Hybrid fusion and “files like this” | Not started | Lexical fusion is not vector/lexical hybrid; semantic and recent-project-context acceptance remain open |
-| Search p50/p95, disk, and 8 GB evidence | Not started | Reproducible corpus and benchmark report required before M3 completion |
+| Search p50/p95 and index-size evidence | Verified locally for synthetic 10k baseline | Release run: zh-TW p50/p95 5.595/5.859 ms; English 10.952/25.565 ms; exact filename 2.007/2.189 ms; miss 0.051/0.058 ms; 11,993,088-byte DB and 5,181,440-byte FTS indexes. One macOS arm64 run only; 100k, real corpus, 8 GB/RSS and remote platforms remain open. |
 
 ## Verification evidence — 2026-07-16
 
@@ -194,10 +194,11 @@ Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate 
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` — passed.
-- `cargo test --workspace --all-features --offline` — 80 passed, 0 failed: CLI 6 + 4 integration, database 16, Desktop Rust 5, domain 5, extractors 26, identity 2, retrieval 2, scanner 12, telemetry 2.
+- `cargo test --workspace --all-features --offline` — 82 passed, 0 failed: CLI 6 + 4 integration, database 16, Desktop Rust 5, domain 5, extractors 26, identity 2, retrieval 2, scanner 12, search benchmark 2, telemetry 2.
 - Database/retrieval fixtures — bundled FTS5 migration/backfill and triggers pass; Traditional Chinese/English path and content substring search passes; stale active-content filtering, query/candidate limits, quote escaping, exact filename fusion, and fixed explanations pass.
 - CLI binary fixture — requested local context is returned on stdout; query, private text, filename, and scope path are absent from structured stderr logs.
 - `pnpm check` — Prettier, ESLint, TypeScript, 13 Vitest tests, and Vite production build passed.
 - `pnpm --filter @deskgraph/desktop tauri build --no-bundle` with `/Users/wetom/.cargo/bin` explicitly on `PATH` — passed and produced `target/release/deskgraph-desktop`.
-- Dependency delta — no registry package, vector extension, embedding/model runtime, API, or network client was added; `Cargo.lock` now contains 484 packages because the local workspace-only `deskgraph-retrieval` crate was added.
-- Evidence still open — latest live Desktop interaction, remote macOS Intel/Windows/Linux runtime, current full-lock RustSec scan, p50/p95 and index-size corpus benchmark, one/two-character strategy, complete filters, vector/embedding/hybrid behavior, and multilingual relevance evaluation.
+- Synthetic search benchmark — release-mode 10,000-document, 1.3 MB zh-TW/English corpus, 50 iterations per case. p95: zh-TW content 5.859 ms, English content 25.565 ms, exact filename 2.189 ms, miss 0.058 ms. SQLite file 11,993,088 bytes; FTS shadow tables 5,181,440 bytes. Full report: `benchmarks/results/search-10k-macos-arm64-2026-07-16.json`.
+- Dependency delta — no registry package, vector extension, embedding/model runtime, API, or network client was added; `Cargo.lock` contains 485 packages because the local workspace-only retrieval and benchmark crates were added.
+- Evidence still open — latest live Desktop interaction, remote macOS Intel/Windows/Linux runtime, current full-lock RustSec scan, representative and 100k corpora, peak RSS/8 GB/thermal evidence, one/two-character strategy, complete filters, vector/embedding/hybrid behavior, and multilingual relevance evaluation. The checked-in 10k result is not a release SLO.
