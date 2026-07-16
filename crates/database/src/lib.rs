@@ -30,11 +30,18 @@ const MIGRATIONS: &[Migration] = &[
         name: "content_chunk_provenance",
         sql: include_str!("../../../migrations/0004_content_chunk_provenance.sql"),
     },
+    Migration {
+        version: 5,
+        name: "lexical_search",
+        sql: include_str!("../../../migrations/0005_lexical_search.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_CHUNKS: usize = 65_536;
 const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_SEARCH_MATCH_BYTES: usize = 1024;
+const MAX_SEARCH_CANDIDATES: u32 = 200;
 
 struct Migration {
     version: i64,
@@ -144,6 +151,22 @@ pub struct ContentChunkWrite {
     pub trust_class: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LexicalCandidateSource {
+    MetadataPath,
+    ExtractedText,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LexicalSearchCandidate {
+    pub source: LexicalCandidateSource,
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub location_id: i64,
+    pub display_path: String,
+    pub snippet: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum DatabaseError {
     Io(std::io::Error),
@@ -163,6 +186,7 @@ pub enum DatabaseError {
     InvalidExtractionJobState,
     ExtractionRunnerLeaseLost,
     ExtractionOutputInvalid,
+    SearchInputInvalid,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -188,6 +212,7 @@ impl DatabaseError {
             Self::InvalidExtractionJobState => "invalid_extraction_job_state",
             Self::ExtractionRunnerLeaseLost => "extraction_runner_lease_lost",
             Self::ExtractionOutputInvalid => "extraction_output_invalid",
+            Self::SearchInputInvalid => "search_input_invalid",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -1485,6 +1510,79 @@ impl ManifestDatabase {
         })
     }
 
+    pub fn lexical_search_candidates(
+        &self,
+        match_query: &str,
+        scope_id: Option<i64>,
+        candidate_limit: u32,
+    ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
+        if match_query.is_empty()
+            || match_query.len() > MAX_SEARCH_MATCH_BYTES
+            || candidate_limit == 0
+            || candidate_limit > MAX_SEARCH_CANDIDATES
+        {
+            return Err(DatabaseError::SearchInputInvalid);
+        }
+        let limit = i64::from(candidate_limit);
+        let mut candidates = Vec::with_capacity(
+            usize::try_from(candidate_limit)
+                .map_err(|_| DatabaseError::SearchInputInvalid)?
+                .saturating_mul(2),
+        );
+
+        let mut metadata_statement = self.connection.prepare(
+            "SELECT l.scope_id, l.node_id, l.id, l.display_path \
+             FROM location_search_fts \
+             JOIN locations l ON l.id = location_search_fts.rowid \
+             WHERE location_search_fts MATCH ?1 AND l.present = 1 \
+               AND (?2 IS NULL OR l.scope_id = ?2) \
+             ORDER BY location_search_fts.rank, l.id \
+             LIMIT ?3",
+        )?;
+        let metadata_rows =
+            metadata_statement.query_map(params![match_query, scope_id, limit], |row| {
+                Ok(LexicalSearchCandidate {
+                    source: LexicalCandidateSource::MetadataPath,
+                    scope_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    location_id: row.get(2)?,
+                    display_path: row.get(3)?,
+                    snippet: None,
+                })
+            })?;
+        for row in metadata_rows {
+            candidates.push(row?);
+        }
+
+        let mut content_statement = self.connection.prepare(
+            "SELECT c.scope_id, c.node_id, c.location_id, l.display_path, \
+                    snippet(content_search_fts, 0, '[', ']', '…', 24) \
+             FROM content_search_fts \
+             JOIN content_chunks c ON c.id = content_search_fts.rowid \
+             JOIN locations l ON l.id = c.location_id AND l.node_id = c.node_id \
+             WHERE content_search_fts MATCH ?1 AND c.active = 1 AND l.present = 1 \
+               AND (?2 IS NULL OR c.scope_id = ?2) \
+             ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
+             LIMIT ?3",
+        )?;
+        let content_rows =
+            content_statement.query_map(params![match_query, scope_id, limit], |row| {
+                Ok(LexicalSearchCandidate {
+                    source: LexicalCandidateSource::ExtractedText,
+                    scope_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    location_id: row.get(2)?,
+                    display_path: row.get(3)?,
+                    snippet: Some(row.get(4)?),
+                })
+            })?;
+        for row in content_rows {
+            candidates.push(row?);
+        }
+
+        Ok(candidates)
+    }
+
     pub fn invalidate_content_for_node(
         &self,
         scope_id: i64,
@@ -1977,8 +2075,8 @@ mod tests {
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0);\
                  INSERT INTO files VALUES (1, 4, 1, 1);\
                  INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E747874', '/scope/file.txt', '/scope/file.txt', 1, 1);\
-                 INSERT INTO extraction_jobs(id, scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, created_at_unix_ms, updated_at_unix_ms) VALUES (1, 1, 1, 1, 'completed', 4, 1, 2, 1, 0, 0);\
-                 INSERT INTO content_chunks(id, scope_id, node_id, location_id, extraction_job_id, ordinal, text, source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, trust_class, provider_id, provider_version, active, created_at_unix_ms) VALUES (1, 1, 1, 1, 1, 0, 'bc', 1, 3, 4, 1, 'untrusted_extracted_text', 'deskgraph.utf8-text', '1', 1, 0);",
+                 INSERT INTO extraction_jobs(id, scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, created_at_unix_ms, updated_at_unix_ms) VALUES (1, 1, 1, 1, 'completed', 4, 1, 6, 1, 0, 0);\
+                 INSERT INTO content_chunks(id, scope_id, node_id, location_id, extraction_job_id, ordinal, text, source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, trust_class, provider_id, provider_version, active, created_at_unix_ms) VALUES (1, 1, 1, 1, 1, 0, 'legacy', 1, 3, 4, 1, 'untrusted_extracted_text', 'deskgraph.utf8-text', '1', 1, 0);",
             )
             .expect("legacy content fixture should initialize");
 
@@ -1997,6 +2095,89 @@ mod tests {
             stored,
             ("byte_range".to_string(), Some(1), Some(3), None, None)
         );
+        let candidates = database
+            .lexical_search_candidates("\"legacy\"", None, 10)
+            .expect("search migration should backfill existing content");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source, LexicalCandidateSource::ExtractedText);
+    }
+
+    #[test]
+    fn trigram_search_indexes_multilingual_metadata_and_only_active_content() {
+        let (mut database, scope_id, node_id, root) = extraction_setup();
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET display_path = '/scope/專案-context.md' WHERE node_id = ?1",
+                [node_id],
+            )
+            .expect("display path should update through the FTS trigger");
+        let text = "Traditional Chinese 專案脈絡 and English context stay local";
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "search-runner", 60_000)
+            .expect("job should claim");
+        database
+            .complete_extraction_job(
+                job.job_id,
+                "search-runner",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                u64::try_from(text.len()).expect("fixture length should fit"),
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: text.to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("content should publish");
+
+        let metadata = database
+            .lexical_search_candidates("\"專案-context\"", Some(scope_id), 10)
+            .expect("metadata search should pass");
+        assert!(
+            metadata
+                .iter()
+                .any(|candidate| candidate.source == LexicalCandidateSource::MetadataPath)
+        );
+        let content = database
+            .lexical_search_candidates("\"專案脈絡\"", None, 10)
+            .expect("content search should pass");
+        let snippet = content
+            .iter()
+            .find(|candidate| candidate.source == LexicalCandidateSource::ExtractedText)
+            .and_then(|candidate| candidate.snippet.as_deref())
+            .expect("content result should include a bounded snippet");
+        assert!(snippet.contains("專案脈絡"));
+
+        publish_manifest_file(&mut database, scope_id, &root, 5);
+        let stale = database
+            .lexical_search_candidates("\"專案脈絡\"", None, 10)
+            .expect("stale search should pass");
+        assert!(
+            stale
+                .iter()
+                .all(|candidate| candidate.source != LexicalCandidateSource::ExtractedText)
+        );
+    }
+
+    #[test]
+    fn search_database_boundary_rejects_unbounded_requests() {
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        assert!(matches!(
+            database.lexical_search_candidates("", None, 10),
+            Err(DatabaseError::SearchInputInvalid)
+        ));
+        assert!(matches!(
+            database.lexical_search_candidates("\"bounded\"", None, 201),
+            Err(DatabaseError::SearchInputInvalid)
+        ));
     }
 
     #[test]

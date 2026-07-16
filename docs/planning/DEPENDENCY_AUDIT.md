@@ -80,6 +80,12 @@ The proposed adapter never writes archive entries to disk or follows relationshi
 
 No candidate may enter `Cargo.toml`, `package.json`, build scripts, or release assets until its row is replaced by verified source/API/version/license/security evidence and an accepted provider-specific decision.
 
+## M3 lexical-search dependency decision
+
+The first M3 slice adds no external package. ADR-015 reuses the already selected bundled SQLite from `rusqlite 0.40.1` / `libsqlite3-sys 0.38.1` and its built-in FTS5 `trigram` tokenizer. SQLite's official FTS5 documentation confirms external-content indexes, synchronization triggers and rebuilds, trigram substring behavior, the three-Unicode-character minimum, `rank`/BM25 ordering, and bounded `snippet()` output. Local migration and multilingual tests prove the selected bundled build exposes FTS5.
+
+No vector extension, tokenizer extension, embedding runtime, model, API, or network client is selected by this decision. The workspace adds only the path-based `deskgraph-retrieval` crate; it introduces no registry dependency and keeps future vector adapters outside the database and domain contracts.
+
 ## GitHub Actions
 
 Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2 is pinned to `11bd71901bbe5b1630ceea73d27597364c9af683`; `actions/setup-node` v6.4.0 is pinned to `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e`. CI permissions default to `contents: read`, and no secrets are exposed to fork pull requests. Remote execution evidence remains blocked until the GitHub repository exists.

@@ -793,6 +793,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deskgraph-retrieval"
+version = "0.1.0"
+dependencies = [
+ "deskgraph-database",
+ "deskgraph-domain",
+]
+
+[[package]]
 name = "deskgraph-scanner"
 version = "0.1.0"
 dependencies = [
