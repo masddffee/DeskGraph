@@ -27,6 +27,7 @@ import {
   type SearchResult,
   type SearchSourceFilter,
 } from './search';
+import { loadRecentWatchEvents, type WatchEventProgress, type WatchEventReason } from './watch';
 
 type ReadyState = {
   kind: 'ready';
@@ -36,6 +37,7 @@ type ReadyState = {
   jobs: ScanJobProgress[];
   extraction: ExtractionStats;
   extractionJobs: ExtractionJobProgress[];
+  watchEvents: WatchEventProgress[];
 };
 type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
 type ActionState =
@@ -74,15 +76,26 @@ function Metric({ label, value }: { label: string; value: number }) {
 }
 
 async function loadDashboard(): Promise<ReadyState> {
-  const [report, manifest, scopes, jobs, extraction, extractionJobs] = await Promise.all([
-    loadHealthReport(),
-    loadManifestStatus(),
-    loadAuthorizedScopes(),
-    loadRecentScanJobs(),
-    loadExtractionStats(),
-    loadRecentExtractions(),
-  ]);
-  return { kind: 'ready', report, manifest, scopes, jobs, extraction, extractionJobs };
+  const [report, manifest, scopes, jobs, extraction, extractionJobs, watchEvents] =
+    await Promise.all([
+      loadHealthReport(),
+      loadManifestStatus(),
+      loadAuthorizedScopes(),
+      loadRecentScanJobs(),
+      loadExtractionStats(),
+      loadRecentExtractions(),
+      loadRecentWatchEvents(),
+    ]);
+  return {
+    kind: 'ready',
+    report,
+    manifest,
+    scopes,
+    jobs,
+    extraction,
+    extractionJobs,
+    watchEvents,
+  };
 }
 
 function replaceJob(jobs: ScanJobProgress[], job: ScanJobProgress): ScanJobProgress[] {
@@ -154,6 +167,22 @@ function activeSearchFilters(response: SearchResponse): string {
   return labels.length > 0 ? labels.join(' · ') : 'all authorized local sources';
 }
 
+function watchReasonLabel(reason: WatchEventReason | null): string {
+  if (reason === 'temporary_download') return 'Temporary download ignored';
+  if (reason === 'hidden_entry') return 'Hidden entry ignored';
+  if (reason === 'unsupported_entry') return 'Unsupported entry ignored';
+  if (reason === 'source_unavailable') return 'Source unavailable';
+  if (reason === 'reconcile_failed') return 'Reconciliation failed safely';
+  return 'No failure';
+}
+
+function watchStatusLabel(event: WatchEventProgress): string {
+  if (event.status === 'stabilizing') return 'Waiting for a stable snapshot';
+  if (event.status === 'reconciling') return 'Atomic manifest reconciliation';
+  if (event.status === 'completed') return 'Reconciled';
+  return watchReasonLabel(event.reason);
+}
+
 export default function App() {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
@@ -223,16 +252,17 @@ export default function App() {
   }
 
   async function refreshManifest() {
-    const [manifest, scopes, jobs, extraction, extractionJobs] = await Promise.all([
+    const [manifest, scopes, jobs, extraction, extractionJobs, watchEvents] = await Promise.all([
       loadManifestStatus(),
       loadAuthorizedScopes(),
       loadRecentScanJobs(),
       loadExtractionStats(),
       loadRecentExtractions(),
+      loadRecentWatchEvents(),
     ]);
     setState((current) =>
       current.kind === 'ready'
-        ? { ...current, manifest, scopes, jobs, extraction, extractionJobs }
+        ? { ...current, manifest, scopes, jobs, extraction, extractionJobs, watchEvents }
         : current,
     );
   }
@@ -594,6 +624,66 @@ export default function App() {
                 ))}
               </ol>
             ) : null}
+          </section>
+
+          <section className="panel panel--watch" aria-labelledby="watch-title">
+            <div className="panel-heading panel-heading--wrap">
+              <div>
+                <p className="panel-kicker">Durable watch reconciliation</p>
+                <h2 id="watch-title">Stable hints, atomic manifest updates</h2>
+                <p>
+                  The local core can debounce path-free event states, reject temporary downloads,
+                  and resume reconciliation after restart. The native OS event adapter and automatic
+                  content re-indexing are not connected yet.
+                </p>
+              </div>
+              <span className="connected-indicator connected-indicator--pending">
+                Core ready · adapter pending
+              </span>
+            </div>
+            <div className="metrics metrics--content">
+              <Metric label="Recent events" value={state.watchEvents.length} />
+              <Metric
+                label="Observed hints"
+                value={state.watchEvents.reduce(
+                  (total, event) => total + event.observation_count,
+                  0,
+                )}
+              />
+              <Metric
+                label="Reconciled"
+                value={state.watchEvents.filter((event) => event.status === 'completed').length}
+              />
+              <Metric
+                label="Needs attention"
+                value={
+                  state.watchEvents.filter(
+                    (event) => event.status === 'failed' || event.status === 'reconciling',
+                  ).length
+                }
+              />
+            </div>
+            {state.watchEvents.length === 0 ? (
+              <p className="content-empty">
+                No event source is enabled. Files are still updated only by an explicit scan.
+              </p>
+            ) : (
+              <ol className="watch-event-list">
+                {state.watchEvents.slice(0, 3).map((event) => (
+                  <li key={event.event_id}>
+                    <div>
+                      <strong>{watchStatusLabel(event)}</strong>
+                      <span>
+                        Event {event.event_id} · scope {event.scope_id} ·{' '}
+                        {event.observation_count.toLocaleString()} coalesced hint
+                        {event.observation_count === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <span>{event.scan_job_id ? `Scan ${event.scan_job_id}` : 'No scan yet'}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
           </section>
 
           <section className="panel panel--content" aria-labelledby="content-title">

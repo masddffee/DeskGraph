@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
     AuthorizedScope, ExtractionJobProgress, ExtractionStats, HealthReport, ManifestStats,
-    ScanJobProgress, SearchFilters, SearchResponse, collect_health_with_manifest,
+    ScanJobProgress, SearchFilters, SearchResponse, WatchEventProgress,
+    collect_health_with_manifest,
 };
 use deskgraph_extractors::{
     extraction_stats_at as read_extraction_stats_at,
@@ -14,6 +15,7 @@ use deskgraph_scanner::{
     authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
+use deskgraph_watcher::recent_watch_events_at as read_recent_watch_events_at;
 use tauri::{Manager, State};
 use tracing::info;
 
@@ -102,6 +104,11 @@ fn recent_content_extractions(
     state: State<'_, ManifestState>,
 ) -> Result<Vec<ExtractionJobProgress>, String> {
     recent_content_extractions_at(&state.database_path).map_err(str::to_string)
+}
+
+#[tauri::command]
+fn recent_watch_events(state: State<'_, ManifestState>) -> Result<Vec<WatchEventProgress>, String> {
+    recent_watch_events_for_database(&state.database_path).map_err(str::to_string)
 }
 
 #[tauri::command]
@@ -207,6 +214,10 @@ fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgres
     read_recent_extraction_jobs_at(path).map_err(|error| error.code())
 }
 
+fn recent_watch_events_for_database(path: &Path) -> Result<Vec<WatchEventProgress>, &'static str> {
+    read_recent_watch_events_at(path).map_err(|error| error.code())
+}
+
 fn search_local_at(
     path: &Path,
     query: &str,
@@ -281,6 +292,7 @@ pub fn run() {
             recent_scan_jobs,
             content_extraction_stats,
             recent_content_extractions,
+            recent_watch_events,
             search_local,
             pause_manifest_scan,
             resume_manifest_scan
@@ -294,6 +306,7 @@ mod tests {
     use super::*;
     use deskgraph_domain::LifecycleState;
     use deskgraph_extractors::{ExtractionLimits, create_extraction_job_at, run_extraction_job_at};
+    use deskgraph_watcher::{WatchPolicy, observe_watch_path_at};
 
     #[test]
     fn initialized_health_uses_the_shared_domain_contract() {
@@ -460,5 +473,37 @@ mod tests {
                 .unwrap_or_default()
                 .contains("專案脈絡")
         );
+    }
+
+    #[test]
+    fn watch_helper_exposes_only_path_free_durable_states() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-watch-private");
+        let source_path = scope_path.join("private-watch.md");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(&source_path, "private watch text").expect("file should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope =
+            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        observe_watch_path_at(
+            &database_path,
+            scope.id,
+            &source_path,
+            WatchPolicy::default(),
+        )
+        .expect("watch hint should persist");
+
+        let payload = serde_json::to_string(
+            &recent_watch_events_for_database(&database_path).expect("watch states should load"),
+        )
+        .expect("watch states should serialize");
+        assert!(payload.contains("deskgraph.watch-event.v1"));
+        assert!(payload.contains("stabilizing"));
+        assert!(!payload.contains("private-watch.md"));
+        assert!(!payload.contains("private watch text"));
+        assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
     }
 }

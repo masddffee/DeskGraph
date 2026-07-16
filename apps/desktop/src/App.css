@@ -442,6 +442,37 @@ select:focus-visible {
   text-transform: uppercase;
 }
 
+.connected-indicator--pending {
+  color: #765b31;
+  background: #f4ead4;
+}
+
+.watch-event-list {
+  padding: 0;
+  margin: 1rem 0 0;
+  list-style: none;
+}
+
+.watch-event-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  padding: 0.85rem 0;
+  color: #657269;
+  font-size: 0.8rem;
+}
+
+.watch-event-list li div,
+.watch-event-list li div span {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.watch-event-list strong {
+  color: #314139;
+}
+
 input:focus-visible {
   outline: 3px solid rgba(227, 163, 58, 0.65);
   outline-offset: 2px;
