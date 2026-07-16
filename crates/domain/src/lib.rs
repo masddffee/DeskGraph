@@ -2,6 +2,7 @@ mod action;
 mod extraction;
 mod health;
 mod manifest;
+mod project;
 mod search;
 mod watch;
 
@@ -15,6 +16,10 @@ pub use health::{
     collect_health, collect_health_with_manifest,
 };
 pub use manifest::{AuthorizedScope, ManifestStats, ScanJobProgress, ScanReport, ScanStatus};
+pub use project::{
+    FolderCategoryCount, FolderFileCategory, FolderProfile, ProjectSignal, ProjectSignalKind,
+    ProjectSuggestion, ProjectSuggestionCreator,
+};
 pub use search::{
     SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,
 };

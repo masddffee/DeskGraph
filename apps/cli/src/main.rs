@@ -9,6 +9,7 @@ use deskgraph_extractors::{
     extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
+use deskgraph_projects::folder_profile_at;
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
     authorize_scope, comparison_key, create_scan_job, pause_scan_job, resume_scan_job,
@@ -107,6 +108,11 @@ enum Command {
         #[command(subcommand)]
         command: OrganizeCommand,
     },
+    /// Read bounded, explainable folder and project facts from the current local manifest.
+    Folder {
+        #[command(subcommand)]
+        command: FolderCommand,
+    },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
         #[command(subcommand)]
@@ -170,6 +176,21 @@ enum OrganizeCommand {
     List {
         #[arg(long)]
         database: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FolderCommand {
+    /// Build one read-only profile for an already scanned folder.
+    Profile {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        node: Option<i64>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        path: Option<PathBuf>,
     },
 }
 
@@ -582,6 +603,36 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 emit_json(&plans, "action_plan_list_read")
             }
         },
+        Command::Folder { command } => match command {
+            FolderCommand::Profile {
+                database,
+                scope,
+                node,
+                path,
+            } => {
+                let node = resolve_manifest_node(
+                    &database,
+                    scope,
+                    node,
+                    path.as_deref(),
+                    "folder_profile_source_not_found",
+                    "folder_profile_source_not_found",
+                    "folder_profile_source_selection_invalid",
+                )?;
+                let profile =
+                    folder_profile_at(&database, scope, node).map_err(|error| error.code())?;
+                print_json(&profile)?;
+                info!(
+                    event = "folder_profile_read",
+                    scope_id = profile.scope_id,
+                    folder_node_id = profile.folder_node_id,
+                    descendant_file_count = profile.descendant_file_count,
+                    descendant_folder_count = profile.descendant_folder_count,
+                    project_suggested = profile.project_suggestion.is_some()
+                );
+                Ok(())
+            }
+        },
         Command::Fixture { command } => match command {
             FixtureCommand::Generate {
                 path,
@@ -643,17 +694,37 @@ fn resolve_extraction_node(
     node_id: Option<i64>,
     source_path: Option<&Path>,
 ) -> Result<i64, &'static str> {
+    resolve_manifest_node(
+        database_path,
+        scope_id,
+        node_id,
+        source_path,
+        "extraction_source_not_found",
+        "extractable_file_not_found",
+        "extraction_source_selection_invalid",
+    )
+}
+
+fn resolve_manifest_node(
+    database_path: &Path,
+    scope_id: i64,
+    node_id: Option<i64>,
+    source_path: Option<&Path>,
+    canonical_not_found_code: &'static str,
+    manifest_not_found_code: &'static str,
+    invalid_selection_code: &'static str,
+) -> Result<i64, &'static str> {
     match (node_id, source_path) {
         (Some(node_id), None) => Ok(node_id),
         (None, Some(source_path)) => {
             let canonical =
-                std::fs::canonicalize(source_path).map_err(|_| "extraction_source_not_found")?;
+                std::fs::canonicalize(source_path).map_err(|_| canonical_not_found_code)?;
             open_database(database_path)?
                 .node_id_for_path_key(scope_id, &comparison_key(&canonical))
                 .map_err(|error| error.code())?
-                .ok_or("extractable_file_not_found")
+                .ok_or(manifest_not_found_code)
         }
-        _ => Err("extraction_source_selection_invalid"),
+        _ => Err(invalid_selection_code),
     }
 }
 

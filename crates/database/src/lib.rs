@@ -1,13 +1,14 @@
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskgraph_domain::{
     ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyReport, AuthorizedScope, ExtractionJobProgress, ExtractionStats,
-    ExtractionStatus, ManifestStats, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
-    WatchEventReason, WatchEventStatus,
+    ExtractionStatus, FolderCategoryCount, FolderFileCategory, ManifestStats, ProjectSignalKind,
+    ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress, WatchEventReason,
+    WatchEventStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -56,6 +57,7 @@ const MAX_SEARCH_MATCH_BYTES: usize = 1024;
 const MAX_SEARCH_CANDIDATES_PER_SOURCE: u32 = 100;
 const MAX_WATCH_PATH_BYTES: usize = 64 * 1024;
 const MAX_ACTION_PATH_BYTES: usize = 64 * 1024;
+const MAX_FOLDER_PROFILE_ENTRIES: u64 = 100_000;
 
 struct Migration {
     version: i64,
@@ -230,6 +232,24 @@ pub struct ActionPlanWrite<'a> {
     pub execution_strategy: ActionExecutionStrategy,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderProfileFacts {
+    pub scope_id: i64,
+    pub folder_node_id: i64,
+    pub folder_location_id: i64,
+    pub display_path: String,
+    pub direct_file_count: u64,
+    pub direct_folder_count: u64,
+    pub descendant_file_count: u64,
+    pub descendant_folder_count: u64,
+    pub total_file_bytes: u64,
+    pub latest_modified_unix_ns: Option<i64>,
+    pub file_categories: Vec<FolderCategoryCount>,
+    pub project_markers: Vec<ProjectSignalKind>,
+    pub observed_at_unix_ms: i64,
+    pub bounded_entry_limit: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentChunkProvenanceWrite {
     ByteRange {
@@ -309,6 +329,9 @@ pub enum DatabaseError {
     ActionPlanNotFound,
     ActionPlanInputInvalid,
     ActionSourceSnapshotChanged,
+    FolderNotFound,
+    FolderProfileInputInvalid,
+    FolderProfileTooLarge,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -342,6 +365,9 @@ impl DatabaseError {
             Self::ActionPlanNotFound => "action_plan_not_found",
             Self::ActionPlanInputInvalid => "action_plan_input_invalid",
             Self::ActionSourceSnapshotChanged => "action_source_snapshot_changed",
+            Self::FolderNotFound => "folder_not_found",
+            Self::FolderProfileInputInvalid => "folder_profile_input_invalid",
+            Self::FolderProfileTooLarge => "folder_profile_entry_limit_exceeded",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -1970,6 +1996,171 @@ impl ManifestDatabase {
         })
     }
 
+    pub fn folder_profile_facts(
+        &self,
+        scope_id: i64,
+        folder_node_id: i64,
+        entry_limit: u64,
+    ) -> Result<FolderProfileFacts, DatabaseError> {
+        if scope_id <= 0
+            || folder_node_id <= 0
+            || entry_limit == 0
+            || entry_limit > MAX_FOLDER_PROFILE_ENTRIES
+        {
+            return Err(DatabaseError::FolderProfileInputInvalid);
+        }
+        let folder = self
+            .connection
+            .query_row(
+                "SELECT l.id, l.path_key, l.display_path \
+                 FROM locations l \
+                 JOIN nodes n ON n.id = l.node_id AND n.kind = 'folder' \
+                 WHERE l.scope_id = ?1 AND l.node_id = ?2 AND l.present = 1 \
+                 ORDER BY l.id LIMIT 1",
+                params![scope_id, folder_node_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::FolderNotFound)?;
+        let prefix_chars = i64::try_from(folder.1.chars().count())
+            .map_err(|_| DatabaseError::FolderProfileInputInvalid)?;
+        let remainder_start = prefix_chars
+            .checked_add(2)
+            .ok_or(DatabaseError::FolderProfileInputInvalid)?;
+        let query_limit = to_i64(
+            entry_limit
+                .checked_add(1)
+                .ok_or(DatabaseError::FolderProfileInputInvalid)?,
+        )?;
+        let separator = MAIN_SEPARATOR.to_string();
+        let mut statement = self.connection.prepare(
+            "SELECT n.kind, COALESCE(f.size_bytes, 0), f.modified_unix_ns, l.display_path, \
+                    CASE WHEN instr(substr(l.path_key, ?4), ?5) = 0 THEN 1 ELSE 0 END \
+             FROM locations l \
+             JOIN nodes n ON n.id = l.node_id \
+             LEFT JOIN files f ON f.node_id = l.node_id \
+             WHERE l.scope_id = ?1 AND l.present = 1 \
+               AND length(l.path_key) > ?2 \
+               AND substr(l.path_key, 1, ?2) = ?3 \
+               AND substr(l.path_key, ?2 + 1, 1) = ?5 \
+             ORDER BY l.id \
+             LIMIT ?6",
+        )?;
+        let mut rows = statement.query(params![
+            scope_id,
+            prefix_chars,
+            folder.1,
+            remainder_start,
+            separator,
+            query_limit,
+        ])?;
+        let mut processed = 0_u64;
+        let mut direct_file_count = 0_u64;
+        let mut direct_folder_count = 0_u64;
+        let mut descendant_file_count = 0_u64;
+        let mut descendant_folder_count = 0_u64;
+        let mut total_file_bytes = 0_u64;
+        let mut latest_modified_unix_ns = None;
+        let mut category_counts = [0_u64; 7];
+        let mut project_markers = std::collections::BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            processed = processed
+                .checked_add(1)
+                .ok_or(DatabaseError::InvalidCount)?;
+            if processed > entry_limit {
+                return Err(DatabaseError::FolderProfileTooLarge);
+            }
+            let kind = NodeKind::from_db(&row.get::<_, String>(0)?)?;
+            let size_bytes = row_u64(row, 1)?;
+            let modified_unix_ns: Option<i64> = row.get(2)?;
+            let display_path: String = row.get(3)?;
+            let is_direct = row.get::<_, i64>(4)? != 0;
+            match kind {
+                NodeKind::File => {
+                    descendant_file_count = descendant_file_count
+                        .checked_add(1)
+                        .ok_or(DatabaseError::InvalidCount)?;
+                    if is_direct {
+                        direct_file_count = direct_file_count
+                            .checked_add(1)
+                            .ok_or(DatabaseError::InvalidCount)?;
+                    }
+                    total_file_bytes = total_file_bytes
+                        .checked_add(size_bytes)
+                        .ok_or(DatabaseError::InvalidCount)?;
+                    if let Some(modified) = modified_unix_ns {
+                        latest_modified_unix_ns = Some(
+                            latest_modified_unix_ns
+                                .map_or(modified, |current: i64| current.max(modified)),
+                        );
+                    }
+                    let category = file_category(Path::new(&display_path));
+                    let category_index = folder_category_index(category);
+                    category_counts[category_index] = category_counts[category_index]
+                        .checked_add(1)
+                        .ok_or(DatabaseError::InvalidCount)?;
+                    if is_direct
+                        && let Some(marker) = project_marker(Path::new(&display_path), kind)
+                    {
+                        project_markers.insert(marker);
+                    }
+                }
+                NodeKind::Folder => {
+                    descendant_folder_count = descendant_folder_count
+                        .checked_add(1)
+                        .ok_or(DatabaseError::InvalidCount)?;
+                    if is_direct {
+                        direct_folder_count = direct_folder_count
+                            .checked_add(1)
+                            .ok_or(DatabaseError::InvalidCount)?;
+                        if let Some(marker) = project_marker(Path::new(&display_path), kind) {
+                            project_markers.insert(marker);
+                        }
+                    }
+                }
+            }
+        }
+        let observed_at_unix_ms: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(COALESCE(finished_at_unix_ms, started_at_unix_ms)), 0) \
+             FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed'",
+            [scope_id],
+            |row| row.get(0),
+        )?;
+        let file_categories = FolderFileCategory::ALL
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, category)| {
+                let file_count = category_counts[index];
+                (file_count > 0).then_some(FolderCategoryCount {
+                    category,
+                    file_count,
+                })
+            })
+            .collect();
+        Ok(FolderProfileFacts {
+            scope_id,
+            folder_node_id,
+            folder_location_id: folder.0,
+            display_path: folder.2,
+            direct_file_count,
+            direct_folder_count,
+            descendant_file_count,
+            descendant_folder_count,
+            total_file_bytes,
+            latest_modified_unix_ns,
+            file_categories,
+            project_markers: project_markers.into_iter().collect(),
+            observed_at_unix_ms,
+            bounded_entry_limit: entry_limit,
+        })
+    }
+
     pub fn action_source_for_path_key(
         &self,
         scope_id: i64,
@@ -2151,6 +2342,64 @@ fn validate_action_plan_write(plan: &ActionPlanWrite<'_>) -> Result<(), Database
         return Err(DatabaseError::ActionPlanInputInvalid);
     }
     Ok(())
+}
+
+fn file_category(path: &Path) -> FolderFileCategory {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "txt" | "md" | "markdown" | "pdf" | "docx" | "pptx" | "xlsx" | "rtf" => {
+            FolderFileCategory::Document
+        }
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "kt" | "kts" | "swift"
+        | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "rb" | "php" | "sh" | "zsh" | "fish"
+        | "toml" | "yaml" | "yml" | "json" | "xml" | "html" | "css" | "sql" => {
+            FolderFileCategory::Code
+        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "tiff" | "bmp" | "svg" => {
+            FolderFileCategory::Image
+        }
+        "csv" | "tsv" | "parquet" | "sqlite" | "db" => FolderFileCategory::Data,
+        "zip" | "tar" | "gz" | "tgz" | "7z" | "rar" => FolderFileCategory::Archive,
+        "mp3" | "wav" | "m4a" | "flac" | "mp4" | "mov" | "mkv" | "avi" => FolderFileCategory::Media,
+        _ => FolderFileCategory::Other,
+    }
+}
+
+fn folder_category_index(category: FolderFileCategory) -> usize {
+    match category {
+        FolderFileCategory::Document => 0,
+        FolderFileCategory::Code => 1,
+        FolderFileCategory::Image => 2,
+        FolderFileCategory::Data => 3,
+        FolderFileCategory::Archive => 4,
+        FolderFileCategory::Media => 5,
+        FolderFileCategory::Other => 6,
+    }
+}
+
+fn project_marker(path: &Path, kind: NodeKind) -> Option<ProjectSignalKind> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    match (kind, name.as_str()) {
+        (NodeKind::File, "cargo.toml") => Some(ProjectSignalKind::CargoManifest),
+        (NodeKind::File, "package.json") => Some(ProjectSignalKind::JavaScriptPackage),
+        (NodeKind::File, "pyproject.toml") => Some(ProjectSignalKind::PythonProject),
+        (NodeKind::File, "go.mod") => Some(ProjectSignalKind::GoModule),
+        (NodeKind::File, "package.swift") => Some(ProjectSignalKind::SwiftPackage),
+        (NodeKind::File, name) if name.ends_with(".sln") => {
+            Some(ProjectSignalKind::VisualStudioSolution)
+        }
+        (NodeKind::File, "readme" | "readme.md" | "readme.txt" | "readme.rst") => {
+            Some(ProjectSignalKind::Readme)
+        }
+        (NodeKind::Folder, name) if name.ends_with(".xcodeproj") => {
+            Some(ProjectSignalKind::XcodeProject)
+        }
+        _ => None,
+    }
 }
 
 fn action_execution_strategy_str(strategy: ActionExecutionStrategy) -> &'static str {

@@ -248,6 +248,88 @@ fn watch_observe_persists_path_free_progress_without_logging_the_hint() {
 }
 
 #[test]
+fn folder_profile_returns_explainable_local_facts_without_logging_paths() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("private-project");
+    let source_folder = scope_path.join("src");
+    std::fs::create_dir_all(&source_folder).expect("scope should create");
+    let marker_path = scope_path.join("Cargo.toml");
+    let private_source = source_folder.join("private_graph.rs");
+    std::fs::write(&marker_path, "[package]").expect("marker should write");
+    std::fs::write(&private_source, "pub fn private_graph() {}").expect("source should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "folder",
+            "profile",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+            "--scope",
+            &scope.id.to_string(),
+            "--path",
+            scope_path.to_str().expect("scope path should be UTF-8"),
+        ])
+        .output()
+        .expect("deskgraph folder profile should start");
+
+    assert!(output.status.success());
+    let profile: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(profile["api_version"], "deskgraph.folder-profile.v1");
+    assert_eq!(profile["scope_id"], scope.id);
+    assert_eq!(
+        profile["display_path"],
+        std::fs::canonicalize(&scope_path)
+            .expect("scope should canonicalize")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(profile["descendant_file_count"], 2);
+    assert_eq!(profile["descendant_folder_count"], 1);
+    assert_eq!(profile["project_suggestion"]["created_by"], "system_rule");
+    assert_eq!(
+        profile["project_suggestion"]["provenance"][0]["kind"],
+        "cargo_manifest"
+    );
+    assert_eq!(
+        profile["project_suggestion"]["confidence_basis_points"],
+        8_500
+    );
+    assert_eq!(
+        profile["project_suggestion"]["model_version"],
+        serde_json::Value::Null
+    );
+    assert!(marker_path.exists());
+    assert!(private_source.exists());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("private_graph.rs"));
+    for secret in [
+        "private-project",
+        "private_graph.rs",
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        private_source
+            .to_str()
+            .expect("source path should be UTF-8"),
+    ] {
+        assert!(!stderr.contains(secret));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}
+
+#[test]
 fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

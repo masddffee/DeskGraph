@@ -6,6 +6,7 @@ members = [
   "crates/domain",
   "crates/extractors",
   "crates/identity",
+  "crates/projects",
   "crates/retrieval",
   "crates/scanner",
   "crates/telemetry",
