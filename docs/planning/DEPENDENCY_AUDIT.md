@@ -20,7 +20,7 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 | Vite / React plugin | Build | 8.1.4 / 6.0.3 | `vite.dev`, npm, `vitejs` repositories | Local production build passes on Node 24.12.0 | MIT | Development/build only; frozen resolution in `pnpm-lock.yaml` |
 | TypeScript | Build | 6.0.3 | `typescriptlang.org`, npm, `microsoft/TypeScript` | Strict typecheck passes | Apache-2.0 | Pinned exactly because TypeScript 7.0.2 exceeded typescript-eslint's declared peer range |
 | ESLint / typescript-eslint | Build | 10.7.0 / 8.64.0 | `eslint.org`, `typescript-eslint.io`, npm | `pnpm peers check` and zero-warning lint pass | MIT | Development only; strict peers are enabled and cannot be silently auto-installed |
-| Vitest | Test | 4.1.10 | `vitest.dev`, npm, `vitest-dev/vitest` | Seven frontend contract tests pass locally | MIT | Node environment only; no browser emulator dependency |
+| Vitest | Test | 4.1.10 | `vitest.dev`, npm, `vitest-dev/vitest` | Ten frontend contract tests pass locally | MIT | Node environment only; no browser emulator dependency |
 | pnpm | Build | 11.10.0 | `pnpm.io`, npm, `pnpm/pnpm` | Corepack activation, lockfile, frozen-compatible install, and peer check pass | MIT | Exact `packageManager`; strict peers and supply-chain policy check enabled |
 | Prettier | Build | 3.9.5 | `prettier.io`, npm, `prettier/prettier` | Repository formatting check passes | MIT | Development only; planning/prompts are excluded to preserve the supplied SSOT text |
 | cargo-audit | Audit tool, not shipped | 0.22.2 | crates.io, `docs.rs/cargo-audit`, `rustsec/rustsec` | RustSec official project; requires Rust 1.88+; local audit executed | Apache-2.0 OR MIT | Installed outside the project and not added to the application dependency graph |
@@ -42,15 +42,32 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 - `rusqlite` currently defaults to `cache` and `ffi-sqlite-wasm-rs`; DeskGraph explicitly opts out of defaults and selects bundled native SQLite.
 - The M1 lockfile resolves 456 crate dependencies. `cargo audit --no-fetch` against 1,160 cached RustSec advisories found zero known vulnerabilities and the same 17 Tauri Linux-path warnings tracked in R-016; the new M1 direct dependencies added no advisory.
 
+## M2 text-extraction dependency decision
+
+The first M2 provider adds **no external dependency**. Plain text, Markdown, and source code use Rust standard-library `Read + Seek`, UTF-8 validation, bounded buffering, chunking, and time/cancellation checks. Durable jobs and content chunks reuse the already audited `rusqlite` database layer; open-file identity reuses the existing `unicode-normalization` and `windows-sys` boundary; `tempfile` remains test-only. The `Cargo.lock` changes for this slice only connect existing DeskGraph workspace crates and do not introduce a new registry package.
+
+This decision keeps the core usable without Python, Docker, Ollama, a model, an API key, or network access. It does not approve any PDF, ZIP/XML, image, OCR, model, or native runtime candidate.
+
+### M2 dependencies still requiring selection and audit
+
+| Capability | Current status | Required evidence before adoption |
+| --- | --- | --- |
+| PDF text | Unselected | Official API and repository, active maintenance, macOS/Windows/Linux packaging, license, advisories, JavaScript/action/attachment behavior, page/byte/time limits, corrupt fixtures |
+| DOCX / PPTX / XLSX | Unselected | ZIP and XML APIs, traversal/decompression defenses, macro/external-link/embedded-object behavior, structural limits, platform packaging, license, advisories, corrupt fixtures |
+| Image metadata | Unselected | Bounded signature/metadata API, supported formats, malformed/oversized behavior, license, advisories, platform behavior |
+| Screenshot OCR | Unselected; D-008 open | Native API availability plus packaged cross-platform fallback, zh-TW/English quality, model/runtime license, checksums, memory/unload behavior, offline packaging without user-installed Python |
+
+No candidate may enter `Cargo.toml`, `package.json`, build scripts, or release assets until its row is replaced by verified source/API/version/license/security evidence and an accepted provider-specific decision.
+
 ## GitHub Actions
 
 Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2 is pinned to `11bd71901bbe5b1630ceea73d27597364c9af683`; `actions/setup-node` v6.4.0 is pinned to `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e`. CI permissions default to `contents: read`, and no secrets are exposed to fork pull requests. Remote execution evidence remains blocked until the GitHub repository exists.
 
 ## Executed verification
 
-- `Cargo.lock` resolves 430 packages including four DeskGraph workspace packages. `cargo metadata` found no missing license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review.
+- `Cargo.lock` resolves 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review.
 - `cargo tree --workspace --depth 1` recorded all direct versions. `cargo tree --target all -i ...` traced RustSec warnings to Tauri/Wry's Linux GTK3 stack and Tauri's URL-pattern parser chain.
-- `cargo audit` loaded 1,160 RustSec advisories and found zero known vulnerabilities plus 17 warnings: ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. These are not suppressed and remain R-016.
+- `cargo audit --no-fetch` loaded 1,160 cached RustSec advisories and scanned all 457 lockfile packages: zero known vulnerabilities plus the same 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. These are not suppressed and remain R-016.
 - `pnpm audit --prod` and full `pnpm audit` found zero known vulnerabilities.
 - `pnpm licenses list --json` failed with `ERR_PNPM_MISSING_PACKAGE_INDEX_FILE` under pnpm's SQLite-backed local store. The recorded equivalent scan read all installed package manifests: 145 unique packages, no missing license fields; 106 MIT, 18 Apache-2.0, 6 BSD-2-Clause, 2 BSD-3-Clause, 7 ISC, 2 MPL-2.0, 1 BlueOak-1.0.0, and 3 Apache-2.0 OR MIT.
 - `pnpm peers check` reports no peer dependency issues after pinning TypeScript 6.0.3.

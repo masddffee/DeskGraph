@@ -15,3 +15,8 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 - CLI and desktop progress controls with paused and interrupted states derived from the local SQLite source of truth.
 - Component-aware protected-system scope denial and macOS/Windows hidden/system metadata exclusions.
 - Batch-level active-runner timing validated against an optimized 10,000-file release scan.
+- Accepted bounded extractor contract with controlled streams, fixed untrusted-text classification, resource limits, cancellation, and atomic per-file publication.
+- Dependency-free UTF-8 extraction for text, Markdown, and source code with Traditional Chinese/English offset fixtures and bounded overlapping chunks.
+- Durable SQLite extraction jobs, content-chunk provenance, source snapshot/open-handle revalidation, lease recovery, cancellation, and stale-content invalidation.
+- Privacy-safe extraction CLI with explicit scanned-file paths plus durable job controls and aggregate statistics.
+- Read-only Desktop extraction statistics and recent-job states through narrow Tauri IPC and runtime-validated TypeScript schemas.

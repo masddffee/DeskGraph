@@ -1,6 +1,6 @@
 # DeskGraph
 
-> **Pre-release M1 — use only with test folders and keep backups.**
+> **Pre-release M2 — use only with test folders and keep backups.**
 
 **Graphify your computer.**
 
@@ -8,9 +8,11 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 ## Current state
 
-The repository is implementing M1 Manifest Graph. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
+The repository is implementing M2 Content Intelligence while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
-Content extraction, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Peak-memory evidence, complete cross-platform runtime evidence, the latest pause/resume UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+The first content slice can extract bounded UTF-8 text from an explicitly selected, already-scanned text, Markdown, or source-code file. It revalidates the authorized scope, manifest snapshot, and actual open-file identity; stores only provenance-bearing `untrusted_extracted_text` chunks; supports durable cancellation/recovery; and atomically preserves the prior complete version on failure. It adds no parser, model, Python, Docker, API-key, or network dependency.
+
+PDF, DOCX, PPTX, XLSX, image metadata, OCR, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -18,6 +20,7 @@ Content extraction, search, watch mode, organization, undo, and MCP are planned 
 - No LLM can execute filesystem operations.
 - Every future move or rename must be previewed, policy-validated, durably journaled, crash-recoverable, and undoable.
 - No path is accessed outside an explicit user scope.
+- Extracted document text is always untrusted data and is never executed.
 - The core product must work without a local LLM, API key, Python, Docker, or Ollama.
 
 ## Prerequisites
@@ -67,13 +70,25 @@ cargo run -p deskgraph-cli -- scan run --database ./deskgraph-dev.sqlite3 --job 
 
 Scan observations stay in job-scoped staging while work is running or paused. The visible manifest is replaced only after the complete job publishes in one SQLite transaction.
 
+Run the current bounded text extraction slice for one file already discovered by the scan:
+
+```bash
+cargo run -p deskgraph-cli -- extract start \
+  --database ./deskgraph-dev.sqlite3 \
+  --scope 1 \
+  --path /absolute/path/to/test-folder/notes.md
+cargo run -p deskgraph-cli -- extract stats --database ./deskgraph-dev.sqlite3
+```
+
+`extract start` opens only the manifest-backed file selected by the explicit path. Its JSON response and structured logs contain job IDs, fixed status/error codes, byte counts, chunks, and timing—not the path, filename, or extracted text. Automation may use `--node` instead of `--path`. Durable controls are available through `extract create/run/status/list/cancel/resume`.
+
 Start the desktop application:
 
 ```bash
 pnpm desktop:dev
 ```
 
-The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows authorized paths only in its explicit scope-management panel.
+The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows authorized paths only in its explicit scope-management panel; its extraction dashboard exposes aggregate counts and fixed job states without paths or content.
 
 ## Development verification
 

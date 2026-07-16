@@ -51,6 +51,19 @@ Provide or authorize clean test machines/VMs for:
 - Windows x64;
 - one documented Linux experimental target.
 
+The current macOS host can compile the isolated Windows open-handle identity adapter, but it cannot compile bundled `libsqlite3-sys` for `x86_64-pc-windows-msvc` because no Windows MSVC C headers/toolchain are installed. This is not a request to weaken bundled SQLite or add an unaudited cross toolchain. On the Windows x64 runner or clean VM, run at minimum:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+pnpm install --frozen-lockfile
+pnpm check
+pnpm --filter @deskgraph/desktop tauri build --no-bundle
+```
+
+Windows evidence must include junction/reparse and hidden/system scanner fixtures, open-handle extraction identity, cancellation/interrupted recovery, text/Markdown/code extraction, and a privacy-safe Desktop/CLI smoke. A successful Rust-only cross-check on macOS is not a substitute.
+
 ## Public release and launch accounts (needed in M10)
 
 GitHub Release must be publicly verified before any social publication. Product Hunt, X, LinkedIn, Reddit, YouTube, domain/DNS, and website credentials remain owner-controlled. Without them, the repository will contain ready-to-post assets and an exact checklist only.

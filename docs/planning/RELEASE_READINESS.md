@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-16
 
-Overall status: **not release-ready**. Local implementation has entered M1 while M0 remote CI evidence remains open.
+Overall status: **not release-ready**. Local implementation has entered M2 while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
@@ -13,8 +13,8 @@ Overall status: **not release-ready**. Local implementation has entered M1 while
 | Explicit authorized scopes                     | Verified locally   | Desktop/CLI authorization, component-aware protected-tree policy, symlink/reparse and platform hidden/system exclusions; Windows runtime fixtures remain |
 | Initial manifest scan                          | In progress        | Release 10k idempotency/timing, durable progress/pause/resume, crash-reopen replay, atomic publish, and Unix permission fixture pass; memory, live updated-UI smoke, and remote CI remain |
 | Incremental watch mode                         | Not started        | Reconciliation/stability/restart tests                   |
-| Extraction and OCR formats                     | Not started        | Fixture suite, limits, corrupt-file isolation            |
-| zh-TW and English                              | Not started        | OCR and retrieval evaluation set                         |
+| Extraction and OCR formats                     | In progress        | Text/Markdown/code provider, durable cancellation, atomic untrusted chunks, limits, invalid UTF-8, source-change and symlink-swap fixtures pass locally; PDF, Office, image metadata, OCR, Windows runtime, and every-format adversarial fixtures remain |
+| zh-TW and English                              | In progress        | Built-in UTF-8 extraction has exact-offset mixed zh-TW/English fixtures; OCR and retrieval evaluation sets remain |
 | Metadata/FTS/vector/hybrid retrieval           | Not started        | Deterministic fallback and p50/p95 report                |
 | Project/folder/related/duplicate/version graph | Not started        | Provenance, correction, evaluation                       |
 | Smart Inbox and explainable classification     | Not started        | UI states and safe suggestion behavior                   |
@@ -37,3 +37,7 @@ The M0 implementation is verified locally. Governance, ADRs, health slice, lockf
 ## M1 local readiness note
 
 The resumable scanner is safe to exercise with test folders: progress and pending paths persist in SQLite, live manifest rows are not replaced until a complete scan publishes atomically, pause is acknowledged between entries, expired work reopens as interrupted, and resume revalidates the original canonical authorization boundary. This is not yet a release claim: Windows junction/hidden-attribute runtime evidence, peak RSS, remote CI, and live UI interaction evidence remain open.
+
+## M2 text-extraction local readiness note
+
+The built-in text/Markdown/code slice is safe to exercise with test files already present in an explicit scanned scope. Providers never receive an arbitrary path, source size and actual open-handle identity are revalidated, reads/chunks/time are bounded, all text remains `untrusted_extracted_text`, and publication is atomic. CLI status and Desktop dashboard payloads contain no paths or text. This is not an M2 completion or release claim: PDF, DOCX, PPTX, XLSX, image metadata, screenshot OCR, complex-format dependency audits, full Windows runtime tests, live Desktop interaction, and 8 GB extraction benchmarks remain open.
