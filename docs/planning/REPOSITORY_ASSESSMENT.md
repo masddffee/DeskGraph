@@ -10,22 +10,22 @@ The correct starting point is M0 Repository Foundation. No later milestone can b
 
 ## Evidence captured before implementation
 
-| Area | Observed state | Assessment |
-| --- | --- | --- |
-| Repository contents | 31 analyzable files: 30 Markdown documents and one JSON manifest, approximately 7,390 words | Planning corpus only |
-| Git | No `.git` directory; `git status` returned “not a git repository” | No history, branch, tags, or commits |
-| Remote | No Git configuration | No authoritative GitHub repository can be identified |
-| GitHub auth | Existing `gh` account token is invalid | Issues, PRs, CI runs, and Releases cannot be queried or created |
-| Source code | No `src/`, `apps/`, `crates/`, or `packages/` implementation directories | M0–M10 implementation absent |
-| Rust | `rustc` and `cargo` initially absent; official `rustup-init` was downloaded and SHA-256 verified during M0 preparation | Toolchain setup was required before validation |
-| Node | Node.js 24.12.0 and npm 11.6.2 available | Satisfies current Vite 8 and ESLint 10 runtime requirements |
-| Package manager | Corepack available; no pinned pnpm or lockfile | Must pin and install pnpm |
-| Tests | No test files or harness | No behavioral evidence |
-| CI | No `.github/workflows/` | No platform evidence |
-| Build/release | No Cargo, Tauri, npm, installer, updater, SBOM, or checksum configuration | Not releasable |
-| Governance | Root safety instructions and two nested-instruction templates existed at repository root | Nested files were not yet installed in their intended scopes |
-| Planning status | Required status, risk, dependency, decision, readiness, and external-action files absent | Must be created in M0 |
-| Hygiene | `.DS_Store` files present; no `.gitignore` | Must prevent local artifacts from entering history |
+| Area                | Observed state                                                                                                         | Assessment                                                      |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| Repository contents | 31 analyzable files: 30 Markdown documents and one JSON manifest, approximately 7,390 words                            | Planning corpus only                                            |
+| Git                 | No `.git` directory; `git status` returned “not a git repository”                                                      | No history, branch, tags, or commits                            |
+| Remote              | No Git configuration                                                                                                   | No authoritative GitHub repository can be identified            |
+| GitHub auth         | Existing `gh` account token is invalid                                                                                 | Issues, PRs, CI runs, and Releases cannot be queried or created |
+| Source code         | No `src/`, `apps/`, `crates/`, or `packages/` implementation directories                                               | M0–M10 implementation absent                                    |
+| Rust                | `rustc` and `cargo` initially absent; official `rustup-init` was downloaded and SHA-256 verified during M0 preparation | Toolchain setup was required before validation                  |
+| Node                | Node.js 24.12.0 and npm 11.6.2 available                                                                               | Satisfies current Vite 8 and ESLint 10 runtime requirements     |
+| Package manager     | Corepack available; no pinned pnpm or lockfile                                                                         | Must pin and install pnpm                                       |
+| Tests               | No test files or harness                                                                                               | No behavioral evidence                                          |
+| CI                  | No `.github/workflows/`                                                                                                | No platform evidence                                            |
+| Build/release       | No Cargo, Tauri, npm, installer, updater, SBOM, or checksum configuration                                              | Not releasable                                                  |
+| Governance          | Root safety instructions and two nested-instruction templates existed at repository root                               | Nested files were not yet installed in their intended scopes    |
+| Planning status     | Required status, risk, dependency, decision, readiness, and external-action files absent                               | Must be created in M0                                           |
+| Hygiene             | `.DS_Store` files present; no `.gitignore`                                                                             | Must prevent local artifacts from entering history              |
 
 ## Specification integrity observations
 
@@ -40,30 +40,30 @@ There was no executable data-loss path because there was no executable product. 
 
 ## M0 Acceptance Criteria — baseline and target evidence
 
-| Criterion | Baseline | Required evidence before M0 can be marked complete |
-| --- | --- | --- |
-| Fresh clone instructions work | Not met | Follow README setup from a clean checkout |
-| CI passes on macOS, Windows, Linux | Not met | Green GitHub Actions matrix on all three OS families |
-| Desktop app opens | Not met | Local launch smoke plus CI build; later clean-machine smoke |
-| CLI health command works | Not met | Executed command and assertions for privacy-safe JSON |
-| No model or API key required | Unproven | CLI and desktop health path succeeds with providers disabled |
-| README labels project pre-release | Not met | README visible and accurate |
+| Criterion                          | Baseline | Required evidence before M0 can be marked complete           |
+| ---------------------------------- | -------- | ------------------------------------------------------------ |
+| Fresh clone instructions work      | Not met  | Follow README setup from a clean checkout                    |
+| CI passes on macOS, Windows, Linux | Not met  | Green GitHub Actions matrix on all three OS families         |
+| Desktop app opens                  | Not met  | Local launch smoke plus CI build; later clean-machine smoke  |
+| CLI health command works           | Not met  | Executed command and assertions for privacy-safe JSON        |
+| No model or API key required       | Unproven | CLI and desktop health path succeeds with providers disabled |
+| README labels project pre-release  | Not met  | README visible and accurate                                  |
 
 ## Milestone mapping at baseline
 
-| Milestone | Baseline status | Evidence |
-| --- | --- | --- |
-| M0 Repository Foundation | Not started | No repository/tooling/app/CLI |
-| M1 Manifest Graph | Not started | No scope, scanner, identity, DB, or graph |
-| M2 Content Intelligence | Not started | No extractor or OCR contracts |
-| M3 Hybrid Retrieval | Not started | No FTS/vector/fusion/search |
-| M4 Project Graph | Not started | No profiles, relations, clustering, or correction flow |
-| M5 Safe Organization | Not started | No planner, validator, transaction journal, executor, recovery, or undo |
-| M6 Watch Mode and Smart Inbox | Not started | No watcher, reconciliation, stability, or inbox |
-| M7 MCP | Not started | No server or scoped read-only tools |
-| M8 Product UI | Not started | No desktop application |
-| M9 Release Engineering | Not started | No packages, signing, updater, SBOM, or release workflow |
-| M10 Launch | Not started | No public download, demo, launch assets, or operations |
+| Milestone                     | Baseline status | Evidence                                                                |
+| ----------------------------- | --------------- | ----------------------------------------------------------------------- |
+| M0 Repository Foundation      | Not started     | No repository/tooling/app/CLI                                           |
+| M1 Manifest Graph             | Not started     | No scope, scanner, identity, DB, or graph                               |
+| M2 Content Intelligence       | Not started     | No extractor or OCR contracts                                           |
+| M3 Hybrid Retrieval           | Not started     | No FTS/vector/fusion/search                                             |
+| M4 Project Graph              | Not started     | No profiles, relations, clustering, or correction flow                  |
+| M5 Safe Organization          | Not started     | No planner, validator, transaction journal, executor, recovery, or undo |
+| M6 Watch Mode and Smart Inbox | Not started     | No watcher, reconciliation, stability, or inbox                         |
+| M7 MCP                        | Not started     | No server or scoped read-only tools                                     |
+| M8 Product UI                 | Not started     | No desktop application                                                  |
+| M9 Release Engineering        | Not started     | No packages, signing, updater, SBOM, or release workflow                |
+| M10 Launch                    | Not started     | No public download, demo, launch assets, or operations                  |
 
 ## First vertical slice
 

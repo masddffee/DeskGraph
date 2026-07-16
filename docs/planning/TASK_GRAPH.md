@@ -38,15 +38,15 @@ M0 Foundation
 
 ## Parallel workstreams
 
-| Workstream | Can start | Must not claim complete before |
-| --- | --- | --- |
-| Governance, ADRs, threat model, dependency audit | M0 | Evidence and review for each milestone |
-| Synthetic/adversarial fixture tooling | M0/M1 | Relevant integration tests consume fixtures |
-| Desktop shell/accessibility/state patterns | M0 | Backend source-of-truth behavior exists |
-| Release CI/SBOM/checksum scaffolding | M0 | Real cross-platform assets are verified |
-| README, diagrams, demo scripts | M0 | Claims reflect the current build |
-| Transaction state-machine design/fault harness | After M0 | M1 identity/scope primitives integrate |
-| Provider/model evaluation | After M0 | License/checksum/memory/package evidence exists |
+| Workstream                                       | Can start | Must not claim complete before                  |
+| ------------------------------------------------ | --------- | ----------------------------------------------- |
+| Governance, ADRs, threat model, dependency audit | M0        | Evidence and review for each milestone          |
+| Synthetic/adversarial fixture tooling            | M0/M1     | Relevant integration tests consume fixtures     |
+| Desktop shell/accessibility/state patterns       | M0        | Backend source-of-truth behavior exists         |
+| Release CI/SBOM/checksum scaffolding             | M0        | Real cross-platform assets are verified         |
+| README, diagrams, demo scripts                   | M0        | Claims reflect the current build                |
+| Transaction state-machine design/fault harness   | After M0  | M1 identity/scope primitives integrate          |
+| Provider/model evaluation                        | After M0  | License/checksum/memory/package evidence exists |
 
 ## Construction steps
 
@@ -63,10 +63,10 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 - Context: no implementation exists; health must be useful without DB/models.
 - Build: Rust workspace, shared health schema, CLI JSON command, Tauri command, React status UI, privacy-safe logging.
-- Tests: schema/serialization/privacy tests, frontend formatter/state tests.
-- Verify: Rust/TS format, lint, typecheck, unit tests, builds, CLI run, desktop smoke.
+- Tests: schema/serialization/privacy tests, frontend formatter/state tests, CLI log redaction assertions, and the exact Tauri invoke contract.
+- Verify: Rust/TS format, lint, typecheck, unit tests, builds, CLI run, desktop runtime smoke showing the Rust → Tauri IPC → React success state, and logs containing no path/content/user data.
 - Rollback: remove the new workspace/app files; planning baseline remains intact.
-- Exit: every local M0 criterion has evidence; remote CI is explicitly separate.
+- Exit: local implementation is verified and every acceptance item has evidence or an explicit external blocker; M0 stays in progress until the macOS/Windows/Linux remote matrix is green.
 
 ### Step 2 — M1 scope and manifest schema
 

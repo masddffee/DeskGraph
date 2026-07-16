@@ -6,7 +6,7 @@ No external step should block safe local implementation. Do not add real credent
 
 ## GitHub repository and CI (needed to close M0 remote evidence)
 
-Current state: no local Git repository/remote at baseline; the configured `gh` account token is invalid.
+Current state: local `main` exists with logical M0 commits, but there is no remote. `gh auth status` still reports the configured `masddffee` token as invalid, so Issues, remote CI, branch protection, and Releases cannot be verified or changed.
 
 Required owner action:
 
@@ -14,8 +14,9 @@ Required owner action:
 2. Decide personal vs organization ownership and confirm the public repository name.
 3. Create the empty public repository without auto-generated files, or provide its URL.
 4. Add it as `origin`, push the local default branch, and enable GitHub Actions.
-5. Protect the default branch after the initial CI workflow is green.
-6. Verify the macOS, Windows, and Linux jobs from a clean remote checkout.
+5. Enable GitHub private vulnerability reporting and update `SECURITY.md` with the final repository advisory path.
+6. Protect the default branch after the initial CI workflow is green.
+7. Verify the macOS, Windows, and Linux jobs from a clean remote checkout.
 
 Validation:
 
