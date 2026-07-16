@@ -90,10 +90,12 @@ Search current metadata and active extracted text without a model:
 cargo run -p deskgraph-cli -- search \
   --database ./deskgraph-dev.sqlite3 \
   --query "專案 context" \
-  --scope 1
+  --scope 1 \
+  --source content \
+  --extension md
 ```
 
-Search is an explicit content-returning operation: its stdout intentionally contains matching authorized paths and bounded snippets for the user who requested them. Structured stderr logs omit the query, paths, filenames, and snippets. Omit `--scope` to search all scopes in this local database; `--limit` accepts 1–50. Queries shorter than three Unicode characters fail closed instead of scanning the corpus.
+Search is an explicit content-returning operation: its stdout intentionally contains matching authorized paths and bounded snippets for the user who requested them. Structured stderr logs omit the query, paths, filenames, and snippets. Omit `--scope` to search all scopes in this local database; `--source` accepts `all`, `metadata`, or `content`; `--extension` accepts one 1–16 character ASCII-alphanumeric suffix with or without a leading dot. Optional `--modified-since` is inclusive and `--modified-before` is exclusive; both use UTC Unix seconds. `--limit` accepts 1–50. Queries shorter than three Unicode characters fail closed instead of scanning the corpus.
 
 The reproducible synthetic lexical benchmark and the latest local evidence are documented under [benchmarks](benchmarks/README.md). The checked-in 10k result is a macOS arm64 development baseline, not an 8 GB or cross-platform release claim.
 

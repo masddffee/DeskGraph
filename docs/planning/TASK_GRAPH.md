@@ -84,8 +84,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 4 — M3 retrieval
 
-- Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, CLI/Desktop entry points, and a reproducible synthetic 10k p50/p95/index-size report are verified locally; this is not 100k, real-corpus, 8 GB, or cross-platform evidence.
-- Next: add bounded type/date/source filters and extend benchmark coverage, then audit a vector adapter/provider before semantic or hybrid implementation.
+- Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, bounded scope/type/date/source filters, CLI/Desktop entry points, and a reproducible synthetic 10k p50/p95/index-size report are verified locally; this is not 100k, real-corpus, 8 GB, or cross-platform evidence.
+- Next: connect project/folder filters after M4 establishes their identities, extend benchmark/evaluation coverage, then audit a vector adapter/provider before semantic or hybrid implementation.
 - Exit with no-model deterministic fallback and zh-TW/English evaluation.
 
 ### Step 5 — M4 context graph

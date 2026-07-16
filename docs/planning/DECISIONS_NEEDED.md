@@ -54,4 +54,5 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - Queries shorter than three Unicode characters fail closed; DeskGraph does not substitute an unindexed full-corpus scan.
 - External-content indexes follow `locations` and `content_chunks`, while present/active source-of-truth joins determine current visibility.
 - Search queries, paths, and snippets may appear only in an explicit user-requested result payload, never ordinary logs or extraction/status payloads.
+- Lexical filters are a closed no-model contract: explicit authorized scope, metadata path vs active extracted text, one normalized ASCII-alphanumeric extension, inclusive `modified_since` and exclusive `modified_before` UTC Unix seconds. Applied normalized values are returned to the caller; project/folder filters wait for graph-backed identities.
 - D-007 and D-009 remain open: no vector extension, embedding runtime, or model is selected by the lexical slice.
