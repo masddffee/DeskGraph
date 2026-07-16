@@ -4,6 +4,7 @@ members = [
   "apps/desktop/src-tauri",
   "crates/database",
   "crates/domain",
+  "crates/extractors",
   "crates/identity",
   "crates/scanner",
   "crates/telemetry",

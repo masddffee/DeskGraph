@@ -682,6 +682,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "deskgraph-extractors"
+version = "0.1.0"
+
+[[package]]
 name = "deskgraph-identity"
 version = "0.1.0"
 dependencies = [
