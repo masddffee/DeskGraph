@@ -3,8 +3,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use deskgraph_database::ManifestDatabase;
-use deskgraph_domain::collect_health;
-use deskgraph_scanner::{authorize_scope, scan_scope};
+use deskgraph_domain::{ScanJobProgress, collect_health};
+use deskgraph_scanner::{
+    authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_batch,
+    run_scan_job_to_terminal, scan_scope,
+};
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use serde::Serialize;
 use tracing::{error, info};
@@ -74,11 +77,61 @@ enum ScopeCommand {
 
 #[derive(Debug, Subcommand)]
 enum ScanCommand {
+    /// Create and complete a scan in the foreground.
     Start {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
         scope: i64,
+    },
+    /// Create a durable scan job without starting its runner.
+    Create {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+    },
+    /// Run a ready or resumed job until it completes or pauses.
+    Run {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// Process one bounded batch and persist progress.
+    Advance {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+        #[arg(long, default_value_t = 256)]
+        batch_size: usize,
+    },
+    /// Read durable progress for one scan job.
+    Status {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// List the 20 most recent durable scan jobs.
+    List {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// Request a safe pause between queue entries.
+    Pause {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
+    /// Revalidate the authorized scope and make a paused job runnable.
+    Resume {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
     },
 }
 
@@ -162,6 +215,48 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 );
                 print_json(&report)
             }
+            ScanCommand::Create { database, scope } => {
+                let mut database = open_database(&database)?;
+                let progress =
+                    create_scan_job(&mut database, scope).map_err(|error| error.code())?;
+                emit_scan_progress(&progress, "metadata_scan_created")
+            }
+            ScanCommand::Run { database, job } => {
+                let mut database = open_database(&database)?;
+                let progress =
+                    run_scan_job_to_terminal(&mut database, job).map_err(|error| error.code())?;
+                emit_scan_progress(&progress, "metadata_scan_runner_stopped")
+            }
+            ScanCommand::Advance {
+                database,
+                job,
+                batch_size,
+            } => {
+                let mut database = open_database(&database)?;
+                let progress = run_scan_job_batch(&mut database, job, batch_size)
+                    .map_err(|error| error.code())?;
+                emit_scan_progress(&progress, "metadata_scan_batch_stopped")
+            }
+            ScanCommand::Status { database, job } => {
+                let database = open_database(&database)?;
+                let progress = database.scan_job(job).map_err(|error| error.code())?;
+                emit_scan_progress(&progress, "metadata_scan_status_read")
+            }
+            ScanCommand::List { database } => {
+                let database = open_database(&database)?;
+                let jobs = database.recent_scan_jobs().map_err(|error| error.code())?;
+                emit_json(&jobs, "metadata_scan_list_read")
+            }
+            ScanCommand::Pause { database, job } => {
+                let mut database = open_database(&database)?;
+                let progress = pause_scan_job(&mut database, job).map_err(|error| error.code())?;
+                emit_scan_progress(&progress, "metadata_scan_pause_requested")
+            }
+            ScanCommand::Resume { database, job } => {
+                let mut database = open_database(&database)?;
+                let progress = resume_scan_job(&mut database, job).map_err(|error| error.code())?;
+                emit_scan_progress(&progress, "metadata_scan_resumed")
+            }
         },
         Command::Fixture { command } => match command {
             FixtureCommand::Generate {
@@ -224,6 +319,24 @@ fn emit_json<T: Serialize>(value: &T, event: &'static str) -> Result<(), &'stati
     Ok(())
 }
 
+fn emit_scan_progress(progress: &ScanJobProgress, event: &'static str) -> Result<(), &'static str> {
+    print_json(progress)?;
+    info!(
+        event = event,
+        scope_id = progress.scope_id,
+        job_id = progress.job_id,
+        status = ?progress.status,
+        queued_entries = progress.queued_entries,
+        processed_entries = progress.processed_entries,
+        discovered_files = progress.discovered_files,
+        discovered_folders = progress.discovered_folders,
+        skipped_entries = progress.skipped_entries,
+        issue_count = progress.issue_count,
+        elapsed_ms = progress.elapsed_ms
+    );
+    Ok(())
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<(), &'static str> {
     let json = serde_json::to_string_pretty(value).map_err(|_| "response_serialization_failed")?;
     println!("{json}");
@@ -243,6 +356,7 @@ mod tests {
     #[test]
     fn scan_requires_an_explicit_database_and_scope() {
         assert!(Cli::try_parse_from(["deskgraph", "scan", "start"]).is_err());
+        assert!(Cli::try_parse_from(["deskgraph", "scan", "run"]).is_err());
     }
 
     #[test]
@@ -273,6 +387,57 @@ mod tests {
             },
         })
         .expect("scan should pass");
+    }
+
+    #[test]
+    fn resumable_scan_controls_run_through_cli_handler() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("authorized");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(scope_path.join("note.md"), "metadata fixture")
+            .expect("fixture should write");
+        let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
+        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        let job = create_scan_job(&mut manifest, scope.id).expect("job should create");
+        drop(manifest);
+
+        execute(Cli {
+            command: Command::Scan {
+                command: ScanCommand::Pause {
+                    database: database.clone(),
+                    job: job.job_id,
+                },
+            },
+        })
+        .expect("pause should pass");
+        execute(Cli {
+            command: Command::Scan {
+                command: ScanCommand::Resume {
+                    database: database.clone(),
+                    job: job.job_id,
+                },
+            },
+        })
+        .expect("resume should pass");
+        execute(Cli {
+            command: Command::Scan {
+                command: ScanCommand::Run {
+                    database: database.clone(),
+                    job: job.job_id,
+                },
+            },
+        })
+        .expect("run should pass");
+
+        let manifest = ManifestDatabase::open(&database).expect("database should reopen");
+        assert_eq!(
+            manifest
+                .scan_job(job.job_id)
+                .expect("job should load")
+                .status,
+            deskgraph_domain::ScanStatus::Completed
+        );
     }
 
     #[test]

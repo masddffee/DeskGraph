@@ -3,11 +3,17 @@ import { useEffect, useState } from 'react';
 import { lifecycleLabel, loadHealthReport, type HealthReport } from './health';
 import {
   addAuthorizedScope,
+  createManifestScan,
   loadAuthorizedScopes,
   loadManifestStatus,
+  loadRecentScanJobs,
+  loadScanJobStatus,
+  pauseManifestScan,
+  resumeManifestScan,
   runManifestScan,
   type AuthorizedScope,
   type ManifestStats,
+  type ScanJobProgress,
 } from './manifest';
 
 type ReadyState = {
@@ -15,6 +21,7 @@ type ReadyState = {
   report: HealthReport;
   manifest: ManifestStats;
   scopes: AuthorizedScope[];
+  jobs: ScanJobProgress[];
 };
 type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
 type ActionState =
@@ -48,12 +55,26 @@ function Metric({ label, value }: { label: string; value: number }) {
 }
 
 async function loadDashboard(): Promise<ReadyState> {
-  const [report, manifest, scopes] = await Promise.all([
+  const [report, manifest, scopes, jobs] = await Promise.all([
     loadHealthReport(),
     loadManifestStatus(),
     loadAuthorizedScopes(),
+    loadRecentScanJobs(),
   ]);
-  return { kind: 'ready', report, manifest, scopes };
+  return { kind: 'ready', report, manifest, scopes, jobs };
+}
+
+function replaceJob(jobs: ScanJobProgress[], job: ScanJobProgress): ScanJobProgress[] {
+  return [job, ...jobs.filter((candidate) => candidate.job_id !== job.job_id)];
+}
+
+function scanStatusLabel(job: ScanJobProgress): string {
+  if (job.status === 'running' && job.pause_requested) return 'Pausing safely…';
+  if (job.status === 'running') return 'Scanning metadata…';
+  if (job.status === 'paused') return 'Paused';
+  if (job.status === 'interrupted') return 'Interrupted safely';
+  if (job.status === 'completed') return 'Completed';
+  return 'Stopped with an error';
 }
 
 export default function App() {
@@ -61,6 +82,11 @@ export default function App() {
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
   const [scopePath, setScopePath] = useState('');
   const [action, setAction] = useState<ActionState>({ kind: 'idle' });
+  const runningJobIds =
+    state.kind === 'ready'
+      ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
+      : [];
+  const runningJobKey = runningJobIds.join(',');
 
   useEffect(() => {
     let active = true;
@@ -79,9 +105,48 @@ export default function App() {
     };
   }, [attempt]);
 
+  useEffect(() => {
+    if (!runningJobKey) return;
+    let active = true;
+
+    const poll = async () => {
+      try {
+        const jobs = await Promise.all(runningJobIds.map((jobId) => loadScanJobStatus(jobId)));
+        if (!active) return;
+        setState((current) => {
+          if (current.kind !== 'ready') return current;
+          return {
+            ...current,
+            jobs: jobs.reduce(replaceJob, current.jobs),
+          };
+        });
+      } catch {
+        // The foreground runner reports a validated error state if polling cannot continue.
+      }
+    };
+
+    const timer = window.setInterval(() => void poll(), 300);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [runningJobKey]);
+
+  function updateJob(job: ScanJobProgress) {
+    setState((current) =>
+      current.kind === 'ready' ? { ...current, jobs: replaceJob(current.jobs, job) } : current,
+    );
+  }
+
   async function refreshManifest() {
-    const [manifest, scopes] = await Promise.all([loadManifestStatus(), loadAuthorizedScopes()]);
-    setState((current) => (current.kind === 'ready' ? { ...current, manifest, scopes } : current));
+    const [manifest, scopes, jobs] = await Promise.all([
+      loadManifestStatus(),
+      loadAuthorizedScopes(),
+      loadRecentScanJobs(),
+    ]);
+    setState((current) =>
+      current.kind === 'ready' ? { ...current, manifest, scopes, jobs } : current,
+    );
   }
 
   async function authorizeRequestedScope() {
@@ -107,20 +172,77 @@ export default function App() {
     }
   }
 
-  async function scan(scope: AuthorizedScope) {
-    setAction({ kind: 'working', label: 'Reading metadata inside the authorized folder…' });
+  async function runJob(job: ScanJobProgress) {
     try {
-      const report = await runManifestScan(scope.id);
+      setAction({ kind: 'working', label: 'Reading metadata inside the authorized folder…' });
+      const progress = await runManifestScan(job.job_id);
+      updateJob(progress);
       await refreshManifest();
-      setAction({
-        kind: 'success',
-        message: `Scan complete: ${report.discovered_files} files and ${report.discovered_folders} folders.`,
-      });
+      if (progress.status === 'completed') {
+        setAction({
+          kind: 'success',
+          message: `Scan complete: ${progress.discovered_files} files and ${progress.discovered_folders} folders.`,
+        });
+      } else if (progress.status === 'paused') {
+        setAction({
+          kind: 'success',
+          message: `Scan paused after ${progress.processed_entries} of ${progress.queued_entries} discovered entries.`,
+        });
+      } else {
+        setAction({
+          kind: 'error',
+          message: 'The scan was interrupted safely. Resume it after checking the authorized folder.',
+        });
+      }
     } catch {
+      await refreshManifest().catch(() => undefined);
       setAction({
         kind: 'error',
         message:
           'The metadata scan stopped safely. Existing manifest data was not partially replaced.',
+      });
+    }
+  }
+
+  async function scan(scope: AuthorizedScope) {
+    setAction({ kind: 'working', label: 'Creating a durable local scan job…' });
+    try {
+      const job = await createManifestScan(scope.id);
+      updateJob(job);
+      await runJob(job);
+    } catch {
+      await refreshManifest().catch(() => undefined);
+      setAction({
+        kind: 'error',
+        message: 'A new scan could not start. Resume the existing job if this folder has one.',
+      });
+    }
+  }
+
+  async function pause(job: ScanJobProgress) {
+    setAction({ kind: 'working', label: 'Waiting for the current metadata entry to finish…' });
+    try {
+      const progress = await pauseManifestScan(job.job_id);
+      updateJob(progress);
+      if (progress.status === 'paused') {
+        setAction({ kind: 'success', message: 'Scan paused. Durable progress is safe to resume.' });
+      }
+    } catch {
+      setAction({ kind: 'error', message: 'The pause request could not be recorded safely.' });
+    }
+  }
+
+  async function resume(job: ScanJobProgress) {
+    setAction({ kind: 'working', label: 'Revalidating the authorized folder boundary…' });
+    try {
+      const progress = await resumeManifestScan(job.job_id);
+      updateJob(progress);
+      await runJob(progress);
+    } catch {
+      await refreshManifest().catch(() => undefined);
+      setAction({
+        kind: 'error',
+        message: 'Resume was denied because the job or authorized folder is no longer valid.',
       });
     }
   }
@@ -254,21 +376,58 @@ export default function App() {
               </div>
             ) : (
               <ul className="scope-list">
-                {state.scopes.map((scope) => (
-                  <li key={scope.id}>
-                    <div>
-                      <span className="scope-label">Authorized scope {scope.id}</span>
-                      <code>{scope.display_path}</code>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={action.kind === 'working'}
-                      onClick={() => void scan(scope)}
-                    >
-                      Scan metadata
-                    </button>
-                  </li>
-                ))}
+                {state.scopes.map((scope) => {
+                  const latestJob = state.jobs.find((job) => job.scope_id === scope.id);
+                  const resumableJob =
+                    latestJob &&
+                    (latestJob.status === 'running' ||
+                      latestJob.status === 'paused' ||
+                      latestJob.status === 'interrupted')
+                      ? latestJob
+                      : undefined;
+                  return (
+                    <li key={scope.id}>
+                      <div className="scope-details">
+                        <span className="scope-label">Authorized scope {scope.id}</span>
+                        <code>{scope.display_path}</code>
+                        {latestJob ? (
+                          <div className="scan-progress" role="status">
+                            <span>{scanStatusLabel(latestJob)}</span>
+                            <span>
+                              {latestJob.processed_entries.toLocaleString()} /{' '}
+                              {latestJob.queued_entries.toLocaleString()} entries ·{' '}
+                              {latestJob.issue_count.toLocaleString()} issues
+                            </span>
+                          </div>
+                        ) : null}
+                      </div>
+                      {resumableJob?.status === 'running' ? (
+                        <button
+                          type="button"
+                          disabled={resumableJob.pause_requested}
+                          onClick={() => void pause(resumableJob)}
+                        >
+                          {resumableJob.pause_requested ? 'Pausing…' : 'Pause scan'}
+                        </button>
+                      ) : null}
+                      {resumableJob?.status === 'paused' ||
+                      resumableJob?.status === 'interrupted' ? (
+                        <button type="button" onClick={() => void resume(resumableJob)}>
+                          Resume scan
+                        </button>
+                      ) : null}
+                      {!resumableJob ? (
+                        <button
+                          type="button"
+                          disabled={action.kind === 'working'}
+                          onClick={() => void scan(scope)}
+                        >
+                          Scan metadata
+                        </button>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>

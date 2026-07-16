@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
-    AuthorizedScope, HealthReport, ManifestStats, ScanReport, collect_health_with_manifest,
+    AuthorizedScope, HealthReport, ManifestStats, ScanJobProgress, collect_health_with_manifest,
 };
-use deskgraph_scanner::{authorize_scope, scan_scope};
+use deskgraph_scanner::{
+    authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
+};
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use tauri::{Manager, State};
 use tracing::info;
@@ -46,27 +48,62 @@ fn authorize_scope_path(
 }
 
 #[tauri::command]
-async fn run_manifest_scan(
+fn create_manifest_scan(
     state: State<'_, ManifestState>,
     scope_id: i64,
-) -> Result<ScanReport, String> {
+) -> Result<ScanJobProgress, String> {
+    let progress =
+        create_manifest_scan_at(&state.database_path, scope_id).map_err(str::to_string)?;
+    log_scan_progress("metadata_scan_created", &progress);
+    Ok(progress)
+}
+
+#[tauri::command]
+async fn run_manifest_scan(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ScanJobProgress, String> {
     let database_path = state.database_path.clone();
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        run_manifest_scan_at(&database_path, scope_id).map_err(str::to_string)
+    let progress = tauri::async_runtime::spawn_blocking(move || {
+        run_manifest_scan_at(&database_path, job_id).map_err(str::to_string)
     })
     .await
     .map_err(|_| "scan_worker_failed".to_string())??;
-    info!(
-        event = "metadata_scan_completed",
-        scope_id = report.scope_id,
-        job_id = report.job_id,
-        discovered_files = report.discovered_files,
-        discovered_folders = report.discovered_folders,
-        skipped_entries = report.skipped_entries,
-        issue_count = report.issue_count,
-        elapsed_ms = report.elapsed_ms
-    );
-    Ok(report)
+    log_scan_progress("metadata_scan_runner_stopped", &progress);
+    Ok(progress)
+}
+
+#[tauri::command]
+fn scan_job_status(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ScanJobProgress, String> {
+    scan_job_status_at(&state.database_path, job_id).map_err(str::to_string)
+}
+
+#[tauri::command]
+fn recent_scan_jobs(state: State<'_, ManifestState>) -> Result<Vec<ScanJobProgress>, String> {
+    recent_scan_jobs_at(&state.database_path).map_err(str::to_string)
+}
+
+#[tauri::command]
+fn pause_manifest_scan(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ScanJobProgress, String> {
+    let progress = pause_manifest_scan_at(&state.database_path, job_id).map_err(str::to_string)?;
+    log_scan_progress("metadata_scan_pause_requested", &progress);
+    Ok(progress)
+}
+
+#[tauri::command]
+fn resume_manifest_scan(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ScanJobProgress, String> {
+    let progress = resume_manifest_scan_at(&state.database_path, job_id).map_err(str::to_string)?;
+    log_scan_progress("metadata_scan_resumed", &progress);
+    Ok(progress)
 }
 
 fn initialize_manifest(path: &Path) -> Result<(), &'static str> {
@@ -99,9 +136,52 @@ fn authorize_scope_at(path: &Path, requested_path: &Path) -> Result<AuthorizedSc
     authorize_scope(&database, requested_path).map_err(|error| error.code())
 }
 
-fn run_manifest_scan_at(path: &Path, scope_id: i64) -> Result<ScanReport, &'static str> {
+fn create_manifest_scan_at(path: &Path, scope_id: i64) -> Result<ScanJobProgress, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
-    scan_scope(&mut database, scope_id).map_err(|error| error.code())
+    create_scan_job(&mut database, scope_id).map_err(|error| error.code())
+}
+
+fn run_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
+    let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    run_scan_job_to_terminal(&mut database, job_id).map_err(|error| error.code())
+}
+
+fn scan_job_status_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
+    ManifestDatabase::open(path)
+        .and_then(|database| database.scan_job(job_id))
+        .map_err(|error| error.code())
+}
+
+fn recent_scan_jobs_at(path: &Path) -> Result<Vec<ScanJobProgress>, &'static str> {
+    ManifestDatabase::open(path)
+        .and_then(|database| database.recent_scan_jobs())
+        .map_err(|error| error.code())
+}
+
+fn pause_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
+    let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    pause_scan_job(&mut database, job_id).map_err(|error| error.code())
+}
+
+fn resume_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
+    let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    resume_scan_job(&mut database, job_id).map_err(|error| error.code())
+}
+
+fn log_scan_progress(event: &'static str, progress: &ScanJobProgress) {
+    info!(
+        event = event,
+        scope_id = progress.scope_id,
+        job_id = progress.job_id,
+        status = ?progress.status,
+        queued_entries = progress.queued_entries,
+        processed_entries = progress.processed_entries,
+        discovered_files = progress.discovered_files,
+        discovered_folders = progress.discovered_folders,
+        skipped_entries = progress.skipped_entries,
+        issue_count = progress.issue_count,
+        elapsed_ms = progress.elapsed_ms
+    );
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -125,7 +205,12 @@ pub fn run() {
             manifest_status,
             authorized_scopes,
             authorize_scope_path,
-            run_manifest_scan
+            create_manifest_scan,
+            run_manifest_scan,
+            scan_job_status,
+            recent_scan_jobs,
+            pause_manifest_scan,
+            resume_manifest_scan
         ])
         .run(tauri::generate_context!())
         .expect("DeskGraph desktop runtime failed");
@@ -172,11 +257,28 @@ mod tests {
         initialize_manifest(&database_path).expect("manifest should initialize");
         let scope =
             authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let job = create_manifest_scan_at(&database_path, scope.id).expect("job should create");
+        let paused = pause_manifest_scan_at(&database_path, job.job_id).expect("job should pause");
+        assert_eq!(paused.status, deskgraph_domain::ScanStatus::Paused);
+        resume_manifest_scan_at(&database_path, job.job_id).expect("job should resume");
         let report =
-            run_manifest_scan_at(&database_path, scope.id).expect("metadata scan should pass");
+            run_manifest_scan_at(&database_path, job.job_id).expect("metadata scan should pass");
         let status = manifest_status_at(&database_path).expect("status should load");
 
         assert_eq!(report.discovered_files, 1);
+        assert_eq!(
+            scan_job_status_at(&database_path, job.job_id)
+                .expect("job status should load")
+                .status,
+            deskgraph_domain::ScanStatus::Completed
+        );
+        assert_eq!(
+            recent_scan_jobs_at(&database_path)
+                .expect("recent jobs should load")
+                .first()
+                .map(|recent| recent.job_id),
+            Some(job.job_id)
+        );
         assert_eq!(status.authorized_scope_count, 1);
         assert_eq!(status.file_count, 1);
         assert_eq!(

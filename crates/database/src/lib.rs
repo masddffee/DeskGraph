@@ -1214,6 +1214,29 @@ mod tests {
     }
 
     #[test]
+    fn active_runner_acknowledges_a_durable_pause_request_on_release() {
+        let (mut database, scope_id, root) = resumable_setup();
+        let job = database
+            .create_resumable_scan_job(scope_id, &root)
+            .expect("job should create");
+        database
+            .claim_scan_job(job.job_id, "runner", 60_000)
+            .expect("job should claim");
+
+        let requested = database
+            .request_scan_pause(job.job_id)
+            .expect("pause should persist");
+        assert_eq!(requested.status, ScanStatus::Running);
+        assert!(requested.pause_requested);
+
+        let paused = database
+            .release_scan_job(job.job_id, "runner")
+            .expect("runner should acknowledge pause");
+        assert_eq!(paused.status, ScanStatus::Paused);
+        assert!(paused.pause_requested);
+    }
+
+    #[test]
     fn expired_runner_is_interrupted_and_queue_item_is_replayable() {
         let (mut database, scope_id, root) = resumable_setup();
         let job = database
@@ -1251,6 +1274,60 @@ mod tests {
             .expect("queue should read")
             .expect("root should replay");
         assert_eq!(replay.id, first.id);
+    }
+
+    #[test]
+    fn reopening_a_file_database_recovers_an_expired_processing_entry() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("manifest.sqlite3");
+        let mut database = ManifestDatabase::open(&path).expect("database should initialize");
+        let scope = database
+            .add_scope(b"/scope", "/scope", "/scope", "test")
+            .expect("scope should persist");
+        let root = QueuedPath {
+            path_raw: b"/scope".to_vec(),
+            path_key: "/scope".to_string(),
+            parent_identity_key: None,
+            is_root: true,
+        };
+        let job = database
+            .create_resumable_scan_job(scope.id, &root)
+            .expect("job should create");
+        database
+            .claim_scan_job(job.job_id, "crashed-runner", 60_000)
+            .expect("job should claim");
+        let processing = database
+            .next_scan_queue_entry(job.job_id, "crashed-runner", 60_000)
+            .expect("queue should read")
+            .expect("root should be processing");
+        database
+            .connection
+            .execute(
+                "UPDATE scan_jobs SET lease_expires_at_unix_ms = 0 WHERE id = ?1",
+                [job.job_id],
+            )
+            .expect("fixture lease should expire");
+        drop(database);
+
+        let mut recovered = ManifestDatabase::open(&path).expect("database should recover on open");
+        assert_eq!(
+            recovered
+                .scan_job(job.job_id)
+                .expect("job should load")
+                .status,
+            ScanStatus::Interrupted
+        );
+        recovered
+            .resume_scan_job(job.job_id)
+            .expect("interrupted job should resume");
+        recovered
+            .claim_scan_job(job.job_id, "new-runner", 60_000)
+            .expect("resumed job should claim");
+        let replay = recovered
+            .next_scan_queue_entry(job.job_id, "new-runner", 60_000)
+            .expect("queue should read")
+            .expect("processing entry should replay");
+        assert_eq!(replay.id, processing.id);
     }
 
     #[test]

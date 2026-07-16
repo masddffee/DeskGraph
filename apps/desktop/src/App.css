@@ -342,6 +342,25 @@ input:focus-visible {
   font-size: 0.84rem;
 }
 
+.scope-details {
+  min-width: 0;
+  flex: 1;
+}
+
+.scan-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  margin-top: 0.65rem;
+  color: #5d6b63;
+  font-size: 0.78rem;
+}
+
+.scan-progress span:first-child {
+  color: #235c3a;
+  font-weight: 800;
+}
+
 .privacy-list li {
   display: flex;
   align-items: center;
