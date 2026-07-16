@@ -229,6 +229,27 @@ mod tests {
     }
 
     #[test]
+    fn readme_without_a_strong_marker_remains_profile_evidence_only() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("notes");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(scope_path.join("README.md"), "folder notes").expect("README should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        let canonical_root = std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
+        let root_node_id = database
+            .node_id_for_path_key(scope.id, &comparison_key(&canonical_root))
+            .expect("root lookup should pass")
+            .expect("root should exist");
+
+        let profile = folder_profile(&database, scope.id, root_node_id)
+            .expect("README-only profile should build");
+
+        assert!(profile.project_suggestion.is_none());
+    }
+
+    #[test]
     fn profile_entry_limit_fails_closed() {
         let fixture = Fixture::new();
         let error =
