@@ -591,6 +591,54 @@ mod tests {
         assert_eq!(second_stats.completed_scan_count, 2);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finder_hidden_flag_is_excluded_and_recorded() {
+        let (directory, mut database, scope_id) = setup();
+        let visible = directory.path().join("visible.txt");
+        let hidden = directory.path().join("finder-hidden.txt");
+        fs::write(&visible, "visible fixture").expect("fixture should write");
+        fs::write(&hidden, "hidden fixture").expect("fixture should write");
+        let status = std::process::Command::new("/usr/bin/chflags")
+            .arg("hidden")
+            .arg(&hidden)
+            .status()
+            .expect("chflags should execute");
+        assert!(status.success());
+
+        let report = scan_scope(&mut database, scope_id).expect("scan should pass");
+
+        assert_eq!(report.discovered_files, 1);
+        assert_eq!(report.skipped_entries, 1);
+        assert_eq!(report.issue_count, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn canonical_scope_uses_filesystem_case_behavior() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let actual = directory.path().join("MixedCaseScope");
+        let alternate_case = directory.path().join("mixedcasescope");
+        fs::create_dir(&actual).expect("scope should create");
+        fs::write(actual.join("note.md"), "metadata fixture").expect("fixture should write");
+        let Ok(canonical_alias) = fs::canonicalize(&alternate_case) else {
+            assert!(fs::canonicalize(&actual).is_ok());
+            return;
+        };
+        let canonical_actual = fs::canonicalize(&actual).expect("scope should canonicalize");
+        assert_eq!(
+            comparison_key(&canonical_alias),
+            comparison_key(&canonical_actual)
+        );
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+
+        let scope = authorize_scope(&database, &alternate_case).expect("alias should authorize");
+        let report = scan_scope(&mut database, scope.id).expect("canonical scope should scan");
+
+        assert_eq!(report.discovered_files, 1);
+        assert_eq!(report.discovered_folders, 1);
+    }
+
     #[test]
     fn bounded_batches_pause_without_publishing_and_resume_to_completion() {
         let (directory, mut database, scope_id) = setup();
