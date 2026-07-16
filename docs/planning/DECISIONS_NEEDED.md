@@ -35,3 +35,4 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - Unicode comparison keys use NFC; Windows additionally uses case-insensitive comparison keys. Canonical scope validation remains the security boundary.
 - Initial scan is metadata-only and never follows symlinks or Windows reparse points.
 - Resumable scans use a persistent path queue and job-scoped staging; only a completed job publishes the live manifest atomically. Pause state and an expiring runner lease survive process exit (ADR-011).
+- Extractor providers receive only core-controlled bounded streams, never arbitrary paths; output remains untrusted and publishes per file only after complete success (ADR-012).

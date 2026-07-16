@@ -118,3 +118,18 @@ Why：
 
 Canonical detail：
 `docs/architecture/adr/0011-resumable-scan-jobs.md`。
+
+## ADR-012 — Bounded extraction provider contract
+
+Decision：
+Extractor provider 不取得任意 filesystem path；Rust core 完成 scope、identity、stability 與 limits 驗證後，只交付受控的 bounded `Read + Seek` source。所有輸出標記為 untrusted，完整成功才原子替換 active chunks。
+
+Why：
+
+- 惡意文件不得擴大 provider 的檔案系統能力。
+- Size、time、decompression、structure、output 與 cancellation limits 必須跨格式一致。
+- Corrupt、cancelled 或超限檔案不能發布 partial retrieval truth，也不能清除上一版成功內容。
+- 核心 text/Markdown/code extraction 不應等待 OCR、Python、模型或大型 parser dependency。
+
+Canonical detail：
+`docs/architecture/adr/0012-bounded-extraction-provider-contract.md`。
