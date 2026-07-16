@@ -191,7 +191,8 @@ export default function App() {
       } else {
         setAction({
           kind: 'error',
-          message: 'The scan was interrupted safely. Resume it after checking the authorized folder.',
+          message:
+            'The scan was interrupted safely. Resume it after checking the authorized folder.',
         });
       }
     } catch {
