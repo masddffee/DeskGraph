@@ -129,7 +129,7 @@ cargo run -p deskgraph-cli -- organize list \
   --database ./deskgraph-dev.sqlite3
 ```
 
-The explicit preview/status response returns canonical before/after paths and passed policy checks; ordinary logs and `organize list` remain path-free. The source must still match its scanned identity and metadata, and the destination must be free. This slice intentionally has no execute command: move, conflict resolution beyond fail-closed/case-only planning, crash recovery, rollback, Undo, and Desktop action controls remain unimplemented.
+The explicit preview/status response returns canonical before/after paths and passed policy checks; ordinary logs and `organize list` remain path-free. The Desktop has the same backend-owned preview form and a path-free recent history. The source must still match its scanned identity and metadata, and the destination must be free. This slice intentionally has no execute command or button: move, conflict resolution beyond fail-closed/case-only planning, crash recovery, rollback, Undo, and Desktop execution controls remain unimplemented.
 
 Start the desktop application:
 
@@ -137,7 +137,7 @@ Start the desktop application:
 pnpm desktop:dev
 ```
 
-The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows paths in explicit scope management and user-invoked search results; its extraction and watch dashboards expose aggregate counts and fixed job states without paths or content. Search snippets are visibly labeled untrusted local text and rendered as text, never executable markup. The Watch panel explicitly reports that its native adapter is not connected.
+The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows paths in explicit scope management, user-invoked search results, and the explicit before/after rename preview; extraction, watch, and recent action-history payloads expose aggregate or fixed states without paths or content. Search snippets are visibly labeled untrusted local text and rendered as text, never executable markup. The Watch panel explicitly reports that its native adapter is not connected, and the organizer panel explicitly reports that no execute control exists.
 
 ## Development verification
 
