@@ -13,10 +13,13 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build.workspace = true
 
 [dependencies]
+deskgraph-database = { path = "../../../crates/database" }
 deskgraph-domain = { path = "../../../crates/domain" }
+deskgraph-scanner = { path = "../../../crates/scanner" }
 deskgraph-telemetry = { path = "../../../crates/telemetry" }
 tauri.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true

@@ -67,7 +67,7 @@ pub fn collect_health() -> HealthReport {
         },
         database: ComponentHealth {
             state: LifecycleState::NotInitialized,
-            reason: "manifest_database_pending_m1",
+            reason: "manifest_database_path_not_provided",
         },
         providers: ProviderHealth {
             ocr: provider_disabled(),
@@ -81,6 +81,17 @@ pub fn collect_health() -> HealthReport {
             authorized_scope_count: 0,
         },
     }
+}
+
+#[must_use]
+pub fn collect_health_with_manifest(authorized_scope_count: u32) -> HealthReport {
+    let mut report = collect_health();
+    report.database = ComponentHealth {
+        state: LifecycleState::Ready,
+        reason: "local_manifest_ready",
+    };
+    report.privacy.authorized_scope_count = authorized_scope_count;
+    report
 }
 
 #[cfg(test)]
@@ -115,5 +126,15 @@ mod tests {
         assert!(!serialized.contains("/Users/"));
         assert!(!serialized.contains("C:\\Users\\"));
         assert!(!serialized.contains("HOME"));
+    }
+
+    #[test]
+    fn initialized_manifest_changes_only_local_database_state_and_scope_count() {
+        let report = collect_health_with_manifest(2);
+
+        assert_eq!(report.database.state, LifecycleState::Ready);
+        assert_eq!(report.privacy.authorized_scope_count, 2);
+        assert!(!report.privacy.filesystem_locations_included);
+        assert!(!report.privacy.network_required);
     }
 }

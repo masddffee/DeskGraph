@@ -662,11 +662,14 @@ dependencies = [
 name = "deskgraph-desktop"
 version = "0.1.0"
 dependencies = [
+ "deskgraph-database",
  "deskgraph-domain",
+ "deskgraph-scanner",
  "deskgraph-telemetry",
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tracing",
 ]
 
