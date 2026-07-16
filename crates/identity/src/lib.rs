@@ -111,6 +111,27 @@ pub fn is_symlink_or_reparse_point(metadata: &Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+#[cfg(windows)]
+pub fn has_hidden_or_system_attribute(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
+
+    metadata.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+}
+
+#[cfg(target_os = "macos")]
+pub fn has_hidden_or_system_attribute(metadata: &Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt;
+
+    const UF_HIDDEN: u32 = 0x0000_8000;
+    metadata.st_flags() & UF_HIDDEN != 0
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn has_hidden_or_system_attribute(_metadata: &Metadata) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn platform_identity_impl(
     _path: &Path,

@@ -10,8 +10,8 @@ use deskgraph_database::{
 use deskgraph_domain::{AuthorizedScope, ScanJobProgress, ScanReport, ScanStatus};
 pub use deskgraph_identity::comparison_key;
 use deskgraph_identity::{
-    IdentityNodeKind, fallback_identity, is_symlink_or_reparse_point, path_from_raw, path_to_raw,
-    platform_identity,
+    IdentityNodeKind, fallback_identity, has_hidden_or_system_attribute,
+    is_symlink_or_reparse_point, path_from_raw, path_to_raw, platform_identity,
 };
 
 #[derive(Debug)]
@@ -256,8 +256,14 @@ fn process_queue_entry(
         }
     };
 
-    if !entry.is_root && is_hidden(path.file_name()) {
-        issues.push(issue("hidden_entry_excluded", &path, None));
+    if !entry.is_root && (is_hidden(path.file_name()) || has_hidden_or_system_attribute(&metadata))
+    {
+        let code = if is_hidden(path.file_name()) {
+            "hidden_entry_excluded"
+        } else {
+            "platform_hidden_or_system_excluded"
+        };
+        issues.push(issue(code, &path, None));
         return Ok(ProcessedQueueEntry {
             observation: None,
             children: Vec::new(),
@@ -399,22 +405,67 @@ fn is_hidden(name: Option<&OsStr>) -> bool {
 
 #[cfg(unix)]
 fn is_protected_system_scope(path: &Path) -> bool {
-    const ROOTS: &[&str] = &[
-        "/", "/System", "/Library", "/private", "/usr", "/bin", "/sbin", "/etc", "/var", "/dev",
-        "/proc", "/sys", "/run", "/boot",
+    const PROTECTED_TREES: &[&str] = &[
+        "/System",
+        "/Library",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/var",
+        "/dev",
+        "/proc",
+        "/sys",
+        "/run",
+        "/boot",
+        "/private/etc",
+        "/private/var/db",
+        "/private/var/root",
+        "/private/var/vm",
+        "/private/var/protected",
     ];
-    ROOTS.iter().any(|root| path == Path::new(root))
+    const PROTECTED_CONTAINER_ROOTS: &[&str] = &[
+        "/Users", "/home", "/Volumes", "/mnt", "/media", "/Network", "/private", "/tmp",
+    ];
+
+    path == Path::new("/")
+        || PROTECTED_TREES
+            .iter()
+            .any(|root| path.starts_with(Path::new(root)))
+        || PROTECTED_CONTAINER_ROOTS
+            .iter()
+            .any(|root| path == Path::new(root))
 }
 
 #[cfg(windows)]
 fn is_protected_system_scope(path: &Path) -> bool {
+    use std::path::Component;
+
     if path.parent().is_none() {
         return true;
     }
-    let key = comparison_key(path);
-    ["\\windows", "\\program files", "\\programdata"]
-        .iter()
-        .any(|suffix| key.ends_with(suffix))
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_lowercase()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(first) = components.first().map(String::as_str) else {
+        return true;
+    };
+    matches!(
+        first,
+        "windows"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
+            | "$recycle.bin"
+            | "system volume information"
+            | "recovery"
+            | "boot"
+            | "perflogs"
+    ) || (matches!(first, "users" | "documents and settings") && components.len() == 1)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -466,6 +517,38 @@ mod tests {
 
         let error = authorize_scope(&database, &file).expect_err("file scope must fail");
         assert!(matches!(error, ScannerError::ScopeIsNotDirectory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_system_descendants_are_denied_but_user_containers_require_a_child() {
+        assert!(is_protected_system_scope(Path::new("/System/Library")));
+        assert!(is_protected_system_scope(Path::new("/usr/local/bin")));
+        assert!(is_protected_system_scope(Path::new("/private/var/db")));
+        assert!(is_protected_system_scope(Path::new("/Users")));
+        assert!(!is_protected_system_scope(Path::new(
+            "/Users/person/Documents"
+        )));
+        assert!(!is_protected_system_scope(Path::new(
+            "/private/var/folders/person/test"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorization_rejects_an_existing_protected_system_descendant() {
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+
+        let error = authorize_scope(&database, Path::new("/usr"))
+            .expect_err("protected system tree must not authorize");
+
+        assert!(matches!(error, ScannerError::ProtectedSystemScope));
+        assert!(
+            database
+                .list_scopes()
+                .expect("scopes should load")
+                .is_empty()
+        );
     }
 
     #[test]
