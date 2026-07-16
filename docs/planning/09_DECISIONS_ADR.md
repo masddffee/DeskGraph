@@ -182,3 +182,10 @@ Status：Accepted。Project root 以 `(scope_id, root_folder_node_id)` 取得穩
 
 Canonical detail：
 `docs/architecture/adr/0019-append-only-project-candidates-and-user-feedback.md`。
+
+## ADR-020 — Bounded exact duplicate candidates
+
+Status：Accepted。第一個 file relation 僅比較同一明確授權 scope 中兩個不同 stable identities 的非空檔案；在 64 MiB 與協作式時間上限內完成 full byte equality、前後 open-handle identity/metadata 驗證，才 append immutable `exact_duplicate` observation。結果永遠是 suggestion，沒有 merge、delete 或檔案操作。
+
+Canonical detail：
+`docs/architecture/adr/0020-bounded-exact-duplicate-candidates.md`。

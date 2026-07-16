@@ -14,9 +14,9 @@ The current content slices can extract bounded UTF-8 from an explicitly selected
 
 The current search slice uses bundled SQLite FTS5 trigram indexes for Traditional Chinese and English substring queries of 3–256 Unicode characters. It requires no embedding or model, returns bounded text snippets, filters out stale chunks and absent locations, and explains whether filename/path, extracted text, or both matched. Scope, source, extension, and modified-time filters plus a synthetic 10k p50/p95/index-size baseline pass locally. One- and two-character queries, project/folder filters, vector semantic search, hybrid fusion, representative/100k/8 GB evaluation, and cross-platform evidence remain open.
 
-The current M4 slices derive bounded Folder Profiles from the current authorized manifest and can persist a correctable Project root candidate from direct deterministic markers such as `Cargo.toml` or `package.json`. Every observation exposes confidence, provenance, observation time, and its fixed rule provider; explicit user accept/reject decisions are append-only and same-decision retries are idempotent. A rejected stable root remains rejected until an opposite explicit correction. Acceptance never creates automatic file membership and requires no model. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
+The current M4 slices derive bounded Folder Profiles, persist correctable Project root candidates, and can compare two explicit current files as a bounded exact-duplicate suggestion. Root observations expose confidence, provenance, observation time, and a fixed rule provider; user accept/reject decisions are append-only and same-decision retries are idempotent. Exact-duplicate checks require two different stable identities, compare every byte of non-empty files up to 64 MiB, and append immutable evidence with no model or hash dependency. Neither root acceptance nor a duplicate suggestion creates file membership or a filesystem action. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
 
-DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, Project file-membership and related/duplicate/version relations, cross-root learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, Project file-membership, related/similarity/version relations, background duplicate discovery, relation feedback, cross-root learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -130,7 +130,22 @@ cargo run -p deskgraph-cli -- project list \
   --database ./deskgraph-dev.sqlite3
 ```
 
-`propose` re-derives and validates current manifest evidence before persistence; it does not accept the candidate. Only `decide` appends an explicit `accepted` or `rejected` user event. Repeating the current decision is idempotent, while an opposite decision appends the next correction sequence. Explicit propose/decide/status responses may contain the current root path; `project list` and structured logs remain path-free. Acceptance confirms only the stable root candidate: file membership, cross-root learning, merge/split, related/duplicate/version relations, retrieval filters, and the Project UI remain unimplemented.
+`propose` re-derives and validates current manifest evidence before persistence; it does not accept the candidate. Only `decide` appends an explicit `accepted` or `rejected` user event. Repeating the current decision is idempotent, while an opposite decision appends the next correction sequence. Explicit propose/decide/status responses may contain the current root path; `project list` and structured logs remain path-free. Acceptance confirms only the stable root candidate: file membership, cross-root learning, merge/split, general related/similarity/version relations, retrieval filters, and the Project UI remain unimplemented.
+
+Check two canonical, already-scanned files for exact byte equality without changing them:
+
+```bash
+cargo run -p deskgraph-cli -- relation duplicate \
+  --database ./deskgraph-dev.sqlite3 \
+  --scope 1 \
+  --left /canonical/path/to/test-folder/copy-a.bin \
+  --right /canonical/path/to/test-folder/copy-b.bin
+cargo run -p deskgraph-cli -- relation verify \
+  --database ./deskgraph-dev.sqlite3 \
+  --relation 1
+```
+
+Both paths must be canonical, non-symlink files with different stable identities in the same authorized scope. DeskGraph revalidates manifest metadata and read-only open-handle identities, then compares every byte in 64 KiB chunks with a 64 MiB maximum and cooperative five-second deadline. Empty, oversized, changed, aliased, different, or unreadable files produce no observation. A successful check or verify appends immutable local evidence and returns the two explicit paths; structured logs omit paths, filenames, database path, and content. The result remains a suggestion and never merges, deletes, renames, moves, or otherwise organizes either file. Background discovery, larger-file hashing, fuzzy similarity, version inference, and relation feedback remain unimplemented.
 
 Exercise the durable watch-reconciliation core with an explicit hint:
 

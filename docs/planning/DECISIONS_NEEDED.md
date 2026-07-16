@@ -80,4 +80,5 @@ D-013 must be resolved before M4 introduces cross-root learned scoring or merge/
 - D-012 is resolved by ADR-019 for durable Project root candidates and exact-root correction. No embedding, vector runtime, model, API, or external dependency is selected by this slice.
 - Project root identities, deterministic suggestion observations/signals, and user feedback events are immutable/append-only. Same-decision retries are idempotent; an opposite decision appends a correction.
 - A rejected root remains rejected on later proposals with the same stable identity, and an accepted root remains accepted. This is exact-root feedback only and creates no file membership edge.
+- ADR-020 adds only explicit same-scope exact-duplicate suggestions for non-empty files up to 64 MiB. Full byte equality, fixed provenance, immutable observations and current source revalidation are required; it adds no relation feedback, merge, deletion, hashing dependency, or file action.
 - D-013 remains open for cross-root learning and merge/split behavior; the default is no inferred influence beyond the root the user explicitly corrected.

@@ -90,8 +90,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 5 — M4 context graph
 
-- Current: ADR-018 derives bounded Folder Profiles from current manifest identities, and ADR-019 persists stable Project root candidates with immutable deterministic observations/signals plus append-only explicit accept/reject feedback. README-only, invented/stale evidence, idempotent retry, opposite-decision correction, rejected-root suppression, entry-limit and log/list-redaction behavior pass locally. Acceptance creates no file membership edge.
-- Next: add deterministic related/duplicate/version candidates with provenance and current-data invalidation, then define file-membership correction and evaluation. Resolve D-013 before cross-root learned scoring or merge/split; add retrieval filters and a backend-owned Project page only after those source-of-truth contracts pass.
+- Current: ADR-018/ADR-019 provide bounded Folder Profiles and stable correctable Project roots. ADR-020 adds an explicit same-scope exact-duplicate suggestion only after canonical path, manifest/platform/open-handle identity, non-empty 64 MiB limit, full byte equality, post-read revalidation, immutable observation and log-redaction gates. Hard links, symlink aliases, different/stale/empty/oversized sources and reversed endpoints pass locally; no result creates membership or a file action.
+- Next: add deterministic version and related candidates with provenance/current-data invalidation, then define file-membership and relation correction/evaluation. Background duplicate discovery and larger-file hashing need a separate bounded design. Resolve D-013 before cross-root learned scoring or merge/split; add retrieval filters and a backend-owned Project page only after those source-of-truth contracts pass.
 - Exit with explainable low-confidence behavior and correction feedback evidence.
 
 ### Step 6 — M5 transaction safety
