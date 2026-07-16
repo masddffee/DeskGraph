@@ -10,8 +10,8 @@ Overall status: **not release-ready**. Local implementation has entered M1 while
 | macOS Intel or Universal package               | Not started        | Native or Universal clean-machine evidence               |
 | Windows x64 installer                          | Not started        | Signed clean-VM install and smoke                        |
 | Linux experimental package                     | Not started        | Clearly labeled build and smoke                          |
-| Explicit authorized scopes                     | Verified locally   | Desktop/CLI authorization, canonical policy, system-root and symlink/hidden exclusions; cross-platform runtime fixtures remain |
-| Initial manifest scan                          | In progress        | 10k idempotency, durable progress/pause/resume, crash-reopen replay, atomic publish, and Unix permission fixture pass; platform exclusions, memory, live updated-UI smoke, and remote CI remain |
+| Explicit authorized scopes                     | Verified locally   | Desktop/CLI authorization, component-aware protected-tree policy, symlink/reparse and platform hidden/system exclusions; Windows runtime fixtures remain |
+| Initial manifest scan                          | In progress        | Release 10k idempotency/timing, durable progress/pause/resume, crash-reopen replay, atomic publish, and Unix permission fixture pass; memory, live updated-UI smoke, and remote CI remain |
 | Incremental watch mode                         | Not started        | Reconciliation/stability/restart tests                   |
 | Extraction and OCR formats                     | Not started        | Fixture suite, limits, corrupt-file isolation            |
 | zh-TW and English                              | Not started        | OCR and retrieval evaluation set                         |
@@ -36,4 +36,4 @@ The M0 implementation is verified locally. Governance, ADRs, health slice, lockf
 
 ## M1 local readiness note
 
-The resumable scanner is safe to exercise with test folders: progress and pending paths persist in SQLite, live manifest rows are not replaced until a complete scan publishes atomically, pause is acknowledged between entries, expired work reopens as interrupted, and resume revalidates the original canonical authorization boundary. This is not yet a release claim: Windows junction/hidden-attribute runtime evidence, platform exclusion hardening, peak RSS, remote CI, and live UI interaction evidence remain open.
+The resumable scanner is safe to exercise with test folders: progress and pending paths persist in SQLite, live manifest rows are not replaced until a complete scan publishes atomically, pause is acknowledged between entries, expired work reopens as interrupted, and resume revalidates the original canonical authorization boundary. This is not yet a release claim: Windows junction/hidden-attribute runtime evidence, peak RSS, remote CI, and live UI interaction evidence remain open.

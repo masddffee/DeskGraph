@@ -10,7 +10,7 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 The repository is implementing M1 Manifest Graph. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
-Content extraction, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Platform-sensitive exclusion hardening, peak-memory evidence, complete cross-platform runtime evidence, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+Content extraction, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Peak-memory evidence, complete cross-platform runtime evidence, the latest pause/resume UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
