@@ -55,12 +55,23 @@ pub struct ExtractionRequest {
     pub modified_unix_ns: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkProvenance {
+    ByteRange {
+        start: u64,
+        end: u64,
+    },
+    PdfPage {
+        page_number: u32,
+        fragment_index: u32,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractedChunk {
     pub ordinal: u32,
     pub text: String,
-    pub source_byte_start: u64,
-    pub source_byte_end: u64,
+    pub provenance: ChunkProvenance,
     pub trust_class: &'static str,
 }
 
@@ -354,10 +365,10 @@ fn chunk_utf8(
             ordinal: u32::try_from(chunks.len())
                 .map_err(|_| ExtractionError::ChunkLimitExceeded)?,
             text: content[start..end].to_string(),
-            source_byte_start: u64::try_from(source_start)
-                .map_err(|_| ExtractionError::OutputTooLarge)?,
-            source_byte_end: u64::try_from(source_end)
-                .map_err(|_| ExtractionError::OutputTooLarge)?,
+            provenance: ChunkProvenance::ByteRange {
+                start: u64::try_from(source_start).map_err(|_| ExtractionError::OutputTooLarge)?,
+                end: u64::try_from(source_end).map_err(|_| ExtractionError::OutputTooLarge)?,
+            },
             trust_class: UNTRUSTED_TEXT,
         });
         if end == content.len() {
@@ -441,8 +452,11 @@ mod tests {
         assert_eq!(output.provider_id, "deskgraph.utf8-text");
         assert_eq!(output.modified_unix_ns, Some(7));
         for chunk in &output.chunks {
-            let start = chunk.source_byte_start as usize;
-            let end = chunk.source_byte_end as usize;
+            let ChunkProvenance::ByteRange { start, end } = chunk.provenance else {
+                panic!("text chunks must use byte provenance");
+            };
+            let start = start as usize;
+            let end = end as usize;
             assert_eq!(chunk.text.as_bytes(), &text.as_bytes()[start..end]);
             assert_eq!(chunk.trust_class, UNTRUSTED_TEXT);
         }
@@ -463,8 +477,10 @@ mod tests {
 
         assert_eq!(output.output_bytes, 5);
         assert_eq!(output.chunks[0].text, "hello");
-        assert_eq!(output.chunks[0].source_byte_start, 3);
-        assert_eq!(output.chunks[0].source_byte_end, 8);
+        assert_eq!(
+            output.chunks[0].provenance,
+            ChunkProvenance::ByteRange { start: 3, end: 8 }
+        );
     }
 
     #[test]
@@ -487,7 +503,10 @@ mod tests {
             output
                 .chunks
                 .iter()
-                .map(|chunk| chunk.source_byte_start)
+                .map(|chunk| match chunk.provenance {
+                    ChunkProvenance::ByteRange { start, .. } => start,
+                    ChunkProvenance::PdfPage { .. } => panic!("expected byte provenance"),
+                })
                 .collect::<Vec<_>>(),
             vec![0, 6, 12]
         );

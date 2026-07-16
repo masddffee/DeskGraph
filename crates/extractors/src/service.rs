@@ -3,7 +3,10 @@ use std::fs::{self, File, Metadata};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use deskgraph_database::{ContentChunkWrite, DatabaseError, ExtractableFile, ManifestDatabase};
+use deskgraph_database::{
+    ContentChunkProvenanceWrite, ContentChunkWrite, DatabaseError, ExtractableFile,
+    ManifestDatabase,
+};
 use deskgraph_domain::{ExtractionJobProgress, ExtractionStats, ExtractionStatus};
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, fallback_identity, has_hidden_or_system_attribute,
@@ -11,8 +14,8 @@ use deskgraph_identity::{
 };
 
 use crate::{
-    CancellationSignal, ExtractionError, ExtractionLimits, ExtractionRequest, ExtractorProvider,
-    MediaKind, Utf8TextExtractor, media_kind_for_extension,
+    CancellationSignal, ChunkProvenance, ExtractionError, ExtractionLimits, ExtractionRequest,
+    ExtractorProvider, MediaKind, Utf8TextExtractor, media_kind_for_extension,
 };
 
 // The provider's absolute processing cap is 60 seconds. Keep enough lease headroom for
@@ -196,8 +199,18 @@ pub fn run_extraction_job_at(
                 .map(|chunk| ContentChunkWrite {
                     ordinal: chunk.ordinal,
                     text: chunk.text,
-                    source_byte_start: chunk.source_byte_start,
-                    source_byte_end: chunk.source_byte_end,
+                    provenance: match chunk.provenance {
+                        ChunkProvenance::ByteRange { start, end } => {
+                            ContentChunkProvenanceWrite::ByteRange { start, end }
+                        }
+                        ChunkProvenance::PdfPage {
+                            page_number,
+                            fragment_index,
+                        } => ContentChunkProvenanceWrite::PdfPage {
+                            page_number,
+                            fragment_index,
+                        },
+                    },
                     trust_class: chunk.trust_class,
                 })
                 .collect::<Vec<_>>();

@@ -25,6 +25,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "content_extraction",
         sql: include_str!("../../../migrations/0003_content_extraction.sql"),
     },
+    Migration {
+        version: 4,
+        name: "content_chunk_provenance",
+        sql: include_str!("../../../migrations/0004_content_chunk_provenance.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -119,12 +124,23 @@ pub struct ExtractableFile {
     pub modified_unix_ns: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentChunkProvenanceWrite {
+    ByteRange {
+        start: u64,
+        end: u64,
+    },
+    PdfPage {
+        page_number: u32,
+        fragment_index: u32,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentChunkWrite {
     pub ordinal: u32,
     pub text: String,
-    pub source_byte_start: u64,
-    pub source_byte_end: u64,
+    pub provenance: ContentChunkProvenanceWrite,
     pub trust_class: &'static str,
 }
 
@@ -1273,11 +1289,16 @@ impl ManifestDatabase {
             return Err(DatabaseError::ExtractionOutputInvalid);
         }
         for (index, chunk) in chunks.iter().enumerate() {
+            let invalid_provenance = match chunk.provenance {
+                ContentChunkProvenanceWrite::ByteRange { start, end } => {
+                    start > end || end > source_size_bytes
+                }
+                ContentChunkProvenanceWrite::PdfPage { page_number, .. } => page_number == 0,
+            };
             if usize::try_from(chunk.ordinal).map_err(|_| DatabaseError::ExtractionOutputInvalid)?
                 != index
                 || chunk.trust_class != "untrusted_extracted_text"
-                || chunk.source_byte_start > chunk.source_byte_end
-                || chunk.source_byte_end > source_size_bytes
+                || invalid_provenance
             {
                 return Err(DatabaseError::ExtractionOutputInvalid);
             }
@@ -1288,12 +1309,38 @@ impl ManifestDatabase {
             params![scope_id, node_id],
         )?;
         for chunk in chunks {
+            let (
+                provenance_kind,
+                source_byte_start,
+                source_byte_end,
+                source_page_number,
+                source_fragment_index,
+            ) = match chunk.provenance {
+                ContentChunkProvenanceWrite::ByteRange { start, end } => (
+                    "byte_range",
+                    Some(to_i64(start)?),
+                    Some(to_i64(end)?),
+                    None,
+                    None,
+                ),
+                ContentChunkProvenanceWrite::PdfPage {
+                    page_number,
+                    fragment_index,
+                } => (
+                    "pdf_page",
+                    None,
+                    None,
+                    Some(i64::from(page_number)),
+                    Some(i64::from(fragment_index)),
+                ),
+            };
             transaction.execute(
                 "INSERT INTO content_chunks( \
                     scope_id, node_id, location_id, extraction_job_id, ordinal, text, \
-                    source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, \
-                    trust_class, provider_id, provider_version, active, created_at_unix_ms \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)",
+                    provenance_kind, source_byte_start, source_byte_end, source_page_number, \
+                    source_fragment_index, source_size_bytes, source_modified_unix_ns, trust_class, \
+                    provider_id, provider_version, active, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1, ?17)",
                 params![
                     scope_id,
                     node_id,
@@ -1301,8 +1348,11 @@ impl ManifestDatabase {
                     job_id,
                     i64::from(chunk.ordinal),
                     chunk.text,
-                    to_i64(chunk.source_byte_start)?,
-                    to_i64(chunk.source_byte_end)?,
+                    provenance_kind,
+                    source_byte_start,
+                    source_byte_end,
+                    source_page_number,
+                    source_fragment_index,
                     to_i64(source_size_bytes)?,
                     source_modified_unix_ns,
                     chunk.trust_class,
@@ -1898,6 +1948,58 @@ mod tests {
     }
 
     #[test]
+    fn v3_content_migration_preserves_exact_byte_provenance() {
+        let connection = Connection::open_in_memory().expect("connection should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at_unix_ms INTEGER NOT NULL);",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..3] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("legacy migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("legacy migration should register");
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'test', 0);\
+                 INSERT INTO scan_jobs(id, scope_id, status, started_at_unix_ms) VALUES (1, 1, 'completed', 0);\
+                 INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0);\
+                 INSERT INTO files VALUES (1, 4, 1, 1);\
+                 INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E747874', '/scope/file.txt', '/scope/file.txt', 1, 1);\
+                 INSERT INTO extraction_jobs(id, scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, created_at_unix_ms, updated_at_unix_ms) VALUES (1, 1, 1, 1, 'completed', 4, 1, 2, 1, 0, 0);\
+                 INSERT INTO content_chunks(id, scope_id, node_id, location_id, extraction_job_id, ordinal, text, source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, trust_class, provider_id, provider_version, active, created_at_unix_ms) VALUES (1, 1, 1, 1, 1, 0, 'bc', 1, 3, 4, 1, 'untrusted_extracted_text', 'deskgraph.utf8-text', '1', 1, 0);",
+            )
+            .expect("legacy content fixture should initialize");
+
+        let database = ManifestDatabase::from_connection(connection)
+            .expect("new provenance migration should apply");
+        let stored: (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>) = database
+            .connection
+            .query_row(
+                "SELECT provenance_kind, source_byte_start, source_byte_end, source_page_number, source_fragment_index FROM content_chunks WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("migrated provenance should load");
+
+        assert_eq!(
+            stored,
+            ("byte_range".to_string(), Some(1), Some(3), None, None)
+        );
+    }
+
+    #[test]
     fn ready_job_can_pause_and_resume_without_processing() {
         let (mut database, scope_id, root) = resumable_setup();
         let job = database
@@ -2158,15 +2260,13 @@ mod tests {
             ContentChunkWrite {
                 ordinal: 0,
                 text: "ab".to_string(),
-                source_byte_start: 0,
-                source_byte_end: 2,
+                provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 2 },
                 trust_class: "untrusted_extracted_text",
             },
             ContentChunkWrite {
                 ordinal: 1,
                 text: "cd".to_string(),
-                source_byte_start: 2,
-                source_byte_end: 4,
+                provenance: ContentChunkProvenanceWrite::ByteRange { start: 2, end: 4 },
                 trust_class: "untrusted_extracted_text",
             },
         ];
@@ -2202,8 +2302,7 @@ mod tests {
         let bounded_chunk = ContentChunkWrite {
             ordinal: 0,
             text: "abcd".to_string(),
-            source_byte_start: 0,
-            source_byte_end: 4,
+            provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
             trust_class: "untrusted_extracted_text",
         };
         let error = database
@@ -2244,8 +2343,7 @@ mod tests {
         let invalid_chunk = ContentChunkWrite {
             ordinal: 0,
             text: "bad".to_string(),
-            source_byte_start: 0,
-            source_byte_end: 3,
+            provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 3 },
             trust_class: "trusted",
         };
         let error = database
@@ -2289,8 +2387,7 @@ mod tests {
         let replacement_chunk = ContentChunkWrite {
             ordinal: 0,
             text: "abcd".to_string(),
-            source_byte_start: 0,
-            source_byte_end: 4,
+            provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
             trust_class: "untrusted_extracted_text",
         };
         database
@@ -2321,6 +2418,51 @@ mod tests {
     }
 
     #[test]
+    fn complete_extraction_stores_page_provenance_without_fake_byte_offsets() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "pdf-runner", 60_000)
+            .expect("job should claim");
+        database
+            .complete_extraction_job(
+                job.job_id,
+                "pdf-runner",
+                "deskgraph.pdf-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "page".to_string(),
+                    provenance: ContentChunkProvenanceWrite::PdfPage {
+                        page_number: 2,
+                        fragment_index: 0,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("page provenance should publish");
+        let stored: (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>) = database
+            .connection
+            .query_row(
+                "SELECT provenance_kind, source_byte_start, source_byte_end, source_page_number, source_fragment_index FROM content_chunks WHERE active = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("page provenance should load");
+
+        assert_eq!(
+            stored,
+            ("pdf_page".to_string(), None, None, Some(2), Some(0))
+        );
+    }
+
+    #[test]
     fn manifest_change_invalidates_prior_content_chunks() {
         let (mut database, scope_id, node_id, root) = extraction_setup();
         let job = database
@@ -2342,8 +2484,7 @@ mod tests {
                 &[ContentChunkWrite {
                     ordinal: 0,
                     text: "abcd".to_string(),
-                    source_byte_start: 0,
-                    source_byte_end: 4,
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
                     trust_class: "untrusted_extracted_text",
                 }],
             )
