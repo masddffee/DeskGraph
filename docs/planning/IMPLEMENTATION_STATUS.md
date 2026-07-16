@@ -91,14 +91,14 @@ The first M2 vertical slice now runs end to end without a new third-party parser
 | Per-file error isolation | Verified locally for text slice | Invalid UTF-8 and invalid limits produce fixed failed-job codes without aborting the process or publishing partial chunks |
 | Privacy-safe usable CLI | Verified locally | `extract start/create/run/status/list/cancel/resume/stats`; explicit `--path` resolves only an existing scanned node; binary test proves path, filename, and extracted text do not enter stdout/stderr |
 | Desktop extraction status | Verified locally except live smoke | Narrow read-only Tauri IPC, runtime-validated TypeScript schemas, empty/success/failure/cancel/interrupted labels, 10 frontend tests, Vite and Tauri release builds; latest window interaction not run |
-| PDF text | Not started | Parser/API/license/security audit and valid/corrupt/action/attachment/limit/cancel/provenance fixtures required |
+| PDF text | Dependency/ADR verified; implementation pending | ADR-013 selects exact no-default-feature `lopdf 0.44.0`; isolated 53-package graph is license-complete, RustSec-clean, and Windows-cross-checkable. Provider/schema plus valid/corrupt/encrypted/action/attachment/limit/cancel/page-provenance fixtures remain required. |
 | DOCX / PPTX / XLSX | Not started | ZIP/XML dependency audit plus traversal, decompression, macro, external-link, embedded-object, limit, cancel, and provenance fixtures required |
 | Image metadata | Not started | Bounded signature/metadata provider and corrupt/oversized fixtures required |
 | Screenshot OCR with zh-TW and English | Not started | D-008 remains open; native and packaged fallback candidates require official API/platform/license/memory evaluation; no Python requirement allowed |
 
 ## Next handoff
 
-Continue `prompts/03_EXTRACTORS_OCR.md`. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI. The next M2 format provider must not be selected until its official API, maintenance, platform support, license, packaging, and security limits are recorded in `DEPENDENCY_AUDIT.md`.
+Continue `prompts/03_EXTRACTORS_OCR.md`. Implement ADR-013's tagged provenance migration and bounded PDF provider next. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI. Every later M2 format provider must still be selected only after its official API, maintenance, platform support, license, packaging, and security limits are recorded in `DEPENDENCY_AUDIT.md`.
 
 ## Verification evidence — 2026-07-16
 

@@ -42,17 +42,28 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 - `rusqlite` currently defaults to `cache` and `ffi-sqlite-wasm-rs`; DeskGraph explicitly opts out of defaults and selects bundled native SQLite.
 - The M1 lockfile resolves 456 crate dependencies. `cargo audit --no-fetch` against 1,160 cached RustSec advisories found zero known vulnerabilities and the same 17 Tauri Linux-path warnings tracked in R-016; the new M1 direct dependencies added no advisory.
 
-## M2 text-extraction dependency decision
+## M2 extraction dependency decisions
 
 The first M2 provider adds **no external dependency**. Plain text, Markdown, and source code use Rust standard-library `Read + Seek`, UTF-8 validation, bounded buffering, chunking, and time/cancellation checks. Durable jobs and content chunks reuse the already audited `rusqlite` database layer; open-file identity reuses the existing `unicode-normalization` and `windows-sys` boundary; `tempfile` remains test-only. The `Cargo.lock` changes for this slice only connect existing DeskGraph workspace crates and do not introduce a new registry package.
 
-This decision keeps the core usable without Python, Docker, Ollama, a model, an API key, or network access. It does not approve any PDF, ZIP/XML, image, OCR, model, or native runtime candidate.
+This decision keeps the core usable without Python, Docker, Ollama, a model, an API key, or network access. It does not approve any ZIP/XML, image, OCR, model, or native runtime candidate.
+
+### PDF text dependency selected
+
+| Dependency | Scope | Selected version | Official source / API evidence | Maintenance and platform evidence | License | Security and decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| `lopdf` | PDF runtime | `0.44.0`, exact, `default-features = false` | crates.io, `docs.rs/lopdf`, `J-F-Liu/lopdf`; verified `LoadOptions::max_decompressed_size`, `Document::load_mem_with_options`, `extract_text_with_limit`, `get_pages`, `is_encrypted`, and `was_encrypted` in the published source | Released 2026-07-10; upstream active when inspected 2026-07-16; Rust 1.88 minimum; minimal crate test passed on macOS arm64 and Windows x64 cross-check compiled; no native PDF library | MIT | Accepted by ADR-013 for strict, bounded, path-free text-layer extraction only. Default features are forbidden. Actions, JavaScript, attachments, annotations, multimedia, external references, passwords, write APIs, and unbounded extraction APIs are outside the adapter. |
+
+The isolated no-default-feature graph resolves 53 registry packages. All report license expressions and all provide a permissive licensing path; final notices/SBOM remain an M9 gate. `cargo audit --no-fetch` with 1,160 cached advisories reported zero vulnerabilities and zero warnings for this minimal graph. By contrast, lopdf's upstream full-feature lock contains vulnerable `crossbeam-epoch 0.9.18` (`RUSTSEC-2026-0204`); that graph is rejected, and CI must keep proving that `crossbeam-*`/Rayon do not enter DeskGraph through this dependency.
+
+The load API limits each eagerly decompressed object or cross-reference stream, and the extraction API limits each page and `/ToUnicode` stream. It does not expose a whole-document aggregate allocator budget. DeskGraph therefore also enforces source bytes, page count, sequential page processing, stored output/chunks, cooperative time/cancellation, and keeps peak residency on an 8 GB machine as an open release gate (R-005/R-007).
+
+`pdf-extract 0.12.0` is rejected: its published `extract_text*`/`extract_text_by_pages*` functions call unbounded `Document::load*` and output traversal, use `lopdf 0.42`, and accept no decompression, page, output, time, or cancellation policy.
 
 ### M2 dependencies still requiring selection and audit
 
 | Capability | Current status | Required evidence before adoption |
 | --- | --- | --- |
-| PDF text | Unselected | Official API and repository, active maintenance, macOS/Windows/Linux packaging, license, advisories, JavaScript/action/attachment behavior, page/byte/time limits, corrupt fixtures |
 | DOCX / PPTX / XLSX | Unselected | ZIP and XML APIs, traversal/decompression defenses, macro/external-link/embedded-object behavior, structural limits, platform packaging, license, advisories, corrupt fixtures |
 | Image metadata | Unselected | Bounded signature/metadata API, supported formats, malformed/oversized behavior, license, advisories, platform behavior |
 | Screenshot OCR | Unselected; D-008 open | Native API availability plus packaged cross-platform fallback, zh-TW/English quality, model/runtime license, checksums, memory/unload behavior, offline packaging without user-installed Python |
