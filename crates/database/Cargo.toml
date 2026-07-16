@@ -1,0 +1,13 @@
+[package]
+name = "deskgraph-database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+deskgraph-domain = { path = "../domain" }
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -34,7 +34,7 @@ fn health_command_emits_privacy_safe_json() {
 }
 
 #[test]
-fn unknown_command_fails_without_a_stack_trace() {
+fn incomplete_command_fails_with_usage_without_a_stack_trace() {
     let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
         .arg("scan")
         .output()
@@ -44,6 +44,6 @@ fn unknown_command_fails_without_a_stack_trace() {
     assert!(output.stdout.is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Invalid command"));
+    assert!(stderr.contains("Usage:"));
     assert!(!stderr.contains("panicked"));
 }

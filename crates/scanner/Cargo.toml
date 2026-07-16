@@ -1,0 +1,14 @@
+[package]
+name = "deskgraph-scanner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+deskgraph-database = { path = "../database" }
+deskgraph-domain = { path = "../domain" }
+deskgraph-identity = { path = "../identity" }
+
+[dev-dependencies]
+tempfile.workspace = true
