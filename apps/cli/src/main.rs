@@ -10,8 +10,8 @@ use deskgraph_extractors::{
     run_extraction_job_at,
 };
 use deskgraph_scanner::{
-    authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_batch,
-    run_scan_job_to_terminal, scan_scope,
+    authorize_scope, comparison_key, create_scan_job, pause_scan_job, resume_scan_job,
+    run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use serde::Serialize;
@@ -153,8 +153,10 @@ enum ExtractCommand {
         database: PathBuf,
         #[arg(long)]
         scope: i64,
-        #[arg(long)]
-        node: i64,
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        node: Option<i64>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        path: Option<PathBuf>,
     },
     /// Create a durable extraction job without opening the source file.
     Create {
@@ -162,8 +164,10 @@ enum ExtractCommand {
         database: PathBuf,
         #[arg(long)]
         scope: i64,
-        #[arg(long)]
-        node: i64,
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        node: Option<i64>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        path: Option<PathBuf>,
     },
     /// Run one queued extraction job to a terminal state.
     Run {
@@ -333,7 +337,9 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 database,
                 scope,
                 node,
+                path,
             } => {
+                let node = resolve_extraction_node(&database, scope, node, path.as_deref())?;
                 let created = create_extraction_job_at(&database, scope, node)
                     .map_err(|error| error.code())?;
                 let progress =
@@ -345,7 +351,9 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 database,
                 scope,
                 node,
+                path,
             } => {
+                let node = resolve_extraction_node(&database, scope, node, path.as_deref())?;
                 let progress = create_extraction_job_at(&database, scope, node)
                     .map_err(|error| error.code())?;
                 emit_extraction_progress(&progress, "content_extraction_created")
@@ -431,6 +439,26 @@ fn generate_fixture(
 
 fn open_database(path: &Path) -> Result<ManifestDatabase, &'static str> {
     ManifestDatabase::open(path).map_err(|error| error.code())
+}
+
+fn resolve_extraction_node(
+    database_path: &Path,
+    scope_id: i64,
+    node_id: Option<i64>,
+    source_path: Option<&Path>,
+) -> Result<i64, &'static str> {
+    match (node_id, source_path) {
+        (Some(node_id), None) => Ok(node_id),
+        (None, Some(source_path)) => {
+            let canonical =
+                std::fs::canonicalize(source_path).map_err(|_| "extraction_source_not_found")?;
+            open_database(database_path)?
+                .node_id_for_path_key(scope_id, &comparison_key(&canonical))
+                .map_err(|error| error.code())?
+                .ok_or("extractable_file_not_found")
+        }
+        _ => Err("extraction_source_selection_invalid"),
+    }
 }
 
 fn emit_json<T: Serialize>(value: &T, event: &'static str) -> Result<(), &'static str> {
@@ -609,7 +637,8 @@ mod tests {
                 command: ExtractCommand::Start {
                     database: database.clone(),
                     scope: scope.id,
-                    node: node_id,
+                    node: Some(node_id),
+                    path: None,
                 },
             },
         })

@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use deskgraph_database::ManifestDatabase;
-use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
+use deskgraph_scanner::{authorize_scope, scan_scope};
 
 #[test]
 fn health_command_emits_privacy_safe_json() {
@@ -63,15 +63,6 @@ fn extraction_command_emits_counts_without_paths_or_content() {
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
     let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
     scan_scope(&mut database, scope.id).expect("scope should scan");
-    let node_id = database
-        .node_id_for_path_key(
-            scope.id,
-            &comparison_key(
-                &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
-            ),
-        )
-        .expect("node lookup should pass")
-        .expect("source node should exist");
     drop(database);
 
     let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
@@ -84,8 +75,8 @@ fn extraction_command_emits_counts_without_paths_or_content() {
                 .expect("database path should be UTF-8"),
             "--scope",
             &scope.id.to_string(),
-            "--node",
-            &node_id.to_string(),
+            "--path",
+            source_path.to_str().expect("source path should be UTF-8"),
         ])
         .output()
         .expect("deskgraph extract should start");
