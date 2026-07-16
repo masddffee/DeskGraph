@@ -14,9 +14,9 @@ The current content slices can extract bounded UTF-8 from an explicitly selected
 
 The current search slice uses bundled SQLite FTS5 trigram indexes for Traditional Chinese and English substring queries of 3–256 Unicode characters. It requires no embedding or model, returns bounded text snippets, filters out stale chunks and absent locations, and explains whether filename/path, extracted text, or both matched. Scope, source, extension, and modified-time filters plus a synthetic 10k p50/p95/index-size baseline pass locally. One- and two-character queries, project/folder filters, vector semantic search, hybrid fusion, representative/100k/8 GB evaluation, and cross-platform evidence remain open.
 
-The current M4 slices derive bounded Folder Profiles, persist correctable Project root candidates, and can compare two explicit current files as a bounded exact-duplicate suggestion. Root and exact-pair accept/reject decisions are append-only, same-decision retries are idempotent, and opposite decisions append corrections. Exact-duplicate checks require two different stable identities, compare every byte of non-empty files up to 64 MiB, and append immutable evidence with no model or hash dependency; every relation decision repeats that live verification first. Neither acceptance path creates file membership or a filesystem action. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
+The current M4 slices derive bounded Folder Profiles, persist correctable Project root candidates, compare two explicit current files as a bounded exact-duplicate suggestion, and recognize a conservative filename-version relation. Root and exact-duplicate pair decisions are append-only; every duplicate decision repeats live byte verification. Version inference accepts only matching normalized base/extension names with explicit `-vN`, `_vN`, ` vN`, or `.vN` suffixes, orders the numeric versions, and remains an unconfirmed suggestion. No relation creates file membership or a filesystem action. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
 
-DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, Project file-membership, related/similarity/version relations, background duplicate discovery, cross-pair learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, Project file-membership, related/similarity and general version discovery, version feedback, background duplicate discovery, cross-pair learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -151,7 +151,22 @@ cargo run -p deskgraph-cli -- relation list \
   --database ./deskgraph-dev.sqlite3
 ```
 
-Both paths must be canonical, non-symlink files with different stable identities in the same authorized scope. DeskGraph revalidates manifest metadata and read-only open-handle identities, then compares every byte in 64 KiB chunks with a 64 MiB maximum and cooperative five-second deadline. Empty, oversized, changed, aliased, different, or unreadable files produce no observation. A successful check or verify appends immutable local evidence and returns the two explicit paths. `decide` performs that complete live verification again before appending an explicit user `accepted` or `rejected` event; repeated decisions are idempotent and opposite decisions remain auditable corrections. `relation list` returns path-free history labeled `verification_required`. Structured logs omit paths, filenames, database path, and content. A decision never merges, deletes, renames, moves, or otherwise organizes either file. Background discovery, larger-file hashing, fuzzy similarity, version inference, and cross-pair learning remain unimplemented.
+Both paths must be canonical, non-symlink files with different stable identities in the same authorized scope. DeskGraph revalidates manifest metadata and read-only open-handle identities, then compares every byte in 64 KiB chunks with a 64 MiB maximum and cooperative five-second deadline. Empty, oversized, changed, aliased, different, or unreadable files produce no observation. A successful check or verify appends immutable local evidence and returns the two explicit paths. `decide` performs that complete live verification again before appending an explicit user `accepted` or `rejected` event; repeated decisions are idempotent and opposite decisions remain auditable corrections. `relation list` returns path-free history labeled `verification_required`. Structured logs omit paths, filenames, database path, and content. A decision never merges, deletes, renames, moves, or otherwise organizes either file. Background discovery, larger-file hashing, fuzzy similarity, general version discovery, and cross-pair learning remain unimplemented.
+
+Suggest and revalidate a conservative filename-version relation without reading file content:
+
+```bash
+cargo run -p deskgraph-cli -- relation version \
+  --database ./deskgraph-dev.sqlite3 \
+  --scope 1 \
+  --first /canonical/path/to/test-folder/企劃-v1.md \
+  --second /canonical/path/to/test-folder/企劃-v2.md
+cargo run -p deskgraph-cli -- relation version-verify \
+  --database ./deskgraph-dev.sqlite3 \
+  --relation 2
+```
+
+Both current files pass the same canonical scope, symlink/reparse, manifest, platform identity, metadata, and read-only open-handle checks before and after name analysis. The normalized base and extension must match, and each stem must end in `-vN`, `_vN`, ` vN`, or `.vN`, where `N` is 1–999999 without a leading zero. Modification time, size, terms such as `final`, and file content never determine order. Explicit output contains both current paths and rule evidence; logs and `relation list` remain path-free. The candidate stays `suggested`: evidence-bound version feedback, general discovery, date/semantic versions, similarity, membership, and file actions remain unimplemented.
 
 Exercise the durable watch-reconciliation core with an explicit hint:
 
