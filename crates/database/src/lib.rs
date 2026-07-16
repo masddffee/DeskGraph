@@ -6,9 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use deskgraph_domain::{
     ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyReport, AuthorizedScope, ExtractionJobProgress, ExtractionStats,
-    ExtractionStatus, FolderCategoryCount, FolderFileCategory, ManifestStats, ProjectSignalKind,
-    ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress, WatchEventReason,
-    WatchEventStatus,
+    ExtractionStatus, FolderCategoryCount, FolderFileCategory, ManifestStats, ProjectCandidate,
+    ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
+    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
+    WatchEventReason, WatchEventStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -47,6 +49,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "action_plan_preview",
         sql: include_str!("../../../migrations/0007_action_plan_preview.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "project_candidates",
+        sql: include_str!("../../../migrations/0008_project_candidates.sql"),
     },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -332,6 +339,9 @@ pub enum DatabaseError {
     FolderNotFound,
     FolderProfileInputInvalid,
     FolderProfileTooLarge,
+    ProjectCandidateNotFound,
+    ProjectCandidateInputInvalid,
+    ProjectCandidateRootNotCurrent,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -368,6 +378,9 @@ impl DatabaseError {
             Self::FolderNotFound => "folder_not_found",
             Self::FolderProfileInputInvalid => "folder_profile_input_invalid",
             Self::FolderProfileTooLarge => "folder_profile_entry_limit_exceeded",
+            Self::ProjectCandidateNotFound => "project_candidate_not_found",
+            Self::ProjectCandidateInputInvalid => "project_candidate_input_invalid",
+            Self::ProjectCandidateRootNotCurrent => "project_candidate_root_not_current",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -2161,6 +2174,356 @@ impl ManifestDatabase {
         })
     }
 
+    pub fn record_project_candidate(
+        &mut self,
+        scope_id: i64,
+        root_folder_node_id: i64,
+        suggestion: &ProjectSuggestion,
+    ) -> Result<ProjectCandidate, DatabaseError> {
+        validate_project_suggestion(scope_id, root_folder_node_id, suggestion)?;
+        let current_facts =
+            self.folder_profile_facts(scope_id, root_folder_node_id, MAX_FOLDER_PROFILE_ENTRIES)?;
+        let suggested_kinds = suggestion
+            .provenance
+            .iter()
+            .map(|signal| signal.kind)
+            .collect::<Vec<_>>();
+        if current_facts.observed_at_unix_ms != suggestion.observed_at_unix_ms
+            || current_facts.project_markers != suggested_kinds
+        {
+            return Err(DatabaseError::ProjectCandidateInputInvalid);
+        }
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let root_is_current = transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM locations l \
+                 JOIN nodes n ON n.id = l.node_id AND n.kind = 'folder' \
+                 WHERE l.scope_id = ?1 AND l.node_id = ?2 AND l.present = 1 \
+             )",
+            params![scope_id, root_folder_node_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !root_is_current {
+            return Err(DatabaseError::ProjectCandidateRootNotCurrent);
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO projects( \
+                 api_version, scope_id, root_folder_node_id, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                ProjectCandidate::API_VERSION,
+                scope_id,
+                root_folder_node_id,
+                now,
+            ],
+        )?;
+        let project_id: i64 = transaction.query_row(
+            "SELECT id FROM projects WHERE scope_id = ?1 AND root_folder_node_id = ?2",
+            params![scope_id, root_folder_node_id],
+            |row| row.get(0),
+        )?;
+        let suggestion_inserted = transaction.execute(
+            "INSERT OR IGNORE INTO project_suggestions( \
+                 project_id, confidence_basis_points, observed_at_unix_ms, provider_id, \
+                 provider_version, model_version, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+            params![
+                project_id,
+                i64::from(suggestion.confidence_basis_points),
+                suggestion.observed_at_unix_ms,
+                suggestion.provider_id,
+                suggestion.provider_version,
+                now,
+            ],
+        )?;
+        let suggestion_id: i64 = transaction.query_row(
+            "SELECT id FROM project_suggestions \
+             WHERE project_id = ?1 AND observed_at_unix_ms = ?2 \
+               AND provider_id = ?3 AND provider_version = ?4",
+            params![
+                project_id,
+                suggestion.observed_at_unix_ms,
+                suggestion.provider_id,
+                suggestion.provider_version,
+            ],
+            |row| row.get(0),
+        )?;
+        if suggestion_inserted == 1 {
+            for (index, signal) in suggestion.provenance.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO project_suggestion_signals( \
+                         suggestion_id, ordinal, signal_kind, marker_name, weight_basis_points \
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        suggestion_id,
+                        to_i64(u64::try_from(index + 1).map_err(|_| DatabaseError::InvalidCount)?)?,
+                        project_signal_kind_str(signal.kind),
+                        signal.marker_name.as_str(),
+                        i64::from(signal.weight_basis_points),
+                    ],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        self.project_candidate(project_id)
+    }
+
+    pub fn project_candidate(&self, project_id: i64) -> Result<ProjectCandidate, DatabaseError> {
+        if project_id <= 0 {
+            return Err(DatabaseError::ProjectCandidateInputInvalid);
+        }
+        let row = self
+            .connection
+            .query_row(
+                "SELECT p.id, p.scope_id, p.root_folder_node_id, l.id, l.display_path, \
+                        s.id, s.confidence_basis_points, s.observed_at_unix_ms, \
+                        s.provider_id, s.provider_version, s.model_version, \
+                        f.sequence, f.decision, f.created_by, f.created_at_unix_ms \
+                 FROM projects p \
+                 JOIN nodes n ON n.id = p.root_folder_node_id AND n.kind = 'folder' \
+                 JOIN locations l ON l.scope_id = p.scope_id \
+                    AND l.node_id = p.root_folder_node_id AND l.present = 1 \
+                 JOIN project_suggestions s ON s.id = ( \
+                    SELECT latest.id FROM project_suggestions latest \
+                    WHERE latest.project_id = p.id \
+                    ORDER BY latest.observed_at_unix_ms DESC, latest.id DESC LIMIT 1 \
+                 ) \
+                 LEFT JOIN project_feedback_events f ON f.id = ( \
+                    SELECT latest_feedback.id FROM project_feedback_events latest_feedback \
+                    WHERE latest_feedback.project_id = p.id \
+                    ORDER BY latest_feedback.sequence DESC LIMIT 1 \
+                 ) \
+                 WHERE p.id = ?1 \
+                 ORDER BY l.id LIMIT 1",
+                [project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            project_id,
+            scope_id,
+            root_folder_node_id,
+            root_folder_location_id,
+            display_path,
+            suggestion_id,
+            confidence_basis_points,
+            observed_at_unix_ms,
+            provider_id,
+            provider_version,
+            model_version,
+            decision_sequence,
+            decision_kind,
+            decision_creator,
+            decided_at_unix_ms,
+        )) = row
+        else {
+            let project_exists = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [project_id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            return Err(if project_exists {
+                DatabaseError::ProjectCandidateRootNotCurrent
+            } else {
+                DatabaseError::ProjectCandidateNotFound
+            });
+        };
+        if provider_id != ProjectSuggestion::PROVIDER_ID
+            || provider_version != ProjectSuggestion::PROVIDER_VERSION
+            || model_version.is_some()
+        {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT signal_kind, marker_name, weight_basis_points \
+             FROM project_suggestion_signals \
+             WHERE suggestion_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([suggestion_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut provenance = Vec::new();
+        for row in rows {
+            let (kind, marker_name, weight_basis_points) = row?;
+            provenance.push(ProjectSignal {
+                kind: project_signal_kind_from_str(&kind)?,
+                marker_name,
+                weight_basis_points: u16::try_from(weight_basis_points)
+                    .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            });
+        }
+        let suggestion = ProjectSuggestion {
+            confidence_basis_points: u16::try_from(confidence_basis_points)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            provenance,
+            observed_at_unix_ms,
+            created_by: ProjectSuggestionCreator::SystemRule,
+            provider_id: ProjectSuggestion::PROVIDER_ID,
+            provider_version: ProjectSuggestion::PROVIDER_VERSION,
+            model_version: None,
+        };
+        let latest_decision = match (
+            decision_sequence,
+            decision_kind,
+            decision_creator,
+            decided_at_unix_ms,
+        ) {
+            (None, None, None, None) => None,
+            (Some(sequence), Some(kind), Some(creator), Some(decided_at_unix_ms)) => {
+                if creator != "user" {
+                    return Err(DatabaseError::InvalidStoredValue);
+                }
+                Some(ProjectDecision {
+                    sequence: u64::try_from(sequence)
+                        .map_err(|_| DatabaseError::InvalidStoredValue)?,
+                    kind: project_decision_kind_from_str(&kind)?,
+                    created_by: ProjectDecisionCreator::User,
+                    decided_at_unix_ms,
+                })
+            }
+            _ => return Err(DatabaseError::InvalidStoredValue),
+        };
+        let state = match latest_decision.as_ref().map(|decision| decision.kind) {
+            None => ProjectCandidateState::Suggested,
+            Some(ProjectDecisionKind::Accepted) => ProjectCandidateState::Accepted,
+            Some(ProjectDecisionKind::Rejected) => ProjectCandidateState::Rejected,
+        };
+        Ok(ProjectCandidate {
+            api_version: ProjectCandidate::API_VERSION,
+            project_id,
+            scope_id,
+            root_folder_node_id,
+            root_folder_location_id,
+            display_path,
+            state,
+            suggestion,
+            latest_decision,
+        })
+    }
+
+    pub fn decide_project_candidate(
+        &mut self,
+        project_id: i64,
+        decision: ProjectDecisionKind,
+    ) -> Result<ProjectCandidate, DatabaseError> {
+        if project_id <= 0 {
+            return Err(DatabaseError::ProjectCandidateInputInvalid);
+        }
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let project_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !project_exists {
+            return Err(DatabaseError::ProjectCandidateNotFound);
+        }
+        let root_is_current = transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM projects p \
+                 JOIN nodes n ON n.id = p.root_folder_node_id AND n.kind = 'folder' \
+                 JOIN locations l ON l.scope_id = p.scope_id \
+                    AND l.node_id = p.root_folder_node_id AND l.present = 1 \
+                 WHERE p.id = ?1 \
+             )",
+            [project_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !root_is_current {
+            return Err(DatabaseError::ProjectCandidateRootNotCurrent);
+        }
+        let latest = transaction
+            .query_row(
+                "SELECT sequence, decision FROM project_feedback_events \
+                 WHERE project_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                [project_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if latest
+            .as_ref()
+            .is_some_and(|(_, stored)| stored == project_decision_kind_str(decision))
+        {
+            transaction.commit()?;
+            return self.project_candidate(project_id);
+        }
+        let sequence = latest.map_or(Ok(1_i64), |(sequence, _)| {
+            sequence.checked_add(1).ok_or(DatabaseError::InvalidCount)
+        })?;
+        transaction.execute(
+            "INSERT INTO project_feedback_events( \
+                 project_id, sequence, decision, created_by, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, 'user', ?4)",
+            params![
+                project_id,
+                sequence,
+                project_decision_kind_str(decision),
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        self.project_candidate(project_id)
+    }
+
+    pub fn recent_project_candidates(&self) -> Result<Vec<ProjectCandidateSummary>, DatabaseError> {
+        let project_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT p.id FROM projects p \
+                 WHERE EXISTS( \
+                    SELECT 1 FROM locations l \
+                    JOIN nodes n ON n.id = l.node_id AND n.kind = 'folder' \
+                    WHERE l.scope_id = p.scope_id \
+                      AND l.node_id = p.root_folder_node_id AND l.present = 1 \
+                 ) \
+                 ORDER BY p.id DESC LIMIT 20",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        project_ids
+            .into_iter()
+            .map(|project_id| {
+                let candidate = self.project_candidate(project_id)?;
+                Ok(ProjectCandidateSummary {
+                    api_version: ProjectCandidateSummary::API_VERSION,
+                    project_id: candidate.project_id,
+                    scope_id: candidate.scope_id,
+                    root_folder_node_id: candidate.root_folder_node_id,
+                    state: candidate.state,
+                    confidence_basis_points: candidate.suggestion.confidence_basis_points,
+                    observed_at_unix_ms: candidate.suggestion.observed_at_unix_ms,
+                    latest_decision_at_unix_ms: candidate
+                        .latest_decision
+                        .map(|decision| decision.decided_at_unix_ms),
+                })
+            })
+            .collect()
+    }
+
     pub fn action_source_for_path_key(
         &self,
         scope_id: i64,
@@ -2342,6 +2705,106 @@ fn validate_action_plan_write(plan: &ActionPlanWrite<'_>) -> Result<(), Database
         return Err(DatabaseError::ActionPlanInputInvalid);
     }
     Ok(())
+}
+
+fn validate_project_suggestion(
+    scope_id: i64,
+    root_folder_node_id: i64,
+    suggestion: &ProjectSuggestion,
+) -> Result<(), DatabaseError> {
+    if scope_id <= 0
+        || root_folder_node_id <= 0
+        || suggestion.observed_at_unix_ms < 0
+        || suggestion.created_by != ProjectSuggestionCreator::SystemRule
+        || suggestion.provider_id != ProjectSuggestion::PROVIDER_ID
+        || suggestion.provider_version != ProjectSuggestion::PROVIDER_VERSION
+        || suggestion.model_version.is_some()
+        || suggestion.provenance.is_empty()
+        || suggestion.provenance.len() > 8
+    {
+        return Err(DatabaseError::ProjectCandidateInputInvalid);
+    }
+    let mut previous_kind = None;
+    let mut strong_weights = Vec::new();
+    for signal in &suggestion.provenance {
+        let (expected_marker, expected_weight) = expected_project_signal(signal.kind);
+        if signal.marker_name != expected_marker
+            || signal.weight_basis_points != expected_weight
+            || previous_kind.is_some_and(|previous| previous >= signal.kind)
+        {
+            return Err(DatabaseError::ProjectCandidateInputInvalid);
+        }
+        previous_kind = Some(signal.kind);
+        if signal.kind != ProjectSignalKind::Readme {
+            strong_weights.push(signal.weight_basis_points);
+        }
+    }
+    let Some(maximum) = strong_weights.iter().copied().max() else {
+        return Err(DatabaseError::ProjectCandidateInputInvalid);
+    };
+    let additional = u16::try_from(strong_weights.len().saturating_sub(1))
+        .map_err(|_| DatabaseError::ProjectCandidateInputInvalid)?
+        .saturating_mul(500);
+    let expected_confidence = maximum.saturating_add(additional).min(9_500);
+    if suggestion.confidence_basis_points != expected_confidence {
+        return Err(DatabaseError::ProjectCandidateInputInvalid);
+    }
+    Ok(())
+}
+
+fn expected_project_signal(kind: ProjectSignalKind) -> (&'static str, u16) {
+    match kind {
+        ProjectSignalKind::CargoManifest => ("Cargo.toml", 8_500),
+        ProjectSignalKind::JavaScriptPackage => ("package.json", 7_500),
+        ProjectSignalKind::PythonProject => ("pyproject.toml", 8_000),
+        ProjectSignalKind::GoModule => ("go.mod", 8_500),
+        ProjectSignalKind::SwiftPackage => ("Package.swift", 8_500),
+        ProjectSignalKind::XcodeProject => ("*.xcodeproj", 9_000),
+        ProjectSignalKind::VisualStudioSolution => ("*.sln", 8_500),
+        ProjectSignalKind::Readme => ("README", 1_500),
+    }
+}
+
+fn project_signal_kind_str(kind: ProjectSignalKind) -> &'static str {
+    match kind {
+        ProjectSignalKind::CargoManifest => "cargo_manifest",
+        ProjectSignalKind::JavaScriptPackage => "javascript_package",
+        ProjectSignalKind::PythonProject => "python_project",
+        ProjectSignalKind::GoModule => "go_module",
+        ProjectSignalKind::SwiftPackage => "swift_package",
+        ProjectSignalKind::XcodeProject => "xcode_project",
+        ProjectSignalKind::VisualStudioSolution => "visual_studio_solution",
+        ProjectSignalKind::Readme => "readme",
+    }
+}
+
+fn project_signal_kind_from_str(stored: &str) -> Result<ProjectSignalKind, DatabaseError> {
+    match stored {
+        "cargo_manifest" => Ok(ProjectSignalKind::CargoManifest),
+        "javascript_package" => Ok(ProjectSignalKind::JavaScriptPackage),
+        "python_project" => Ok(ProjectSignalKind::PythonProject),
+        "go_module" => Ok(ProjectSignalKind::GoModule),
+        "swift_package" => Ok(ProjectSignalKind::SwiftPackage),
+        "xcode_project" => Ok(ProjectSignalKind::XcodeProject),
+        "visual_studio_solution" => Ok(ProjectSignalKind::VisualStudioSolution),
+        "readme" => Ok(ProjectSignalKind::Readme),
+        _ => Err(DatabaseError::InvalidStoredValue),
+    }
+}
+
+fn project_decision_kind_str(decision: ProjectDecisionKind) -> &'static str {
+    match decision {
+        ProjectDecisionKind::Accepted => "accepted",
+        ProjectDecisionKind::Rejected => "rejected",
+    }
+}
+
+fn project_decision_kind_from_str(stored: &str) -> Result<ProjectDecisionKind, DatabaseError> {
+    match stored {
+        "accepted" => Ok(ProjectDecisionKind::Accepted),
+        "rejected" => Ok(ProjectDecisionKind::Rejected),
+        _ => Err(DatabaseError::InvalidStoredValue),
+    }
 }
 
 fn file_category(path: &Path) -> FolderFileCategory {
@@ -3013,6 +3476,70 @@ mod tests {
         (database, scope_id, node_id, root)
     }
 
+    fn project_setup() -> (ManifestDatabase, i64, i64) {
+        let (mut database, scope_id, root) = resumable_setup();
+        let job = database
+            .create_resumable_scan_job(scope_id, &root)
+            .expect("scan job should create");
+        database
+            .claim_scan_job(job.job_id, "project-scan", 60_000)
+            .expect("scan should claim");
+        let root_entry = database
+            .next_scan_queue_entry(job.job_id, "project-scan", 60_000)
+            .expect("queue should load")
+            .expect("root should exist");
+        let root_observation = observation("/scope", NodeKind::Folder, None);
+        let child = QueuedPath {
+            path_raw: b"/scope/Cargo.toml".to_vec(),
+            path_key: "/scope/Cargo.toml".to_string(),
+            parent_identity_key: Some(root_observation.identity_key.clone()),
+            is_root: false,
+        };
+        database
+            .stage_scan_queue_entry(
+                job.job_id,
+                "project-scan",
+                root_entry.id,
+                Some(&root_observation),
+                std::slice::from_ref(&child),
+                &[],
+                0,
+                1,
+                60_000,
+            )
+            .expect("root should stage");
+        let child_entry = database
+            .next_scan_queue_entry(job.job_id, "project-scan", 60_000)
+            .expect("queue should load")
+            .expect("child should exist");
+        let cargo_observation = observation(
+            "/scope/Cargo.toml",
+            NodeKind::File,
+            Some(root_observation.identity_key),
+        );
+        database
+            .stage_scan_queue_entry(
+                job.job_id,
+                "project-scan",
+                child_entry.id,
+                Some(&cargo_observation),
+                &[],
+                &[],
+                0,
+                1,
+                60_000,
+            )
+            .expect("marker should stage");
+        database
+            .finalize_resumable_scan_job(job.job_id, "project-scan")
+            .expect("scan should publish");
+        let root_node_id = database
+            .node_id_for_path_key(scope_id, "/scope")
+            .expect("node query should pass")
+            .expect("root node should exist");
+        (database, scope_id, root_node_id)
+    }
+
     #[test]
     fn migrations_initialize_manifest_schema() {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
@@ -3116,6 +3643,108 @@ mod tests {
                 )
                 .is_err(),
             "append-only journal delete must fail"
+        );
+    }
+
+    #[test]
+    fn project_candidate_feedback_is_append_only_validated_and_idempotent() {
+        let (mut database, scope_id, root_node_id) = project_setup();
+        let facts = database
+            .folder_profile_facts(scope_id, root_node_id, MAX_FOLDER_PROFILE_ENTRIES)
+            .expect("profile facts should load");
+        let suggestion = ProjectSuggestion {
+            confidence_basis_points: 8_500,
+            provenance: vec![ProjectSignal {
+                kind: ProjectSignalKind::CargoManifest,
+                marker_name: "Cargo.toml".to_string(),
+                weight_basis_points: 8_500,
+            }],
+            observed_at_unix_ms: facts.observed_at_unix_ms,
+            created_by: ProjectSuggestionCreator::SystemRule,
+            provider_id: ProjectSuggestion::PROVIDER_ID,
+            provider_version: ProjectSuggestion::PROVIDER_VERSION,
+            model_version: None,
+        };
+        let candidate = database
+            .record_project_candidate(scope_id, root_node_id, &suggestion)
+            .expect("candidate should persist");
+        let repeated = database
+            .record_project_candidate(scope_id, root_node_id, &suggestion)
+            .expect("same observation should be idempotent");
+        assert_eq!(candidate.project_id, repeated.project_id);
+        assert_eq!(candidate.state, ProjectCandidateState::Suggested);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM project_suggestions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("suggestions should count"),
+            1
+        );
+
+        let rejected = database
+            .decide_project_candidate(candidate.project_id, ProjectDecisionKind::Rejected)
+            .expect("candidate should reject");
+        let repeated_rejection = database
+            .decide_project_candidate(candidate.project_id, ProjectDecisionKind::Rejected)
+            .expect("same decision should be idempotent");
+        assert_eq!(rejected.latest_decision, repeated_rejection.latest_decision);
+        let accepted = database
+            .decide_project_candidate(candidate.project_id, ProjectDecisionKind::Accepted)
+            .expect("candidate should accept after correction");
+        assert_eq!(accepted.state, ProjectCandidateState::Accepted);
+        assert_eq!(
+            accepted
+                .latest_decision
+                .as_ref()
+                .map(|event| event.sequence),
+            Some(2)
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM project_feedback_events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("feedback should count"),
+            2
+        );
+
+        let mut invalid = suggestion.clone();
+        invalid.confidence_basis_points = 8_501;
+        assert!(matches!(
+            database.record_project_candidate(scope_id, root_node_id, &invalid),
+            Err(DatabaseError::ProjectCandidateInputInvalid)
+        ));
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE projects SET created_at_unix_ms = created_at_unix_ms + 1 WHERE id = ?1",
+                    [candidate.project_id],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM project_suggestion_signals WHERE suggestion_id = ( \
+                    SELECT id FROM project_suggestions WHERE project_id = ?1 LIMIT 1 \
+                 )",
+                    [candidate.project_id],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM project_feedback_events WHERE project_id = ?1",
+                    [candidate.project_id],
+                )
+                .is_err()
         );
     }
 

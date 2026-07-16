@@ -17,8 +17,10 @@ pub use health::{
 };
 pub use manifest::{AuthorizedScope, ManifestStats, ScanJobProgress, ScanReport, ScanStatus};
 pub use project::{
-    FolderCategoryCount, FolderFileCategory, FolderProfile, ProjectSignal, ProjectSignalKind,
-    ProjectSuggestion, ProjectSuggestionCreator,
+    FolderCategoryCount, FolderFileCategory, FolderProfile, ProjectCandidate,
+    ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
+    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator,
 };
 pub use search::{
     SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,

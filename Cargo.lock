@@ -806,6 +806,7 @@ dependencies = [
  "deskgraph-database",
  "deskgraph-domain",
  "deskgraph-scanner",
+ "serde_json",
  "tempfile",
 ]
 

@@ -3,13 +3,17 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use deskgraph_database::ManifestDatabase;
+use deskgraph_domain::ProjectDecisionKind;
 use deskgraph_domain::{ExtractionJobProgress, ScanJobProgress, collect_health};
 use deskgraph_extractors::{
     ExtractionLimits, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
     extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
-use deskgraph_projects::folder_profile_at;
+use deskgraph_projects::{
+    decide_project_candidate_at, folder_profile_at, project_candidate_at, propose_project_at,
+    recent_project_candidates_at,
+};
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
     authorize_scope, comparison_key, create_scan_job, pause_scan_job, resume_scan_job,
@@ -40,6 +44,21 @@ enum SearchSourceArg {
     All,
     Metadata,
     Content,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProjectDecisionArg {
+    Accept,
+    Reject,
+}
+
+impl From<ProjectDecisionArg> for ProjectDecisionKind {
+    fn from(decision: ProjectDecisionArg) -> Self {
+        match decision {
+            ProjectDecisionArg::Accept => Self::Accepted,
+            ProjectDecisionArg::Reject => Self::Rejected,
+        }
+    }
 }
 
 impl From<SearchSourceArg> for SearchSourceFilter {
@@ -112,6 +131,11 @@ enum Command {
     Folder {
         #[command(subcommand)]
         command: FolderCommand,
+    },
+    /// Persist and explicitly correct explainable project-root candidates.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
     },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
@@ -191,6 +215,42 @@ enum FolderCommand {
         node: Option<i64>,
         #[arg(long, conflicts_with = "node", required_unless_present = "node")]
         path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+    /// Persist the current deterministic folder suggestion without accepting membership.
+    Propose {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        node: Option<i64>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        path: Option<PathBuf>,
+    },
+    /// Append an explicit user accept/reject correction; repeated decisions are idempotent.
+    Decide {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        project: i64,
+        #[arg(long, value_enum)]
+        decision: ProjectDecisionArg,
+    },
+    /// Read one explicit candidate including its current root path and latest decision.
+    Status {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        project: i64,
+    },
+    /// List the 20 most recent path-free candidate summaries.
+    List {
+        #[arg(long)]
+        database: PathBuf,
     },
 }
 
@@ -631,6 +691,75 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                     project_suggested = profile.project_suggestion.is_some()
                 );
                 Ok(())
+            }
+        },
+        Command::Project { command } => match command {
+            ProjectCommand::Propose {
+                database,
+                scope,
+                node,
+                path,
+            } => {
+                let node = resolve_manifest_node(
+                    &database,
+                    scope,
+                    node,
+                    path.as_deref(),
+                    "project_root_not_found",
+                    "project_root_not_found",
+                    "project_root_selection_invalid",
+                )?;
+                let candidate =
+                    propose_project_at(&database, scope, node).map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "project_candidate_proposed",
+                    project_id = candidate.project_id,
+                    scope_id = candidate.scope_id,
+                    root_folder_node_id = candidate.root_folder_node_id,
+                    state = ?candidate.state,
+                    confidence_basis_points = candidate.suggestion.confidence_basis_points
+                );
+                Ok(())
+            }
+            ProjectCommand::Decide {
+                database,
+                project,
+                decision,
+            } => {
+                let candidate = decide_project_candidate_at(&database, project, decision.into())
+                    .map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "project_candidate_decided",
+                    project_id = candidate.project_id,
+                    scope_id = candidate.scope_id,
+                    root_folder_node_id = candidate.root_folder_node_id,
+                    state = ?candidate.state,
+                    decision_sequence = candidate
+                        .latest_decision
+                        .as_ref()
+                        .map(|decision| decision.sequence)
+                );
+                Ok(())
+            }
+            ProjectCommand::Status { database, project } => {
+                let candidate =
+                    project_candidate_at(&database, project).map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "project_candidate_status_read",
+                    project_id = candidate.project_id,
+                    scope_id = candidate.scope_id,
+                    root_folder_node_id = candidate.root_folder_node_id,
+                    state = ?candidate.state
+                );
+                Ok(())
+            }
+            ProjectCommand::List { database } => {
+                let candidates =
+                    recent_project_candidates_at(&database).map_err(|error| error.code())?;
+                emit_json(&candidates, "project_candidate_list_read")
             }
         },
         Command::Fixture { command } => match command {

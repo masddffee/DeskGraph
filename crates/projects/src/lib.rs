@@ -3,7 +3,8 @@ use std::path::Path;
 
 use deskgraph_database::{DatabaseError, FolderProfileFacts, ManifestDatabase};
 use deskgraph_domain::{
-    FolderProfile, ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
+    FolderProfile, ProjectCandidate, ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal,
+    ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
 };
 
 const DEFAULT_ENTRY_LIMIT: u64 = 100_000;
@@ -11,6 +12,7 @@ const DEFAULT_ENTRY_LIMIT: u64 = 100_000;
 #[derive(Debug)]
 pub enum ProjectError {
     Database(DatabaseError),
+    SuggestionUnavailable,
 }
 
 impl ProjectError {
@@ -18,6 +20,7 @@ impl ProjectError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Database(error) => error.code(),
+            Self::SuggestionUnavailable => "project_suggestion_unavailable",
         }
     }
 }
@@ -51,6 +54,57 @@ pub fn folder_profile(
     folder_node_id: i64,
 ) -> Result<FolderProfile, ProjectError> {
     folder_profile_with_limit(database, scope_id, folder_node_id, DEFAULT_ENTRY_LIMIT)
+}
+
+pub fn propose_project_at(
+    database_path: &Path,
+    scope_id: i64,
+    root_folder_node_id: i64,
+) -> Result<ProjectCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    propose_project(&mut database, scope_id, root_folder_node_id)
+}
+
+pub fn propose_project(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    root_folder_node_id: i64,
+) -> Result<ProjectCandidate, ProjectError> {
+    let profile = folder_profile(database, scope_id, root_folder_node_id)?;
+    let suggestion = profile
+        .project_suggestion
+        .ok_or(ProjectError::SuggestionUnavailable)?;
+    database
+        .record_project_candidate(scope_id, root_folder_node_id, &suggestion)
+        .map_err(Into::into)
+}
+
+pub fn project_candidate_at(
+    database_path: &Path,
+    project_id: i64,
+) -> Result<ProjectCandidate, ProjectError> {
+    ManifestDatabase::open(database_path)?
+        .project_candidate(project_id)
+        .map_err(Into::into)
+}
+
+pub fn decide_project_candidate_at(
+    database_path: &Path,
+    project_id: i64,
+    decision: ProjectDecisionKind,
+) -> Result<ProjectCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    database
+        .decide_project_candidate(project_id, decision)
+        .map_err(Into::into)
+}
+
+pub fn recent_project_candidates_at(
+    database_path: &Path,
+) -> Result<Vec<ProjectCandidateSummary>, ProjectError> {
+    ManifestDatabase::open(database_path)?
+        .recent_project_candidates()
+        .map_err(Into::into)
 }
 
 fn folder_profile_with_limit(
@@ -129,7 +183,7 @@ fn project_signal(kind: ProjectSignalKind) -> ProjectSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deskgraph_domain::FolderFileCategory;
+    use deskgraph_domain::{FolderFileCategory, ProjectCandidateState};
     use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
 
     struct Fixture {
@@ -256,5 +310,87 @@ mod tests {
             folder_profile_with_limit(&fixture.database, fixture.scope_id, fixture.root_node_id, 1)
                 .expect_err("oversized profile should fail closed");
         assert_eq!(error.code(), "folder_profile_entry_limit_exceeded");
+    }
+
+    #[test]
+    fn explicit_feedback_changes_future_candidate_state_and_is_idempotent() {
+        let mut fixture = Fixture::new();
+        let proposed = propose_project(
+            &mut fixture.database,
+            fixture.scope_id,
+            fixture.root_node_id,
+        )
+        .expect("candidate should persist");
+        assert_eq!(proposed.state, ProjectCandidateState::Suggested);
+        assert!(proposed.latest_decision.is_none());
+
+        let rejected = fixture
+            .database
+            .decide_project_candidate(proposed.project_id, ProjectDecisionKind::Rejected)
+            .expect("candidate should reject");
+        assert_eq!(rejected.state, ProjectCandidateState::Rejected);
+        assert_eq!(
+            rejected
+                .latest_decision
+                .as_ref()
+                .map(|event| event.sequence),
+            Some(1)
+        );
+
+        let proposed_again = propose_project(
+            &mut fixture.database,
+            fixture.scope_id,
+            fixture.root_node_id,
+        )
+        .expect("same evidence should resolve the existing candidate");
+        assert_eq!(proposed_again.project_id, proposed.project_id);
+        assert_eq!(proposed_again.state, ProjectCandidateState::Rejected);
+
+        let accepted = fixture
+            .database
+            .decide_project_candidate(proposed.project_id, ProjectDecisionKind::Accepted)
+            .expect("user should be able to correct the rejection");
+        assert_eq!(accepted.state, ProjectCandidateState::Accepted);
+        assert_eq!(
+            accepted
+                .latest_decision
+                .as_ref()
+                .map(|event| event.sequence),
+            Some(2)
+        );
+        let idempotent = fixture
+            .database
+            .decide_project_candidate(proposed.project_id, ProjectDecisionKind::Accepted)
+            .expect("repeated decision should be idempotent");
+        assert_eq!(idempotent.latest_decision, accepted.latest_decision);
+
+        let summaries = fixture
+            .database
+            .recent_project_candidates()
+            .expect("summaries should load");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].state, ProjectCandidateState::Accepted);
+        let summary = serde_json::to_value(&summaries[0]).expect("summary should serialize");
+        assert!(summary.get("display_path").is_none());
+        assert!(summary.get("suggestion").is_none());
+    }
+
+    #[test]
+    fn folder_without_strong_evidence_cannot_be_persisted_as_a_project() {
+        let mut fixture = Fixture::new();
+        let error = propose_project(
+            &mut fixture.database,
+            fixture.scope_id,
+            fixture.source_node_id,
+        )
+        .expect_err("source folder has no project marker");
+        assert_eq!(error.code(), "project_suggestion_unavailable");
+        assert!(
+            fixture
+                .database
+                .recent_project_candidates()
+                .expect("summaries should load")
+                .is_empty()
+        );
     }
 }

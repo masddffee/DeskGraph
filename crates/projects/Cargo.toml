@@ -11,4 +11,5 @@ deskgraph-domain = { path = "../domain" }
 
 [dev-dependencies]
 deskgraph-scanner = { path = "../scanner" }
+serde_json.workspace = true
 tempfile.workspace = true

@@ -330,6 +330,162 @@ fn folder_profile_returns_explainable_local_facts_without_logging_paths() {
 }
 
 #[test]
+fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("private-correctable-project");
+    let source_folder = scope_path.join("src");
+    std::fs::create_dir_all(&source_folder).expect("scope should create");
+    let marker_path = scope_path.join("Cargo.toml");
+    let private_source = source_folder.join("secret_context.rs");
+    std::fs::write(&marker_path, "[package]").expect("marker should write");
+    std::fs::write(&private_source, "pub fn secret_context() {}").expect("source should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let scope_arg = scope.id.to_string();
+    let path_arg = scope_path.to_str().expect("scope path should be UTF-8");
+    let run = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+            .args(arguments)
+            .output()
+            .expect("deskgraph project command should start")
+    };
+
+    let proposed = run(&[
+        "project",
+        "propose",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_arg,
+        "--path",
+        path_arg,
+    ]);
+    assert!(proposed.status.success());
+    let proposed_json: serde_json::Value =
+        serde_json::from_slice(&proposed.stdout).expect("proposal should be JSON");
+    assert_eq!(
+        proposed_json["api_version"],
+        "deskgraph.project-candidate.v1"
+    );
+    assert_eq!(proposed_json["state"], "suggested");
+    assert_eq!(proposed_json["latest_decision"], serde_json::Value::Null);
+    let project_id = proposed_json["project_id"]
+        .as_i64()
+        .expect("project id should exist");
+    let project_arg = project_id.to_string();
+
+    let rejected = run(&[
+        "project",
+        "decide",
+        "--database",
+        database_arg,
+        "--project",
+        &project_arg,
+        "--decision",
+        "reject",
+    ]);
+    assert!(rejected.status.success());
+    let rejected_json: serde_json::Value =
+        serde_json::from_slice(&rejected.stdout).expect("rejection should be JSON");
+    assert_eq!(rejected_json["state"], "rejected");
+    assert_eq!(rejected_json["latest_decision"]["sequence"], 1);
+    assert_eq!(rejected_json["latest_decision"]["created_by"], "user");
+
+    let proposed_again = run(&[
+        "project",
+        "propose",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_arg,
+        "--path",
+        path_arg,
+    ]);
+    assert!(proposed_again.status.success());
+    let proposed_again_json: serde_json::Value =
+        serde_json::from_slice(&proposed_again.stdout).expect("proposal should be JSON");
+    assert_eq!(proposed_again_json["project_id"], project_id);
+    assert_eq!(proposed_again_json["state"], "rejected");
+
+    let accepted = run(&[
+        "project",
+        "decide",
+        "--database",
+        database_arg,
+        "--project",
+        &project_arg,
+        "--decision",
+        "accept",
+    ]);
+    assert!(accepted.status.success());
+    let accepted_json: serde_json::Value =
+        serde_json::from_slice(&accepted.stdout).expect("acceptance should be JSON");
+    assert_eq!(accepted_json["state"], "accepted");
+    assert_eq!(accepted_json["latest_decision"]["sequence"], 2);
+
+    let accepted_again = run(&[
+        "project",
+        "decide",
+        "--database",
+        database_arg,
+        "--project",
+        &project_arg,
+        "--decision",
+        "accept",
+    ]);
+    assert!(accepted_again.status.success());
+    let accepted_again_json: serde_json::Value =
+        serde_json::from_slice(&accepted_again.stdout).expect("acceptance should be JSON");
+    assert_eq!(accepted_again_json["latest_decision"]["sequence"], 2);
+
+    let list = run(&["project", "list", "--database", database_arg]);
+    assert!(list.status.success());
+    let summaries: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("candidate list should be JSON");
+    assert_eq!(summaries[0]["project_id"], project_id);
+    assert_eq!(summaries[0]["state"], "accepted");
+    assert!(summaries[0].get("display_path").is_none());
+    assert!(summaries[0].get("suggestion").is_none());
+
+    assert!(marker_path.exists());
+    assert!(private_source.exists());
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    for output in [
+        &proposed,
+        &rejected,
+        &proposed_again,
+        &accepted,
+        &accepted_again,
+        &list,
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for secret in [
+            "private-correctable-project",
+            "secret_context.rs",
+            path_arg,
+            private_source
+                .to_str()
+                .expect("source path should be UTF-8"),
+        ] {
+            assert!(!stderr.contains(secret));
+            assert!(!list_stdout.contains(secret));
+        }
+        assert!(
+            stderr
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+    }
+}
+
+#[test]
 fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

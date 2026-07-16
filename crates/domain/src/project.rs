@@ -72,6 +72,68 @@ impl ProjectSuggestion {
     pub const PROVIDER_VERSION: &str = "1";
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCandidateState {
+    Suggested,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDecisionKind {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectDecisionCreator {
+    User,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectDecision {
+    pub sequence: u64,
+    pub kind: ProjectDecisionKind,
+    pub created_by: ProjectDecisionCreator,
+    pub decided_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectCandidate {
+    pub api_version: &'static str,
+    pub project_id: i64,
+    pub scope_id: i64,
+    pub root_folder_node_id: i64,
+    pub root_folder_location_id: i64,
+    pub display_path: String,
+    pub state: ProjectCandidateState,
+    pub suggestion: ProjectSuggestion,
+    pub latest_decision: Option<ProjectDecision>,
+}
+
+impl ProjectCandidate {
+    pub const API_VERSION: &str = "deskgraph.project-candidate.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectCandidateSummary {
+    pub api_version: &'static str,
+    pub project_id: i64,
+    pub scope_id: i64,
+    pub root_folder_node_id: i64,
+    pub state: ProjectCandidateState,
+    pub confidence_basis_points: u16,
+    pub observed_at_unix_ms: i64,
+    pub latest_decision_at_unix_ms: Option<i64>,
+}
+
+impl ProjectCandidateSummary {
+    pub const API_VERSION: &str = "deskgraph.project-candidate-summary.v1";
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderProfile {
     pub api_version: &'static str,
@@ -118,5 +180,23 @@ mod tests {
         assert_eq!(value["created_by"], "system_rule");
         assert_eq!(value["model_version"], serde_json::Value::Null);
         assert_eq!(value["provenance"][0]["kind"], "cargo_manifest");
+    }
+
+    #[test]
+    fn project_candidate_summary_is_path_free_and_feedback_is_explicit() {
+        let summary = ProjectCandidateSummary {
+            api_version: ProjectCandidateSummary::API_VERSION,
+            project_id: 1,
+            scope_id: 2,
+            root_folder_node_id: 3,
+            state: ProjectCandidateState::Rejected,
+            confidence_basis_points: 8_500,
+            observed_at_unix_ms: 4,
+            latest_decision_at_unix_ms: Some(5),
+        };
+        let value = serde_json::to_value(&summary).expect("summary should serialize");
+        assert_eq!(value["state"], "rejected");
+        assert!(value.get("display_path").is_none());
+        assert!(value.get("suggestion").is_none());
     }
 }
