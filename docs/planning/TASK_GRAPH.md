@@ -100,8 +100,9 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 7 — M6/M8 continuous product workflow
 
-- Build watcher reconciliation/stability/resource controls and Smart Inbox; connect full onboarding/search/preview/history flows.
-- Exit with keyboard/accessibility/loading/empty/partial/paused/error states and E2E tests.
+- Current: ADR-016 and the durable untrusted-hint → per-scope debounce → stability/open-handle identity → atomically linked manifest reconcile core pass locally, including rename and two restart states; CLI/Desktop status is path-free and explicitly adapter-pending.
+- Next: audit and connect native platform adapters or an explicitly documented polling adapter, missed-event reconciliation, incremental extraction/indexing, background resource controls, then the separate suggest-only Smart Inbox state model and full onboarding/search/preview/history flows.
+- Exit only after event/load storms, temporary downloads, rename/move reconciliation, restart, low-memory/8 GB, Windows/macOS/Linux runtime, keyboard/accessibility/loading/empty/partial/paused/error states, and no-file-action-by-default E2E acceptance pass.
 
 ### Step 8 — M7 MCP
 

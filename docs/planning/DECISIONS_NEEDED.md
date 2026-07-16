@@ -56,3 +56,9 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - Search queries, paths, and snippets may appear only in an explicit user-requested result payload, never ordinary logs or extraction/status payloads.
 - Lexical filters are a closed no-model contract: explicit authorized scope, metadata path vs active extracted text, one normalized ASCII-alphanumeric extension, inclusive `modified_since` and exclusive `modified_before` UTC Unix seconds. Applied normalized values are returned to the caller; project/folder filters wait for graph-backed identities.
 - D-007 and D-009 remain open: no vector extension, embedding runtime, or model is selected by the lexical slice.
+
+## Decisions made while entering M6
+
+- Filesystem events are untrusted hints. Durable per-scope debounce and a bounded stability gate must complete before the existing atomic manifest scanner reconciles live state (ADR-016).
+- The first core uses a one-second default stability window, closed temporary-download suffixes, size/modified-time/platform-identity snapshots, and read-only open-handle identity verification.
+- Watch status is path-free outside explicit adapter/user input. Native OS adapters, incremental extraction/indexing, cloud-placeholder policy, background resource controls, and Smart Inbox remain unselected or unimplemented.

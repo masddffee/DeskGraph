@@ -99,13 +99,28 @@ Search is an explicit content-returning operation: its stdout intentionally cont
 
 The reproducible synthetic lexical benchmark and the latest local evidence are documented under [benchmarks](benchmarks/README.md). The checked-in 10k result is a macOS arm64 development baseline, not an 8 GB or cross-platform release claim.
 
+Exercise the durable watch-reconciliation core with an explicit hint:
+
+```bash
+cargo run -p deskgraph-cli -- watch observe \
+  --database ./deskgraph-dev.sqlite3 \
+  --scope 1 \
+  --path /absolute/path/to/test-folder/notes.md
+cargo run -p deskgraph-cli -- watch advance \
+  --database ./deskgraph-dev.sqlite3 \
+  --event 1
+cargo run -p deskgraph-cli -- watch list --database ./deskgraph-dev.sqlite3
+```
+
+`observe` validates the current authorized scope and persists a path-free status response. Events within one scope coalesce until the one-second stability deadline; run `advance` at or after `stable_after_unix_ms` to revalidate size, modified time, identity, and read-only access before an atomic manifest reconciliation. This is a core/CLI development slice, not automatic Watch Mode: native OS event adapters, incremental content re-extraction/indexing, cloud-placeholder handling, and background resource controls remain unimplemented.
+
 Start the desktop application:
 
 ```bash
 pnpm desktop:dev
 ```
 
-The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows paths in explicit scope management and user-invoked search results; its extraction dashboard exposes aggregate counts and fixed job states without paths or content. Search snippets are visibly labeled untrusted local text and rendered as text, never executable markup.
+The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows paths in explicit scope management and user-invoked search results; its extraction and watch dashboards expose aggregate counts and fixed job states without paths or content. Search snippets are visibly labeled untrusted local text and rendered as text, never executable markup. The Watch panel explicitly reports that its native adapter is not connected.
 
 ## Development verification
 

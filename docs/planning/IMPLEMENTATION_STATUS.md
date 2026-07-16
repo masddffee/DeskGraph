@@ -6,11 +6,13 @@ Status vocabulary: `not started`, `in progress`, `blocked`, `verified locally`, 
 
 ## Current milestones
 
-M2 Content Intelligence remains on the critical path and M3 Hybrid Retrieval has an active lexical workstream — both are **in progress**. M0 remains open for remote CI evidence, and M1 remains open for complete Windows runtime, peak-memory, and latest live-UI evidence.
+M2 Content Intelligence remains on the critical path, M3 Hybrid Retrieval has an active lexical workstream, and M6 has a first durable watch-reconciliation core — all are **in progress**. M0 remains open for remote CI evidence, and M1 remains open for complete Windows runtime, peak-memory, and latest live-UI evidence.
 
 Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdown, source-code, and text-layer PDF files are resolved inside their authorized scope; the core revalidates the canonical scope, exclusion policy, manifest snapshot, and open-file identity; bounded providers receive only a controlled `Read + Seek`; durable SQLite jobs support cancellation and interrupted recovery; tagged byte/page provenance and complete untrusted chunks publish atomically; CLI and Desktop expose privacy-safe progress and counts. Invalid UTF-8, corrupt/encrypted PDF, active PDF content and attachments, decompression/page/output limits, changed files, symlink swaps, cancellation, expired leases, false output sizes, and failed replacement are covered locally. M2 is not complete because Office formats, image metadata, OCR, remaining adversarial fixtures, full Windows runtime evidence, and an extraction benchmark on 8 GB hardware remain open.
 
 One M3 lexical vertical slice now runs end to end. Transactional SQLite FTS5 trigram indexes cover current authorized display paths and active extracted chunks; normalized quoted queries are limited to 3–256 Unicode characters, results/candidates are capped, stale content is filtered by source-of-truth joins, and deterministic fusion exposes exact filename/path/content explanations. Scope, metadata-vs-content source, ASCII-alphanumeric extension, and inclusive/exclusive UTC modified-time filters are validated by both retrieval and database boundaries. CLI and Desktop return user-requested paths and bounded snippets while logs omit query/path/text. This is not M3 completion: one- and two-character search, project/folder filters, vector/embedding adapters, semantic and “files like this” queries, hybrid fusion, representative multilingual evaluation, 100k/8 GB/cross-platform benchmarks, and live-UI evidence remain open.
+
+One M6 core vertical slice now runs end to end. Untrusted path hints are canonical-scope validated, temporary/hidden entries are ignored, events coalesce durably per scope, and unchanged existence/kind/size/modified-time/platform identity plus read-only open-handle identity are required before an atomically linked resumable scan reconciles the manifest. Stabilizing and reconciling events resume after database reopen; rename storms preserve identity locally. CLI and Desktop status are path-free. This is not automatic Watch Mode: native OS adapters, efficient per-node reconciliation, incremental extraction/indexing, cloud-placeholder handling, background pause/resource/low-memory policy, notification preferences, Smart Inbox states, Windows runtime evidence, and live Desktop interaction remain open.
 
 ## Milestones
 
@@ -22,7 +24,7 @@ One M3 lexical vertical slice now runs end to end. Transactional SQLite FTS5 tri
 | M3 Hybrid Retrieval           | In progress | Offline path/content FTS5 trigram → bounded retrieval and scope/type/date/source filters → deterministic explanations → CLI/Desktop search → synthetic 10k benchmark | Project/folder filters and extended benchmarks, then audited vector/embedding adapters, fusion, evaluation |
 | M4 Project Graph              | Not started | Planning only                                                              | Explainable project relations and corrections         |
 | M5 Safe Organization          | Not started | Safety rules only                                                          | Journaled preview/execute/recover/undo slice          |
-| M6 Watch Mode and Smart Inbox | Not started | Planning only                                                              | Stable incremental event slice                        |
+| M6 Watch Mode and Smart Inbox | In progress | Untrusted hint → durable per-scope debounce → stability/open-handle identity gate → atomically linked resumable manifest reconciliation → path-free CLI/Desktop status | Native adapters, incremental extraction/indexing, resource controls, Smart Inbox |
 | M7 Read-only MCP              | Not started | ADR only                                                                   | Scoped stdio query slice                              |
 | M8 Product UI                 | Not started | Planning only                                                              | M0 creates only the shell/status slice                |
 | M9 Release Engineering        | Not started | Planning only                                                              | CI foundation, then packages/updater/SBOM             |
@@ -33,10 +35,10 @@ One M3 lexical vertical slice now runs end to end. Transactional SQLite FTS5 tri
 | Acceptance criterion                                     | Status             | Evidence / blocker                                                         |
 | -------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------- |
 | Monorepo established                                     | Verified locally   | Rust workspace, pnpm workspace, Tauri/React desktop, CLI, and both lockfiles |
-| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 83 tests pass        |
-| TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 13 Vitest tests, and Vite build pass            |
+| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 91 tests pass        |
+| TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 16 Vitest tests, and Vite build pass            |
 | ADR template                                             | Verified locally   | `docs/architecture/adr/0000-template.md`                                   |
-| Root and nested AGENTS instructions                      | Verified locally   | Root plus Desktop, scanner, extractor, and transaction safety instructions |
+| Root and nested AGENTS instructions                      | Verified locally   | Root plus Desktop, scanner, extractor, transaction, and watcher safety instructions |
 | Cross-platform CI matrix configured                      | Verified locally   | Pinned-action workflow covers macOS, Windows, and Linux                    |
 | Cross-platform CI matrix passes                          | Blocked externally | No GitHub remote/auth or CI run yet                                        |
 | Apache-2.0 license decision                              | Verified locally   | Root `LICENSE`, authoritative ADR-008, and package metadata                |
@@ -57,7 +59,7 @@ One M3 lexical vertical slice now runs end to end. Transactional SQLite FTS5 tri
 
 - No GitHub repository/remote and invalid GitHub authentication: remote Issues, Releases, and CI results do not exist.
 - Signing, notarization, clean Windows/macOS VM validation, and launch accounts are external later-stage requirements.
-- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The current 485-package lock adds only local workspace retrieval and benchmark packages after the 483-package PDF state, but the post-PDF full-lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
+- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The current 486-package lock adds only local workspace retrieval, benchmark, and watcher packages after the 483-package PDF state, but the post-PDF full-lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
 - Windows open-handle file-identity adapter compiles for `x86_64-pc-windows-msvc`, but complete scanner/extractor cross-checks cannot be produced on this macOS host because bundled SQLite needs a Windows C/MSVC toolchain. Remote Windows CI remains required.
 - Local 10k timing and idempotency are measured, but peak RSS sampling was denied by the restricted runner and its escalation reviewer was unavailable due tool quota. This does not block code work; the 8 GB release gate remains open.
 
@@ -101,6 +103,25 @@ One M3 lexical vertical slice now runs end to end. Transactional SQLite FTS5 tri
 ## Next handoff
 
 Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate before accepting ADR-014 or implementing Office; do not add the ZIP/XML candidates while the isolated closure and audit evidence is unavailable. In parallel, continue `prompts/04_HYBRID_SEARCH.md` from the verified lexical slice and bounded type/date/source filters: add project/folder filters only after their source-of-truth graph model exists, and extend the benchmark to 100k, representative corpora, peak RSS and remote platforms; vector/embedding candidates remain unselected. Image metadata and OCR remain separate provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI.
+
+For `prompts/07_WATCH_SMART_INBOX.md`, continue from ADR-016 by auditing/selecting native event adapters per platform or implementing an explicitly documented dependency-free polling adapter; then connect missed-event reconciliation and incremental extraction/indexing without bypassing the stability gate. Keep Smart Inbox, generated rules, and file actions outside that adapter.
+
+## M6 watch-core acceptance checklist
+
+| Acceptance criterion | Status | Evidence / blocker |
+| --- | --- | --- |
+| Watch event source abstraction | Verified locally for core contract | Public `WatchEventSource` yields untrusted scope/path hints; no native adapter is selected or claimed |
+| Durable debounce and event storms | Verified locally | Migration 0006 allows one stabilizing event per scope; repeated/rename hints coalesce and reset the bounded deadline |
+| Stability and read-only identity gate | Verified locally on macOS | Existence/kind/size/mtime/platform identity must remain unchanged; file open-handle identity must match before reconcile; Windows runtime pending |
+| Temporary and hidden input handling | Verified locally | `.part`, `.crdownload`, `.download`, dot-hidden and platform-hidden paths do not start reconciliation |
+| Atomic manifest reconciliation | Verified locally | Watch event and normal resumable scan job link in one transaction; live manifest still publishes only after a complete scan |
+| Restart recovery | Verified locally | Both stabilizing and atomically linked reconciling events survive reopen and reach completion; failed scanner state remains fixed-code |
+| Rename storm identity | Verified locally on Unix | Old/new hints coalesce; full reconciliation preserves node identity and removes the stale location without duplicates |
+| Path-free CLI and Desktop state | Verified locally except live UI smoke | `watch observe/advance/status/list`, narrow read-only Tauri list command, strict TS parser, honest adapter-pending panel; binary/Rust tests exclude paths and content |
+| Native macOS/Windows/Linux adapters | Not started | Dependency/API/platform audit and missed-event fixtures required; manual CLI hint is not automatic Watch Mode |
+| Incremental extraction/indexing | Not started | Manifest reconcile invalidates stale content safely but does not enqueue re-extraction or embeddings |
+| Cloud placeholders, low-memory/background controls | Not started | Provider/platform detection, pause/resume, battery/thermal and 8 GB evidence required |
+| Smart Inbox, notifications, generated rules | Not started | Suggest-only state model and UI belong to later M6 slices; no file action is permitted here |
 
 ## M3 acceptance checklist
 
@@ -194,11 +215,18 @@ Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate 
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` — passed.
-- `cargo test --workspace --all-features --offline` — 83 passed, 0 failed: CLI 6 + 4 integration, database 16, Desktop Rust 5, domain 5, extractors 26, identity 2, retrieval 3, scanner 12, search benchmark 2, telemetry 2.
+- `cargo test --workspace --all-features --offline` — 91 passed, 0 failed: CLI 6 + 5 integration, database 16, Desktop Rust 6, domain 6, extractors 26, identity 2, retrieval 3, scanner 12, search benchmark 2, telemetry 2, watcher 5.
 - Database/retrieval fixtures — bundled FTS5 migration/backfill and triggers pass; Traditional Chinese/English path and content substring search passes; stale active-content filtering, query/candidate limits, quote escaping, exact filename fusion, fixed explanations, source selection, extension normalization, date bounds, and invalid-filter rejection pass.
 - CLI binary fixture — requested filtered local context and normalized filter diagnostics are returned on stdout; query, private text, filename, and scope path are absent from structured stderr logs.
-- `pnpm check` — Prettier, ESLint, TypeScript, 13 Vitest tests, and Vite production build passed.
+- `pnpm check` — Prettier, ESLint, TypeScript, 16 Vitest tests, and Vite production build passed.
 - `pnpm --filter @deskgraph/desktop tauri build --no-bundle` with `/Users/wetom/.cargo/bin` explicitly on `PATH` — passed and produced `target/release/deskgraph-desktop`.
 - Synthetic search benchmark — rerun against the current filtered SQL path in release mode with a 10,000-document, 1.3 MB zh-TW/English corpus and 50 iterations per case. p95: zh-TW content 5.931 ms, English content 16.119 ms, exact filename 2.249 ms, miss 0.090 ms. SQLite file 11,993,088 bytes; FTS shadow tables 5,181,440 bytes. Full report: `benchmarks/results/search-10k-macos-arm64-2026-07-16.json`.
-- Dependency delta — no registry package, vector extension, embedding/model runtime, API, or network client was added; `Cargo.lock` contains 485 packages because the local workspace-only retrieval and benchmark crates were added.
+- Dependency delta — M3 added no registry package, vector extension, embedding/model runtime, API, or network client. Its retrieval and benchmark crates are local workspace packages; the current 486-package lock also includes the later local watcher crate.
 - Evidence still open — latest live Desktop interaction, remote macOS Intel/Windows/Linux runtime, current full-lock RustSec scan, representative and 100k corpora, peak RSS/8 GB/thermal evidence, one/two-character strategy, graph-backed project/folder filters, vector/embedding/hybrid behavior, and multilingual relevance evaluation. The checked-in 10k result is not a release SLO.
+
+## M6 durable-watch-core vertical-slice evidence — 2026-07-16
+
+- Shared workspace gates — Rust format and all-feature Clippy passed; 91 Rust tests passed; `pnpm check` passed with 16 Vitest tests; the no-bundle Tauri release build produced `target/release/deskgraph-desktop`.
+- Watch-core fixtures — temporary download ignore, changing-snapshot deadline reset, scope/symlink/missing-path escape denial, rename-storm coalescing with identity preservation, stabilizing restart, and atomically linked reconciling restart all pass. CLI/Desktop status payload tests contain no observed path or content.
+- Dependency delta — M6 added only the local workspace `deskgraph-watcher` crate. No registry package, native watcher, async runtime, API, or network client was added; `Cargo.lock` now contains 486 packages.
+- Evidence still open — native platform adapters or a documented polling adapter, missed-event schedules, efficient per-node reconciliation, incremental extraction/indexing, cloud-placeholder handling, background pause/resource/low-memory policy, Smart Inbox, load/8 GB/thermal evidence, Windows runtime, latest live Desktop interaction, remote platform CI, and the current full-lock RustSec scan.

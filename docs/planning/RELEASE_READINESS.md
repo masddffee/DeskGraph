@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-16
 
-Overall status: **not release-ready**. Local implementation is in M2 with one parallel M3 lexical slice while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
+Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical and M6 durable watch-core slices, while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
@@ -12,7 +12,7 @@ Overall status: **not release-ready**. Local implementation is in M2 with one pa
 | Linux experimental package                     | Not started        | Clearly labeled build and smoke                          |
 | Explicit authorized scopes                     | Verified locally   | Desktop/CLI authorization, component-aware protected-tree policy, symlink/reparse and platform hidden/system exclusions; Windows runtime fixtures remain |
 | Initial manifest scan                          | In progress        | Release 10k idempotency/timing, durable progress/pause/resume, crash-reopen replay, atomic publish, and Unix permission fixture pass; memory, live updated-UI smoke, and remote CI remain |
-| Incremental watch mode                         | Not started        | Reconciliation/stability/restart tests                   |
+| Incremental watch mode                         | In progress        | Durable core debounce/stability/atomic reconcile/restart/rename fixtures and path-free CLI/Desktop status pass locally; native OS adapters, incremental extraction/indexing, placeholder handling, resource policy, Windows/runtime/live-UI evidence remain |
 | Extraction and OCR formats                     | In progress        | Text/Markdown/code and bounded text-layer PDF providers, durable cancellation, tagged provenance, atomic untrusted chunks, corrupt/encrypted/active-content/decompression fixtures pass locally; Office, image metadata, OCR, Windows runtime, 8 GB residency, and remaining corpora remain |
 | zh-TW and English                              | In progress        | Built-in UTF-8 extraction has exact byte-offset mixed zh-TW/English fixtures; PDF ToUnicode fixture extracts both with page provenance; OCR and retrieval evaluation sets remain |
 | Metadata/FTS/vector/hybrid retrieval           | In progress        | Offline path/content FTS5, bounded scope/type/date/source filters, deterministic explanations, CLI/Desktop and synthetic 10k p50/p95/index-size baseline pass locally; project/folder filters, vectors, embeddings, hybrid fusion, real/100k/8 GB evaluation and cross-platform/live-UI evidence remain |
@@ -45,3 +45,7 @@ The text/Markdown/code and text-layer PDF slices are safe to exercise with test 
 ## M3 lexical local readiness note
 
 The FTS5 baseline is safe to exercise on test scopes: search is read-only, stays in bundled SQLite, accepts bounded quoted queries of at least three Unicode characters, caps candidates/results/snippets, excludes absent locations and stale chunks, and exposes fixed ranking explanations. Scope, match-source, extension, and modified-time filters are validated twice and echoed after normalization. User-invoked CLI/Desktop results intentionally return authorized paths and bounded untrusted snippets; ordinary logs omit query/path/text. A reproducible 10k synthetic macOS arm64 baseline records p50/p95/max and FTS bytes. This is not an M3 or release claim: graph-backed project/folder filters, vector/embedding providers, hybrid/semantic behavior, representative/100k/8 GB/RSS/thermal evaluation, short-query strategy, live Desktop interaction, and remote platform runtime remain open.
+
+## M6 watch-core local readiness note
+
+The durable reconciliation core is safe to exercise with explicit CLI hints on test scopes: events are untrusted, scope/path/symlink policy is revalidated, temporary downloads are ignored, a stable read-only identity snapshot is required, and only the existing atomic scanner can publish live metadata. Status is path-free and restart fixtures pass. This is not automatic Watch Mode or M6 completion: no native event adapter, incremental extraction/indexing, placeholder detection, low-memory/background resource policy, notifications, Smart Inbox, Windows runtime, 8 GB benchmark, or live Desktop interaction has passed.
