@@ -25,6 +25,13 @@ const response: SearchResponse = {
   mode: 'lexical',
   embeddings_enabled: false,
   query: '專案 context',
+  filters: {
+    scope_id: 1,
+    source: 'extracted_text',
+    extension: 'md',
+    modified_since_unix_seconds: 1,
+    modified_before_unix_seconds: 2,
+  },
   result_count: 1,
   results: [result],
   elapsed_ms: 3,
@@ -48,14 +55,49 @@ describe('search contract', () => {
     expect(() => parseSearchResponse({ ...response, result_count: 2 })).toThrow(
       'Invalid search response',
     );
+    expect(() =>
+      parseSearchResponse({
+        ...response,
+        filters: { ...response.filters, extension: '../md' },
+      }),
+    ).toThrow('Invalid search filter response');
+    expect(() =>
+      parseSearchResponse({
+        ...response,
+        filters: {
+          ...response.filters,
+          modified_since_unix_seconds: 2,
+          modified_before_unix_seconds: 2,
+        },
+      }),
+    ).toThrow('Invalid search filter response');
   });
 
   it('uses one narrow read-only Tauri command with explicit bounds', async () => {
     const invokeCommand = vi.fn().mockResolvedValue(response);
-    await expect(searchLocal('專案 context', 1, 20, invokeCommand)).resolves.toEqual(response);
+    await expect(
+      searchLocal(
+        '專案 context',
+        {
+          scopeId: 1,
+          source: 'extracted_text',
+          extension: '.MD',
+          modifiedSinceUnixSeconds: 1,
+          modifiedBeforeUnixSeconds: 2,
+          limit: 20,
+        },
+        invokeCommand,
+      ),
+    ).resolves.toEqual(response);
     expect(invokeCommand).toHaveBeenCalledWith(SEARCH_LOCAL_COMMAND, {
       query: '專案 context',
-      scopeId: 1,
+      filters: {
+        scope_id: 1,
+        source: 'extracted_text',
+        extension: '.MD',
+        modified_since_unix_seconds: 1,
+        modified_before_unix_seconds: 2,
+      },
       limit: 20,
     });
   });

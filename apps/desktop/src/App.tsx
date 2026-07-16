@@ -21,7 +21,12 @@ import {
   type ManifestStats,
   type ScanJobProgress,
 } from './manifest';
-import { searchLocal, type SearchResponse, type SearchResult } from './search';
+import {
+  searchLocal,
+  type SearchResponse,
+  type SearchResult,
+  type SearchSourceFilter,
+} from './search';
 
 type ReadyState = {
   kind: 'ready';
@@ -115,6 +120,40 @@ function searchExplanation(result: SearchResult): string {
   return 'Extracted text';
 }
 
+function utcDateToUnixSeconds(value: string): number | null {
+  if (!value) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const milliseconds = Date.parse(`${value}T00:00:00Z`);
+  if (!Number.isFinite(milliseconds)) return null;
+  if (new Date(milliseconds).toISOString().slice(0, 10) !== value) return null;
+  return Math.floor(milliseconds / 1000);
+}
+
+function activeSearchFilters(response: SearchResponse): string {
+  const labels: string[] = [];
+  if (response.filters.scope_id !== null) {
+    labels.push(`scope ${response.filters.scope_id}`);
+  }
+  if (response.filters.source === 'metadata_path') labels.push('paths only');
+  if (response.filters.source === 'extracted_text') labels.push('extracted text only');
+  if (response.filters.extension) labels.push(`.${response.filters.extension}`);
+  if (response.filters.modified_since_unix_seconds !== null) {
+    labels.push(
+      `since ${new Date(response.filters.modified_since_unix_seconds * 1000)
+        .toISOString()
+        .slice(0, 10)} UTC`,
+    );
+  }
+  if (response.filters.modified_before_unix_seconds !== null) {
+    labels.push(
+      `before ${new Date(response.filters.modified_before_unix_seconds * 1000)
+        .toISOString()
+        .slice(0, 10)} UTC`,
+    );
+  }
+  return labels.length > 0 ? labels.join(' · ') : 'all authorized local sources';
+}
+
 export default function App() {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
@@ -122,6 +161,10 @@ export default function App() {
   const [action, setAction] = useState<ActionState>({ kind: 'idle' });
   const [searchQuery, setSearchQuery] = useState('');
   const [searchScopeId, setSearchScopeId] = useState<number | null>(null);
+  const [searchSource, setSearchSource] = useState<SearchSourceFilter>('all');
+  const [searchExtension, setSearchExtension] = useState('');
+  const [searchModifiedSince, setSearchModifiedSince] = useState('');
+  const [searchModifiedBefore, setSearchModifiedBefore] = useState('');
   const [searchState, setSearchState] = useState<SearchState>({ kind: 'idle' });
   const runningJobIds =
     state.kind === 'ready'
@@ -302,9 +345,38 @@ export default function App() {
       });
       return;
     }
+    const extension = searchExtension.trim();
+    if (extension && !/^\.?[a-z0-9]{1,16}$/i.test(extension)) {
+      setSearchState({
+        kind: 'error',
+        message: 'File type must be a 1–16 character extension such as md, pdf, or docx.',
+      });
+      return;
+    }
+    const modifiedSinceUnixSeconds = utcDateToUnixSeconds(searchModifiedSince);
+    const modifiedBeforeUnixSeconds = utcDateToUnixSeconds(searchModifiedBefore);
+    if (
+      (searchModifiedSince && modifiedSinceUnixSeconds === null) ||
+      (searchModifiedBefore && modifiedBeforeUnixSeconds === null) ||
+      (modifiedSinceUnixSeconds !== null &&
+        modifiedBeforeUnixSeconds !== null &&
+        modifiedSinceUnixSeconds >= modifiedBeforeUnixSeconds)
+    ) {
+      setSearchState({
+        kind: 'error',
+        message: 'Choose a valid UTC date range where “Modified since” is before “Before”.',
+      });
+      return;
+    }
     setSearchState({ kind: 'working' });
     try {
-      const response = await searchLocal(query, searchScopeId);
+      const response = await searchLocal(query, {
+        scopeId: searchScopeId,
+        source: searchSource,
+        extension: extension || null,
+        modifiedSinceUnixSeconds,
+        modifiedBeforeUnixSeconds,
+      });
       setSearchState({ kind: 'ready', response });
     } catch {
       setSearchState({
@@ -442,6 +514,46 @@ export default function App() {
                   {searchState.kind === 'working' ? 'Searching…' : 'Search'}
                 </button>
               </div>
+              <div className="search-filter-grid" aria-label="Bounded local search filters">
+                <label>
+                  Match source
+                  <select
+                    value={searchSource}
+                    onChange={(event) => setSearchSource(event.target.value as SearchSourceFilter)}
+                  >
+                    <option value="all">Paths + extracted text</option>
+                    <option value="metadata_path">Filenames and paths only</option>
+                    <option value="extracted_text">Extracted text only</option>
+                  </select>
+                </label>
+                <label>
+                  File type
+                  <input
+                    value={searchExtension}
+                    onChange={(event) => setSearchExtension(event.target.value)}
+                    placeholder="md or pdf"
+                    maxLength={17}
+                    autoComplete="off"
+                    spellCheck="false"
+                  />
+                </label>
+                <label>
+                  Modified since (UTC)
+                  <input
+                    type="date"
+                    value={searchModifiedSince}
+                    onChange={(event) => setSearchModifiedSince(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Before (UTC, exclusive)
+                  <input
+                    type="date"
+                    value={searchModifiedBefore}
+                    onChange={(event) => setSearchModifiedBefore(event.target.value)}
+                  />
+                </label>
+              </div>
             </form>
 
             {searchState.kind === 'error' ? (
@@ -460,7 +572,7 @@ export default function App() {
                   {searchState.response.result_count.toLocaleString()} results ·{' '}
                   {searchState.response.elapsed_ms.toLocaleString()} ms
                 </span>
-                <span>Ranked by exact filename, path, then active extracted text</span>
+                <span>{activeSearchFilters(searchState.response)}</span>
               </div>
             ) : null}
             {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (

@@ -349,6 +349,23 @@ select:focus-visible {
   gap: 0.75rem;
 }
 
+.search-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.search-filter-grid label {
+  margin: 0;
+}
+
+.search-filter-grid input,
+.search-filter-grid select {
+  width: 100%;
+  margin-top: 0.45rem;
+}
+
 .search-message,
 .search-summary {
   border-top: 1px solid rgba(27, 59, 40, 0.12);
@@ -581,6 +598,10 @@ footer {
   .scope-list li {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .search-filter-grid {
+    grid-template-columns: 1fr;
   }
 }
 

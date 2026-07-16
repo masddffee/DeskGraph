@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use deskgraph_database::ManifestDatabase;
-use deskgraph_retrieval::{SearchRequest, search};
+use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -106,6 +106,10 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
             SearchRequest {
                 query,
                 scope_id: Some(1),
+                source: SearchSourceFilter::All,
+                extension: None,
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
                 limit: Some(20),
             },
         )
@@ -122,6 +126,10 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
                 SearchRequest {
                     query,
                     scope_id: Some(1),
+                    source: SearchSourceFilter::All,
+                    extension: None,
+                    modified_since_unix_seconds: None,
+                    modified_before_unix_seconds: None,
                     limit: Some(20),
                 },
             )

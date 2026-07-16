@@ -9,4 +9,6 @@ pub use health::{
     collect_health, collect_health_with_manifest,
 };
 pub use manifest::{AuthorizedScope, ManifestStats, ScanJobProgress, ScanReport, ScanStatus};
-pub use search::{SearchMatchedField, SearchMode, SearchResponse, SearchResult};
+pub use search::{
+    SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,
+};

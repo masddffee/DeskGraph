@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
     AuthorizedScope, ExtractionJobProgress, ExtractionStats, HealthReport, ManifestStats,
-    ScanJobProgress, SearchResponse, collect_health_with_manifest,
+    ScanJobProgress, SearchFilters, SearchResponse, collect_health_with_manifest,
 };
 use deskgraph_extractors::{
     extraction_stats_at as read_extraction_stats_at,
     recent_extraction_jobs_at as read_recent_extraction_jobs_at,
 };
-use deskgraph_retrieval::{SearchRequest, search_at as run_search_at};
+use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 use deskgraph_scanner::{
     authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
 };
@@ -108,16 +108,20 @@ fn recent_content_extractions(
 fn search_local(
     state: State<'_, ManifestState>,
     query: String,
-    scope_id: Option<i64>,
+    filters: SearchFilters,
     limit: Option<u32>,
 ) -> Result<SearchResponse, String> {
     let response =
-        search_local_at(&state.database_path, &query, scope_id, limit).map_err(str::to_string)?;
+        search_local_at(&state.database_path, &query, &filters, limit).map_err(str::to_string)?;
     info!(
         event = "local_search_completed",
-        scope_id = scope_id,
+        scope_id = filters.scope_id,
         result_count = response.result_count,
         elapsed_ms = response.elapsed_ms,
+        filters_applied = filters.extension.is_some()
+            || filters.modified_since_unix_seconds.is_some()
+            || filters.modified_before_unix_seconds.is_some()
+            || filters.source != SearchSourceFilter::All,
         mode = "lexical"
     );
     Ok(response)
@@ -206,14 +210,18 @@ fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgres
 fn search_local_at(
     path: &Path,
     query: &str,
-    scope_id: Option<i64>,
+    filters: &SearchFilters,
     limit: Option<u32>,
 ) -> Result<SearchResponse, &'static str> {
     run_search_at(
         path,
         SearchRequest {
             query,
-            scope_id,
+            scope_id: filters.scope_id,
+            source: filters.source,
+            extension: filters.extension.as_deref(),
+            modified_since_unix_seconds: filters.modified_since_unix_seconds,
+            modified_before_unix_seconds: filters.modified_before_unix_seconds,
             limit,
         },
     )
@@ -427,9 +435,22 @@ mod tests {
         run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
             .expect("extraction should complete");
 
-        let response = search_local_at(&database_path, "專案脈絡", Some(scope.id), Some(10))
-            .expect("search should pass");
+        let response = search_local_at(
+            &database_path,
+            "專案脈絡",
+            &SearchFilters {
+                scope_id: Some(scope.id),
+                source: SearchSourceFilter::ExtractedText,
+                extension: Some("MD".to_string()),
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+            },
+            Some(10),
+        )
+        .expect("search should pass");
         assert_eq!(response.result_count, 1);
+        assert_eq!(response.filters.source, SearchSourceFilter::ExtractedText);
+        assert_eq!(response.filters.extension.as_deref(), Some("md"));
         assert_eq!(response.results[0].node_id, node_id);
         assert_eq!(response.results[0].explanation, "extracted_text_substring");
         assert!(

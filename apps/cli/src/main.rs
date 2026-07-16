@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{ExtractionJobProgress, ScanJobProgress, collect_health};
 use deskgraph_extractors::{
@@ -9,7 +9,7 @@ use deskgraph_extractors::{
     extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
-use deskgraph_retrieval::{SearchRequest, search_at};
+use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
     authorize_scope, comparison_key, create_scan_job, pause_scan_job, resume_scan_job,
     run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
@@ -27,6 +27,23 @@ use tracing::{error, info};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SearchSourceArg {
+    All,
+    Metadata,
+    Content,
+}
+
+impl From<SearchSourceArg> for SearchSourceFilter {
+    fn from(source: SearchSourceArg) -> Self {
+        match source {
+            SearchSourceArg::All => Self::All,
+            SearchSourceArg::Metadata => Self::MetadataPath,
+            SearchSourceArg::Content => Self::ExtractedText,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -61,6 +78,17 @@ enum Command {
         query: String,
         #[arg(long)]
         scope: Option<i64>,
+        #[arg(long, value_enum, default_value_t = SearchSourceArg::All)]
+        source: SearchSourceArg,
+        /// Match one ASCII alphanumeric file extension, with or without a leading dot.
+        #[arg(long)]
+        extension: Option<String>,
+        /// Inclusive modified-time lower bound in Unix seconds.
+        #[arg(long)]
+        modified_since: Option<i64>,
+        /// Exclusive modified-time upper bound in Unix seconds.
+        #[arg(long)]
+        modified_before: Option<i64>,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -402,6 +430,10 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             database,
             query,
             scope,
+            source,
+            extension,
+            modified_since,
+            modified_before,
             limit,
         } => {
             let response = search_at(
@@ -409,6 +441,10 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 SearchRequest {
                     query: &query,
                     scope_id: scope,
+                    source: source.into(),
+                    extension: extension.as_deref(),
+                    modified_since_unix_seconds: modified_since,
+                    modified_before_unix_seconds: modified_before,
                     limit,
                 },
             )
@@ -419,6 +455,10 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 scope_id = scope,
                 result_count = response.result_count,
                 elapsed_ms = response.elapsed_ms,
+                filters_applied = extension.is_some()
+                    || modified_since.is_some()
+                    || modified_before.is_some()
+                    || !matches!(source, SearchSourceArg::All),
                 mode = "lexical"
             );
             Ok(())

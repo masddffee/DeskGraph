@@ -1,8 +1,18 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export const SEARCH_LOCAL_COMMAND = 'search_local';
+const MAX_FILTER_UNIX_SECONDS = 9_223_372_036;
 
 export type SearchMatchedField = 'metadata_path' | 'extracted_text';
+export type SearchSourceFilter = 'all' | 'metadata_path' | 'extracted_text';
+
+export interface SearchFilters {
+  scope_id: number | null;
+  source: SearchSourceFilter;
+  extension: string | null;
+  modified_since_unix_seconds: number | null;
+  modified_before_unix_seconds: number | null;
+}
 
 export interface SearchResult {
   scope_id: number;
@@ -25,12 +35,22 @@ export interface SearchResponse {
   mode: 'lexical';
   embeddings_enabled: false;
   query: string;
+  filters: SearchFilters;
   result_count: number;
   results: SearchResult[];
   elapsed_ms: number;
 }
 
 type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+export interface SearchOptions {
+  scopeId?: number | null;
+  source?: SearchSourceFilter;
+  extension?: string | null;
+  modifiedSinceUnixSeconds?: number | null;
+  modifiedBeforeUnixSeconds?: number | null;
+  limit?: number;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -46,6 +66,36 @@ function isId(value: unknown): value is number {
 
 function isMatchedField(value: unknown): value is SearchMatchedField {
   return value === 'metadata_path' || value === 'extracted_text';
+}
+
+function isSourceFilter(value: unknown): value is SearchSourceFilter {
+  return value === 'all' || value === 'metadata_path' || value === 'extracted_text';
+}
+
+function isNullableId(value: unknown): value is number | null {
+  return value === null || isId(value);
+}
+
+function isNullableUnixSeconds(value: unknown): value is number | null {
+  return value === null || (isCount(value) && value <= MAX_FILTER_UNIX_SECONDS);
+}
+
+function parseSearchFilters(value: unknown): SearchFilters {
+  if (!isRecord(value)) throw new Error('Invalid search filter response');
+  const valid =
+    isNullableId(value.scope_id) &&
+    isSourceFilter(value.source) &&
+    (value.extension === null ||
+      (typeof value.extension === 'string' && /^[a-z0-9]{1,16}$/.test(value.extension))) &&
+    isNullableUnixSeconds(value.modified_since_unix_seconds) &&
+    isNullableUnixSeconds(value.modified_before_unix_seconds) &&
+    !(
+      value.modified_since_unix_seconds !== null &&
+      value.modified_before_unix_seconds !== null &&
+      value.modified_since_unix_seconds >= value.modified_before_unix_seconds
+    );
+  if (!valid) throw new Error('Invalid search filter response');
+  return value as unknown as SearchFilters;
 }
 
 function isExplanation(value: unknown): value is SearchResult['explanation'] {
@@ -83,6 +133,7 @@ export function parseSearchResponse(value: unknown): SearchResponse {
     throw new Error('Invalid search response');
   }
   const results = value.results.map(parseSearchResult);
+  const filters = parseSearchFilters(value.filters);
   const valid =
     value.api_version === 'deskgraph.search.v1' &&
     value.mode === 'lexical' &&
@@ -92,14 +143,25 @@ export function parseSearchResponse(value: unknown): SearchResponse {
     value.result_count === results.length &&
     isCount(value.elapsed_ms);
   if (!valid) throw new Error('Invalid search response');
-  return { ...(value as unknown as SearchResponse), results };
+  return { ...(value as unknown as SearchResponse), filters, results };
 }
 
 export async function searchLocal(
   query: string,
-  scopeId: number | null = null,
-  limit = 20,
+  options: SearchOptions = {},
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
 ): Promise<SearchResponse> {
-  return parseSearchResponse(await invokeCommand(SEARCH_LOCAL_COMMAND, { query, scopeId, limit }));
+  return parseSearchResponse(
+    await invokeCommand(SEARCH_LOCAL_COMMAND, {
+      query,
+      filters: {
+        scope_id: options.scopeId ?? null,
+        source: options.source ?? 'all',
+        extension: options.extension?.trim() || null,
+        modified_since_unix_seconds: options.modifiedSinceUnixSeconds ?? null,
+        modified_before_unix_seconds: options.modifiedBeforeUnixSeconds ?? null,
+      },
+      limit: options.limit ?? 20,
+    }),
+  );
 }

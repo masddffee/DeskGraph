@@ -13,6 +13,23 @@ pub enum SearchMatchedField {
     ExtractedText,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSourceFilter {
+    All,
+    MetadataPath,
+    ExtractedText,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchFilters {
+    pub scope_id: Option<i64>,
+    pub source: SearchSourceFilter,
+    pub extension: Option<String>,
+    pub modified_since_unix_seconds: Option<i64>,
+    pub modified_before_unix_seconds: Option<i64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearchResult {
     pub scope_id: i64,
@@ -31,6 +48,7 @@ pub struct SearchResponse {
     pub mode: SearchMode,
     pub embeddings_enabled: bool,
     pub query: String,
+    pub filters: SearchFilters,
     pub result_count: u64,
     pub results: Vec<SearchResult>,
     pub elapsed_ms: u64,
@@ -51,6 +69,13 @@ mod tests {
             mode: SearchMode::Lexical,
             embeddings_enabled: false,
             query: "專案 context".to_string(),
+            filters: SearchFilters {
+                scope_id: Some(1),
+                source: SearchSourceFilter::All,
+                extension: Some("md".to_string()),
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+            },
             result_count: 1,
             results: vec![SearchResult {
                 scope_id: 1,
@@ -72,6 +97,8 @@ mod tests {
         assert_eq!(value["api_version"], "deskgraph.search.v1");
         assert_eq!(value["mode"], "lexical");
         assert_eq!(value["embeddings_enabled"], false);
+        assert_eq!(value["filters"]["source"], "all");
+        assert_eq!(value["filters"]["extension"], "md");
         assert_eq!(value["results"][0]["matched_fields"][1], "extracted_text");
     }
 }

@@ -157,6 +157,22 @@ pub enum LexicalCandidateSource {
     ExtractedText,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LexicalSearchSource {
+    All,
+    MetadataPath,
+    ExtractedText,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LexicalSearchFilters<'a> {
+    pub scope_id: Option<i64>,
+    pub source: LexicalSearchSource,
+    pub extension: Option<&'a str>,
+    pub modified_since_unix_ns: Option<i64>,
+    pub modified_before_unix_ns: Option<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LexicalSearchCandidate {
     pub source: LexicalCandidateSource,
@@ -1513,71 +1529,127 @@ impl ManifestDatabase {
     pub fn lexical_search_candidates(
         &self,
         match_query: &str,
-        scope_id: Option<i64>,
+        filters: LexicalSearchFilters<'_>,
         per_source_candidate_limit: u32,
     ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
         if match_query.is_empty()
             || match_query.len() > MAX_SEARCH_MATCH_BYTES
             || per_source_candidate_limit == 0
             || per_source_candidate_limit > MAX_SEARCH_CANDIDATES_PER_SOURCE
+            || filters.scope_id.is_some_and(|scope_id| scope_id <= 0)
+            || filters.extension.is_some_and(|extension| {
+                extension.is_empty()
+                    || extension.len() > 16
+                    || !extension
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            })
+            || filters
+                .modified_since_unix_ns
+                .is_some_and(|timestamp| timestamp < 0)
+            || filters
+                .modified_before_unix_ns
+                .is_some_and(|timestamp| timestamp < 0)
+            || matches!(
+                (
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns
+                ),
+                (Some(since), Some(before)) if since >= before
+            )
         {
             return Err(DatabaseError::SearchInputInvalid);
         }
         let limit = i64::from(per_source_candidate_limit);
+        let maximum_sources = if filters.source == LexicalSearchSource::All {
+            2
+        } else {
+            1
+        };
         let mut candidates = Vec::with_capacity(
             usize::try_from(per_source_candidate_limit)
                 .map_err(|_| DatabaseError::SearchInputInvalid)?
-                .saturating_mul(2),
+                .saturating_mul(maximum_sources),
         );
 
-        let mut metadata_statement = self.connection.prepare(
-            "SELECT l.scope_id, l.node_id, l.id, l.display_path \
-             FROM location_search_fts \
-             JOIN locations l ON l.id = location_search_fts.rowid \
-             WHERE location_search_fts MATCH ?1 AND l.present = 1 \
-               AND (?2 IS NULL OR l.scope_id = ?2) \
-             ORDER BY location_search_fts.rank, l.id \
-             LIMIT ?3",
-        )?;
-        let metadata_rows =
-            metadata_statement.query_map(params![match_query, scope_id, limit], |row| {
-                Ok(LexicalSearchCandidate {
-                    source: LexicalCandidateSource::MetadataPath,
-                    scope_id: row.get(0)?,
-                    node_id: row.get(1)?,
-                    location_id: row.get(2)?,
-                    display_path: row.get(3)?,
-                    snippet: None,
-                })
-            })?;
-        for row in metadata_rows {
-            candidates.push(row?);
+        if filters.source != LexicalSearchSource::ExtractedText {
+            let mut metadata_statement = self.connection.prepare(
+                "SELECT l.scope_id, l.node_id, l.id, l.display_path \
+                 FROM location_search_fts \
+                 JOIN locations l ON l.id = location_search_fts.rowid \
+                 LEFT JOIN files f ON f.node_id = l.node_id \
+                 WHERE location_search_fts MATCH ?1 AND l.present = 1 \
+                   AND (?2 IS NULL OR l.scope_id = ?2) \
+                   AND (?3 IS NULL OR (f.node_id IS NOT NULL AND substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3)) \
+                   AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
+                   AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+                 ORDER BY location_search_fts.rank, l.id \
+                 LIMIT ?6",
+            )?;
+            let metadata_rows = metadata_statement.query_map(
+                params![
+                    match_query,
+                    filters.scope_id,
+                    filters.extension,
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns,
+                    limit
+                ],
+                |row| {
+                    Ok(LexicalSearchCandidate {
+                        source: LexicalCandidateSource::MetadataPath,
+                        scope_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        display_path: row.get(3)?,
+                        snippet: None,
+                    })
+                },
+            )?;
+            for row in metadata_rows {
+                candidates.push(row?);
+            }
         }
 
-        let mut content_statement = self.connection.prepare(
-            "SELECT c.scope_id, c.node_id, c.location_id, l.display_path, \
-                    snippet(content_search_fts, 0, '[', ']', '…', 24) \
-             FROM content_search_fts \
-             JOIN content_chunks c ON c.id = content_search_fts.rowid \
-             JOIN locations l ON l.id = c.location_id AND l.node_id = c.node_id \
-             WHERE content_search_fts MATCH ?1 AND c.active = 1 AND l.present = 1 \
-               AND (?2 IS NULL OR c.scope_id = ?2) \
-             ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
-             LIMIT ?3",
-        )?;
-        let content_rows =
-            content_statement.query_map(params![match_query, scope_id, limit], |row| {
-                Ok(LexicalSearchCandidate {
-                    source: LexicalCandidateSource::ExtractedText,
-                    scope_id: row.get(0)?,
-                    node_id: row.get(1)?,
-                    location_id: row.get(2)?,
-                    display_path: row.get(3)?,
-                    snippet: Some(row.get(4)?),
-                })
-            })?;
-        for row in content_rows {
-            candidates.push(row?);
+        if filters.source != LexicalSearchSource::MetadataPath {
+            let mut content_statement = self.connection.prepare(
+                "SELECT c.scope_id, c.node_id, c.location_id, l.display_path, \
+                        snippet(content_search_fts, 0, '[', ']', '…', 24) \
+                 FROM content_search_fts \
+                 JOIN content_chunks c ON c.id = content_search_fts.rowid \
+                 JOIN locations l ON l.id = c.location_id AND l.node_id = c.node_id \
+                 JOIN files f ON f.node_id = c.node_id \
+                 WHERE content_search_fts MATCH ?1 AND c.active = 1 AND l.present = 1 \
+                   AND (?2 IS NULL OR c.scope_id = ?2) \
+                   AND (?3 IS NULL OR substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3) \
+                   AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
+                   AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+                 ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
+                 LIMIT ?6",
+            )?;
+            let content_rows = content_statement.query_map(
+                params![
+                    match_query,
+                    filters.scope_id,
+                    filters.extension,
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns,
+                    limit
+                ],
+                |row| {
+                    Ok(LexicalSearchCandidate {
+                        source: LexicalCandidateSource::ExtractedText,
+                        scope_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        display_path: row.get(3)?,
+                        snippet: Some(row.get(4)?),
+                    })
+                },
+            )?;
+            for row in content_rows {
+                candidates.push(row?);
+            }
         }
 
         Ok(candidates)
@@ -1897,6 +1969,16 @@ fn migration_checksum(sql: &str) -> String {
 mod tests {
     use super::*;
 
+    fn lexical_filters(scope_id: Option<i64>) -> LexicalSearchFilters<'static> {
+        LexicalSearchFilters {
+            scope_id,
+            source: LexicalSearchSource::All,
+            extension: None,
+            modified_since_unix_ns: None,
+            modified_before_unix_ns: None,
+        }
+    }
+
     fn resumable_setup() -> (ManifestDatabase, i64, QueuedPath) {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
@@ -2096,7 +2178,7 @@ mod tests {
             ("byte_range".to_string(), Some(1), Some(3), None, None)
         );
         let candidates = database
-            .lexical_search_candidates("\"legacy\"", None, 10)
+            .lexical_search_candidates("\"legacy\"", lexical_filters(None), 10)
             .expect("search migration should backfill existing content");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source, LexicalCandidateSource::ExtractedText);
@@ -2139,15 +2221,33 @@ mod tests {
             .expect("content should publish");
 
         let metadata = database
-            .lexical_search_candidates("\"專案-context\"", Some(scope_id), 10)
+            .lexical_search_candidates("\"專案-context\"", lexical_filters(Some(scope_id)), 10)
             .expect("metadata search should pass");
         assert!(
             metadata
                 .iter()
                 .any(|candidate| candidate.source == LexicalCandidateSource::MetadataPath)
         );
+        let filtered_metadata = database
+            .lexical_search_candidates(
+                "\"專案-context\"",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    source: LexicalSearchSource::MetadataPath,
+                    extension: Some("md"),
+                    modified_since_unix_ns: Some(1),
+                    modified_before_unix_ns: Some(2),
+                },
+                10,
+            )
+            .expect("bounded metadata filters should pass");
+        assert_eq!(filtered_metadata.len(), 1);
+        assert_eq!(
+            filtered_metadata[0].source,
+            LexicalCandidateSource::MetadataPath
+        );
         let content = database
-            .lexical_search_candidates("\"專案脈絡\"", None, 10)
+            .lexical_search_candidates("\"專案脈絡\"", lexical_filters(None), 10)
             .expect("content search should pass");
         let snippet = content
             .iter()
@@ -2156,9 +2256,49 @@ mod tests {
             .expect("content result should include a bounded snippet");
         assert!(snippet.contains("專案脈絡"));
 
+        let filtered_content = database
+            .lexical_search_candidates(
+                "\"專案脈絡\"",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    source: LexicalSearchSource::ExtractedText,
+                    extension: Some("md"),
+                    modified_since_unix_ns: Some(1),
+                    modified_before_unix_ns: Some(2),
+                },
+                10,
+            )
+            .expect("bounded content filters should pass");
+        assert_eq!(filtered_content.len(), 1);
+        assert_eq!(
+            filtered_content[0].source,
+            LexicalCandidateSource::ExtractedText
+        );
+        for filters in [
+            LexicalSearchFilters {
+                source: LexicalSearchSource::MetadataPath,
+                ..lexical_filters(Some(scope_id))
+            },
+            LexicalSearchFilters {
+                extension: Some("txt"),
+                ..lexical_filters(Some(scope_id))
+            },
+            LexicalSearchFilters {
+                modified_since_unix_ns: Some(2),
+                ..lexical_filters(Some(scope_id))
+            },
+        ] {
+            assert!(
+                database
+                    .lexical_search_candidates("\"專案脈絡\"", filters, 10)
+                    .expect("bounded non-matching filter should pass")
+                    .is_empty()
+            );
+        }
+
         publish_manifest_file(&mut database, scope_id, &root, 5);
         let stale = database
-            .lexical_search_candidates("\"專案脈絡\"", None, 10)
+            .lexical_search_candidates("\"專案脈絡\"", lexical_filters(None), 10)
             .expect("stale search should pass");
         assert!(
             stale
@@ -2171,13 +2311,33 @@ mod tests {
     fn search_database_boundary_rejects_unbounded_requests() {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         assert!(matches!(
-            database.lexical_search_candidates("", None, 10),
+            database.lexical_search_candidates("", lexical_filters(None), 10),
             Err(DatabaseError::SearchInputInvalid)
         ));
         assert!(matches!(
-            database.lexical_search_candidates("\"bounded\"", None, 101),
+            database.lexical_search_candidates("\"bounded\"", lexical_filters(None), 101),
             Err(DatabaseError::SearchInputInvalid)
         ));
+        for filters in [
+            LexicalSearchFilters {
+                scope_id: Some(0),
+                ..lexical_filters(None)
+            },
+            LexicalSearchFilters {
+                extension: Some("m_d"),
+                ..lexical_filters(None)
+            },
+            LexicalSearchFilters {
+                modified_since_unix_ns: Some(2),
+                modified_before_unix_ns: Some(2),
+                ..lexical_filters(None)
+            },
+        ] {
+            assert!(matches!(
+                database.lexical_search_candidates("\"bounded\"", filters, 10),
+                Err(DatabaseError::SearchInputInvalid)
+            ));
+        }
     }
 
     #[test]

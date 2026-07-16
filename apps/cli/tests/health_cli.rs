@@ -145,6 +145,10 @@ fn search_command_returns_requested_local_context_without_logging_it() {
             "searchable context",
             "--scope",
             &scope.id.to_string(),
+            "--source",
+            "content",
+            "--extension",
+            ".MD",
         ])
         .output()
         .expect("deskgraph search should start");
@@ -155,6 +159,9 @@ fn search_command_returns_requested_local_context_without_logging_it() {
     assert_eq!(response["api_version"], "deskgraph.search.v1");
     assert_eq!(response["mode"], "lexical");
     assert_eq!(response["embeddings_enabled"], false);
+    assert_eq!(response["filters"]["scope_id"], scope.id);
+    assert_eq!(response["filters"]["source"], "extracted_text");
+    assert_eq!(response["filters"]["extension"], "md");
     assert_eq!(response["result_count"], 1);
     assert_eq!(response["results"][0]["node_id"], node_id);
     let snippet = response["results"][0]["snippet"]
