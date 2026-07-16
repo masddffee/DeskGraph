@@ -734,6 +734,7 @@ dependencies = [
  "deskgraph-retrieval",
  "deskgraph-scanner",
  "deskgraph-telemetry",
+ "deskgraph-watcher",
  "serde",
  "serde_json",
  "tempfile",
@@ -830,6 +831,17 @@ version = "0.1.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "deskgraph-watcher"
+version = "0.1.0"
+dependencies = [
+ "deskgraph-database",
+ "deskgraph-domain",
+ "deskgraph-identity",
+ "deskgraph-scanner",
+ "tempfile",
 ]
 
 [[package]]

@@ -191,3 +191,58 @@ fn search_command_returns_requested_local_context_without_logging_it() {
             .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
     );
 }
+
+#[test]
+fn watch_observe_persists_path_free_progress_without_logging_the_hint() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("authorized-watch");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let watched_path = scope_path.join("private-watch-notes.md");
+    std::fs::write(&watched_path, "private local context").expect("fixture should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "watch",
+            "observe",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+            "--scope",
+            &scope.id.to_string(),
+            "--path",
+            watched_path.to_str().expect("watch path should be UTF-8"),
+        ])
+        .output()
+        .expect("deskgraph watch observe should start");
+
+    assert!(output.status.success());
+    let progress: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(progress["api_version"], "deskgraph.watch-event.v1");
+    assert_eq!(progress["status"], "stabilizing");
+    assert_eq!(progress["scope_id"], scope.id);
+    assert!(progress.get("path").is_none());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in [
+        "private-watch-notes.md",
+        watched_path.to_str().expect("watch path should be UTF-8"),
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        "private local context",
+    ] {
+        assert!(!stdout.contains(secret));
+        assert!(!stderr.contains(secret));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}

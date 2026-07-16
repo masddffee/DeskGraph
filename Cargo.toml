@@ -9,6 +9,7 @@ members = [
   "crates/retrieval",
   "crates/scanner",
   "crates/telemetry",
+  "crates/watcher",
   "tools/search-benchmark",
 ]
 resolver = "3"

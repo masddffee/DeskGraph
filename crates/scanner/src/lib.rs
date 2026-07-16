@@ -208,7 +208,7 @@ pub fn resume_scan_job(
     database.resume_scan_job(job_id).map_err(Into::into)
 }
 
-fn validated_scope_root(
+pub fn validated_scope_root(
     database: &ManifestDatabase,
     scope_id: i64,
 ) -> Result<std::path::PathBuf, ScannerError> {

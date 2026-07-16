@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskgraph_domain::{
     AuthorizedScope, ExtractionJobProgress, ExtractionStats, ExtractionStatus, ManifestStats,
-    ScanJobProgress, ScanReport, ScanStatus,
+    ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress, WatchEventReason,
+    WatchEventStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -35,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "lexical_search",
         sql: include_str!("../../../migrations/0005_lexical_search.sql"),
     },
+    Migration {
+        version: 6,
+        name: "watch_reconciliation",
+        sql: include_str!("../../../migrations/0006_watch_reconciliation.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -42,6 +48,7 @@ const MAX_EXTRACTION_CHUNKS: usize = 65_536;
 const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_MATCH_BYTES: usize = 1024;
 const MAX_SEARCH_CANDIDATES_PER_SOURCE: u32 = 100;
+const MAX_WATCH_PATH_BYTES: usize = 64 * 1024;
 
 struct Migration {
     version: i64,
@@ -116,6 +123,59 @@ pub struct QueueEntry {
     pub path_key: String,
     pub parent_identity_key: Option<Vec<u8>>,
     pub is_root: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchSnapshotKind {
+    Missing,
+    File,
+    Folder,
+}
+
+impl WatchSnapshotKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::File => "file",
+            Self::Folder => "folder",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "missing" => Ok(Self::Missing),
+            "file" => Ok(Self::File),
+            "folder" => Ok(Self::Folder),
+            _ => Err(DatabaseError::InvalidStoredValue),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchSnapshot {
+    pub kind: WatchSnapshotKind,
+    pub size_bytes: Option<u64>,
+    pub modified_unix_ns: Option<i64>,
+    pub identity_key: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchEventRecord {
+    pub progress: WatchEventProgress,
+    pub path_raw: Vec<u8>,
+    pub path_key: String,
+    pub snapshot: WatchSnapshot,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WatchObservationWrite<'a> {
+    pub scope_id: i64,
+    pub path_raw: &'a [u8],
+    pub path_key: &'a str,
+    pub snapshot: &'a WatchSnapshot,
+    pub stable_after_unix_ms: i64,
+    pub ignored_reason: Option<WatchEventReason>,
+    pub observed_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +263,9 @@ pub enum DatabaseError {
     ExtractionRunnerLeaseLost,
     ExtractionOutputInvalid,
     SearchInputInvalid,
+    WatchEventNotFound,
+    InvalidWatchEventState,
+    WatchInputInvalid,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -229,6 +292,9 @@ impl DatabaseError {
             Self::ExtractionRunnerLeaseLost => "extraction_runner_lease_lost",
             Self::ExtractionOutputInvalid => "extraction_output_invalid",
             Self::SearchInputInvalid => "search_input_invalid",
+            Self::WatchEventNotFound => "watch_event_not_found",
+            Self::InvalidWatchEventState => "invalid_watch_event_state",
+            Self::WatchInputInvalid => "watch_input_invalid",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -497,37 +563,9 @@ impl ManifestDatabase {
         scope_id: i64,
         root: &QueuedPath,
     ) -> Result<ScanJobProgress, DatabaseError> {
-        self.scope_record(scope_id)?;
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
-        let active_jobs: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM scan_jobs WHERE scope_id = ?1 AND status IN ('running', 'interrupted')",
-            [scope_id],
-            |row| row.get(0),
-        )?;
-        if active_jobs != 0 {
-            return Err(DatabaseError::ScanJobAlreadyActive);
-        }
-        transaction.execute(
-            "INSERT INTO scan_jobs( \
-                scope_id, status, control_state, queued_entries, processed_entries, \
-                started_at_unix_ms, updated_at_unix_ms \
-             ) VALUES (?1, 'running', 'ready', 1, 0, ?2, ?2)",
-            params![scope_id, now],
-        )?;
-        let job_id = transaction.last_insert_rowid();
-        transaction.execute(
-            "INSERT INTO scan_queue( \
-                scan_id, path_raw, path_key, parent_identity_key, is_root, state \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
-            params![
-                job_id,
-                root.path_raw,
-                root.path_key,
-                root.parent_identity_key,
-                i64::from(root.is_root),
-            ],
-        )?;
+        let job_id = insert_resumable_scan_job(&transaction, scope_id, root, now)?;
         transaction.commit()?;
         self.scan_job(job_id)
     }
@@ -553,6 +591,188 @@ impl ManifestDatabase {
         )?;
         let jobs = statement.query_map([], scan_job_from_row)?;
         jobs.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn record_watch_observation_at(
+        &mut self,
+        observation: WatchObservationWrite<'_>,
+    ) -> Result<WatchEventRecord, DatabaseError> {
+        validate_watch_observation(&observation)?;
+        let transaction = self.connection.transaction()?;
+        let scope_exists: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM authorized_scopes WHERE id = ?1",
+            [observation.scope_id],
+            |row| row.get(0),
+        )?;
+        if scope_exists != 1 {
+            return Err(DatabaseError::ScopeNotFound);
+        }
+        let (status, reason) = if let Some(reason) = observation.ignored_reason {
+            ("ignored", Some(watch_reason_as_str(reason)))
+        } else {
+            ("stabilizing", None)
+        };
+        let size_bytes = observation.snapshot.size_bytes.map(to_i64).transpose()?;
+        let event_id = if observation.ignored_reason.is_none() {
+            let existing = transaction
+                .query_row(
+                    "SELECT id FROM watch_events WHERE scope_id = ?1 AND status = 'stabilizing'",
+                    [observation.scope_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(event_id) = existing {
+                transaction.execute(
+                    "UPDATE watch_events SET path_raw = ?2, path_key = ?3, observed_kind = ?4, \
+                        observed_size_bytes = ?5, observed_modified_unix_ns = ?6, \
+                        observed_identity_key = ?7, observation_count = observation_count + 1, \
+                        stable_after_unix_ms = ?8, updated_at_unix_ms = ?9 \
+                     WHERE id = ?1 AND status = 'stabilizing'",
+                    params![
+                        event_id,
+                        observation.path_raw,
+                        observation.path_key,
+                        observation.snapshot.kind.as_str(),
+                        size_bytes,
+                        observation.snapshot.modified_unix_ns,
+                        observation.snapshot.identity_key,
+                        observation.stable_after_unix_ms,
+                        observation.observed_at_unix_ms,
+                    ],
+                )?;
+                event_id
+            } else {
+                insert_watch_event(&transaction, observation, status, reason, size_bytes)?
+            }
+        } else {
+            insert_watch_event(&transaction, observation, status, reason, size_bytes)?
+        };
+        transaction.commit()?;
+        self.watch_event(event_id)
+    }
+
+    pub fn watch_event(&self, event_id: i64) -> Result<WatchEventRecord, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
+                    scan_job_id, reason, path_raw, path_key, observed_kind, observed_size_bytes, \
+                    observed_modified_unix_ns, observed_identity_key \
+                 FROM watch_events WHERE id = ?1",
+                [event_id],
+                watch_event_from_row,
+            )
+            .optional()?
+            .ok_or(DatabaseError::WatchEventNotFound)
+    }
+
+    pub fn recent_watch_events(&self) -> Result<Vec<WatchEventProgress>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
+                scan_job_id, reason, path_raw, path_key, observed_kind, observed_size_bytes, \
+                observed_modified_unix_ns, observed_identity_key \
+             FROM watch_events ORDER BY id DESC LIMIT 20",
+        )?;
+        let events = statement.query_map([], watch_event_from_row)?;
+        events
+            .map(|event| event.map(|event| event.progress))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_watch_event_ignored_at(
+        &self,
+        event_id: i64,
+        reason: WatchEventReason,
+        now_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let changed = self.connection.execute(
+            "UPDATE watch_events SET status = 'ignored', reason = ?2, updated_at_unix_ms = ?3 \
+             WHERE id = ?1 AND status = 'stabilizing'",
+            params![event_id, watch_reason_as_str(reason), now_unix_ms],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::InvalidWatchEventState);
+        }
+        Ok(self.watch_event(event_id)?.progress)
+    }
+
+    pub fn begin_watch_reconciliation_at(
+        &mut self,
+        event_id: i64,
+        root: &QueuedPath,
+        now_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let transaction = self.connection.transaction()?;
+        let (scope_id, status, stable_after): (i64, String, i64) = transaction
+            .query_row(
+                "SELECT scope_id, status, stable_after_unix_ms FROM watch_events WHERE id = ?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or(DatabaseError::WatchEventNotFound)?;
+        if status != "stabilizing" || stable_after > now_unix_ms {
+            return Err(DatabaseError::InvalidWatchEventState);
+        }
+        let scan_job_id = insert_resumable_scan_job(&transaction, scope_id, root, now_unix_ms)?;
+        let changed = transaction.execute(
+            "UPDATE watch_events SET status = 'reconciling', scan_job_id = ?2, reason = NULL, \
+                updated_at_unix_ms = ?3 WHERE id = ?1 AND status = 'stabilizing'",
+            params![event_id, scan_job_id, now_unix_ms],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::InvalidWatchEventState);
+        }
+        transaction.commit()?;
+        Ok(self.watch_event(event_id)?.progress)
+    }
+
+    pub fn complete_watch_reconciliation_at(
+        &self,
+        event_id: i64,
+        now_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let changed = self.connection.execute(
+            "UPDATE watch_events SET status = 'completed', reason = NULL, updated_at_unix_ms = ?2 \
+             WHERE id = ?1 AND status = 'reconciling' AND EXISTS ( \
+                SELECT 1 FROM scan_jobs WHERE scan_jobs.id = watch_events.scan_job_id \
+                    AND scan_jobs.status = 'completed' \
+             )",
+            params![event_id, now_unix_ms],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::InvalidWatchEventState);
+        }
+        Ok(self.watch_event(event_id)?.progress)
+    }
+
+    pub fn fail_watch_event_at(
+        &self,
+        event_id: i64,
+        reason: WatchEventReason,
+        now_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let changed = self.connection.execute(
+            "UPDATE watch_events SET status = 'failed', reason = ?2, \
+                updated_at_unix_ms = ?3 WHERE id = ?1 AND status IN ('stabilizing', 'reconciling')",
+            params![event_id, watch_reason_as_str(reason), now_unix_ms],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::InvalidWatchEventState);
+        }
+        Ok(self.watch_event(event_id)?.progress)
     }
 
     pub fn request_scan_pause(&mut self, job_id: i64) -> Result<ScanJobProgress, DatabaseError> {
@@ -1719,6 +1939,53 @@ impl ManifestDatabase {
     }
 }
 
+fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventRecord> {
+    let stored_status: String = row.get(2)?;
+    let status = match stored_status.as_str() {
+        "stabilizing" => WatchEventStatus::Stabilizing,
+        "reconciling" => WatchEventStatus::Reconciling,
+        "completed" => WatchEventStatus::Completed,
+        "ignored" => WatchEventStatus::Ignored,
+        "failed" => WatchEventStatus::Failed,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let stored_reason: Option<String> = row.get(6)?;
+    let reason = stored_reason
+        .as_deref()
+        .map(watch_reason_from_str)
+        .transpose()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let stored_kind: String = row.get(9)?;
+    let kind =
+        WatchSnapshotKind::from_db(&stored_kind).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let stored_size: Option<i64> = row.get(10)?;
+    let size_bytes = stored_size
+        .map(|value| {
+            u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, value))
+        })
+        .transpose()?;
+    Ok(WatchEventRecord {
+        progress: WatchEventProgress {
+            api_version: WatchEventProgress::API_VERSION,
+            event_id: row.get(0)?,
+            scope_id: row.get(1)?,
+            status,
+            observation_count: row_u64(row, 3)?,
+            stable_after_unix_ms: row.get(4)?,
+            scan_job_id: row.get(5)?,
+            reason,
+        },
+        path_raw: row.get(7)?,
+        path_key: row.get(8)?,
+        snapshot: WatchSnapshot {
+            kind,
+            size_bytes,
+            modified_unix_ns: row.get(11)?,
+            identity_key: row.get(12)?,
+        },
+    })
+}
+
 fn scan_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobProgress> {
     let stored_status: String = row.get(2)?;
     let control_state: String = row.get(3)?;
@@ -1744,6 +2011,140 @@ fn scan_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobProgres
         elapsed_ms: row_u64(row, 10)?,
         pause_requested: row.get::<_, i64>(11)? != 0,
     })
+}
+
+fn validate_watch_observation(
+    observation: &WatchObservationWrite<'_>,
+) -> Result<(), DatabaseError> {
+    if observation.scope_id <= 0
+        || observation.path_raw.is_empty()
+        || observation.path_raw.len() > MAX_WATCH_PATH_BYTES
+        || observation.path_key.is_empty()
+        || observation.path_key.len() > MAX_WATCH_PATH_BYTES
+        || observation.observed_at_unix_ms < 0
+        || observation.stable_after_unix_ms < observation.observed_at_unix_ms
+        || observation
+            .snapshot
+            .identity_key
+            .as_ref()
+            .is_some_and(|identity| identity.is_empty() || identity.len() > 4096)
+    {
+        return Err(DatabaseError::WatchInputInvalid);
+    }
+    let snapshot_valid = match observation.snapshot.kind {
+        WatchSnapshotKind::Missing => {
+            observation.snapshot.size_bytes.is_none()
+                && observation.snapshot.modified_unix_ns.is_none()
+                && observation.snapshot.identity_key.is_none()
+        }
+        WatchSnapshotKind::File => {
+            observation.snapshot.size_bytes.is_some() && observation.snapshot.identity_key.is_some()
+        }
+        WatchSnapshotKind::Folder => {
+            observation.snapshot.size_bytes.is_none() && observation.snapshot.identity_key.is_some()
+        }
+    };
+    if snapshot_valid {
+        Ok(())
+    } else {
+        Err(DatabaseError::WatchInputInvalid)
+    }
+}
+
+fn insert_watch_event(
+    transaction: &Transaction<'_>,
+    observation: WatchObservationWrite<'_>,
+    status: &str,
+    reason: Option<&str>,
+    size_bytes: Option<i64>,
+) -> Result<i64, DatabaseError> {
+    transaction.execute(
+        "INSERT INTO watch_events( \
+            scope_id, status, path_raw, path_key, observed_kind, observed_size_bytes, \
+            observed_modified_unix_ns, observed_identity_key, observation_count, \
+            stable_after_unix_ms, reason, created_at_unix_ms, updated_at_unix_ms \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?11)",
+        params![
+            observation.scope_id,
+            status,
+            observation.path_raw,
+            observation.path_key,
+            observation.snapshot.kind.as_str(),
+            size_bytes,
+            observation.snapshot.modified_unix_ns,
+            observation.snapshot.identity_key,
+            observation.stable_after_unix_ms,
+            reason,
+            observation.observed_at_unix_ms,
+        ],
+    )?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn insert_resumable_scan_job(
+    transaction: &Transaction<'_>,
+    scope_id: i64,
+    root: &QueuedPath,
+    now: i64,
+) -> Result<i64, DatabaseError> {
+    let scope_exists: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM authorized_scopes WHERE id = ?1",
+        [scope_id],
+        |row| row.get(0),
+    )?;
+    if scope_exists != 1 {
+        return Err(DatabaseError::ScopeNotFound);
+    }
+    let active_jobs: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM scan_jobs WHERE scope_id = ?1 AND status IN ('running', 'interrupted')",
+        [scope_id],
+        |row| row.get(0),
+    )?;
+    if active_jobs != 0 {
+        return Err(DatabaseError::ScanJobAlreadyActive);
+    }
+    transaction.execute(
+        "INSERT INTO scan_jobs( \
+            scope_id, status, control_state, queued_entries, processed_entries, \
+            started_at_unix_ms, updated_at_unix_ms \
+         ) VALUES (?1, 'running', 'ready', 1, 0, ?2, ?2)",
+        params![scope_id, now],
+    )?;
+    let job_id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO scan_queue( \
+            scan_id, path_raw, path_key, parent_identity_key, is_root, state \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+        params![
+            job_id,
+            root.path_raw,
+            root.path_key,
+            root.parent_identity_key,
+            i64::from(root.is_root),
+        ],
+    )?;
+    Ok(job_id)
+}
+
+fn watch_reason_as_str(reason: WatchEventReason) -> &'static str {
+    match reason {
+        WatchEventReason::TemporaryDownload => "temporary_download",
+        WatchEventReason::HiddenEntry => "hidden_entry",
+        WatchEventReason::UnsupportedEntry => "unsupported_entry",
+        WatchEventReason::SourceUnavailable => "source_unavailable",
+        WatchEventReason::ReconcileFailed => "reconcile_failed",
+    }
+}
+
+fn watch_reason_from_str(value: &str) -> Result<WatchEventReason, DatabaseError> {
+    match value {
+        "temporary_download" => Ok(WatchEventReason::TemporaryDownload),
+        "hidden_entry" => Ok(WatchEventReason::HiddenEntry),
+        "unsupported_entry" => Ok(WatchEventReason::UnsupportedEntry),
+        "source_unavailable" => Ok(WatchEventReason::SourceUnavailable),
+        "reconcile_failed" => Ok(WatchEventReason::ReconcileFailed),
+        _ => Err(DatabaseError::InvalidStoredValue),
+    }
 }
 
 fn extraction_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractionJobProgress> {

@@ -15,6 +15,10 @@ use deskgraph_scanner::{
     run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
+use deskgraph_watcher::{
+    WatchPolicy, advance_watch_event_at, observe_watch_path_at, recent_watch_events_at,
+    watch_event_at,
+};
 use serde::Serialize;
 use tracing::{error, info};
 
@@ -92,10 +96,47 @@ enum Command {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Ingest and reconcile bounded filesystem-change hints without trusting event paths.
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
         #[command(subcommand)]
         command: FixtureCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WatchCommand {
+    /// Persist one adapter/user-observed path after scope validation and debounce it by scope.
+    Observe {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Advance one durable event through stability validation and atomic manifest reconciliation.
+    Advance {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        event: i64,
+    },
+    /// Read one path-free durable event status.
+    Status {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        event: i64,
+    },
+    /// List the 20 most recent path-free durable event states.
+    List {
+        #[arg(long)]
+        database: PathBuf,
     },
 }
 
@@ -463,6 +504,31 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             );
             Ok(())
         }
+        Command::Watch { command } => match command {
+            WatchCommand::Observe {
+                database,
+                scope,
+                path,
+            } => {
+                let progress =
+                    observe_watch_path_at(&database, scope, &path, WatchPolicy::default())
+                        .map_err(|error| error.code())?;
+                emit_json(&progress, "watch_event_observed")
+            }
+            WatchCommand::Advance { database, event } => {
+                let progress = advance_watch_event_at(&database, event, WatchPolicy::default())
+                    .map_err(|error| error.code())?;
+                emit_json(&progress, "watch_event_advanced")
+            }
+            WatchCommand::Status { database, event } => {
+                let progress = watch_event_at(&database, event).map_err(|error| error.code())?;
+                emit_json(&progress, "watch_event_status_read")
+            }
+            WatchCommand::List { database } => {
+                let events = recent_watch_events_at(&database).map_err(|error| error.code())?;
+                emit_json(&events, "watch_event_list_read")
+            }
+        },
         Command::Fixture { command } => match command {
             FixtureCommand::Generate {
                 path,
