@@ -1,0 +1,23 @@
+# Risk Register
+
+Last reviewed: 2026-07-16
+
+Scale: likelihood and impact are `low`, `medium`, or `high`. A risk remains open until evidence closes it.
+
+| ID | Risk | Likelihood | Impact | Mitigation and required evidence | Owner phase | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| R-001 | Scope escape through symlink, junction, Unicode, or case handling | High | High | Canonical allowlist checks at every boundary; adversarial fixtures; no path-only identity | M1/M5/M7 | Open |
+| R-002 | Data loss or unrecoverable move/rename | Medium | High | Immutable plan, policy validation, durable journal, identity recheck, verification, fault injection, idempotent undo | M5 | Open |
+| R-003 | Cross-volume or removable-drive interruption leaves duplicate/partial state | High | High | Copy-verify-commit state machine, resumable cleanup policy without permanent deletion, process-kill tests | M5 | Open |
+| R-004 | Watcher event storms create duplicates or process unstable downloads | High | High | Debounce/reconcile, stability windows, temp suffix exclusions, persistent jobs, identity-based rescan | M6 | Open |
+| R-005 | OCR/Office/PDF input causes resource exhaustion or code execution | Medium | High | No macro/attachment execution; strict bytes/pages/time limits; isolation; corrupt fixtures | M2 | Open |
+| R-006 | Optional AI becomes a hidden hard dependency | Medium | High | Deterministic fallback as a release gate; providers lazy/unloadable; no key/model in core E2E | M0/M3/M9 | Open |
+| R-007 | 8 GB devices exceed memory/CPU/thermal budgets | High | High | Bounded queues, one provider resident, low-memory mode, 10k/100k measured reports | M2/M3/M6/M9 | Open |
+| R-008 | Inferred relations are opaque or cause unsafe confidence | Medium | High | Required provenance, confidence, timestamps, corrections, low-confidence suggestions only | M4/M5 | Open |
+| R-009 | MCP exposes out-of-scope or excessive local content | Medium | High | Identity-based parameters, scope middleware, minimal fields, local audit, injection tests, no writes | M7 | Open |
+| R-010 | Dependency/model/updater supply-chain compromise | Medium | High | Source/license/maintenance audit, lockfiles, checksums, pinned Actions, SBOM, signed updater metadata | All/M9 | Open |
+| R-011 | Platform behavior diverges across macOS Intel/Arm, Windows, and Linux | High | High | CI matrix, platform fixtures, clean-machine smoke, separate platform evidence | M0–M9 | Open |
+| R-012 | Planning status overstates unverified features | Medium | High | Evidence-linked status vocabulary; acceptance checklist; no “complete” from docs alone | All | Mitigated by process |
+| R-013 | Invalid GitHub credentials delay Issues, CI, and release evidence | High | Medium | Continue local work; exact re-auth/remote steps in external actions; never claim remote completion | M0/M9 | Open |
+| R-014 | Packaging/signing credentials are unavailable | High | Medium | Produce unsigned internal artifacts and exact protected-secret instructions; label honestly | M9 | Open |
+| R-015 | Missing master orchestrator file causes execution drift | Medium | Medium | Treat accepted ADRs + current planning + phase prompts as SSOT; maintain task graph/status | M0 | Open |

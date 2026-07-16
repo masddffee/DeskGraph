@@ -1,0 +1,23 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Local graph analysis artifacts
+graphify-out/
+
+# Rust build artifacts
+target/
+
+# JavaScript dependencies and build output
+node_modules/
+apps/desktop/dist/
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# IDE settings
+.idea/
+.vscode/
