@@ -733,6 +733,24 @@ impl ManifestDatabase {
         self.scan_job(job_id)
     }
 
+    pub fn record_scan_runner_elapsed(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+        elapsed_ms: u64,
+    ) -> Result<ScanJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        ensure_owned_runner(&transaction, job_id, runner_token, now)?;
+        transaction.execute(
+            "UPDATE scan_jobs SET elapsed_ms = elapsed_ms + ?3, updated_at_unix_ms = ?4 \
+             WHERE id = ?1 AND runner_token = ?2",
+            params![job_id, runner_token, to_i64(elapsed_ms)?, now],
+        )?;
+        transaction.commit()?;
+        self.scan_job(job_id)
+    }
+
     pub fn finalize_resumable_scan_job(
         &mut self,
         job_id: i64,
@@ -1228,6 +1246,10 @@ mod tests {
             .expect("pause should persist");
         assert_eq!(requested.status, ScanStatus::Running);
         assert!(requested.pause_requested);
+        let timed = database
+            .record_scan_runner_elapsed(job.job_id, "runner", 17)
+            .expect("active time should persist");
+        assert_eq!(timed.elapsed_ms, 17);
 
         let paused = database
             .release_scan_job(job.job_id, "runner")

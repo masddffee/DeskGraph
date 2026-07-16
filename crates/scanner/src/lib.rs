@@ -131,29 +131,31 @@ pub fn run_scan_job_batch(
     let canonical_root = validated_scope_root(database, current.scope_id)?;
     let runner_token = runner_token()?;
     database.claim_scan_job(job_id, &runner_token, RUNNER_LEASE_MS)?;
+    let batch_started = Instant::now();
 
     for _ in 0..batch_size {
         let progress = database.scan_job(job_id)?;
         if progress.pause_requested {
+            persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
             return database
                 .release_scan_job(job_id, &runner_token)
                 .map_err(Into::into);
         }
         let Some(entry) = database.next_scan_queue_entry(job_id, &runner_token, RUNNER_LEASE_MS)?
         else {
+            persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
             return database
                 .finalize_resumable_scan_job(job_id, &runner_token)
                 .map_err(Into::into);
         };
-        let started = Instant::now();
         let processed = match process_queue_entry(&canonical_root, &entry) {
             Ok(processed) => processed,
             Err(error) => {
+                persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
                 database.fail_resumable_scan_job(job_id, &runner_token)?;
                 return Err(error);
             }
         };
-        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         database.stage_scan_queue_entry(
             job_id,
             &runner_token,
@@ -162,11 +164,12 @@ pub fn run_scan_job_batch(
             &processed.children,
             &processed.issues,
             processed.skipped_entries,
-            elapsed_ms,
+            0,
             RUNNER_LEASE_MS,
         )?;
     }
 
+    persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
     database
         .release_scan_job(job_id, &runner_token)
         .map_err(Into::into)
@@ -397,6 +400,17 @@ fn runner_token() -> Result<String, ScannerError> {
         .map_err(|_| ScannerError::ScanFailed)?
         .as_nanos();
     Ok(format!("{}:{nanos}", std::process::id()))
+}
+
+fn persist_batch_elapsed(
+    database: &mut ManifestDatabase,
+    job_id: i64,
+    runner_token: &str,
+    started: Instant,
+) -> Result<(), ScannerError> {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    database.record_scan_runner_elapsed(job_id, runner_token, elapsed_ms)?;
+    Ok(())
 }
 
 fn is_hidden(name: Option<&OsStr>) -> bool {
