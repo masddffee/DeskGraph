@@ -1,0 +1,64 @@
+{
+  "api_version": "deskgraph.search-benchmark.v1",
+  "measured_at": "2026-07-16",
+  "host": {
+    "os": "macOS 26.5.1",
+    "architecture": "arm64",
+    "memory_bytes": null,
+    "memory_note": "sandbox did not expose hw.memsize; this is not 8 GB evidence"
+  },
+  "toolchain": {
+    "rustc": "1.97.0 (2d8144b78 2026-07-07)",
+    "cargo": "1.97.0 (c980f4866 2026-06-30)",
+    "profile": "release"
+  },
+  "command": "cargo run -p deskgraph-search-benchmark --release --offline -- --database /private/tmp/deskgraph-search-benchmark-v1.sqlite3 --documents 10000 --iterations 50",
+  "corpus": "synthetic_traditional_chinese_english_v1",
+  "documents": 10000,
+  "content_bytes": 1300000,
+  "fixture_elapsed_ms": 1182,
+  "database_bytes": 11993088,
+  "fts_index_bytes": 5181440,
+  "query_reports": [
+    {
+      "case": "traditional_chinese_content",
+      "result_count": 20,
+      "iterations": 50,
+      "p50_us": 5595,
+      "p95_us": 5859,
+      "max_us": 6183
+    },
+    {
+      "case": "english_content",
+      "result_count": 20,
+      "iterations": 50,
+      "p50_us": 10952,
+      "p95_us": 25565,
+      "max_us": 43680
+    },
+    {
+      "case": "exact_filename",
+      "result_count": 1,
+      "iterations": 50,
+      "p50_us": 2007,
+      "p95_us": 2189,
+      "max_us": 2211
+    },
+    {
+      "case": "missing_term",
+      "result_count": 0,
+      "iterations": 50,
+      "p50_us": 51,
+      "p95_us": 58,
+      "max_us": 118
+    }
+  ],
+  "limitations": [
+    "single local macOS arm64 run",
+    "synthetic corpus only",
+    "no peak RSS or 8 GB hardware evidence",
+    "no macOS Intel, Windows, or Linux evidence",
+    "no scan, extraction, OCR, embedding, UI, concurrency, or thermal measurement",
+    "not a release SLO"
+  ]
+}
