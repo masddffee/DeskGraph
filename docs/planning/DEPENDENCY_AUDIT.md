@@ -20,7 +20,7 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 | Vite / React plugin | Build | 8.1.4 / 6.0.3 | `vite.dev`, npm, `vitejs` repositories | Local production build passes on Node 24.12.0 | MIT | Development/build only; frozen resolution in `pnpm-lock.yaml` |
 | TypeScript | Build | 6.0.3 | `typescriptlang.org`, npm, `microsoft/TypeScript` | Strict typecheck passes | Apache-2.0 | Pinned exactly because TypeScript 7.0.2 exceeded typescript-eslint's declared peer range |
 | ESLint / typescript-eslint | Build | 10.7.0 / 8.64.0 | `eslint.org`, `typescript-eslint.io`, npm | `pnpm peers check` and zero-warning lint pass | MIT | Development only; strict peers are enabled and cannot be silently auto-installed |
-| Vitest | Test | 4.1.10 | `vitest.dev`, npm, `vitest-dev/vitest` | Four frontend contract tests pass locally | MIT | Node environment only; no browser emulator dependency |
+| Vitest | Test | 4.1.10 | `vitest.dev`, npm, `vitest-dev/vitest` | Seven frontend contract tests pass locally | MIT | Node environment only; no browser emulator dependency |
 | pnpm | Build | 11.10.0 | `pnpm.io`, npm, `pnpm/pnpm` | Corepack activation, lockfile, frozen-compatible install, and peer check pass | MIT | Exact `packageManager`; strict peers and supply-chain policy check enabled |
 | Prettier | Build | 3.9.5 | `prettier.io`, npm, `prettier/prettier` | Repository formatting check passes | MIT | Development only; planning/prompts are excluded to preserve the supplied SSOT text |
 | cargo-audit | Audit tool, not shipped | 0.22.2 | crates.io, `docs.rs/cargo-audit`, `rustsec/rustsec` | RustSec official project; requires Rust 1.88+; local audit executed | Apache-2.0 OR MIT | Installed outside the project and not added to the application dependency graph |
@@ -59,7 +59,7 @@ Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2
 
 - Execute frozen installs and all checks in remote macOS, Windows, and Linux CI.
 - Revisit native transitive dependencies, redistribution notices, and R-016 when packaging begins.
-- Re-run the Rust dependency and license audit after the M1 lockfile changes.
+- Re-run the Rust dependency and license audit after every future lockfile change.
 - Audit every OCR, embedding, vector, model, archive, PDF, and Office dependency separately before M2/M3/M9 adoption.
 
 ## Rejected or deferred at M0

@@ -8,9 +8,9 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 ## Current state
 
-The repository is implementing M1 Manifest Graph. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
+The repository is implementing M1 Manifest Graph. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
-Content extraction, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Persistent scan pause/resume and complete cross-platform runtime evidence are also still open, so this is not a public v0.1 release.
+Content extraction, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Platform-sensitive exclusion hardening, peak-memory evidence, complete cross-platform runtime evidence, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -53,6 +53,19 @@ cargo run -p deskgraph-cli -- manifest stats --database ./deskgraph-dev.sqlite3
 ```
 
 `scope add` canonicalizes and stores the explicit local boundary. It does not scan. `scan start` reads names and filesystem metadata within that boundary but does not open file contents. Scope paths are returned only by explicit scope-management commands and UI; structured logs omit them.
+
+For a durable job that can be inspected, paused, resumed, or advanced in bounded batches:
+
+```bash
+cargo run -p deskgraph-cli -- scan create --database ./deskgraph-dev.sqlite3 --scope 1
+cargo run -p deskgraph-cli -- scan status --database ./deskgraph-dev.sqlite3 --job 1
+cargo run -p deskgraph-cli -- scan advance --database ./deskgraph-dev.sqlite3 --job 1 --batch-size 256
+cargo run -p deskgraph-cli -- scan pause --database ./deskgraph-dev.sqlite3 --job 1
+cargo run -p deskgraph-cli -- scan resume --database ./deskgraph-dev.sqlite3 --job 1
+cargo run -p deskgraph-cli -- scan run --database ./deskgraph-dev.sqlite3 --job 1
+```
+
+Scan observations stay in job-scoped staging while work is running or paused. The visible manifest is replaced only after the complete job publishes in one SQLite transaction.
 
 Start the desktop application:
 

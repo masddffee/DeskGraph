@@ -8,14 +8,14 @@ Status vocabulary: `not started`, `in progress`, `blocked`, `verified locally`, 
 
 M1 Manifest Graph — **in progress**. M0 Repository Foundation remains open only for external remote CI evidence.
 
-The first M1 vertical slice now runs end to end: an explicit folder is canonicalized and persisted as an authorization boundary; a metadata-only scanner records stable File/Folder nodes and `located_in` relations in a checksummed bundled SQLite schema; CLI and Tauri/React expose scope management, scan execution, and graph statistics. Local adversarial and 10,000-file evidence passes. M1 is not complete because persistent pause/resume, permission-denied and complete Windows runtime fixtures, peak-memory evidence, and remote CI remain open.
+The M1 vertical slice now runs end to end: an explicit folder is canonicalized and persisted as an authorization boundary; a metadata-only scanner records stable File/Folder nodes and `located_in` relations in a checksummed bundled SQLite schema; durable queue/staging tables preserve progress across process exit; CLI and Tauri/React expose create, progress, pause, resume, interrupted recovery, and graph statistics. Local adversarial, permission-denied, crash-reopen, and 10,000-file evidence passes. M1 is not complete because platform-sensitive exclusions, complete Windows runtime fixtures, peak-memory evidence, remote CI, and a live smoke of the new paused/resume UI remain open.
 
 ## Milestones
 
 | Milestone                     | Status      | Current evidence                                                           | Next gate                                             |
 | ----------------------------- | ----------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
 | M0 Repository Foundation      | In progress | Local foundation slice, governance, lockfiles, checks, CLI, and desktop smoke verified | Green macOS/Windows/Linux CI matrix |
-| M1 Manifest Graph             | In progress | Explicit scope → canonical policy → SQLite manifest → metadata scan → CLI/desktop stats; 10k and adversarial local tests | Persistent pause/resume, permission fixture, cross-platform runtime CI |
+| M1 Manifest Graph             | In progress | Explicit scope → durable bounded queue/staging → atomic SQLite manifest publish → CLI/desktop progress and controls; 10k, permission, recovery, and adversarial local tests | Platform-sensitive exclusions, peak RSS, cross-platform runtime CI |
 | M2 Content Intelligence       | Not started | Planning only                                                              | Extractor contract and fixtures                       |
 | M3 Hybrid Retrieval           | Not started | Planning only                                                              | FTS fallback, vector adapter, fusion, evaluation      |
 | M4 Project Graph              | Not started | Planning only                                                              | Explainable project relations and corrections         |
@@ -71,15 +71,15 @@ The first M1 vertical slice now runs end to end: an explicit folder is canonical
 | File/Folder nodes and `located_in` relations | Verified locally | Transactional observation upsert and active relation reconciliation |
 | Rescan idempotency | Verified locally | Unit fixture and three 10k scans retain exactly 10,101 active nodes/locations |
 | Move preserves identity where metadata permits | Verified locally on Unix | Rename and hard-link fixture retains node ID; Windows runtime fixture pending |
-| Permission failures are recorded | Implemented, fixture pending | Bounded `directory_read_denied`/metadata issue codes exist; deterministic cross-platform test remains |
-| Persistent progress/pause/resume | Not started | Scan jobs persist start/completion/failure only; no queue or pause API yet |
-| CLI graph statistics | Verified locally | `manifest`, `scope`, and `scan` commands execute the complete slice |
-| Desktop graph statistics and usable scope UI | Verified locally | Rust IPC + validated TypeScript contracts + production build + live accessibility/screenshot smoke |
+| Permission failures are recorded | Verified locally on Unix; Windows runtime pending | Restricted-directory fixture records `permission_denied` without failing the scan; issue remains staged until atomic publish |
+| Persistent progress/pause/resume | Verified locally | Durable path queue, job-scoped staging, lease recovery, pause handshake, scope revalidation, replay after database reopen, and atomic publish tests pass |
+| CLI graph statistics | Verified locally | `scan create/run/advance/status/list/pause/resume` expose validated progress without logging paths; foreground `scan start` remains available |
+| Desktop graph statistics and usable scope UI | Verified locally except latest live smoke | Narrow Rust IPC, validated TypeScript contracts, backend-derived progress polling, paused/interrupted states, production build; live window smoke for the new controls blocked by local tool quota |
 | Synthetic 10k generator and benchmark | Verified locally for timing/counts | 10k/100 folder generator; 1.366 s initial and 1.260 s rescan scanner time; peak RSS pending |
 
 ## Next handoff
 
-Continue `prompts/02_MANIFEST_GRAPH.md`, not Prompt 03. The next coherent slice is a persistent directory queue with progress, pause, resume, and interrupted-job recovery, followed by deterministic permission-denied/platform fixtures. M0 remote CI evidence can be attached independently when the GitHub repository exists.
+Continue `prompts/02_MANIFEST_GRAPH.md`, not Prompt 03. The next coherent slice is the platform exclusion hardening: protected-system descendants, Windows hidden/system attributes, platform preset boundaries, and adversarial fixtures. Then capture peak RSS and attach macOS/Windows/Linux runtime CI evidence when those environments exist.
 
 ## Verification evidence — 2026-07-16
 
@@ -108,3 +108,15 @@ Continue `prompts/02_MANIFEST_GRAPH.md`, not Prompt 03. The next coherent slice 
 - CLI end-to-end smoke — initialize manifest, authorize explicit temp scope, scan, and stats all returned validated JSON without path fields in logs.
 - 10k benchmark — 10,000 files + 101 folders, 0 issues; initial scanner 1.366 s, rescan 1.260 s; 10,101 active nodes after repeated scans. Peak RSS not captured.
 - `cargo audit --no-fetch` — zero known vulnerabilities and the existing 17 tracked warnings.
+
+## M1 durable-scan verification evidence — 2026-07-16
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` — passed.
+- `cargo test --workspace --all-features --offline` — 34 passed, 0 failed.
+- Durable database tests — active pause request is acknowledged between entries; expired `processing` work becomes `interrupted` on database reopen and replays after explicit resume; staged observations remain invisible until one final transaction.
+- Scanner tests — bounded batch progress, pause without partial publish, resume to completion, pre-resume scope revalidation, and Unix `permission_denied` isolation pass.
+- `pnpm --dir apps/desktop test` — 7 passed, 0 failed; all scan job states and narrow IPC argument contracts validated.
+- `pnpm --dir apps/desktop lint`, `typecheck`, and `build` — passed.
+- `pnpm tauri build --no-bundle` with the pinned Cargo path — release build passed and produced `target/release/deskgraph-desktop`.
+- Live Tauri smoke for the new paused/resume controls — not run; Computer Use launch approval was rejected because the local tool quota was exhausted. The prior M1 manifest UI live smoke remains valid only for the older scope/scan/statistics screen.

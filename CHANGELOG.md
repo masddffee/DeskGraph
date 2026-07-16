@@ -11,3 +11,5 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 - M1 bundled SQLite manifest with checksummed migration, stable file identity, canonical scope policy, and metadata-only scanner.
 - CLI commands and desktop UI for explicit folder authorization, initial scan, and manifest graph statistics.
 - Synthetic 10,000-file fixture generator and local idempotent-scan benchmark.
+- Durable bounded scan queue, staged atomic manifest publishing, pause/resume, lease-based crash recovery, and replay after process interruption.
+- CLI and desktop progress controls with paused and interrupted states derived from the local SQLite source of truth.
