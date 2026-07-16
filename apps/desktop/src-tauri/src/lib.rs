@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
     AuthorizedScope, ExtractionJobProgress, ExtractionStats, HealthReport, ManifestStats,
-    ScanJobProgress, collect_health_with_manifest,
+    ScanJobProgress, SearchResponse, collect_health_with_manifest,
 };
 use deskgraph_extractors::{
     extraction_stats_at as read_extraction_stats_at,
     recent_extraction_jobs_at as read_recent_extraction_jobs_at,
 };
+use deskgraph_retrieval::{SearchRequest, search_at as run_search_at};
 use deskgraph_scanner::{
     authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
 };
@@ -104,6 +105,25 @@ fn recent_content_extractions(
 }
 
 #[tauri::command]
+fn search_local(
+    state: State<'_, ManifestState>,
+    query: String,
+    scope_id: Option<i64>,
+    limit: Option<u32>,
+) -> Result<SearchResponse, String> {
+    let response =
+        search_local_at(&state.database_path, &query, scope_id, limit).map_err(str::to_string)?;
+    info!(
+        event = "local_search_completed",
+        scope_id = scope_id,
+        result_count = response.result_count,
+        elapsed_ms = response.elapsed_ms,
+        mode = "lexical"
+    );
+    Ok(response)
+}
+
+#[tauri::command]
 fn pause_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
@@ -183,6 +203,23 @@ fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgres
     read_recent_extraction_jobs_at(path).map_err(|error| error.code())
 }
 
+fn search_local_at(
+    path: &Path,
+    query: &str,
+    scope_id: Option<i64>,
+    limit: Option<u32>,
+) -> Result<SearchResponse, &'static str> {
+    run_search_at(
+        path,
+        SearchRequest {
+            query,
+            scope_id,
+            limit,
+        },
+    )
+    .map_err(|error| error.code())
+}
+
 fn pause_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
     pause_scan_job(&mut database, job_id).map_err(|error| error.code())
@@ -236,6 +273,7 @@ pub fn run() {
             recent_scan_jobs,
             content_extraction_stats,
             recent_content_extractions,
+            search_local,
             pause_manifest_scan,
             resume_manifest_scan
         ])
@@ -356,5 +394,50 @@ mod tests {
         assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
         assert!(payload.contains("deskgraph.extraction-stats.v1"));
         assert!(payload.contains("\"status\":\"completed\""));
+    }
+
+    #[test]
+    fn search_helper_returns_bounded_user_requested_context() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-search");
+        let source_path = scope_path.join("專案-context.md");
+        let private_text = "Traditional Chinese 專案脈絡 and English context";
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(&source_path, private_text).expect("file should create");
+
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope =
+            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let database = ManifestDatabase::open(&database_path).expect("database should open");
+        let node_id = database
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("source node should exist");
+        drop(database);
+        let job = create_extraction_job_at(&database_path, scope.id, node_id)
+            .expect("extraction should create");
+        run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
+            .expect("extraction should complete");
+
+        let response = search_local_at(&database_path, "專案脈絡", Some(scope.id), Some(10))
+            .expect("search should pass");
+        assert_eq!(response.result_count, 1);
+        assert_eq!(response.results[0].node_id, node_id);
+        assert_eq!(response.results[0].explanation, "extracted_text_substring");
+        assert!(
+            response.results[0]
+                .snippet
+                .as_deref()
+                .unwrap_or_default()
+                .contains("專案脈絡")
+        );
     }
 }

@@ -9,6 +9,7 @@ use deskgraph_extractors::{
     extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
+use deskgraph_retrieval::{SearchRequest, search_at};
 use deskgraph_scanner::{
     authorize_scope, comparison_key, create_scan_job, pause_scan_job, resume_scan_job,
     run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
@@ -51,6 +52,17 @@ enum Command {
     Extract {
         #[command(subcommand)]
         command: ExtractCommand,
+    },
+    /// Search current local metadata and extracted text without embeddings.
+    Search {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        scope: Option<i64>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
@@ -386,6 +398,31 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 emit_json(&stats, "content_extraction_stats_read")
             }
         },
+        Command::Search {
+            database,
+            query,
+            scope,
+            limit,
+        } => {
+            let response = search_at(
+                &database,
+                SearchRequest {
+                    query: &query,
+                    scope_id: scope,
+                    limit,
+                },
+            )
+            .map_err(|error| error.code())?;
+            print_json(&response)?;
+            info!(
+                event = "local_search_completed",
+                scope_id = scope,
+                result_count = response.result_count,
+                elapsed_ms = response.elapsed_ms,
+                mode = "lexical"
+            );
+            Ok(())
+        }
         Command::Fixture { command } => match command {
             FixtureCommand::Generate {
                 path,

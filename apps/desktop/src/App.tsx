@@ -21,6 +21,7 @@ import {
   type ManifestStats,
   type ScanJobProgress,
 } from './manifest';
+import { searchLocal, type SearchResponse, type SearchResult } from './search';
 
 type ReadyState = {
   kind: 'ready';
@@ -36,6 +37,11 @@ type ActionState =
   | { kind: 'idle' }
   | { kind: 'working'; label: string }
   | { kind: 'success'; message: string }
+  | { kind: 'error'; message: string };
+type SearchState =
+  | { kind: 'idle' }
+  | { kind: 'working' }
+  | { kind: 'ready'; response: SearchResponse }
   | { kind: 'error'; message: string };
 
 interface StatusRowProps {
@@ -97,11 +103,26 @@ function extractionStatusLabel(job: ExtractionJobProgress): string {
   return 'File skipped safely';
 }
 
+function searchExplanation(result: SearchResult): string {
+  if (result.explanation === 'exact_filename_and_extracted_text') {
+    return 'Exact filename + extracted text';
+  }
+  if (result.explanation === 'exact_filename') return 'Exact filename';
+  if (result.explanation === 'path_and_extracted_text_substring') {
+    return 'Path + extracted text';
+  }
+  if (result.explanation === 'path_substring') return 'Filename or path';
+  return 'Extracted text';
+}
+
 export default function App() {
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
   const [scopePath, setScopePath] = useState('');
   const [action, setAction] = useState<ActionState>({ kind: 'idle' });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchScopeId, setSearchScopeId] = useState<number | null>(null);
+  const [searchState, setSearchState] = useState<SearchState>({ kind: 'idle' });
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
@@ -272,6 +293,27 @@ export default function App() {
     }
   }
 
+  async function submitSearch() {
+    const query = searchQuery.trim();
+    if ([...query].length < 3) {
+      setSearchState({
+        kind: 'error',
+        message: 'Enter at least 3 characters to keep local search bounded.',
+      });
+      return;
+    }
+    setSearchState({ kind: 'working' });
+    try {
+      const response = await searchLocal(query, searchScopeId);
+      setSearchState({ kind: 'ready', response });
+    } catch {
+      setSearchState({
+        kind: 'error',
+        message: 'Search stopped safely. Try a shorter query or refresh the local manifest.',
+      });
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="hero">
@@ -349,6 +391,97 @@ export default function App() {
               <Metric label="Locations" value={state.manifest.active_location_count} />
               <Metric label="Scan issues" value={state.manifest.issue_count} />
             </div>
+          </section>
+
+          <section className="panel panel--search" aria-labelledby="search-title">
+            <div className="panel-heading panel-heading--wrap">
+              <div>
+                <p className="panel-kicker">Deterministic local search</p>
+                <h2 id="search-title">Find filenames and extracted text</h2>
+                <p>
+                  Traditional Chinese and English queries stay inside SQLite. Embeddings are off;
+                  every result says which local field matched.
+                </p>
+              </div>
+              <span className="connected-indicator">Lexical · offline</span>
+            </div>
+            <form
+              className="search-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submitSearch();
+              }}
+            >
+              <label htmlFor="search-query">Search local context</label>
+              <div className="search-form-row">
+                <input
+                  id="search-query"
+                  type="search"
+                  value={searchQuery}
+                  onChange={(event) => setSearchQuery(event.target.value)}
+                  placeholder="專案脈絡 or project context"
+                  autoComplete="off"
+                  spellCheck="false"
+                  maxLength={256}
+                />
+                <select
+                  aria-label="Search folder scope"
+                  value={searchScopeId ?? ''}
+                  onChange={(event) =>
+                    setSearchScopeId(event.target.value ? Number(event.target.value) : null)
+                  }
+                >
+                  <option value="">All authorized folders</option>
+                  {state.scopes.map((scope) => (
+                    <option key={scope.id} value={scope.id}>
+                      Authorized scope {scope.id}
+                    </option>
+                  ))}
+                </select>
+                <button type="submit" disabled={searchState.kind === 'working'}>
+                  {searchState.kind === 'working' ? 'Searching…' : 'Search'}
+                </button>
+              </div>
+            </form>
+
+            {searchState.kind === 'error' ? (
+              <p className="search-message search-message--error" role="alert">
+                {searchState.message}
+              </p>
+            ) : null}
+            {searchState.kind === 'ready' && searchState.response.results.length === 0 ? (
+              <p className="search-message" role="status">
+                No current path or active extracted text matched “{searchState.response.query}”.
+              </p>
+            ) : null}
+            {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
+              <div className="search-summary" role="status">
+                <span>
+                  {searchState.response.result_count.toLocaleString()} results ·{' '}
+                  {searchState.response.elapsed_ms.toLocaleString()} ms
+                </span>
+                <span>Ranked by exact filename, path, then active extracted text</span>
+              </div>
+            ) : null}
+            {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
+              <ol className="search-results">
+                {searchState.response.results.map((result) => (
+                  <li key={`${result.node_id}:${result.location_id}`}>
+                    <div className="search-result-heading">
+                      <span className="search-rank">#{result.lexical_rank}</span>
+                      <strong>{searchExplanation(result)}</strong>
+                    </div>
+                    <code>{result.display_path}</code>
+                    {result.snippet ? (
+                      <p className="search-snippet">
+                        <span>Untrusted local text</span>
+                        {result.snippet}
+                      </p>
+                    ) : null}
+                  </li>
+                ))}
+              </ol>
+            ) : null}
           </section>
 
           <section className="panel panel--content" aria-labelledby="content-title">
