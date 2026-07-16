@@ -1,6 +1,6 @@
 # DeskGraph
 
-> **Pre-release foundation — not ready for personal file indexing.**
+> **Pre-release M1 — use only with test folders and keep backups.**
 
 **Graphify your computer.**
 
@@ -8,7 +8,9 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 ## Current state
 
-The repository is implementing M0 Repository Foundation. The first runnable slice is a privacy-safe health check shared by the CLI and Tauri desktop shell. Scanning, extraction, search, organization, undo, and MCP are planned but **not shipped**.
+The repository is implementing M1 Manifest Graph. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
+
+Content extraction, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Persistent scan pause/resume and complete cross-platform runtime evidence are also still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -41,13 +43,24 @@ Run the privacy-safe CLI health check:
 cargo run -p deskgraph-cli -- health
 ```
 
+Run the M1 metadata-only CLI slice with a new local manifest and a test folder you explicitly choose:
+
+```bash
+cargo run -p deskgraph-cli -- manifest init --database ./deskgraph-dev.sqlite3
+cargo run -p deskgraph-cli -- scope add --database ./deskgraph-dev.sqlite3 --path /absolute/path/to/test-folder
+cargo run -p deskgraph-cli -- scan start --database ./deskgraph-dev.sqlite3 --scope 1
+cargo run -p deskgraph-cli -- manifest stats --database ./deskgraph-dev.sqlite3
+```
+
+`scope add` canonicalizes and stores the explicit local boundary. It does not scan. `scan start` reads names and filesystem metadata within that boundary but does not open file contents. Scope paths are returned only by explicit scope-management commands and UI; structured logs omit them.
+
 Start the desktop application:
 
 ```bash
 pnpm desktop:dev
 ```
 
-The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations.
+The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows authorized paths only in its explicit scope-management panel.
 
 ## Development verification
 

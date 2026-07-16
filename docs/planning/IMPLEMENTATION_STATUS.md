@@ -6,16 +6,16 @@ Status vocabulary: `not started`, `in progress`, `blocked`, `verified locally`, 
 
 ## Current milestone
 
-M0 Repository Foundation — **in progress**.
+M1 Manifest Graph — **in progress**. M0 Repository Foundation remains open only for external remote CI evidence.
 
-The repository began with planning documents only. The shared privacy-safe health report now runs through the Rust CLI and the complete Tauri IPC → React desktop path. Local M0 implementation is verified; M0 remains in progress because the required macOS/Windows/Linux remote CI evidence does not exist yet.
+The first M1 vertical slice now runs end to end: an explicit folder is canonicalized and persisted as an authorization boundary; a metadata-only scanner records stable File/Folder nodes and `located_in` relations in a checksummed bundled SQLite schema; CLI and Tauri/React expose scope management, scan execution, and graph statistics. Local adversarial and 10,000-file evidence passes. M1 is not complete because persistent pause/resume, permission-denied and complete Windows runtime fixtures, peak-memory evidence, and remote CI remain open.
 
 ## Milestones
 
 | Milestone                     | Status      | Current evidence                                                           | Next gate                                             |
 | ----------------------------- | ----------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
 | M0 Repository Foundation      | In progress | Local foundation slice, governance, lockfiles, checks, CLI, and desktop smoke verified | Green macOS/Windows/Linux CI matrix |
-| M1 Manifest Graph             | Not started | Planning only                                                              | Start `prompts/02_MANIFEST_GRAPH.md` after M0 handoff |
+| M1 Manifest Graph             | In progress | Explicit scope → canonical policy → SQLite manifest → metadata scan → CLI/desktop stats; 10k and adversarial local tests | Persistent pause/resume, permission fixture, cross-platform runtime CI |
 | M2 Content Intelligence       | Not started | Planning only                                                              | Extractor contract and fixtures                       |
 | M3 Hybrid Retrieval           | Not started | Planning only                                                              | FTS fallback, vector adapter, fusion, evaluation      |
 | M4 Project Graph              | Not started | Planning only                                                              | Explainable project relations and corrections         |
@@ -56,10 +56,30 @@ The repository began with planning documents only. The shared privacy-safe healt
 - No GitHub repository/remote and invalid GitHub authentication: remote Issues, Releases, and CI results do not exist.
 - Signing, notarization, clean Windows/macOS VM validation, and launch accounts are external later-stage requirements.
 - RustSec reports zero known vulnerabilities but 17 warnings in the all-target lockfile, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; tracked as R-016.
+- Windows file-identity adapter compiles for `x86_64-pc-windows-msvc`, but a complete scanner cross-check cannot be produced on this macOS host because bundled SQLite needs a Windows C/MSVC toolchain. Remote Windows CI remains required.
+- Local 10k timing and idempotency are measured, but peak RSS sampling was denied by the restricted runner and its escalation reviewer was unavailable due tool quota. This does not block code work; the 8 GB release gate remains open.
+
+## M1 acceptance checklist
+
+| Acceptance criterion | Status | Evidence / blocker |
+| --- | --- | --- |
+| Explicit persisted scope configuration | Verified locally | CLI and desktop require an existing user-entered directory; authorization never triggers a scan |
+| Canonical path and system-root policy | Verified locally | Canonical authorization/rescan revalidation, scope containment on every observation, protected-root denial |
+| Symlink/junction/reparse loop defense | Verified locally on Unix; Windows runtime pending | `symlink_metadata` before canonicalization; no following; loop fixture passes; Windows adapter checks reparse attribute |
+| Hidden/default-sensitive exclusions | Verified locally | Hidden entries are skipped and recorded; broader platform preset/exclusion UX remains M1/M8 work |
+| SQLite migrations documented and safe | Verified locally | Embedded migration, checksum mismatch rejection, WAL, foreign keys, FULL synchronous, reopen test |
+| File/Folder nodes and `located_in` relations | Verified locally | Transactional observation upsert and active relation reconciliation |
+| Rescan idempotency | Verified locally | Unit fixture and three 10k scans retain exactly 10,101 active nodes/locations |
+| Move preserves identity where metadata permits | Verified locally on Unix | Rename and hard-link fixture retains node ID; Windows runtime fixture pending |
+| Permission failures are recorded | Implemented, fixture pending | Bounded `directory_read_denied`/metadata issue codes exist; deterministic cross-platform test remains |
+| Persistent progress/pause/resume | Not started | Scan jobs persist start/completion/failure only; no queue or pause API yet |
+| CLI graph statistics | Verified locally | `manifest`, `scope`, and `scan` commands execute the complete slice |
+| Desktop graph statistics and usable scope UI | Verified locally | Rust IPC + validated TypeScript contracts + production build + live accessibility/screenshot smoke |
+| Synthetic 10k generator and benchmark | Verified locally for timing/counts | 10k/100 folder generator; 1.366 s initial and 1.260 s rescan scanner time; peak RSS pending |
 
 ## Next handoff
 
-Local work can continue at `prompts/02_MANIFEST_GRAPH.md` while M0 remains open for remote CI evidence. M1 must begin with explicit scope configuration, canonical path policy, SQLite migration design, file identity, exclusions, and a safe metadata-only scan slice.
+Continue `prompts/02_MANIFEST_GRAPH.md`, not Prompt 03. The next coherent slice is a persistent directory queue with progress, pause, resume, and interrupted-job recovery, followed by deterministic permission-denied/platform fixtures. M0 remote CI evidence can be attached independently when the GitHub repository exists.
 
 ## Verification evidence — 2026-07-16
 
@@ -74,3 +94,17 @@ Local work can continue at `prompts/02_MANIFEST_GRAPH.md` while M0 remains open 
 - `pnpm audit` and `pnpm audit --prod` — zero known vulnerabilities.
 - `cargo audit` — zero known vulnerabilities and 17 warnings; warnings remain open, not suppressed.
 - Isolated clean clone — `pnpm install --frozen-lockfile`, 9 Rust tests, and complete `pnpm check` passed without relying on the working tree's build outputs.
+
+## M1 verification evidence — 2026-07-16
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` — passed.
+- `cargo test --workspace --all-features --offline` — 25 passed, 0 failed, including the fixture-generator contract.
+- `cargo check -p deskgraph-identity --target x86_64-pc-windows-msvc --all-features --offline` — passed for the isolated Windows file-identity boundary.
+- Complete scanner Windows cross-check — blocked locally by missing Windows C/MSVC headers required to compile bundled SQLite; must run in Windows CI.
+- `pnpm check` — format, lint, typecheck, 7 Vitest tests, and production web build passed.
+- `pnpm --filter @deskgraph/desktop tauri build --debug --bundles app` — produced `DeskGraph.app` with bundled SQLite.
+- Live desktop accessibility and screenshot smoke — manifest ready, zero auto-authorized scopes, explicit path field, separate authorize/scan actions, graph metrics visible.
+- CLI end-to-end smoke — initialize manifest, authorize explicit temp scope, scan, and stats all returned validated JSON without path fields in logs.
+- 10k benchmark — 10,000 files + 101 folders, 0 issues; initial scanner 1.366 s, rescan 1.260 s; 10,101 active nodes after repeated scans. Peak RSS not captured.
+- `cargo audit --no-fetch` — zero known vulnerabilities and the existing 17 tracked warnings.

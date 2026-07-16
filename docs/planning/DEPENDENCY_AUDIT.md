@@ -40,6 +40,7 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 - Rust 1.97 `std::os::windows::fs::MetadataExt::{volume_serial_number,file_index,number_of_links}` was compiled against `x86_64-pc-windows-msvc` and rejected with `E0658 windows_by_handle`; it is not a viable stable implementation.
 - The selected Microsoft binding exposes the required stable Win32 APIs. Windows CI must compile and run identity fixtures before M1 can be considered cross-platform verified.
 - `rusqlite` currently defaults to `cache` and `ffi-sqlite-wasm-rs`; DeskGraph explicitly opts out of defaults and selects bundled native SQLite.
+- The M1 lockfile resolves 456 crate dependencies. `cargo audit --no-fetch` against 1,160 cached RustSec advisories found zero known vulnerabilities and the same 17 Tauri Linux-path warnings tracked in R-016; the new M1 direct dependencies added no advisory.
 
 ## GitHub Actions
 

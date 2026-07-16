@@ -16,7 +16,7 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 | D-004 | Opt-in telemetry and crash reporting                        | Before public beta                    | None, local-only export, or privacy-reviewed opt-in provider                                 | No telemetry and no network egress                                         |
 | D-005 | Linux experimental artifact                                 | M9                                    | AppImage first, `.deb` optional; cannot delay macOS/Windows                                  | AppImage candidate, explicitly experimental                                |
 | D-006 | Default scope presets and platform Screenshots discovery    | M1/M8                                 | Desktop/Downloads/Documents plus platform-aware screenshots; every path still user-confirmed | Show presets but grant nothing until explicit selection                    |
-| D-007 | SQLite Rust binding and vector adapter                      | M1/M3                                 | Evaluate API, bundling, license, FTS5, Windows/macOS/Linux, and migration behavior           | No dependency selected                                                     |
+| D-007 | Vector adapter after SQLite manifest                        | M3                                    | SQLite binding is decided in ADR-010; evaluate vector API, license, multilingual behavior, and migrations | No vector dependency selected; deterministic lexical fallback required     |
 | D-008 | OCR provider stack                                          | M2                                    | Native providers plus packaged cross-platform fallback; zh-TW + English                      | No Python/user-installed runtime; no provider selected                     |
 | D-009 | Embedding model/runtime                                     | M3/M9                                 | Multilingual, int8, license, checksum, memory, model-removal support                         | Deterministic lexical retrieval remains required                           |
 | D-010 | Product trademark/name clearance and reverse-DNS identifier | Before signed release                 | DeskGraph availability and legal review                                                      | Development identifier only; no trademark claim                            |
@@ -27,3 +27,10 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - Project code license: Apache-2.0 (recorded in ADR-008).
 - Rust workspace + Tauri 2 + React/TypeScript + pnpm follows the accepted architecture.
 - Health data is a closed, privacy-safe schema shared by CLI and desktop; no paths, filenames, content, identifiers, or model output.
+
+## Decisions made in M1
+
+- Bundled SQLite through `rusqlite 0.40.1` is the manifest source of truth.
+- File identity is separate from location: Unix device/inode and Windows volume serial/file index through an isolated `windows-sys` adapter.
+- Unicode comparison keys use NFC; Windows additionally uses case-insensitive comparison keys. Canonical scope validation remains the security boundary.
+- Initial scan is metadata-only and never follows symlinks or Windows reparse points.

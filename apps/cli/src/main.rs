@@ -39,6 +39,11 @@ enum Command {
         #[command(subcommand)]
         command: ScanCommand,
     },
+    /// Generate a bounded synthetic metadata-scan fixture.
+    Fixture {
+        #[command(subcommand)]
+        command: FixtureCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,6 +80,25 @@ enum ScanCommand {
         #[arg(long)]
         scope: i64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum FixtureCommand {
+    Generate {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long, default_value_t = 10_000)]
+        files: u32,
+        #[arg(long, default_value_t = 100)]
+        directories: u32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct FixtureReport {
+    api_version: &'static str,
+    generated_files: u32,
+    generated_directories: u32,
 }
 
 fn main() -> ExitCode {
@@ -139,7 +163,55 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 print_json(&report)
             }
         },
+        Command::Fixture { command } => match command {
+            FixtureCommand::Generate {
+                path,
+                files,
+                directories,
+            } => {
+                let report = generate_fixture(&path, files, directories)?;
+                emit_json(&report, "scan_fixture_generated")
+            }
+        },
     }
+}
+
+fn generate_fixture(
+    path: &Path,
+    files: u32,
+    directories: u32,
+) -> Result<FixtureReport, &'static str> {
+    const MAX_FILES: u32 = 1_000_000;
+    const MAX_DIRECTORIES: u32 = 10_000;
+    if files > MAX_FILES {
+        return Err("fixture_file_count_out_of_range");
+    }
+    if directories == 0 || directories > MAX_DIRECTORIES {
+        return Err("fixture_directory_count_out_of_range");
+    }
+    if path.try_exists().map_err(|_| "fixture_path_check_failed")? {
+        return Err("fixture_path_already_exists");
+    }
+
+    std::fs::create_dir_all(path).map_err(|_| "fixture_root_create_failed")?;
+    let mut folders = Vec::with_capacity(directories as usize);
+    for index in 0..directories {
+        let folder = path.join(format!("group-{index:05}"));
+        std::fs::create_dir(&folder).map_err(|_| "fixture_directory_create_failed")?;
+        folders.push(folder);
+    }
+    for index in 0..files {
+        let folder = &folders[(index % directories) as usize];
+        let file = folder.join(format!("document-{index:07}.txt"));
+        std::fs::write(file, b"DeskGraph metadata benchmark fixture\n")
+            .map_err(|_| "fixture_file_create_failed")?;
+    }
+
+    Ok(FixtureReport {
+        api_version: "deskgraph.fixture.v1",
+        generated_files: files,
+        generated_directories: directories,
+    })
 }
 
 fn open_database(path: &Path) -> Result<ManifestDatabase, &'static str> {
@@ -201,5 +273,24 @@ mod tests {
             },
         })
         .expect("scan should pass");
+    }
+
+    #[test]
+    fn fixture_generator_is_bounded_and_never_overwrites() {
+        let directory = tempfile::tempdir().expect("fixture parent should exist");
+        let root = directory.path().join("generated");
+        let report = generate_fixture(&root, 12, 3).expect("fixture should generate");
+
+        assert_eq!(report.generated_files, 12);
+        assert_eq!(report.generated_directories, 3);
+        assert_eq!(
+            generate_fixture(&root, 1, 1).expect_err("existing path must be preserved"),
+            "fixture_path_already_exists"
+        );
+        assert_eq!(
+            generate_fixture(&directory.path().join("too-many"), 1_000_001, 1)
+                .expect_err("unbounded fixture must fail"),
+            "fixture_file_count_out_of_range"
+        );
     }
 }

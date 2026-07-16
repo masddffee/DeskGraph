@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-16
 
-Overall status: **not release-ready**. The project is in M0 foundation work.
+Overall status: **not release-ready**. Local implementation has entered M1 while M0 remote CI evidence remains open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
@@ -10,8 +10,8 @@ Overall status: **not release-ready**. The project is in M0 foundation work.
 | macOS Intel or Universal package               | Not started        | Native or Universal clean-machine evidence               |
 | Windows x64 installer                          | Not started        | Signed clean-VM install and smoke                        |
 | Linux experimental package                     | Not started        | Clearly labeled build and smoke                          |
-| Explicit authorized scopes                     | Not started        | Scope UX, canonical policy, adversarial tests            |
-| Initial manifest scan                          | Not started        | Idempotent 10k scan evidence                             |
+| Explicit authorized scopes                     | Verified locally   | Desktop/CLI authorization, canonical policy, system-root and symlink/hidden exclusions; cross-platform runtime fixtures remain |
+| Initial manifest scan                          | In progress        | 10k initial scan and rescans are idempotent locally; pause/resume, permission fixture, memory and remote CI remain |
 | Incremental watch mode                         | Not started        | Reconciliation/stability/restart tests                   |
 | Extraction and OCR formats                     | Not started        | Fixture suite, limits, corrupt-file isolation            |
 | zh-TW and English                              | Not started        | OCR and retrieval evaluation set                         |
@@ -21,7 +21,7 @@ Overall status: **not release-ready**. The project is in M0 foundation work.
 | Rename/move preview                            | Not started        | Before/after/scope/policy UI and tests                   |
 | Journal, crash recovery, undo                  | Not started        | Fault injection and idempotent undo suite                |
 | Read-only MCP                                  | Not started        | Scope escape/injection tests and no write tools          |
-| 8 GB benchmark                                 | Not started        | Published hardware/OS/config/results                     |
+| 8 GB benchmark                                 | In progress        | M1 timing/count baseline published; release-build peak RSS and documented 8 GB hardware remain |
 | Updater pipeline                               | Not started        | Signed metadata dry run and rollback                     |
 | SBOM and checksums                             | Not started        | Release-attached, independently verified artifacts       |
 | GitHub Release                                 | Blocked externally | Remote, auth, verified assets, public download smoke     |
