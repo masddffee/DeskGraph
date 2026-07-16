@@ -103,3 +103,18 @@ Why：
 
 Canonical detail：
 `docs/architecture/adr/0010-manifest-store-and-file-identity.md`。
+
+## ADR-011 — Resumable scan jobs publish atomically
+
+Decision：
+Scan path queue、observations 與 issues 先持久化到 job-scoped staging；pause、crash 與 resume 都不修改 live manifest。只有完整掃描結束後，才以單一 SQLite transaction 發布並 reconcile stale locations。
+
+Why：
+
+- Progress 與 pause/resume 必須跨 process exit 保留。
+- Partial scan 不能暫時成為 graph source of truth。
+- Runner lease 可區分失聯工作與正常的 concurrent status/pause connection。
+- 同一 queue entry 重播必須 idempotent。
+
+Canonical detail：
+`docs/architecture/adr/0011-resumable-scan-jobs.md`。
