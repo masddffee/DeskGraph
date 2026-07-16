@@ -41,7 +41,7 @@ const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_CHUNKS: usize = 65_536;
 const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_MATCH_BYTES: usize = 1024;
-const MAX_SEARCH_CANDIDATES: u32 = 200;
+const MAX_SEARCH_CANDIDATES_PER_SOURCE: u32 = 100;
 
 struct Migration {
     version: i64,
@@ -1514,18 +1514,18 @@ impl ManifestDatabase {
         &self,
         match_query: &str,
         scope_id: Option<i64>,
-        candidate_limit: u32,
+        per_source_candidate_limit: u32,
     ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
         if match_query.is_empty()
             || match_query.len() > MAX_SEARCH_MATCH_BYTES
-            || candidate_limit == 0
-            || candidate_limit > MAX_SEARCH_CANDIDATES
+            || per_source_candidate_limit == 0
+            || per_source_candidate_limit > MAX_SEARCH_CANDIDATES_PER_SOURCE
         {
             return Err(DatabaseError::SearchInputInvalid);
         }
-        let limit = i64::from(candidate_limit);
+        let limit = i64::from(per_source_candidate_limit);
         let mut candidates = Vec::with_capacity(
-            usize::try_from(candidate_limit)
+            usize::try_from(per_source_candidate_limit)
                 .map_err(|_| DatabaseError::SearchInputInvalid)?
                 .saturating_mul(2),
         );
@@ -2175,7 +2175,7 @@ mod tests {
             Err(DatabaseError::SearchInputInvalid)
         ));
         assert!(matches!(
-            database.lexical_search_candidates("\"bounded\"", None, 201),
+            database.lexical_search_candidates("\"bounded\"", None, 101),
             Err(DatabaseError::SearchInputInvalid)
         ));
     }

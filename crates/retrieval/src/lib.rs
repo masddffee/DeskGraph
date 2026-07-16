@@ -12,7 +12,7 @@ const MIN_QUERY_CHARS: usize = 3;
 const MAX_QUERY_CHARS: usize = 256;
 const DEFAULT_RESULT_LIMIT: u32 = 20;
 const MAX_RESULT_LIMIT: u32 = 50;
-const MAX_CANDIDATE_LIMIT: u32 = 200;
+const MAX_CANDIDATES_PER_SOURCE: u32 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchRequest<'a> {
@@ -85,10 +85,13 @@ pub fn search(
     if limit == 0 || limit > MAX_RESULT_LIMIT {
         return Err(SearchError::LimitOutOfRange);
     }
-    let candidate_limit = limit.saturating_mul(4).min(MAX_CANDIDATE_LIMIT);
+    let per_source_candidate_limit = limit.saturating_mul(2).min(MAX_CANDIDATES_PER_SOURCE);
     let match_query = quote_fts_phrase(&normalized_query);
-    let candidates =
-        database.lexical_search_candidates(&match_query, request.scope_id, candidate_limit)?;
+    let candidates = database.lexical_search_candidates(
+        &match_query,
+        request.scope_id,
+        per_source_candidate_limit,
+    )?;
     let results = rank_candidates(&normalized_query, candidates, limit);
     let result_count = u64::try_from(results.len()).map_err(|_| SearchError::LimitOutOfRange)?;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
