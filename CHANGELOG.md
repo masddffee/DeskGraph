@@ -22,3 +22,5 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 - Read-only Desktop extraction statistics and recent-job states through narrow Tauri IPC and runtime-validated TypeScript schemas.
 - Tagged content provenance with a forward migration that preserves existing byte ranges and adds page/fragment locations without fabricated offsets.
 - Strict bounded text-layer PDF extraction with exact no-default-feature `lopdf`, encrypted-input rejection, inert JavaScript/actions/attachments, sequential page cancellation, and Traditional Chinese/English fixtures.
+- Deterministic offline SQLite FTS5 trigram indexes for current paths and active extracted chunks, with transactional backfill/synchronization, bounded quoted queries, Traditional Chinese/English fixtures, stale-content filtering, exact-filename fusion, and fixed ranking explanations.
+- Privacy-aware lexical search commands in CLI and Tauri plus a Desktop search UI with scope selection, validated response schemas, bounded untrusted snippets, empty/error states, and no query/path/text logging.

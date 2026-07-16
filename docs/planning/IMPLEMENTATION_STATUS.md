@@ -4,11 +4,13 @@ Last updated: 2026-07-16
 
 Status vocabulary: `not started`, `in progress`, `blocked`, `verified locally`, `verified in CI`, `released`.
 
-## Current milestone
+## Current milestones
 
-M2 Content Intelligence — **in progress**. M0 remains open for remote CI evidence, and M1 remains open for complete Windows runtime, peak-memory, and latest live-UI evidence.
+M2 Content Intelligence remains on the critical path and M3 Hybrid Retrieval has an active lexical workstream — both are **in progress**. M0 remains open for remote CI evidence, and M1 remains open for complete Windows runtime, peak-memory, and latest live-UI evidence.
 
 Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdown, source-code, and text-layer PDF files are resolved inside their authorized scope; the core revalidates the canonical scope, exclusion policy, manifest snapshot, and open-file identity; bounded providers receive only a controlled `Read + Seek`; durable SQLite jobs support cancellation and interrupted recovery; tagged byte/page provenance and complete untrusted chunks publish atomically; CLI and Desktop expose privacy-safe progress and counts. Invalid UTF-8, corrupt/encrypted PDF, active PDF content and attachments, decompression/page/output limits, changed files, symlink swaps, cancellation, expired leases, false output sizes, and failed replacement are covered locally. M2 is not complete because Office formats, image metadata, OCR, remaining adversarial fixtures, full Windows runtime evidence, and an extraction benchmark on 8 GB hardware remain open.
+
+One M3 vertical slice now runs end to end. Transactional SQLite FTS5 trigram indexes cover current authorized display paths and active extracted chunks; normalized quoted queries are limited to 3–256 Unicode characters, results/candidates are capped, stale content is filtered by source-of-truth joins, and deterministic fusion exposes exact filename/path/content explanations. CLI and Desktop return user-requested paths and bounded snippets while logs omit query/path/text. This is not M3 completion: one- and two-character search, type/date/project/folder/source filters beyond scope, vector/embedding adapters, semantic and “files like this” queries, hybrid fusion, multilingual evaluation, p50/p95/disk benchmarks, and cross-platform/live-UI evidence remain open.
 
 ## Milestones
 
@@ -17,7 +19,7 @@ Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdo
 | M0 Repository Foundation      | In progress | Local foundation slice, governance, lockfiles, checks, CLI, and desktop smoke verified | Green macOS/Windows/Linux CI matrix |
 | M1 Manifest Graph             | In progress | Explicit scope → durable bounded queue/staging → atomic SQLite manifest publish → CLI/desktop progress and controls; 10k, permission, recovery, protected-tree, and adversarial local tests | Peak RSS, latest live UI smoke, cross-platform runtime CI |
 | M2 Content Intelligence       | In progress | Text/Markdown/code plus bounded text-layer PDF → durable job → open-file identity revalidation → tagged provenance → atomic untrusted chunks → CLI/Desktop status | Audit and implement Office, image metadata, and OCR providers one at a time; benchmark on 8 GB |
-| M3 Hybrid Retrieval           | Not started | Planning only                                                              | FTS fallback, vector adapter, fusion, evaluation      |
+| M3 Hybrid Retrieval           | In progress | Offline path/content FTS5 trigram → bounded retrieval service → deterministic explanations → CLI/Desktop search | Benchmarks and filters, then audited vector/embedding adapters, fusion, evaluation |
 | M4 Project Graph              | Not started | Planning only                                                              | Explainable project relations and corrections         |
 | M5 Safe Organization          | Not started | Safety rules only                                                          | Journaled preview/execute/recover/undo slice          |
 | M6 Watch Mode and Smart Inbox | Not started | Planning only                                                              | Stable incremental event slice                        |
@@ -31,8 +33,8 @@ Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdo
 | Acceptance criterion                                     | Status             | Evidence / blocker                                                         |
 | -------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------- |
 | Monorepo established                                     | Verified locally   | Rust workspace, pnpm workspace, Tauri/React desktop, CLI, and both lockfiles |
-| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 73 tests pass        |
-| TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 10 Vitest tests, and Vite build pass            |
+| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 80 tests pass        |
+| TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 13 Vitest tests, and Vite build pass            |
 | ADR template                                             | Verified locally   | `docs/architecture/adr/0000-template.md`                                   |
 | Root and nested AGENTS instructions                      | Verified locally   | Root plus Desktop, scanner, extractor, and transaction safety instructions |
 | Cross-platform CI matrix configured                      | Verified locally   | Pinned-action workflow covers macOS, Windows, and Linux                    |
@@ -55,7 +57,7 @@ Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdo
 
 - No GitHub repository/remote and invalid GitHub authentication: remote Issues, Releases, and CI results do not exist.
 - Signing, notarization, clean Windows/macOS VM validation, and launch accounts are external later-stage requirements.
-- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The post-integration 483-package lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
+- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The current 484-package lock differs only by one local workspace retrieval crate after the 483-package PDF state, but the post-PDF full-lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
 - Windows open-handle file-identity adapter compiles for `x86_64-pc-windows-msvc`, but complete scanner/extractor cross-checks cannot be produced on this macOS host because bundled SQLite needs a Windows C/MSVC toolchain. Remote Windows CI remains required.
 - Local 10k timing and idempotency are measured, but peak RSS sampling was denied by the restricted runner and its escalation reviewer was unavailable due tool quota. This does not block code work; the 8 GB release gate remains open.
 
@@ -98,7 +100,23 @@ Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdo
 
 ## Next handoff
 
-Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate before accepting ADR-014 or implementing Office; do not add the ZIP/XML candidates while the isolated closure and audit evidence is unavailable. In parallel, use existing audited SQLite for a bounded M3 lexical-search slice without claiming M2 complete. Image metadata and OCR remain separate provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI.
+Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate before accepting ADR-014 or implementing Office; do not add the ZIP/XML candidates while the isolated closure and audit evidence is unavailable. In parallel, continue `prompts/04_HYBRID_SEARCH.md` from the verified lexical slice with a reproducible corpus, p50/p95 and index-size benchmark, then bounded filters; vector/embedding candidates remain unselected. Image metadata and OCR remain separate provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI.
+
+## M3 acceptance checklist
+
+| Acceptance criterion | Status | Evidence / blocker |
+| --- | --- | --- |
+| SQLite FTS5 indexing | Verified locally | Migration 0005 creates external-content trigram indexes, synchronization triggers, and transactional rebuilds for existing locations/chunks on the bundled SQLite build |
+| Deterministic no-model fallback | Verified locally | Accepted ADR-015; lexical path has no model/API/network/new registry dependency and reports `embeddings_enabled: false` |
+| Current-data safety | Verified locally | Metadata joins `present` locations; content joins `active` chunks and `present` locations; manifest-change fixture proves stale text cannot surface |
+| Bounded query and result policy | Verified locally | 3–256 Unicode characters, no non-whitespace controls, quoted FTS phrase, bound SQL parameters, 50 results and 100 candidates per source/200 total maximum; short queries fail closed |
+| Traditional Chinese and English lexical search | Verified locally for substring baseline | Mixed path/content fixtures and Desktop helper pass; complete multilingual relevance set remains open |
+| Metadata and FTS search | Verified locally for path/content substring | Exact filename boost, path/content fusion, snippets, scope filter, fixed explanations; type/date/project/folder/source filters remain incomplete |
+| CLI search | Verified locally | Explicit `search --database --query [--scope] [--limit]`; stdout intentionally returns requested local context while binary test proves stderr logs omit query/path/text |
+| Desktop search UI | Verified locally except live smoke | Narrow read-only Tauri command, strict TypeScript parser, query/scope form, loading/empty/error/results, visible explanations and untrusted-text label; Vite/Tauri release builds pass |
+| Vector semantic search and embedding cache | Not started | D-007/D-009 open; dependency, model, license, checksum, memory, unload, and multilingual evidence required |
+| Hybrid fusion and “files like this” | Not started | Lexical fusion is not vector/lexical hybrid; semantic and recent-project-context acceptance remain open |
+| Search p50/p95, disk, and 8 GB evidence | Not started | Reproducible corpus and benchmark report required before M3 completion |
 
 ## Verification evidence — 2026-07-16
 
@@ -171,3 +189,15 @@ Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate 
 - Minimal dependency cross-platform evidence — exact `lopdf 0.44.0`, default features disabled, has no Rayon/crossbeam entry in DeskGraph's tree; isolated macOS arm64 test and `x86_64-pc-windows-msvc` check passed. The complete extractor Windows cross-check still stops at bundled SQLite because this macOS host lacks Windows MSVC C headers.
 - Security evidence — isolated 53-package no-default-feature closure scanned 1,160 cached RustSec advisories with zero findings. The post-integration 483-package full-lock rerun was rejected by the local tool quota; do not reuse the older 457-package result as current evidence.
 - Remaining PDF gates — aggregate peak RSS on documented 8 GB hardware, remote macOS Intel/Windows/Linux runtime, latest live Desktop smoke, full-lock RustSec rerun, and broader real-world corpus quality/latency measurement.
+
+## M3 lexical-search vertical-slice evidence — 2026-07-16
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` — passed.
+- `cargo test --workspace --all-features --offline` — 80 passed, 0 failed: CLI 6 + 4 integration, database 16, Desktop Rust 5, domain 5, extractors 26, identity 2, retrieval 2, scanner 12, telemetry 2.
+- Database/retrieval fixtures — bundled FTS5 migration/backfill and triggers pass; Traditional Chinese/English path and content substring search passes; stale active-content filtering, query/candidate limits, quote escaping, exact filename fusion, and fixed explanations pass.
+- CLI binary fixture — requested local context is returned on stdout; query, private text, filename, and scope path are absent from structured stderr logs.
+- `pnpm check` — Prettier, ESLint, TypeScript, 13 Vitest tests, and Vite production build passed.
+- `pnpm --filter @deskgraph/desktop tauri build --no-bundle` with `/Users/wetom/.cargo/bin` explicitly on `PATH` — passed and produced `target/release/deskgraph-desktop`.
+- Dependency delta — no registry package, vector extension, embedding/model runtime, API, or network client was added; `Cargo.lock` now contains 484 packages because the local workspace-only `deskgraph-retrieval` crate was added.
+- Evidence still open — latest live Desktop interaction, remote macOS Intel/Windows/Linux runtime, current full-lock RustSec scan, p50/p95 and index-size corpus benchmark, one/two-character strategy, complete filters, vector/embedding/hybrid behavior, and multilingual relevance evaluation.

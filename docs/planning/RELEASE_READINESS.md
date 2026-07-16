@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-16
 
-Overall status: **not release-ready**. Local implementation has entered M2 while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
+Overall status: **not release-ready**. Local implementation is in M2 with one parallel M3 lexical slice while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
@@ -15,7 +15,7 @@ Overall status: **not release-ready**. Local implementation has entered M2 while
 | Incremental watch mode                         | Not started        | Reconciliation/stability/restart tests                   |
 | Extraction and OCR formats                     | In progress        | Text/Markdown/code and bounded text-layer PDF providers, durable cancellation, tagged provenance, atomic untrusted chunks, corrupt/encrypted/active-content/decompression fixtures pass locally; Office, image metadata, OCR, Windows runtime, 8 GB residency, and remaining corpora remain |
 | zh-TW and English                              | In progress        | Built-in UTF-8 extraction has exact byte-offset mixed zh-TW/English fixtures; PDF ToUnicode fixture extracts both with page provenance; OCR and retrieval evaluation sets remain |
-| Metadata/FTS/vector/hybrid retrieval           | Not started        | Deterministic fallback and p50/p95 report                |
+| Metadata/FTS/vector/hybrid retrieval           | In progress        | Offline path/content FTS5 baseline, bounded queries, deterministic explanations, CLI/Desktop contracts pass locally; filters, vectors, embeddings, hybrid fusion, evaluation, p50/p95/disk and cross-platform/live-UI evidence remain |
 | Project/folder/related/duplicate/version graph | Not started        | Provenance, correction, evaluation                       |
 | Smart Inbox and explainable classification     | Not started        | UI states and safe suggestion behavior                   |
 | Rename/move preview                            | Not started        | Before/after/scope/policy UI and tests                   |
@@ -41,3 +41,7 @@ The resumable scanner is safe to exercise with test folders: progress and pendin
 ## M2 extraction local readiness note
 
 The text/Markdown/code and text-layer PDF slices are safe to exercise with test files already present in an explicit scanned scope. Providers never receive an arbitrary path; source size and actual open-handle identity are revalidated; reads/decompression/pages/chunks/time are bounded; PDF active content and attachments remain inert; all text stays `untrusted_extracted_text`; and publication is atomic. CLI status and Desktop dashboard payloads contain no paths or text. This is not an M2 completion or release claim: DOCX, PPTX, XLSX, image metadata, screenshot OCR, later dependency audits, full Windows/macOS Intel/Linux runtime tests, live Desktop interaction, post-integration full-lock RustSec rerun, real-world PDF corpus evaluation, and 8 GB extraction benchmarks remain open.
+
+## M3 lexical local readiness note
+
+The FTS5 baseline is safe to exercise on test scopes: search is read-only, stays in bundled SQLite, accepts bounded quoted queries of at least three Unicode characters, caps candidates/results/snippets, excludes absent locations and stale chunks, and exposes fixed ranking explanations. User-invoked CLI/Desktop results intentionally return authorized paths and bounded untrusted snippets; ordinary logs omit query/path/text. This is not an M3 or release claim: filters, vector/embedding providers, hybrid/semantic behavior, evaluation, p50/p95/index-size/8 GB evidence, short-query strategy, live Desktop interaction, and remote platform runtime remain open.

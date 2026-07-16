@@ -84,7 +84,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 4 — M3 retrieval
 
-- Build FTS first, then audited vector adapter/provider, then fusion and explanations.
+- Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, CLI, and Desktop entry points are verified locally; corpus benchmarks and complete filters remain open.
+- Next: add reproducible p50/p95/index-size evidence and bounded filters, then audit a vector adapter/provider before semantic or hybrid implementation.
 - Exit with no-model deterministic fallback and zh-TW/English evaluation.
 
 ### Step 5 — M4 context graph

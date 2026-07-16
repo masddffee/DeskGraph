@@ -1,6 +1,6 @@
 # DeskGraph
 
-> **Pre-release M2 — use only with test folders and keep backups.**
+> **Pre-release M2/M3 — use only with test folders and keep backups.**
 
 **Graphify your computer.**
 
@@ -8,11 +8,13 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 ## Current state
 
-The repository is implementing M2 Content Intelligence while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
+The repository is implementing M2 Content Intelligence plus the deterministic M3 lexical baseline while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, report graph statistics, and search current local paths and active extracted text. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
 The current content slices can extract bounded UTF-8 from an explicitly selected, already-scanned text, Markdown, source-code, or text-layer PDF file. They revalidate the authorized scope, manifest snapshot, and actual open-file identity; store only provenance-bearing `untrusted_extracted_text` chunks; support durable cancellation/recovery; and atomically preserve the prior complete version on failure. PDF extraction uses a strictly bounded, path-free Rust adapter, rejects encrypted PDFs, ignores active content and attachments, and records page/fragment provenance instead of fabricated byte offsets.
 
-DOCX, PPTX, XLSX, image metadata, OCR, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+The current search slice uses bundled SQLite FTS5 trigram indexes for Traditional Chinese and English substring queries of 3–256 Unicode characters. It requires no embedding or model, returns bounded text snippets, filters out stale chunks and absent locations, and explains whether filename/path, extracted text, or both matched. One- and two-character queries, vector semantic search, hybrid fusion, complete filters, evaluation, and p50/p95 benchmarks remain open.
+
+DOCX, PPTX, XLSX, image metadata, OCR, vector/hybrid retrieval, watch mode, organization, undo, and MCP are planned but **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -82,13 +84,24 @@ cargo run -p deskgraph-cli -- extract stats --database ./deskgraph-dev.sqlite3
 
 Use the same command with a `.pdf` path for a text-layer PDF. `extract start` opens only the manifest-backed file selected by the explicit path. Its JSON response and structured logs contain job IDs, fixed status/error codes, byte counts, chunks, and timing—not the path, filename, or extracted text. Automation may use `--node` instead of `--path`. Durable controls are available through `extract create/run/status/list/cancel/resume`.
 
+Search current metadata and active extracted text without a model:
+
+```bash
+cargo run -p deskgraph-cli -- search \
+  --database ./deskgraph-dev.sqlite3 \
+  --query "專案 context" \
+  --scope 1
+```
+
+Search is an explicit content-returning operation: its stdout intentionally contains matching authorized paths and bounded snippets for the user who requested them. Structured stderr logs omit the query, paths, filenames, and snippets. Omit `--scope` to search all scopes in this local database; `--limit` accepts 1–50. Queries shorter than three Unicode characters fail closed instead of scanning the corpus.
+
 Start the desktop application:
 
 ```bash
 pnpm desktop:dev
 ```
 
-The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows authorized paths only in its explicit scope-management panel; its extraction dashboard exposes aggregate counts and fixed job states without paths or content.
+The health report includes only the application version, OS/architecture, database lifecycle state, optional-provider state, and privacy flags. It does not include filesystem locations. The desktop shows paths in explicit scope management and user-invoked search results; its extraction dashboard exposes aggregate counts and fixed job states without paths or content. Search snippets are visibly labeled untrusted local text and rendered as text, never executable markup.
 
 ## Development verification
 

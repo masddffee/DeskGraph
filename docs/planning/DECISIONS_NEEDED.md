@@ -47,3 +47,11 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - PDF text uses exact `lopdf 0.44.0` with default features disabled, strict bounded in-memory APIs, sequential page processing, no password handling, and no active-content traversal (ADR-013).
 - Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page and fragment indexes. Structural formats never receive fabricated byte offsets.
 - ADR-014 proposes a shared, path-free, allowlisted OOXML ZIP/XML adapter. D-011 remains open because the exact minimal dependency closures could not be audited after local Cargo registry access was rejected by the exhausted tool quota.
+
+## Decisions made while entering M3
+
+- Bundled SQLite FTS5 `trigram` is the deterministic Traditional Chinese/English lexical substring baseline (ADR-015).
+- Queries shorter than three Unicode characters fail closed; DeskGraph does not substitute an unindexed full-corpus scan.
+- External-content indexes follow `locations` and `content_chunks`, while present/active source-of-truth joins determine current visibility.
+- Search queries, paths, and snippets may appear only in an explicit user-requested result payload, never ordinary logs or extraction/status payloads.
+- D-007 and D-009 remain open: no vector extension, embedding runtime, or model is selected by the lexical slice.
