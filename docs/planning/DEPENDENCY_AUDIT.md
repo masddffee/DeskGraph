@@ -68,6 +68,16 @@ The load API limits each eagerly decompressed object or cross-reference stream, 
 | Image metadata | Unselected | Bounded signature/metadata API, supported formats, malformed/oversized behavior, license, advisories, platform behavior |
 | Screenshot OCR | Unselected; D-008 open | Native API availability plus packaged cross-platform fallback, zh-TW/English quality, model/runtime license, checksums, memory/unload behavior, offline packaging without user-installed Python |
 
+### Office OOXML candidates — not approved
+
+ADR-014 records a Proposed allowlisted-parts design. Official published documentation was inspected for the current stable `zip 8.6.0` (`zip-rs/zip2`, MIT, Rust 1.88+) and `quick-xml 0.41.0` (`tafia/quick-xml`, MIT, streaming pull parser). These are candidates only and have not entered a DeskGraph manifest or lockfile.
+
+The archive candidate exposes central-directory construction, entry count, encrypted status, compressed/uncompressed sizes, overlap detection, and enclosed-name validation. Its default feature set includes multiple compression and cryptography implementations that DeskGraph does not need and would reject. The provisional feature shape is therefore exact `8.6.0`, `default-features = false`, plus only the verified stored/DEFLATE read capability. The XML candidate has no default features and exposes explicit start/text/DTD/general-reference events suitable for a core-owned depth/event/entity policy.
+
+Adoption is blocked on evidence, not on a product choice: the local Cargo registry request required to generate isolated exact closures was rejected because the tool quota was exhausted. The missing gate is an isolated lock and source inspection, complete license list, `cargo audit --no-fetch`, macOS arm64 test, Windows x64 check, then a full 483-plus-package lock audit. Until that gate passes, neither crate is selected and no high-level Office crate is accepted as a substitute.
+
+The proposed adapter never writes archive entries to disk or follows relationships. It selects only exact DOCX/PPTX/XLSX text parts, rejects encryption/overlap/unsafe or duplicate selected names/unsupported compression, bounds claimed and actual decompression plus structure/output/time, rejects DTD and unsupported entities, keeps macros/formulas/external links/embeddings inert, and requires explicit paragraph/slide/cell provenance.
+
 No candidate may enter `Cargo.toml`, `package.json`, build scripts, or release assets until its row is replaced by verified source/API/version/license/security evidence and an accepted provider-specific decision.
 
 ## GitHub Actions

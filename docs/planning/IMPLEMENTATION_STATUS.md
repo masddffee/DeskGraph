@@ -92,13 +92,13 @@ Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdo
 | Privacy-safe usable CLI | Verified locally | `extract start/create/run/status/list/cancel/resume/stats`; explicit `--path` resolves only an existing scanned node; binary test proves path, filename, and extracted text do not enter stdout/stderr |
 | Desktop extraction status | Verified locally except live smoke | Narrow read-only Tauri IPC, runtime-validated TypeScript schemas, empty/success/failure/cancel/interrupted labels, 10 frontend tests, Vite and Tauri release builds; latest window interaction not run |
 | PDF text | Verified locally; platform/memory evidence pending | Strict bounded `lopdf 0.44.0` provider routes through manifest identity and atomic SQLite publication. zh-TW/English, corrupt, encrypted, JavaScript/Launch/URI/attachment inertness, decompression/page/output/cancel, page provenance, and service routing fixtures pass. Aggregate parser residency, remote macOS Intel/Windows/Linux runtime, and post-integration full-lock RustSec scan remain open. |
-| DOCX / PPTX / XLSX | Not started | ZIP/XML dependency audit plus traversal, decompression, macro, external-link, embedded-object, limit, cancel, and provenance fixtures required |
+| DOCX / PPTX / XLSX | Research in progress | Proposed ADR-014 defines allowlisted in-memory parts and safety/fixture gates; `zip 8.6.0` and `quick-xml 0.41.0` remain unapproved until exact closure, license, RustSec, API, and platform evidence can run |
 | Image metadata | Not started | Bounded signature/metadata provider and corrupt/oversized fixtures required |
 | Screenshot OCR with zh-TW and English | Not started | D-008 remains open; native and packaged fallback candidates require official API/platform/license/memory evaluation; no Python requirement allowed |
 
 ## Next handoff
 
-Continue `prompts/03_EXTRACTORS_OCR.md`. Select and audit the smallest safe Office ZIP/XML stack before implementation; image metadata and OCR remain separate later provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI. Every later M2 provider must still be selected only after its official API, maintenance, platform support, license, packaging, and security limits are recorded in `DEPENDENCY_AUDIT.md`.
+Continue `prompts/03_EXTRACTORS_OCR.md`. Complete D-011's exact dependency gate before accepting ADR-014 or implementing Office; do not add the ZIP/XML candidates while the isolated closure and audit evidence is unavailable. In parallel, use existing audited SQLite for a bounded M3 lexical-search slice without claiming M2 complete. Image metadata and OCR remain separate provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI.
 
 ## Verification evidence — 2026-07-16
 
