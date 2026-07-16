@@ -76,9 +76,9 @@ Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2
 
 ## Executed verification
 
-- `Cargo.lock` resolves 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review.
+- Before the PDF dependency, `Cargo.lock` resolved 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review. The PDF integration lock now contains 483 packages.
 - `cargo tree --workspace --depth 1` recorded all direct versions. `cargo tree --target all -i ...` traced RustSec warnings to Tauri/Wry's Linux GTK3 stack and Tauri's URL-pattern parser chain.
-- `cargo audit --no-fetch` loaded 1,160 cached RustSec advisories and scanned all 457 lockfile packages: zero known vulnerabilities plus the same 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. These are not suppressed and remain R-016.
+- The last complete all-target scan before PDF loaded 1,160 cached RustSec advisories and scanned 457 lockfile packages: zero known vulnerabilities plus 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. The isolated 53-package PDF closure separately returned zero findings. A post-integration scan of the full 483-package lock was requested but rejected because the local tool quota was exhausted; it remains mandatory and the older all-target result must not be presented as current.
 - `pnpm audit --prod` and full `pnpm audit` found zero known vulnerabilities.
 - `pnpm licenses list --json` failed with `ERR_PNPM_MISSING_PACKAGE_INDEX_FILE` under pnpm's SQLite-backed local store. The recorded equivalent scan read all installed package manifests: 145 unique packages, no missing license fields; 106 MIT, 18 Apache-2.0, 6 BSD-2-Clause, 2 BSD-3-Clause, 7 ISC, 2 MPL-2.0, 1 BlueOak-1.0.0, and 3 Apache-2.0 OR MIT.
 - `pnpm peers check` reports no peer dependency issues after pinning TypeScript 6.0.3.
@@ -88,7 +88,7 @@ Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2
 - Execute frozen installs and all checks in remote macOS, Windows, and Linux CI.
 - Revisit native transitive dependencies, redistribution notices, and R-016 when packaging begins.
 - Re-run the Rust dependency and license audit after every future lockfile change.
-- Audit every OCR, embedding, vector, model, archive, PDF, and Office dependency separately before M2/M3/M9 adoption.
+- Audit every OCR, embedding, vector, model, archive, and Office dependency separately before M2/M3/M9 adoption; rerun the full lock audit after the accepted PDF delta.
 
 ## Rejected or deferred at M0
 

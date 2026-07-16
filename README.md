@@ -10,9 +10,9 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 The repository is implementing M2 Content Intelligence while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, and report graph statistics. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
-The first content slice can extract bounded UTF-8 text from an explicitly selected, already-scanned text, Markdown, or source-code file. It revalidates the authorized scope, manifest snapshot, and actual open-file identity; stores only provenance-bearing `untrusted_extracted_text` chunks; supports durable cancellation/recovery; and atomically preserves the prior complete version on failure. It adds no parser, model, Python, Docker, API-key, or network dependency.
+The current content slices can extract bounded UTF-8 from an explicitly selected, already-scanned text, Markdown, source-code, or text-layer PDF file. They revalidate the authorized scope, manifest snapshot, and actual open-file identity; store only provenance-bearing `untrusted_extracted_text` chunks; support durable cancellation/recovery; and atomically preserve the prior complete version on failure. PDF extraction uses a strictly bounded, path-free Rust adapter, rejects encrypted PDFs, ignores active content and attachments, and records page/fragment provenance instead of fabricated byte offsets.
 
-PDF, DOCX, PPTX, XLSX, image metadata, OCR, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
+DOCX, PPTX, XLSX, image metadata, OCR, search, watch mode, organization, undo, and MCP are planned but **not shipped**. Scanned/image-only PDFs require the future OCR provider. Peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are still open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -70,7 +70,7 @@ cargo run -p deskgraph-cli -- scan run --database ./deskgraph-dev.sqlite3 --job 
 
 Scan observations stay in job-scoped staging while work is running or paused. The visible manifest is replaced only after the complete job publishes in one SQLite transaction.
 
-Run the current bounded text extraction slice for one file already discovered by the scan:
+Run the current bounded text/PDF extraction slice for one file already discovered by the scan:
 
 ```bash
 cargo run -p deskgraph-cli -- extract start \
@@ -80,7 +80,7 @@ cargo run -p deskgraph-cli -- extract start \
 cargo run -p deskgraph-cli -- extract stats --database ./deskgraph-dev.sqlite3
 ```
 
-`extract start` opens only the manifest-backed file selected by the explicit path. Its JSON response and structured logs contain job IDs, fixed status/error codes, byte counts, chunks, and timing—not the path, filename, or extracted text. Automation may use `--node` instead of `--path`. Durable controls are available through `extract create/run/status/list/cancel/resume`.
+Use the same command with a `.pdf` path for a text-layer PDF. `extract start` opens only the manifest-backed file selected by the explicit path. Its JSON response and structured logs contain job IDs, fixed status/error codes, byte counts, chunks, and timing—not the path, filename, or extracted text. Automation may use `--node` instead of `--path`. Durable controls are available through `extract create/run/status/list/cancel/resume`.
 
 Start the desktop application:
 

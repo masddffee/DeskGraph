@@ -20,3 +20,5 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 - Durable SQLite extraction jobs, content-chunk provenance, source snapshot/open-handle revalidation, lease recovery, cancellation, and stale-content invalidation.
 - Privacy-safe extraction CLI with explicit scanned-file paths plus durable job controls and aggregate statistics.
 - Read-only Desktop extraction statistics and recent-job states through narrow Tauri IPC and runtime-validated TypeScript schemas.
+- Tagged content provenance with a forward migration that preserves existing byte ranges and adds page/fragment locations without fabricated offsets.
+- Strict bounded text-layer PDF extraction with exact no-default-feature `lopdf`, encrypted-input rejection, inert JavaScript/actions/attachments, sequential page cancellation, and Traditional Chinese/English fixtures.

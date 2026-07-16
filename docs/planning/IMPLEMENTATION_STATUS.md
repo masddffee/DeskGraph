@@ -8,7 +8,7 @@ Status vocabulary: `not started`, `in progress`, `blocked`, `verified locally`, 
 
 M2 Content Intelligence — **in progress**. M0 remains open for remote CI evidence, and M1 remains open for complete Windows runtime, peak-memory, and latest live-UI evidence.
 
-The first M2 vertical slice now runs end to end without a new third-party parser: an explicit already-scanned text, Markdown, or source-code file is resolved inside its authorized scope; the core revalidates the canonical scope, exclusion policy, manifest snapshot, and open-file identity; a bounded UTF-8 provider receives only a controlled `Read + Seek`; durable SQLite jobs support cancellation and interrupted recovery; complete untrusted chunks atomically replace prior active content; CLI and Desktop expose privacy-safe progress and counts. Invalid UTF-8, changed files, symlink swaps, invalid limits, cancellation, expired leases, false output sizes, and failed replacement are covered locally. M2 is not complete because PDF, DOCX, PPTX, XLSX, image metadata, OCR, every-format corrupt/macro fixtures, full Windows runtime evidence, and an extraction benchmark on 8 GB hardware remain open.
+Two M2 vertical slices now run end to end. Explicit already-scanned text, Markdown, source-code, and text-layer PDF files are resolved inside their authorized scope; the core revalidates the canonical scope, exclusion policy, manifest snapshot, and open-file identity; bounded providers receive only a controlled `Read + Seek`; durable SQLite jobs support cancellation and interrupted recovery; tagged byte/page provenance and complete untrusted chunks publish atomically; CLI and Desktop expose privacy-safe progress and counts. Invalid UTF-8, corrupt/encrypted PDF, active PDF content and attachments, decompression/page/output limits, changed files, symlink swaps, cancellation, expired leases, false output sizes, and failed replacement are covered locally. M2 is not complete because Office formats, image metadata, OCR, remaining adversarial fixtures, full Windows runtime evidence, and an extraction benchmark on 8 GB hardware remain open.
 
 ## Milestones
 
@@ -16,7 +16,7 @@ The first M2 vertical slice now runs end to end without a new third-party parser
 | ----------------------------- | ----------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
 | M0 Repository Foundation      | In progress | Local foundation slice, governance, lockfiles, checks, CLI, and desktop smoke verified | Green macOS/Windows/Linux CI matrix |
 | M1 Manifest Graph             | In progress | Explicit scope → durable bounded queue/staging → atomic SQLite manifest publish → CLI/desktop progress and controls; 10k, permission, recovery, protected-tree, and adversarial local tests | Peak RSS, latest live UI smoke, cross-platform runtime CI |
-| M2 Content Intelligence       | In progress | Bounded provider → durable job → open-file identity revalidation → atomic untrusted chunks → CLI/Desktop status; text/Markdown/code and adversarial fixtures pass locally | Audit and implement PDF, Office, image metadata, and OCR providers one at a time |
+| M2 Content Intelligence       | In progress | Text/Markdown/code plus bounded text-layer PDF → durable job → open-file identity revalidation → tagged provenance → atomic untrusted chunks → CLI/Desktop status | Audit and implement Office, image metadata, and OCR providers one at a time; benchmark on 8 GB |
 | M3 Hybrid Retrieval           | Not started | Planning only                                                              | FTS fallback, vector adapter, fusion, evaluation      |
 | M4 Project Graph              | Not started | Planning only                                                              | Explainable project relations and corrections         |
 | M5 Safe Organization          | Not started | Safety rules only                                                          | Journaled preview/execute/recover/undo slice          |
@@ -31,7 +31,7 @@ The first M2 vertical slice now runs end to end without a new third-party parser
 | Acceptance criterion                                     | Status             | Evidence / blocker                                                         |
 | -------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------- |
 | Monorepo established                                     | Verified locally   | Rust workspace, pnpm workspace, Tauri/React desktop, CLI, and both lockfiles |
-| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 63 tests pass        |
+| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 73 tests pass        |
 | TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 10 Vitest tests, and Vite build pass            |
 | ADR template                                             | Verified locally   | `docs/architecture/adr/0000-template.md`                                   |
 | Root and nested AGENTS instructions                      | Verified locally   | Root plus Desktop, scanner, extractor, and transaction safety instructions |
@@ -55,7 +55,7 @@ The first M2 vertical slice now runs end to end without a new third-party parser
 
 - No GitHub repository/remote and invalid GitHub authentication: remote Issues, Releases, and CI results do not exist.
 - Signing, notarization, clean Windows/macOS VM validation, and launch accounts are external later-stage requirements.
-- RustSec reports zero known vulnerabilities but 17 warnings in the all-target lockfile, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; tracked as R-016.
+- The last complete pre-PDF all-target RustSec scan reported zero known vulnerabilities and 17 warnings, including unmaintained GTK3 bindings and one `glib` unsound advisory on Tauri's Linux path; the isolated no-default-feature PDF closure is RustSec-clean. The post-integration 483-package lock scan was rejected by the local tool quota and must be rerun; tracked as R-010/R-016.
 - Windows open-handle file-identity adapter compiles for `x86_64-pc-windows-msvc`, but complete scanner/extractor cross-checks cannot be produced on this macOS host because bundled SQLite needs a Windows C/MSVC toolchain. Remote Windows CI remains required.
 - Local 10k timing and idempotency are measured, but peak RSS sampling was denied by the restricted runner and its escalation reviewer was unavailable due tool quota. This does not block code work; the 8 GB release gate remains open.
 
@@ -85,20 +85,20 @@ The first M2 vertical slice now runs end to end without a new third-party parser
 | Text, Markdown, and source-code extraction | Verified locally | Dependency-free UTF-8 provider, explicit extension routing, BOM/offset handling, zh-TW + English fixture, invalid-encoding isolation |
 | Durable extraction jobs and cancellation | Verified locally | Queued/running/completed/failed/cancelled/interrupted states, durable cancel request, bounded polling, expiring runner lease, explicit resume after recovery |
 | Scope, exclusion, identity, and TOCTOU revalidation | Verified locally on Unix; Windows runtime pending | Canonical root/source containment, hidden/symlink/reparse denial, creation-time manifest snapshot, actual open-handle identity before and after extraction; symlink-swap fixture passes |
-| Bounded resource policy | Verified locally for built-in provider | Defaults: 4 MiB source, 8 MiB stored output, 2,048 chunks, 5 seconds; absolute caps: 64 MiB source/output, 65,536 chunks, 64 KiB/chunk, 60 seconds; database independently validates output totals |
+| Bounded resource policy | Verified locally for text and PDF providers | Defaults: 4 MiB source, 8 MiB decompression unit/stored output, 512 PDF pages, 2,048 chunks, 5 seconds; absolute caps: 64 MiB source/decompression/output, 4,096 pages, 65,536 chunks, 64 KiB/chunk, 60 seconds; database independently validates output totals |
 | Atomic content publication and prior-version safety | Verified locally | Per-file transaction deactivates prior chunks only after all chunks validate; failure/cancellation preserves the prior complete version; source changes invalidate stale content |
-| Provenance, offsets, and untrusted classification | Verified locally for byte-oriented provider | Every chunk records scope/node/location/job, provider/version, source byte range/snapshot, ordinal, and fixed `untrusted_extracted_text` trust class |
-| Per-file error isolation | Verified locally for text slice | Invalid UTF-8 and invalid limits produce fixed failed-job codes without aborting the process or publishing partial chunks |
+| Provenance, offsets, and untrusted classification | Verified locally for byte and PDF providers | Migration preserves existing exact byte ranges; PDF chunks store page/fragment with byte columns null; every chunk records source identity/snapshot, provider/version, ordinal, and fixed `untrusted_extracted_text` trust class |
+| Per-file error isolation | Verified locally for text and PDF slices | Invalid UTF-8, corrupt/encrypted PDF, decompression/page/output limits, and invalid policy produce fixed errors without aborting the process or publishing partial chunks |
 | Privacy-safe usable CLI | Verified locally | `extract start/create/run/status/list/cancel/resume/stats`; explicit `--path` resolves only an existing scanned node; binary test proves path, filename, and extracted text do not enter stdout/stderr |
 | Desktop extraction status | Verified locally except live smoke | Narrow read-only Tauri IPC, runtime-validated TypeScript schemas, empty/success/failure/cancel/interrupted labels, 10 frontend tests, Vite and Tauri release builds; latest window interaction not run |
-| PDF text | Dependency/ADR verified; implementation pending | ADR-013 selects exact no-default-feature `lopdf 0.44.0`; isolated 53-package graph is license-complete, RustSec-clean, and Windows-cross-checkable. Provider/schema plus valid/corrupt/encrypted/action/attachment/limit/cancel/page-provenance fixtures remain required. |
+| PDF text | Verified locally; platform/memory evidence pending | Strict bounded `lopdf 0.44.0` provider routes through manifest identity and atomic SQLite publication. zh-TW/English, corrupt, encrypted, JavaScript/Launch/URI/attachment inertness, decompression/page/output/cancel, page provenance, and service routing fixtures pass. Aggregate parser residency, remote macOS Intel/Windows/Linux runtime, and post-integration full-lock RustSec scan remain open. |
 | DOCX / PPTX / XLSX | Not started | ZIP/XML dependency audit plus traversal, decompression, macro, external-link, embedded-object, limit, cancel, and provenance fixtures required |
 | Image metadata | Not started | Bounded signature/metadata provider and corrupt/oversized fixtures required |
 | Screenshot OCR with zh-TW and English | Not started | D-008 remains open; native and packaged fallback candidates require official API/platform/license/memory evaluation; no Python requirement allowed |
 
 ## Next handoff
 
-Continue `prompts/03_EXTRACTORS_OCR.md`. Implement ADR-013's tagged provenance migration and bounded PDF provider next. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI. Every later M2 format provider must still be selected only after its official API, maintenance, platform support, license, packaging, and security limits are recorded in `DEPENDENCY_AUDIT.md`.
+Continue `prompts/03_EXTRACTORS_OCR.md`. Select and audit the smallest safe Office ZIP/XML stack before implementation; image metadata and OCR remain separate later provider decisions. Keep M1 evidence closure as a parallel release workstream: Windows junction/hidden-attribute runtime fixtures, peak RSS on an unrestricted 8 GB machine, latest desktop interaction smoke, and remote macOS/Windows/Linux CI. Every later M2 provider must still be selected only after its official API, maintenance, platform support, license, packaging, and security limits are recorded in `DEPENDENCY_AUDIT.md`.
 
 ## Verification evidence — 2026-07-16
 
@@ -158,3 +158,16 @@ Continue `prompts/03_EXTRACTORS_OCR.md`. Implement ADR-013's tagged provenance m
 - `cargo audit --no-fetch` — 1,160 cached advisories, 457 lockfile packages, zero known vulnerabilities, and the same 17 tracked warnings under R-016.
 - Latest extraction dashboard live-window smoke — not run; the earlier Computer Use launch approval was rejected because the local tool quota was exhausted. No visual/runtime claim is inferred from the successful production build.
 - Dependency delta — no new external parser, OCR, model, Python, Docker, or network dependency; M2 reuses audited workspace SQLite/identity/test dependencies and the Rust standard library.
+
+## M2 bounded-PDF vertical-slice evidence — 2026-07-16
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo test --workspace --all-features --offline --quiet` — 73 passed, 0 failed: CLI 6 + 3 integration, database 14, Desktop Rust 4, domain 4, extractors 26, identity 2, scanner 12, telemetry 2.
+- `cargo clippy --workspace --all-targets --all-features --offline -- -D warnings` — passed.
+- PDF/extractor tests — 26 passed total. PDF fixtures cover Traditional Chinese and English ToUnicode text, exact page/fragment provenance, corrupt input, empty-password encryption rejection, inert JavaScript/Launch/URI/attachments, compressed-page limits, page/output caps, cancellation between pages, and manifest-to-provider routing.
+- Provenance/database tests — 14 passed. Migration v3→v4 preserves exact byte ranges; PDF rows require page/fragment and store no fake byte offsets; publication remains atomic.
+- `pnpm check` — Prettier, ESLint, TypeScript, 10 Vitest tests, and Vite production build passed.
+- `pnpm --filter @deskgraph/desktop tauri build --no-bundle` — passed and produced `target/release/deskgraph-desktop` with the PDF provider.
+- Minimal dependency cross-platform evidence — exact `lopdf 0.44.0`, default features disabled, has no Rayon/crossbeam entry in DeskGraph's tree; isolated macOS arm64 test and `x86_64-pc-windows-msvc` check passed. The complete extractor Windows cross-check still stops at bundled SQLite because this macOS host lacks Windows MSVC C headers.
+- Security evidence — isolated 53-package no-default-feature closure scanned 1,160 cached RustSec advisories with zero findings. The post-integration 483-package full-lock rerun was rejected by the local tool quota; do not reuse the older 457-package result as current evidence.
+- Remaining PDF gates — aggregate peak RSS on documented 8 GB hardware, remote macOS Intel/Windows/Linux runtime, latest live Desktop smoke, full-lock RustSec rerun, and broader real-world corpus quality/latency measurement.
