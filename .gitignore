@@ -10,7 +10,12 @@ target/
 
 # JavaScript dependencies and build output
 node_modules/
+.pnpm-store/
 apps/desktop/dist/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/icons/android/
+apps/desktop/src-tauri/icons/ios/
+*.tsbuildinfo
 
 # Local environment and logs
 .env

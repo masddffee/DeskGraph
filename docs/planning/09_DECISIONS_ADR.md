@@ -6,6 +6,7 @@ Decision：
 v0.1 使用 SQLite + adjacency tables + FTS5 + vector adapter。
 
 Why：
+
 - 單一檔案。
 - 無伺服器。
 - 易備份。
@@ -22,6 +23,7 @@ Decision：
 核心搜尋、圖譜與整理不得依賴 LLM。
 
 Why：
+
 - 安裝包大小。
 - 記憶體。
 - 硬體差異。
@@ -70,3 +72,20 @@ OCR、Embedding、LLM、Vector Index 都使用 abstraction。
 
 Why：
 避免綁死仍快速變動的模型與套件。
+
+## ADR-008 — Apache-2.0 project license
+
+Decision：
+DeskGraph 原創專案程式碼以 Apache License 2.0 發布。第三方依賴、模型、圖示、字型與資料集保留各自經稽核的授權與 notices。
+
+Why：
+
+- 符合 M0 對明確 permissive open-source license 的要求。
+- 除了商用、修改與散布權，也提供明確專利授權與專利終止條款。
+- 對未來貢獻者提供一致的預設授權契約。
+
+Revisit：
+只有在有文件化的法律或生態系需求，且完成貢獻者影響評估後重新審議。
+
+Canonical detail：
+`docs/architecture/adr/0008-project-license.md`。

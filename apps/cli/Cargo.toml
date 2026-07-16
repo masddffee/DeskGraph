@@ -1,0 +1,19 @@
+[package]
+name = "deskgraph-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "deskgraph"
+path = "src/main.rs"
+
+[dependencies]
+deskgraph-domain = { path = "../../crates/domain" }
+deskgraph-telemetry = { path = "../../crates/telemetry" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

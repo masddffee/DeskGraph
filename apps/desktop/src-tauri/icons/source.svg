@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="DeskGraph pre-release icon">
+  <rect width="1024" height="1024" rx="224" fill="#101826" />
+  <path d="M268 296h236c142 0 252 86 252 216S646 728 504 728H268V296Z" fill="none" stroke="#f6f2e9" stroke-width="72" stroke-linejoin="round" />
+  <circle cx="304" cy="512" r="54" fill="#f3b85b" />
+  <circle cx="512" cy="328" r="54" fill="#71d2bd" />
+  <circle cx="720" cy="512" r="54" fill="#ee7d70" />
+  <circle cx="512" cy="696" r="54" fill="#83aaf2" />
+  <path d="M304 512 512 328l208 184-208 184-208-184Z" fill="none" stroke="#f6f2e9" stroke-width="30" stroke-linejoin="round" opacity=".88" />
+</svg>

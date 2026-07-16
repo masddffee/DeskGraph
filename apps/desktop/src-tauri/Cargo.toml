@@ -1,0 +1,22 @@
+[package]
+name = "deskgraph-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "deskgraph_desktop"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+deskgraph-domain = { path = "../../../crates/domain" }
+deskgraph-telemetry = { path = "../../../crates/telemetry" }
+tauri.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

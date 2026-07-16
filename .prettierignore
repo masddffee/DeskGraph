@@ -1,0 +1,12 @@
+target/
+node_modules/
+graphify-out/
+apps/desktop/dist/
+Cargo.lock
+pnpm-lock.yaml
+LICENSE
+AGENTS.md
+apps-desktop.AGENTS.md
+crates-transactions.AGENTS.md
+docs/planning/
+prompts/
