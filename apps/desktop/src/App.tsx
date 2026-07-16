@@ -2,6 +2,12 @@ import { useEffect, useState } from 'react';
 
 import { lifecycleLabel, loadHealthReport, type HealthReport } from './health';
 import {
+  loadExtractionStats,
+  loadRecentExtractions,
+  type ExtractionJobProgress,
+  type ExtractionStats,
+} from './extraction';
+import {
   addAuthorizedScope,
   createManifestScan,
   loadAuthorizedScopes,
@@ -22,6 +28,8 @@ type ReadyState = {
   manifest: ManifestStats;
   scopes: AuthorizedScope[];
   jobs: ScanJobProgress[];
+  extraction: ExtractionStats;
+  extractionJobs: ExtractionJobProgress[];
 };
 type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
 type ActionState =
@@ -55,13 +63,15 @@ function Metric({ label, value }: { label: string; value: number }) {
 }
 
 async function loadDashboard(): Promise<ReadyState> {
-  const [report, manifest, scopes, jobs] = await Promise.all([
+  const [report, manifest, scopes, jobs, extraction, extractionJobs] = await Promise.all([
     loadHealthReport(),
     loadManifestStatus(),
     loadAuthorizedScopes(),
     loadRecentScanJobs(),
+    loadExtractionStats(),
+    loadRecentExtractions(),
   ]);
-  return { kind: 'ready', report, manifest, scopes, jobs };
+  return { kind: 'ready', report, manifest, scopes, jobs, extraction, extractionJobs };
 }
 
 function replaceJob(jobs: ScanJobProgress[], job: ScanJobProgress): ScanJobProgress[] {
@@ -75,6 +85,16 @@ function scanStatusLabel(job: ScanJobProgress): string {
   if (job.status === 'interrupted') return 'Interrupted safely';
   if (job.status === 'completed') return 'Completed';
   return 'Stopped with an error';
+}
+
+function extractionStatusLabel(job: ExtractionJobProgress): string {
+  if (job.status === 'queued') return 'Waiting to start';
+  if (job.status === 'running' && job.cancel_requested) return 'Stopping safely…';
+  if (job.status === 'running') return 'Extracting bounded text…';
+  if (job.status === 'completed') return 'Completed';
+  if (job.status === 'cancelled') return 'Cancelled safely';
+  if (job.status === 'interrupted') return 'Interrupted safely';
+  return 'File skipped safely';
 }
 
 export default function App() {
@@ -139,13 +159,17 @@ export default function App() {
   }
 
   async function refreshManifest() {
-    const [manifest, scopes, jobs] = await Promise.all([
+    const [manifest, scopes, jobs, extraction, extractionJobs] = await Promise.all([
       loadManifestStatus(),
       loadAuthorizedScopes(),
       loadRecentScanJobs(),
+      loadExtractionStats(),
+      loadRecentExtractions(),
     ]);
     setState((current) =>
-      current.kind === 'ready' ? { ...current, manifest, scopes, jobs } : current,
+      current.kind === 'ready'
+        ? { ...current, manifest, scopes, jobs, extraction, extractionJobs }
+        : current,
     );
   }
 
@@ -252,14 +276,14 @@ export default function App() {
     <main className="app-shell">
       <header className="hero">
         <div>
-          <p className="eyebrow">DeskGraph · M1 Manifest Graph</p>
+          <p className="eyebrow">DeskGraph · M2 Local Context</p>
           <h1>Graphify your computer.</h1>
           <p className="hero-copy">
-            Authorize one local folder at a time, then build a metadata-only manifest without
-            uploading paths or file contents.
+            Authorize one local folder at a time, build its metadata manifest, and keep bounded text
+            extraction on this computer.
           </p>
           <p className="hero-copy hero-copy--zh">
-            一次明確授權一個本機資料夾；只建立 metadata manifest，不上傳路徑或檔案內容。
+            一次明確授權一個本機資料夾；metadata 與受限文字抽取都留在本機，不上傳路徑或內容。
           </p>
         </div>
         <span className="release-badge">PRE-RELEASE</span>
@@ -325,6 +349,48 @@ export default function App() {
               <Metric label="Locations" value={state.manifest.active_location_count} />
               <Metric label="Scan issues" value={state.manifest.issue_count} />
             </div>
+          </section>
+
+          <section className="panel panel--content" aria-labelledby="content-title">
+            <div className="panel-heading panel-heading--wrap">
+              <div>
+                <p className="panel-kicker">Bounded local content</p>
+                <h2 id="content-title">
+                  {state.extraction.extracted_file_count === 0
+                    ? 'No file content extracted yet'
+                    : 'Local text is ready'}
+                </h2>
+                <p>
+                  Only already-scanned text, Markdown, and code files are eligible. Every source is
+                  revalidated, output is size-limited, and a failed job cannot replace the last
+                  complete text.
+                </p>
+              </div>
+              <span className="connected-indicator">Never uploaded</span>
+            </div>
+            <div className="metrics metrics--content">
+              <Metric label="Files with text" value={state.extraction.extracted_file_count} />
+              <Metric label="Active chunks" value={state.extraction.active_chunk_count} />
+              <Metric label="Completed jobs" value={state.extraction.completed_job_count} />
+              <Metric
+                label="Skipped or cancelled"
+                value={state.extraction.failed_job_count + state.extraction.cancelled_job_count}
+              />
+            </div>
+            {state.extractionJobs[0] ? (
+              <div className="extraction-progress" role="status">
+                <span>Latest job {state.extractionJobs[0].job_id}</span>
+                <strong>{extractionStatusLabel(state.extractionJobs[0])}</strong>
+                <span>
+                  {state.extractionJobs[0].chunk_count.toLocaleString()} chunks ·{' '}
+                  {state.extractionJobs[0].output_bytes.toLocaleString()} bytes
+                </span>
+              </div>
+            ) : (
+              <p className="content-empty">
+                Extraction is opt-in. Authorizing or scanning a folder never reads file contents.
+              </p>
+            )}
           </section>
 
           <section className="panel panel--scopes" aria-labelledby="scopes-title">
@@ -437,7 +503,7 @@ export default function App() {
 
       <footer>
         <span>DeskGraph {state.kind === 'ready' ? state.report.app_version : '0.1.0'}</span>
-        <span>Metadata only · No content extraction · No file operations</span>
+        <span>Metadata + bounded local text · No uploads · No file operations</span>
       </footer>
     </main>
   );

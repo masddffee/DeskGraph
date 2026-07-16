@@ -2,7 +2,12 @@ use std::path::{Path, PathBuf};
 
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
-    AuthorizedScope, HealthReport, ManifestStats, ScanJobProgress, collect_health_with_manifest,
+    AuthorizedScope, ExtractionJobProgress, ExtractionStats, HealthReport, ManifestStats,
+    ScanJobProgress, collect_health_with_manifest,
+};
+use deskgraph_extractors::{
+    extraction_stats_at as read_extraction_stats_at,
+    recent_extraction_jobs_at as read_recent_extraction_jobs_at,
 };
 use deskgraph_scanner::{
     authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
@@ -87,6 +92,18 @@ fn recent_scan_jobs(state: State<'_, ManifestState>) -> Result<Vec<ScanJobProgre
 }
 
 #[tauri::command]
+fn content_extraction_stats(state: State<'_, ManifestState>) -> Result<ExtractionStats, String> {
+    content_extraction_stats_at(&state.database_path).map_err(str::to_string)
+}
+
+#[tauri::command]
+fn recent_content_extractions(
+    state: State<'_, ManifestState>,
+) -> Result<Vec<ExtractionJobProgress>, String> {
+    recent_content_extractions_at(&state.database_path).map_err(str::to_string)
+}
+
+#[tauri::command]
 fn pause_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
@@ -158,6 +175,14 @@ fn recent_scan_jobs_at(path: &Path) -> Result<Vec<ScanJobProgress>, &'static str
         .map_err(|error| error.code())
 }
 
+fn content_extraction_stats_at(path: &Path) -> Result<ExtractionStats, &'static str> {
+    read_extraction_stats_at(path).map_err(|error| error.code())
+}
+
+fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgress>, &'static str> {
+    read_recent_extraction_jobs_at(path).map_err(|error| error.code())
+}
+
 fn pause_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
     pause_scan_job(&mut database, job_id).map_err(|error| error.code())
@@ -209,6 +234,8 @@ pub fn run() {
             run_manifest_scan,
             scan_job_status,
             recent_scan_jobs,
+            content_extraction_stats,
+            recent_content_extractions,
             pause_manifest_scan,
             resume_manifest_scan
         ])
@@ -220,6 +247,7 @@ pub fn run() {
 mod tests {
     use super::*;
     use deskgraph_domain::LifecycleState;
+    use deskgraph_extractors::{ExtractionLimits, create_extraction_job_at, run_extraction_job_at};
 
     #[test]
     fn initialized_health_uses_the_shared_domain_contract() {
@@ -285,5 +313,48 @@ mod tests {
             authorized_scopes_at(&database_path).expect("scopes should load"),
             vec![scope]
         );
+    }
+
+    #[test]
+    fn extraction_helpers_expose_counts_without_paths_or_text() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-private");
+        let source_path = scope_path.join("private-notes.md");
+        let private_text = "私人內容不得出現在狀態 payload";
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(&source_path, private_text).expect("file should create");
+
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope =
+            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let database = ManifestDatabase::open(&database_path).expect("database should open");
+        let node_id = database
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("source node should exist");
+        drop(database);
+        let job = create_extraction_job_at(&database_path, scope.id, node_id)
+            .expect("extraction should create");
+        run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
+            .expect("extraction should complete");
+
+        let payload = serde_json::to_string(&(
+            content_extraction_stats_at(&database_path).expect("stats should load"),
+            recent_content_extractions_at(&database_path).expect("jobs should load"),
+        ))
+        .expect("payload should serialize");
+        assert!(!payload.contains(private_text));
+        assert!(!payload.contains("private-notes.md"));
+        assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
+        assert!(payload.contains("deskgraph.extraction-stats.v1"));
+        assert!(payload.contains("\"status\":\"completed\""));
     }
 }

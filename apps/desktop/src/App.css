@@ -127,6 +127,7 @@ h2 {
   gap: 1.25rem;
 }
 
+.panel--content,
 .panel--scopes {
   grid-column: 1 / -1;
 }
@@ -170,6 +171,10 @@ footer {
   margin-bottom: 0;
   color: #657269;
   line-height: 1.55;
+}
+
+.panel--content .panel-heading--wrap p {
+  max-width: 72ch;
 }
 
 .status-list {
@@ -237,6 +242,41 @@ footer {
   font-weight: 750;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.metrics--content {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.panel--content .metric {
+  border-color: rgba(27, 59, 40, 0.12);
+  background: #f4f7f1;
+}
+
+.panel--content .metric span {
+  color: #69766e;
+}
+
+.extraction-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.8rem;
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  color: #5d6b63;
+  font-size: 0.82rem;
+}
+
+.extraction-progress strong {
+  color: #235c3a;
+}
+
+.content-empty {
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  margin: 1.25rem 0 0;
+  padding-top: 1rem;
+  color: #657269;
 }
 
 .scope-count {
@@ -418,6 +458,10 @@ footer {
     display: flex;
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .metrics--content {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .release-badge {

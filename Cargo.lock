@@ -665,6 +665,7 @@ version = "0.1.0"
 dependencies = [
  "deskgraph-database",
  "deskgraph-domain",
+ "deskgraph-extractors",
  "deskgraph-scanner",
  "deskgraph-telemetry",
  "serde_json",
