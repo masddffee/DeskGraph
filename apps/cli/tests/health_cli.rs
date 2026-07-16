@@ -560,6 +560,87 @@ fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
         .as_i64()
         .expect("relation id should exist")
         .to_string();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "decide",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+            "--decision",
+            "reject",
+        ])
+        .output()
+        .expect("deskgraph relation reject should start");
+    assert!(rejected.status.success());
+    let rejected_json: serde_json::Value =
+        serde_json::from_slice(&rejected.stdout).expect("rejection should be JSON");
+    assert_eq!(rejected_json["state"], "rejected");
+    assert_eq!(rejected_json["latest_decision"]["sequence"], 1);
+
+    let duplicate_again = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "duplicate",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_arg,
+            "--left",
+            left_arg,
+            "--right",
+            right_arg,
+        ])
+        .output()
+        .expect("deskgraph relation duplicate should restart");
+    assert!(duplicate_again.status.success());
+    let duplicate_again_json: serde_json::Value = serde_json::from_slice(&duplicate_again.stdout)
+        .expect("rechecked candidate should be JSON");
+    assert_eq!(duplicate_again_json["state"], "rejected");
+    assert_eq!(
+        duplicate_again_json["relation_id"],
+        candidate["relation_id"]
+    );
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "decide",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+            "--decision",
+            "accept",
+        ])
+        .output()
+        .expect("deskgraph relation accept should start");
+    assert!(accepted.status.success());
+    let accepted_json: serde_json::Value =
+        serde_json::from_slice(&accepted.stdout).expect("acceptance should be JSON");
+    assert_eq!(accepted_json["state"], "accepted");
+    assert_eq!(accepted_json["latest_decision"]["sequence"], 2);
+
+    let accepted_again = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "decide",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+            "--decision",
+            "accept",
+        ])
+        .output()
+        .expect("deskgraph repeated relation accept should start");
+    assert!(accepted_again.status.success());
+    let accepted_again_json: serde_json::Value =
+        serde_json::from_slice(&accepted_again.stdout).expect("repeated acceptance should be JSON");
+    assert_eq!(accepted_again_json["state"], "accepted");
+    assert_eq!(accepted_again_json["latest_decision"]["sequence"], 2);
+
     let verified = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
         .args([
             "relation",
@@ -575,7 +656,21 @@ fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
     let verified_json: serde_json::Value =
         serde_json::from_slice(&verified.stdout).expect("verification should be JSON");
     assert_eq!(verified_json["relation_id"], candidate["relation_id"]);
-    assert_eq!(verified_json["state"], "suggested");
+    assert_eq!(verified_json["state"], "accepted");
+
+    let list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args(["relation", "list", "--database", database_arg])
+        .output()
+        .expect("deskgraph relation list should start");
+    assert!(list.status.success());
+    let summaries: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("relation list should be JSON");
+    assert_eq!(summaries[0]["relation_id"], candidate["relation_id"]);
+    assert_eq!(summaries[0]["state"], "accepted");
+    assert_eq!(summaries[0]["verification_required"], true);
+    assert!(summaries[0].get("left").is_none());
+    assert!(summaries[0].get("right").is_none());
+    assert!(summaries[0].get("display_path").is_none());
 
     assert_eq!(
         std::fs::read(&left_path).expect("left should remain"),
@@ -585,7 +680,16 @@ fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
         std::fs::read(&right_path).expect("right should remain"),
         private_content
     );
-    for output in [&duplicate, &verified] {
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    for output in [
+        &duplicate,
+        &rejected,
+        &duplicate_again,
+        &accepted,
+        &accepted_again,
+        &verified,
+        &list,
+    ] {
         let stderr = String::from_utf8_lossy(&output.stderr);
         for secret in [
             "private-duplicates",
@@ -597,6 +701,7 @@ fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
             "private duplicate local context",
         ] {
             assert!(!stderr.contains(secret));
+            assert!(!list_stdout.contains(secret));
         }
         assert!(
             stderr

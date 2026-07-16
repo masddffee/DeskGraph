@@ -144,6 +144,8 @@ pub enum FileRelationKind {
 #[serde(rename_all = "snake_case")]
 pub enum FileRelationCandidateState {
     Suggested,
+    Accepted,
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -156,6 +158,27 @@ pub enum FileRelationComparisonKind {
 #[serde(rename_all = "snake_case")]
 pub enum FileRelationCreator {
     SystemRule,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRelationDecisionKind {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileRelationDecisionCreator {
+    User,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileRelationDecision {
+    pub sequence: u64,
+    pub kind: FileRelationDecisionKind,
+    pub created_by: FileRelationDecisionCreator,
+    pub decided_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -195,10 +218,30 @@ pub struct FileRelationCandidate {
     pub left: FileRelationEndpoint,
     pub right: FileRelationEndpoint,
     pub evidence: FileRelationEvidence,
+    pub latest_decision: Option<FileRelationDecision>,
 }
 
 impl FileRelationCandidate {
     pub const API_VERSION: &str = "deskgraph.file-relation-candidate.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileRelationCandidateSummary {
+    pub api_version: &'static str,
+    pub relation_id: i64,
+    pub kind: FileRelationKind,
+    pub state: FileRelationCandidateState,
+    pub scope_id: i64,
+    pub left_node_id: i64,
+    pub right_node_id: i64,
+    pub confidence_basis_points: u16,
+    pub last_observed_at_unix_ms: i64,
+    pub latest_decision_at_unix_ms: Option<i64>,
+    pub verification_required: bool,
+}
+
+impl FileRelationCandidateSummary {
+    pub const API_VERSION: &str = "deskgraph.file-relation-candidate-summary.v1";
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -295,6 +338,7 @@ mod tests {
                 model_version: None,
                 bounded_max_bytes: 64 * 1024 * 1024,
             },
+            latest_decision: None,
         };
         let value = serde_json::to_value(candidate).expect("candidate should serialize");
         assert_eq!(value["kind"], "exact_duplicate");
@@ -303,5 +347,29 @@ mod tests {
         assert_eq!(value["evidence"]["confidence_basis_points"], 10_000);
         assert_eq!(value["evidence"]["created_by"], "system_rule");
         assert_eq!(value["evidence"]["model_version"], serde_json::Value::Null);
+        assert_eq!(value["latest_decision"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn file_relation_history_summary_is_path_free_and_requires_verification() {
+        let summary = FileRelationCandidateSummary {
+            api_version: FileRelationCandidateSummary::API_VERSION,
+            relation_id: 1,
+            kind: FileRelationKind::ExactDuplicate,
+            state: FileRelationCandidateState::Rejected,
+            scope_id: 2,
+            left_node_id: 3,
+            right_node_id: 4,
+            confidence_basis_points: 10_000,
+            last_observed_at_unix_ms: 5,
+            latest_decision_at_unix_ms: Some(6),
+            verification_required: true,
+        };
+        let value = serde_json::to_value(summary).expect("summary should serialize");
+        assert_eq!(value["state"], "rejected");
+        assert_eq!(value["verification_required"], true);
+        assert!(value.get("display_path").is_none());
+        assert!(value.get("left").is_none());
+        assert!(value.get("right").is_none());
     }
 }

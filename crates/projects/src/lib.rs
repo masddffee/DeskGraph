@@ -6,9 +6,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use deskgraph_database::{ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase};
 use deskgraph_domain::{
-    FileRelationCandidate, FolderProfile, ProjectCandidate, ProjectCandidateSummary,
-    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
-    ProjectSuggestionCreator,
+    FileRelationCandidate, FileRelationCandidateSummary, FileRelationDecisionKind, FolderProfile,
+    ProjectCandidate, ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal,
+    ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
 };
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
@@ -222,6 +222,34 @@ pub fn verify_exact_duplicate(
         Some(right_snapshot.node_id),
     )?;
     compare_and_record(database, left, right)
+}
+
+pub fn decide_exact_duplicate_at(
+    database_path: &Path,
+    relation_id: i64,
+    decision: FileRelationDecisionKind,
+) -> Result<FileRelationCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    decide_exact_duplicate(&mut database, relation_id, decision)
+}
+
+pub fn decide_exact_duplicate(
+    database: &mut ManifestDatabase,
+    relation_id: i64,
+    decision: FileRelationDecisionKind,
+) -> Result<FileRelationCandidate, ProjectError> {
+    verify_exact_duplicate(database, relation_id)?;
+    database
+        .decide_file_relation_candidate(relation_id, decision)
+        .map_err(Into::into)
+}
+
+pub fn recent_file_relation_candidates_at(
+    database_path: &Path,
+) -> Result<Vec<FileRelationCandidateSummary>, ProjectError> {
+    ManifestDatabase::open(database_path)?
+        .recent_file_relation_candidates()
+        .map_err(Into::into)
 }
 
 fn open_relation_source(
@@ -503,7 +531,7 @@ mod tests {
     use super::*;
     use deskgraph_domain::{
         FileRelationCandidateState, FileRelationComparisonKind, FileRelationCreator,
-        FolderFileCategory, ProjectCandidateState,
+        FileRelationDecisionKind, FolderFileCategory, ProjectCandidateState,
     };
     use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
 
@@ -760,6 +788,54 @@ mod tests {
         let verified = verify_exact_duplicate(&mut database, candidate.relation_id)
             .expect("current relation should verify");
         assert_eq!(verified.relation_id, candidate.relation_id);
+        let rejected = decide_exact_duplicate(
+            &mut database,
+            candidate.relation_id,
+            FileRelationDecisionKind::Rejected,
+        )
+        .expect("a verified relation should reject");
+        assert_eq!(rejected.state, FileRelationCandidateState::Rejected);
+        assert_eq!(
+            rejected
+                .latest_decision
+                .as_ref()
+                .map(|decision| decision.sequence),
+            Some(1)
+        );
+        let checked_again =
+            check_exact_duplicate(&mut database, scope.id, &canonical_left, &canonical_right)
+                .expect("later evidence should retain pair feedback");
+        assert_eq!(checked_again.state, FileRelationCandidateState::Rejected);
+        let accepted = decide_exact_duplicate(
+            &mut database,
+            candidate.relation_id,
+            FileRelationDecisionKind::Accepted,
+        )
+        .expect("a verified relation should accept after correction");
+        assert_eq!(accepted.state, FileRelationCandidateState::Accepted);
+        assert_eq!(
+            accepted
+                .latest_decision
+                .as_ref()
+                .map(|decision| decision.sequence),
+            Some(2)
+        );
+        let repeated_acceptance = decide_exact_duplicate(
+            &mut database,
+            candidate.relation_id,
+            FileRelationDecisionKind::Accepted,
+        )
+        .expect("repeating acceptance should remain idempotent");
+        assert_eq!(
+            repeated_acceptance.latest_decision,
+            accepted.latest_decision
+        );
+        let summaries = database
+            .recent_file_relation_candidates()
+            .expect("relation summaries should load");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].state, FileRelationCandidateState::Accepted);
+        assert!(summaries[0].verification_required);
         assert_eq!(
             std::fs::read(&left_path).expect("left should remain"),
             private_bytes

@@ -7,12 +7,13 @@ use deskgraph_domain::{
     ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyReport, AuthorizedScope, ExtractionJobProgress, ExtractionStats,
     ExtractionStatus, FileRelationCandidate, FileRelationCandidateState,
-    FileRelationComparisonKind, FileRelationCreator, FileRelationEndpoint, FileRelationEvidence,
-    FileRelationKind, FolderCategoryCount, FolderFileCategory, ManifestStats, ProjectCandidate,
-    ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
-    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
-    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
-    WatchEventReason, WatchEventStatus,
+    FileRelationCandidateSummary, FileRelationComparisonKind, FileRelationCreator,
+    FileRelationDecision, FileRelationDecisionCreator, FileRelationDecisionKind,
+    FileRelationEndpoint, FileRelationEvidence, FileRelationKind, FolderCategoryCount,
+    FolderFileCategory, ManifestStats, ProjectCandidate, ProjectCandidateState,
+    ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator, ProjectDecisionKind,
+    ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator, ScanJobProgress,
+    ScanReport, ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -61,6 +62,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "exact_duplicate_candidates",
         sql: include_str!("../../../migrations/0009_exact_duplicate_candidates.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "file_relation_feedback",
+        sql: include_str!("../../../migrations/0010_file_relation_feedback.sql"),
     },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2613,7 +2619,9 @@ impl ManifestDatabase {
                         observation.compared_bytes, observation.confidence_basis_points, \
                         observation.comparison_kind, observation.created_by, \
                         observation.provider_id, observation.provider_version, \
-                        observation.model_version, observation.observed_at_unix_ms \
+                        observation.model_version, observation.observed_at_unix_ms, \
+                        feedback.sequence, feedback.decision, feedback.created_by, \
+                        feedback.created_at_unix_ms \
                  FROM file_relation_candidates r \
                  JOIN file_relation_observations observation ON observation.id = ( \
                     SELECT latest.id FROM file_relation_observations latest \
@@ -2638,6 +2646,11 @@ impl ManifestDatabase {
                  JOIN files right_file ON right_file.node_id = r.right_node_id \
                     AND right_file.size_bytes = observation.source_size_bytes \
                     AND right_file.modified_unix_ns IS observation.right_modified_unix_ns \
+                 LEFT JOIN file_relation_feedback_events feedback ON feedback.id = ( \
+                    SELECT latest_feedback.id FROM file_relation_feedback_events latest_feedback \
+                    WHERE latest_feedback.relation_id = r.id \
+                    ORDER BY latest_feedback.sequence DESC LIMIT 1 \
+                 ) \
                  WHERE r.id = ?1",
                 [relation_id],
                 |row| {
@@ -2663,6 +2676,10 @@ impl ManifestDatabase {
                         row.get::<_, String>(18)?,
                         row.get::<_, Option<String>>(19)?,
                         row.get::<_, i64>(20)?,
+                        row.get::<_, Option<i64>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, Option<String>>(23)?,
+                        row.get::<_, Option<i64>>(24)?,
                     ))
                 },
             )
@@ -2689,6 +2706,10 @@ impl ManifestDatabase {
             provider_version,
             model_version,
             observed_at_unix_ms,
+            decision_sequence,
+            decision_kind,
+            decision_creator,
+            decided_at_unix_ms,
         )) = row
         else {
             let relation_exists = self.connection.query_row(
@@ -2718,11 +2739,37 @@ impl ManifestDatabase {
         if source_size_bytes == 0 || source_size_bytes > MAX_FILE_RELATION_SOURCE_BYTES {
             return Err(DatabaseError::InvalidStoredValue);
         }
+        let latest_decision = match (
+            decision_sequence,
+            decision_kind,
+            decision_creator,
+            decided_at_unix_ms,
+        ) {
+            (None, None, None, None) => None,
+            (Some(sequence), Some(kind), Some(creator), Some(decided_at_unix_ms)) => {
+                if creator != "user" {
+                    return Err(DatabaseError::InvalidStoredValue);
+                }
+                Some(FileRelationDecision {
+                    sequence: u64::try_from(sequence)
+                        .map_err(|_| DatabaseError::InvalidStoredValue)?,
+                    kind: file_relation_decision_kind_from_str(&kind)?,
+                    created_by: FileRelationDecisionCreator::User,
+                    decided_at_unix_ms,
+                })
+            }
+            _ => return Err(DatabaseError::InvalidStoredValue),
+        };
+        let state = match latest_decision.as_ref().map(|decision| decision.kind) {
+            None => FileRelationCandidateState::Suggested,
+            Some(FileRelationDecisionKind::Accepted) => FileRelationCandidateState::Accepted,
+            Some(FileRelationDecisionKind::Rejected) => FileRelationCandidateState::Rejected,
+        };
         Ok(FileRelationCandidate {
             api_version: FileRelationCandidate::API_VERSION,
             relation_id,
             kind: FileRelationKind::ExactDuplicate,
-            state: FileRelationCandidateState::Suggested,
+            state,
             left: FileRelationEndpoint {
                 scope_id,
                 node_id: left_node_id,
@@ -2751,7 +2798,203 @@ impl ManifestDatabase {
                 model_version: None,
                 bounded_max_bytes: MAX_FILE_RELATION_SOURCE_BYTES,
             },
+            latest_decision,
         })
+    }
+
+    pub fn decide_file_relation_candidate(
+        &mut self,
+        relation_id: i64,
+        decision: FileRelationDecisionKind,
+    ) -> Result<FileRelationCandidate, DatabaseError> {
+        if relation_id <= 0 {
+            return Err(DatabaseError::FileRelationCandidateInputInvalid);
+        }
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let relation_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_relation_candidates WHERE id = ?1)",
+            [relation_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !relation_exists {
+            return Err(DatabaseError::FileRelationCandidateNotFound);
+        }
+        let relation_is_current = transaction.query_row(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM file_relation_candidates r \
+                 JOIN file_relation_observations observation ON observation.id = ( \
+                    SELECT latest.id FROM file_relation_observations latest \
+                    WHERE latest.relation_id = r.id \
+                    ORDER BY latest.observed_at_unix_ms DESC, latest.id DESC LIMIT 1 \
+                 ) \
+                 JOIN locations left_location ON left_location.id = observation.left_location_id \
+                    AND left_location.scope_id = r.scope_id \
+                    AND left_location.node_id = r.left_node_id AND left_location.present = 1 \
+                 JOIN files left_file ON left_file.node_id = r.left_node_id \
+                    AND left_file.size_bytes = observation.source_size_bytes \
+                    AND left_file.modified_unix_ns IS observation.left_modified_unix_ns \
+                 JOIN locations right_location ON right_location.id = observation.right_location_id \
+                    AND right_location.scope_id = r.scope_id \
+                    AND right_location.node_id = r.right_node_id AND right_location.present = 1 \
+                 JOIN files right_file ON right_file.node_id = r.right_node_id \
+                    AND right_file.size_bytes = observation.source_size_bytes \
+                    AND right_file.modified_unix_ns IS observation.right_modified_unix_ns \
+                 WHERE r.id = ?1 AND r.relation_kind = 'exact_duplicate' \
+             )",
+            [relation_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !relation_is_current {
+            return Err(DatabaseError::FileRelationCandidateNotCurrent);
+        }
+        let latest = transaction
+            .query_row(
+                "SELECT sequence, decision FROM file_relation_feedback_events \
+                 WHERE relation_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                [relation_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if latest
+            .as_ref()
+            .is_some_and(|(_, stored)| stored == file_relation_decision_kind_str(decision))
+        {
+            transaction.commit()?;
+            return self.file_relation_candidate(relation_id);
+        }
+        let sequence = latest.map_or(Ok(1_i64), |(sequence, _)| {
+            sequence.checked_add(1).ok_or(DatabaseError::InvalidCount)
+        })?;
+        transaction.execute(
+            "INSERT INTO file_relation_feedback_events( \
+                 relation_id, sequence, decision, created_by, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, 'user', ?4)",
+            params![
+                relation_id,
+                sequence,
+                file_relation_decision_kind_str(decision),
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        self.file_relation_candidate(relation_id)
+    }
+
+    pub fn recent_file_relation_candidates(
+        &self,
+    ) -> Result<Vec<FileRelationCandidateSummary>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, r.relation_kind, r.scope_id, r.left_node_id, r.right_node_id, \
+                    observation.confidence_basis_points, observation.comparison_kind, \
+                    observation.created_by, observation.provider_id, \
+                    observation.provider_version, observation.model_version, \
+                    observation.observed_at_unix_ms, feedback.sequence, feedback.decision, \
+                    feedback.created_by, feedback.created_at_unix_ms \
+             FROM file_relation_candidates r \
+             JOIN file_relation_observations observation ON observation.id = ( \
+                SELECT latest.id FROM file_relation_observations latest \
+                WHERE latest.relation_id = r.id \
+                ORDER BY latest.observed_at_unix_ms DESC, latest.id DESC LIMIT 1 \
+             ) \
+             LEFT JOIN file_relation_feedback_events feedback ON feedback.id = ( \
+                SELECT latest_feedback.id FROM file_relation_feedback_events latest_feedback \
+                WHERE latest_feedback.relation_id = r.id \
+                ORDER BY latest_feedback.sequence DESC LIMIT 1 \
+             ) \
+             ORDER BY observation.observed_at_unix_ms DESC, r.id DESC LIMIT 20",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, Option<i64>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<i64>>(15)?,
+            ))
+        })?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                relation_id,
+                relation_kind,
+                scope_id,
+                left_node_id,
+                right_node_id,
+                confidence_basis_points,
+                comparison_kind,
+                created_by,
+                provider_id,
+                provider_version,
+                model_version,
+                observed_at_unix_ms,
+                decision_sequence,
+                decision_kind,
+                decision_creator,
+                decided_at_unix_ms,
+            ) = row?;
+            if relation_kind != "exact_duplicate"
+                || comparison_kind != "byte_for_byte"
+                || created_by != "system_rule"
+                || provider_id != FileRelationEvidence::PROVIDER_ID
+                || provider_version != FileRelationEvidence::PROVIDER_VERSION
+                || model_version.is_some()
+                || confidence_basis_points != 10_000
+            {
+                return Err(DatabaseError::InvalidStoredValue);
+            }
+            let latest_decision = match (
+                decision_sequence,
+                decision_kind,
+                decision_creator,
+                decided_at_unix_ms,
+            ) {
+                (None, None, None, None) => None,
+                (Some(sequence), Some(kind), Some(creator), Some(decided_at_unix_ms)) => {
+                    if creator != "user" {
+                        return Err(DatabaseError::InvalidStoredValue);
+                    }
+                    let _ =
+                        u64::try_from(sequence).map_err(|_| DatabaseError::InvalidStoredValue)?;
+                    Some((
+                        file_relation_decision_kind_from_str(&kind)?,
+                        decided_at_unix_ms,
+                    ))
+                }
+                _ => return Err(DatabaseError::InvalidStoredValue),
+            };
+            let state = match latest_decision.map(|decision| decision.0) {
+                None => FileRelationCandidateState::Suggested,
+                Some(FileRelationDecisionKind::Accepted) => FileRelationCandidateState::Accepted,
+                Some(FileRelationDecisionKind::Rejected) => FileRelationCandidateState::Rejected,
+            };
+            candidates.push(FileRelationCandidateSummary {
+                api_version: FileRelationCandidateSummary::API_VERSION,
+                relation_id,
+                kind: FileRelationKind::ExactDuplicate,
+                state,
+                scope_id,
+                left_node_id,
+                right_node_id,
+                confidence_basis_points: u16::try_from(confidence_basis_points)
+                    .map_err(|_| DatabaseError::InvalidStoredValue)?,
+                last_observed_at_unix_ms: observed_at_unix_ms,
+                latest_decision_at_unix_ms: latest_decision.map(|decision| decision.1),
+                verification_required: true,
+            });
+        }
+        Ok(candidates)
     }
 
     pub fn exact_duplicate_sources(
@@ -3159,6 +3402,23 @@ fn project_decision_kind_from_str(stored: &str) -> Result<ProjectDecisionKind, D
     match stored {
         "accepted" => Ok(ProjectDecisionKind::Accepted),
         "rejected" => Ok(ProjectDecisionKind::Rejected),
+        _ => Err(DatabaseError::InvalidStoredValue),
+    }
+}
+
+fn file_relation_decision_kind_str(decision: FileRelationDecisionKind) -> &'static str {
+    match decision {
+        FileRelationDecisionKind::Accepted => "accepted",
+        FileRelationDecisionKind::Rejected => "rejected",
+    }
+}
+
+fn file_relation_decision_kind_from_str(
+    stored: &str,
+) -> Result<FileRelationDecisionKind, DatabaseError> {
+    match stored {
+        "accepted" => Ok(FileRelationDecisionKind::Accepted),
+        "rejected" => Ok(FileRelationDecisionKind::Rejected),
         _ => Err(DatabaseError::InvalidStoredValue),
     }
 }
@@ -4194,6 +4454,78 @@ mod tests {
             .expect("observation count should load");
         assert_eq!(observation_count, 2);
 
+        let rejected = database
+            .decide_file_relation_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Rejected,
+            )
+            .expect("candidate should reject");
+        assert_eq!(rejected.state, FileRelationCandidateState::Rejected);
+        assert_eq!(
+            rejected
+                .latest_decision
+                .as_ref()
+                .map(|decision| decision.sequence),
+            Some(1)
+        );
+        let repeated_rejection = database
+            .decide_file_relation_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Rejected,
+            )
+            .expect("same decision should be idempotent");
+        assert_eq!(repeated_rejection.latest_decision, rejected.latest_decision);
+        let observed_after_rejection = database
+            .record_exact_duplicate_candidate(&left, &right)
+            .expect("new evidence should retain pair-specific feedback");
+        assert_eq!(
+            observed_after_rejection.state,
+            FileRelationCandidateState::Rejected
+        );
+        let accepted = database
+            .decide_file_relation_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Accepted,
+            )
+            .expect("candidate should accept after correction");
+        assert_eq!(accepted.state, FileRelationCandidateState::Accepted);
+        assert_eq!(
+            accepted
+                .latest_decision
+                .as_ref()
+                .map(|decision| decision.sequence),
+            Some(2)
+        );
+        let repeated_acceptance = database
+            .decide_file_relation_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Accepted,
+            )
+            .expect("same acceptance should be idempotent");
+        assert_eq!(
+            repeated_acceptance.latest_decision,
+            accepted.latest_decision
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM file_relation_feedback_events WHERE relation_id = ?1",
+                    [candidate.relation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("feedback count should load"),
+            2
+        );
+        let summaries = database
+            .recent_file_relation_candidates()
+            .expect("relation summaries should load");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].state, FileRelationCandidateState::Accepted);
+        assert!(summaries[0].verification_required);
+        assert_eq!(summaries[0].left_node_id, left.node_id);
+        assert_eq!(summaries[0].right_node_id, right.node_id);
+
         let mut stale_left = left.clone();
         stale_left.modified_unix_ns = Some(3);
         assert!(matches!(
@@ -4210,6 +4542,25 @@ mod tests {
                 .connection
                 .execute(
                     "UPDATE file_relation_candidates SET scope_id = scope_id WHERE id = ?1",
+                    [candidate.relation_id],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE file_relation_feedback_events SET decision = decision \
+                     WHERE relation_id = ?1",
+                    [candidate.relation_id],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM file_relation_feedback_events WHERE relation_id = ?1",
                     [candidate.relation_id],
                 )
                 .is_err()
