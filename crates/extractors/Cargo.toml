@@ -9,6 +9,7 @@ license.workspace = true
 deskgraph-database = { path = "../database" }
 deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
+lopdf.workspace = true
 
 [dev-dependencies]
 deskgraph-scanner = { path = "../scanner" }

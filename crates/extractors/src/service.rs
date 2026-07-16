@@ -15,12 +15,14 @@ use deskgraph_identity::{
 
 use crate::{
     CancellationSignal, ChunkProvenance, ExtractionError, ExtractionLimits, ExtractionRequest,
-    ExtractorProvider, MediaKind, Utf8TextExtractor, media_kind_for_extension,
+    ExtractorProvider, MediaKind, PdfTextExtractor, Utf8TextExtractor, media_kind_for_extension,
 };
 
 // The provider's absolute processing cap is 60 seconds. Keep enough lease headroom for
 // post-read identity validation and one atomic SQLite publish without permitting stale runners.
 const RUNNER_LEASE_MS: i64 = 120_000;
+const ROUTER_PROVIDER_ID: &str = "deskgraph.extractor-router";
+const ROUTER_PROVIDER_VERSION: &str = "1";
 
 #[derive(Debug)]
 pub enum ExtractionServiceError {
@@ -174,11 +176,10 @@ pub fn run_extraction_job_at(
     let runner_token = runner_token()?;
     database.claim_extraction_job(job_id, &runner_token, RUNNER_LEASE_MS)?;
     let started = Instant::now();
-    let provider = Utf8TextExtractor;
-    let provider_id = provider.provider_id();
-    let provider_version = provider.provider_version();
-
-    let result = extract_claimed_job(&database, database_path, job_id, limits, &provider);
+    let attempt = extract_claimed_job(&database, database_path, job_id, limits);
+    let provider_id = attempt.provider_id;
+    let provider_version = attempt.provider_version;
+    let result = attempt.result;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok(output) => {
@@ -291,23 +292,70 @@ fn extract_claimed_job(
     database_path: &Path,
     job_id: i64,
     limits: ExtractionLimits,
-    provider: &Utf8TextExtractor,
-) -> Result<crate::ExtractionOutput, ExtractionServiceError> {
-    let source = database.extractable_file_for_job(job_id)?;
-    let (mut file, media_kind) = validate_source(database, &source)?;
-    let cancellation = DatabaseCancellation::open(database_path, job_id)?;
-    let output = provider.extract(
-        &mut file,
-        ExtractionRequest {
-            media_kind,
-            expected_source_bytes: source.size_bytes,
-            modified_unix_ns: source.modified_unix_ns,
-        },
-        limits,
-        &cancellation,
-    )?;
-    validate_open_file(&file, &source)?;
-    Ok(output)
+) -> ExtractionAttempt {
+    let source = match database.extractable_file_for_job(job_id) {
+        Ok(source) => source,
+        Err(error) => return ExtractionAttempt::router_error(error.into()),
+    };
+    let (mut file, media_kind) = match validate_source(database, &source) {
+        Ok(validated) => validated,
+        Err(error) => return ExtractionAttempt::router_error(error),
+    };
+    let text_provider = Utf8TextExtractor;
+    let pdf_provider = PdfTextExtractor;
+    let provider: &dyn ExtractorProvider = match media_kind {
+        MediaKind::PlainText | MediaKind::Markdown | MediaKind::SourceCode => &text_provider,
+        MediaKind::Pdf => &pdf_provider,
+    };
+    let provider_id = provider.provider_id();
+    let provider_version = provider.provider_version();
+    let cancellation = match DatabaseCancellation::open(database_path, job_id) {
+        Ok(cancellation) => cancellation,
+        Err(error) => {
+            return ExtractionAttempt {
+                provider_id,
+                provider_version,
+                result: Err(error),
+            };
+        }
+    };
+    let result = provider
+        .extract(
+            &mut file,
+            ExtractionRequest {
+                media_kind,
+                expected_source_bytes: source.size_bytes,
+                modified_unix_ns: source.modified_unix_ns,
+            },
+            limits,
+            &cancellation,
+        )
+        .map_err(ExtractionServiceError::from)
+        .and_then(|output| {
+            validate_open_file(&file, &source)?;
+            Ok(output)
+        });
+    ExtractionAttempt {
+        provider_id,
+        provider_version,
+        result,
+    }
+}
+
+struct ExtractionAttempt {
+    provider_id: &'static str,
+    provider_version: &'static str,
+    result: Result<crate::ExtractionOutput, ExtractionServiceError>,
+}
+
+impl ExtractionAttempt {
+    fn router_error(error: ExtractionServiceError) -> Self {
+        Self {
+            provider_id: ROUTER_PROVIDER_ID,
+            provider_version: ROUTER_PROVIDER_VERSION,
+            result: Err(error),
+        }
+    }
 }
 
 fn validate_source(
@@ -416,6 +464,8 @@ mod tests {
     use super::*;
     use deskgraph_domain::ExtractionStatus;
     use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Document, Object, Stream, dictionary};
     use std::path::PathBuf;
 
     struct Fixture {
@@ -451,6 +501,56 @@ mod tests {
         }
     }
 
+    fn pdf_bytes(text: &str) -> Vec<u8> {
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Courier",
+        });
+        let resources_id = document.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        });
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Tj", vec![Object::string_literal(text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            content.encode().expect("PDF content should encode"),
+        ));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => resources_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        document
+            .save_to(&mut bytes)
+            .expect("PDF fixture should save");
+        bytes
+    }
+
     #[test]
     fn markdown_file_runs_from_manifest_identity_to_atomic_chunks() {
         let fixture = fixture("notes.md", "# DeskGraph\n本機 context\n".as_bytes());
@@ -470,6 +570,28 @@ mod tests {
             completed.provider_id.as_deref(),
             Some("deskgraph.utf8-text")
         );
+        assert!(completed.chunk_count > 0);
+        let stats = extraction_stats_at(&fixture.database_path).expect("stats should load");
+        assert_eq!(stats.extracted_file_count, 1);
+        assert_eq!(stats.active_chunk_count, completed.chunk_count);
+    }
+
+    #[test]
+    fn pdf_file_routes_from_manifest_identity_to_bounded_provider() {
+        let fixture = fixture("reference.pdf", &pdf_bytes("DeskGraph PDF context"));
+        let job =
+            create_extraction_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("job should create");
+
+        let completed = run_extraction_job_at(
+            &fixture.database_path,
+            job.job_id,
+            ExtractionLimits::default(),
+        )
+        .expect("PDF job should run");
+
+        assert_eq!(completed.status, ExtractionStatus::Completed);
+        assert_eq!(completed.provider_id.as_deref(), Some("deskgraph.pdf-text"));
         assert!(completed.chunk_count > 0);
         let stats = extraction_stats_at(&fixture.database_path).expect("stats should load");
         assert_eq!(stats.extracted_file_count, 1);

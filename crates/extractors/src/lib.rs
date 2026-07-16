@@ -3,8 +3,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod pdf;
 mod service;
 
+pub use pdf::PdfTextExtractor;
 pub use service::{
     ExtractionServiceError, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
     extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
@@ -17,12 +19,15 @@ pub const ABSOLUTE_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const ABSOLUTE_MAX_CHUNKS: usize = 65_536;
 pub const ABSOLUTE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 pub const ABSOLUTE_MAX_PROCESSING_TIME: Duration = Duration::from_secs(60);
+pub const ABSOLUTE_MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+pub const ABSOLUTE_MAX_PDF_PAGES: u32 = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaKind {
     PlainText,
     Markdown,
     SourceCode,
+    Pdf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +37,8 @@ pub struct ExtractionLimits {
     pub max_chunks: usize,
     pub max_chunk_bytes: usize,
     pub chunk_overlap_bytes: usize,
+    pub max_decompressed_bytes: usize,
+    pub max_pdf_pages: u32,
     pub max_processing_time: Duration,
 }
 
@@ -43,6 +50,8 @@ impl Default for ExtractionLimits {
             max_chunks: 2_048,
             max_chunk_bytes: 4_096,
             chunk_overlap_bytes: 256,
+            max_decompressed_bytes: 8 * 1024 * 1024,
+            max_pdf_pages: 512,
             max_processing_time: Duration::from_secs(5),
         }
     }
@@ -96,6 +105,10 @@ pub enum ExtractionError {
     SourceSeekFailed,
     SourceReadFailed,
     InvalidUtf8,
+    InvalidPdf,
+    EncryptedPdfUnsupported,
+    DecompressionLimitExceeded,
+    PageLimitExceeded,
     ChunkLimitExceeded,
     Cancelled,
     TimeLimitExceeded,
@@ -113,6 +126,10 @@ impl ExtractionError {
             Self::SourceSeekFailed => "extraction_source_seek_failed",
             Self::SourceReadFailed => "extraction_source_read_failed",
             Self::InvalidUtf8 => "extraction_invalid_utf8",
+            Self::InvalidPdf => "extraction_pdf_invalid",
+            Self::EncryptedPdfUnsupported => "extraction_pdf_encrypted_unsupported",
+            Self::DecompressionLimitExceeded => "extraction_decompression_limit_exceeded",
+            Self::PageLimitExceeded => "extraction_page_limit_exceeded",
             Self::ChunkLimitExceeded => "extraction_chunk_limit_exceeded",
             Self::Cancelled => "extraction_cancelled",
             Self::TimeLimitExceeded => "extraction_time_limit_exceeded",
@@ -216,39 +233,8 @@ impl ExtractorProvider for Utf8TextExtractor {
 
         let started = Instant::now();
         check_control(started, limits.max_processing_time, cancellation)?;
-        source
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| ExtractionError::SourceSeekFailed)?;
-        let capacity = usize::try_from(request.expected_source_bytes)
-            .map_err(|_| ExtractionError::SourceTooLarge)?;
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            check_control(started, limits.max_processing_time, cancellation)?;
-            let read = source
-                .read(&mut buffer)
-                .map_err(|_| ExtractionError::SourceReadFailed)?;
-            if read == 0 {
-                break;
-            }
-            let next_length = bytes
-                .len()
-                .checked_add(read)
-                .ok_or(ExtractionError::SourceTooLarge)?;
-            if u64::try_from(next_length).map_err(|_| ExtractionError::SourceTooLarge)?
-                > limits.max_source_bytes
-            {
-                return Err(ExtractionError::SourceTooLarge);
-            }
-            bytes.extend_from_slice(&buffer[..read]);
-        }
-        check_control(started, limits.max_processing_time, cancellation)?;
-
-        let source_bytes =
-            u64::try_from(bytes.len()).map_err(|_| ExtractionError::SourceTooLarge)?;
-        if source_bytes != request.expected_source_bytes {
-            return Err(ExtractionError::SourceChanged);
-        }
+        let bytes = read_bounded_source(source, request, limits, started, cancellation)?;
+        let source_bytes = request.expected_source_bytes;
         let content_offset = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
             3
         } else {
@@ -287,11 +273,12 @@ pub fn media_kind_for_extension(extension: &str) -> Option<MediaKind> {
         | "swift" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "py" | "rb" | "php" | "sh"
         | "bash" | "zsh" | "fish" | "sql" | "html" | "htm" | "css" | "scss" | "sass" | "less"
         | "json" | "jsonl" | "toml" | "yaml" | "yml" | "xml" => Some(MediaKind::SourceCode),
+        "pdf" => Some(MediaKind::Pdf),
         _ => None,
     }
 }
 
-fn validate_limits(limits: ExtractionLimits) -> Result<(), ExtractionError> {
+pub(crate) fn validate_limits(limits: ExtractionLimits) -> Result<(), ExtractionError> {
     if limits.max_source_bytes == 0
         || limits.max_source_bytes > ABSOLUTE_MAX_SOURCE_BYTES
         || limits.max_output_bytes == 0
@@ -301,6 +288,10 @@ fn validate_limits(limits: ExtractionLimits) -> Result<(), ExtractionError> {
         || limits.max_chunk_bytes < 4
         || limits.max_chunk_bytes > ABSOLUTE_MAX_CHUNK_BYTES
         || limits.chunk_overlap_bytes >= limits.max_chunk_bytes
+        || limits.max_decompressed_bytes == 0
+        || limits.max_decompressed_bytes > ABSOLUTE_MAX_DECOMPRESSED_BYTES
+        || limits.max_pdf_pages == 0
+        || limits.max_pdf_pages > ABSOLUTE_MAX_PDF_PAGES
         || limits.max_processing_time.is_zero()
         || limits.max_processing_time > ABSOLUTE_MAX_PROCESSING_TIME
     {
@@ -309,7 +300,7 @@ fn validate_limits(limits: ExtractionLimits) -> Result<(), ExtractionError> {
     Ok(())
 }
 
-fn check_control(
+pub(crate) fn check_control(
     started: Instant,
     max_processing_time: Duration,
     cancellation: &dyn CancellationSignal,
@@ -321,6 +312,47 @@ fn check_control(
         return Err(ExtractionError::TimeLimitExceeded);
     }
     Ok(())
+}
+
+pub(crate) fn read_bounded_source(
+    source: &mut dyn ControlledSource,
+    request: ExtractionRequest,
+    limits: ExtractionLimits,
+    started: Instant,
+    cancellation: &dyn CancellationSignal,
+) -> Result<Vec<u8>, ExtractionError> {
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ExtractionError::SourceSeekFailed)?;
+    let capacity = usize::try_from(request.expected_source_bytes)
+        .map_err(|_| ExtractionError::SourceTooLarge)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_control(started, limits.max_processing_time, cancellation)?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| ExtractionError::SourceReadFailed)?;
+        if read == 0 {
+            break;
+        }
+        let next_length = bytes
+            .len()
+            .checked_add(read)
+            .ok_or(ExtractionError::SourceTooLarge)?;
+        if u64::try_from(next_length).map_err(|_| ExtractionError::SourceTooLarge)?
+            > limits.max_source_bytes
+        {
+            return Err(ExtractionError::SourceTooLarge);
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    check_control(started, limits.max_processing_time, cancellation)?;
+    let source_bytes = u64::try_from(bytes.len()).map_err(|_| ExtractionError::SourceTooLarge)?;
+    if source_bytes != request.expected_source_bytes {
+        return Err(ExtractionError::SourceChanged);
+    }
+    Ok(bytes)
 }
 
 fn chunk_utf8(
@@ -404,6 +436,8 @@ mod tests {
             max_chunks: 32,
             max_chunk_bytes: 12,
             chunk_overlap_bytes: 3,
+            max_decompressed_bytes: 1_024,
+            max_pdf_pages: 8,
             max_processing_time: Duration::from_secs(1),
         }
     }
@@ -413,7 +447,7 @@ mod tests {
         assert_eq!(media_kind_for_extension(".TXT"), Some(MediaKind::PlainText));
         assert_eq!(media_kind_for_extension("md"), Some(MediaKind::Markdown));
         assert_eq!(media_kind_for_extension("Rs"), Some(MediaKind::SourceCode));
-        assert_eq!(media_kind_for_extension("pdf"), None);
+        assert_eq!(media_kind_for_extension("pdf"), Some(MediaKind::Pdf));
         assert_eq!(media_kind_for_extension("exe"), None);
     }
 
