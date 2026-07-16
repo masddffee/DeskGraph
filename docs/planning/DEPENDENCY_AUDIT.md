@@ -90,15 +90,19 @@ No vector extension, tokenizer extension, embedding runtime, model, API, or netw
 
 The first M6 slice adds only the local path-based `deskgraph-watcher` workspace crate. It reuses the audited database/domain/identity/scanner layers and Rust standard library; no native watcher, async runtime, network client, or registry package was added. Native adapter candidates remain unapproved until official API, maintenance, platform, license, and security evidence exists.
 
+## M5 rename-preview dependency decision
+
+The first M5 slice adds only the local path-based `deskgraph-transactions` workspace crate. It reuses the audited database/domain/identity/scanner layers and Rust standard library. No registry package, file-operation plugin, async runtime, model, network client, shell, Python, Docker, or native runtime was added. `serde_json` and `tempfile` remain test-only workspace dependencies.
+
 ## GitHub Actions
 
 Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2 is pinned to `11bd71901bbe5b1630ceea73d27597364c9af683`; `actions/setup-node` v6.4.0 is pinned to `48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e`. CI permissions default to `contents: read`, and no secrets are exposed to fork pull requests. Remote execution evidence remains blocked until the GitHub repository exists.
 
 ## Executed verification
 
-- Before the PDF dependency, `Cargo.lock` resolved 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review. PDF integration produced 483 packages; local workspace-only retrieval, benchmark, and watcher crates bring the current lock to 486 without a new registry package.
+- Before the PDF dependency, `Cargo.lock` resolved 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review. PDF integration produced 483 packages; local workspace-only retrieval, benchmark, watcher, and transaction crates bring the current lock to 487 without a new registry package.
 - `cargo tree --workspace --depth 1` recorded all direct versions. `cargo tree --target all -i ...` traced RustSec warnings to Tauri/Wry's Linux GTK3 stack and Tauri's URL-pattern parser chain.
-- The last complete all-target scan before PDF loaded 1,160 cached RustSec advisories and scanned 457 lockfile packages: zero known vulnerabilities plus 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. The isolated 53-package PDF closure separately returned zero findings. A post-integration scan was requested at the 483-package PDF state but rejected because the local tool quota was exhausted; the current 486-package lock still requires that full scan, and the older all-target result must not be presented as current.
+- The last complete all-target scan before PDF loaded 1,160 cached RustSec advisories and scanned 457 lockfile packages: zero known vulnerabilities plus 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. The isolated 53-package PDF closure separately returned zero findings. A post-integration scan was requested at the 483-package PDF state but rejected because the local tool quota was exhausted; the current 487-package lock still requires that full scan, and the older all-target result must not be presented as current.
 - `pnpm audit --prod` and full `pnpm audit` found zero known vulnerabilities.
 - `pnpm licenses list --json` failed with `ERR_PNPM_MISSING_PACKAGE_INDEX_FILE` under pnpm's SQLite-backed local store. The recorded equivalent scan read all installed package manifests: 145 unique packages, no missing license fields; 106 MIT, 18 Apache-2.0, 6 BSD-2-Clause, 2 BSD-3-Clause, 7 ISC, 2 MPL-2.0, 1 BlueOak-1.0.0, and 3 Apache-2.0 OR MIT.
 - `pnpm peers check` reports no peer dependency issues after pinning TypeScript 6.0.3.

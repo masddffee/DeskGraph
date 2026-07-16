@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-07-16
 
-Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical and M6 durable watch-core slices, while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
+Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical, M5 rename-preview, and M6 durable watch-core slices, while M0 remote CI and M1 cross-platform/memory/live-UI evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
@@ -18,8 +18,8 @@ Overall status: **not release-ready**. Local implementation is in M2 with parall
 | Metadata/FTS/vector/hybrid retrieval           | In progress        | Offline path/content FTS5, bounded scope/type/date/source filters, deterministic explanations, CLI/Desktop and synthetic 10k p50/p95/index-size baseline pass locally; project/folder filters, vectors, embeddings, hybrid fusion, real/100k/8 GB evaluation and cross-platform/live-UI evidence remain |
 | Project/folder/related/duplicate/version graph | Not started        | Provenance, correction, evaluation                       |
 | Smart Inbox and explainable classification     | Not started        | UI states and safe suggestion behavior                   |
-| Rename/move preview                            | Not started        | Before/after/scope/policy UI and tests                   |
-| Journal, crash recovery, undo                  | Not started        | Fault injection and idempotent undo suite                |
+| Rename/move preview                            | In progress        | Same-folder file rename CLI preview, canonical scope/identity/open-handle/portable-name/conflict policy and before/after contract pass locally; Move, folders, Desktop UI, fresh Windows/live-UI evidence remain |
+| Journal, crash recovery, undo                  | In progress        | Plan plus `preview_created` event commit atomically and reject mutation/deletion; no execution journal states, fault injection, recovery, rollback, or Undo yet |
 | Read-only MCP                                  | Not started        | Scope escape/injection tests and no write tools          |
 | 8 GB benchmark                                 | In progress        | M1 timing/count baseline published; release-build peak RSS and documented 8 GB hardware remain |
 | Updater pipeline                               | Not started        | Signed metadata dry run and rollback                     |
@@ -49,3 +49,7 @@ The FTS5 baseline is safe to exercise on test scopes: search is read-only, stays
 ## M6 watch-core local readiness note
 
 The durable reconciliation core is safe to exercise with explicit CLI hints on test scopes: events are untrusted, scope/path/symlink policy is revalidated, temporary downloads are ignored, a stable read-only identity snapshot is required, and only the existing atomic scanner can publish live metadata. Status is path-free and restart fixtures pass. This is not automatic Watch Mode or M6 completion: no native event adapter, incremental extraction/indexing, placeholder detection, low-memory/background resource policy, notifications, Smart Inbox, Windows runtime, 8 GB benchmark, or live Desktop interaction has passed.
+
+## M5 rename-preview local readiness note
+
+The bounded rename preview is safe to exercise on test files after a completed scan: it performs no filesystem mutation, denies symlink/reparse and path-fallback sources, matches manifest metadata and platform/open-handle identity, validates a portable same-folder name, fails on occupied destinations, and commits an immutable plan plus first append-only event atomically. Explicit preview/status returns paths; logs and list summaries do not. This is not M5 completion or a usable organizer: Move, folder actions, execution, source revalidation immediately before action, destination verification/hash, cross-volume handling, process-kill/permission/disconnect fault injection, recovery, rollback, idempotent Undo, audit history UI, and Windows runtime evidence remain open.

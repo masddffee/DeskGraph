@@ -95,7 +95,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 6 — M5 transaction safety
 
-- Build immutable plan and policy validator before executor; implement state machine/journal/recovery/undo before UI execution control.
+- Current: ADR-017 and a same-folder scanned-file rename preview pass canonical scope, manifest/metadata/platform/open-handle identity, portable-name, destination-conflict, immutable-plan and atomic append-only first-journal-event gates; CLI exposes explicit before/after preview/status and path-free summaries, with no execution path.
+- Next: expand the append-only state machine before implementing executor; add Move/cross-volume copy-verify-commit, immediate pre-action identity validation, destination verification/hash, process-kill/permission/conflict/disconnect fault injection, startup recovery, rollback and idempotent Undo before any Desktop execution control.
 - Exit only after fault injection, cross-volume, conflict, source-change, process-kill, and idempotent undo pass.
 
 ### Step 7 — M6/M8 continuous product workflow

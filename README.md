@@ -114,6 +114,23 @@ cargo run -p deskgraph-cli -- watch list --database ./deskgraph-dev.sqlite3
 
 `observe` validates the current authorized scope and persists a path-free status response. Events within one scope coalesce until the one-second stability deadline; run `advance` at or after `stable_after_unix_ms` to revalidate size, modified time, identity, and read-only access before an atomic manifest reconciliation. This is a core/CLI development slice, not automatic Watch Mode: native OS event adapters, incremental content re-extraction/indexing, cloud-placeholder handling, and background resource controls remain unimplemented.
 
+Create a durable same-folder file rename preview without changing the filesystem:
+
+```bash
+cargo run -p deskgraph-cli -- organize rename-preview \
+  --database ./deskgraph-dev.sqlite3 \
+  --scope 1 \
+  --source /absolute/path/to/test-folder/draft.md \
+  --new-name final.md
+cargo run -p deskgraph-cli -- organize status \
+  --database ./deskgraph-dev.sqlite3 \
+  --plan 1
+cargo run -p deskgraph-cli -- organize list \
+  --database ./deskgraph-dev.sqlite3
+```
+
+The explicit preview/status response returns canonical before/after paths and passed policy checks; ordinary logs and `organize list` remain path-free. The source must still match its scanned identity and metadata, and the destination must be free. This slice intentionally has no execute command: move, conflict resolution beyond fail-closed/case-only planning, crash recovery, rollback, Undo, and Desktop action controls remain unimplemented.
+
 Start the desktop application:
 
 ```bash

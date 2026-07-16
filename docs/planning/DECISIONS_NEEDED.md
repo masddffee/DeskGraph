@@ -62,3 +62,10 @@ No product decision blocks local M0 implementation. GitHub remote ownership bloc
 - Filesystem events are untrusted hints. Durable per-scope debounce and a bounded stability gate must complete before the existing atomic manifest scanner reconciles live state (ADR-016).
 - The first core uses a one-second default stability window, closed temporary-download suffixes, size/modified-time/platform-identity snapshots, and read-only open-handle identity verification.
 - Watch status is path-free outside explicit adapter/user input. Native OS adapters, incremental extraction/indexing, cloud-placeholder policy, background resource controls, and Smart Inbox remain unselected or unimplemented.
+
+## Decisions made while entering M5
+
+- An organization preview is an immutable core-owned record, not mutable frontend or LLM output. The first slice supports only a same-folder rename preview for a present scanned file (ADR-017).
+- A preview requires canonical explicit scope containment, a strong manifest identity, matching size/modified time, a matching read-only open handle, a portable single-component target name, and a conflict-free destination.
+- Plan plus sequence-1 `preview_created` event commit atomically; both tables reject update/delete. Explicit preview/status may return before/after paths, while logs and recent-plan summaries remain path-free.
+- No executor, move, rollback, recovery, undo, or Desktop execution control may be added until their append-only state machine and fault-injection acceptance are defined and pass.
