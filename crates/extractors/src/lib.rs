@@ -3,6 +3,14 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod service;
+
+pub use service::{
+    ExtractionServiceError, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
+    extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
+    run_extraction_job_at,
+};
+
 pub const UNTRUSTED_TEXT: &str = "untrusted_extracted_text";
 pub const ABSOLUTE_MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 pub const ABSOLUTE_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -31,7 +39,7 @@ impl Default for ExtractionLimits {
     fn default() -> Self {
         Self {
             max_source_bytes: 4 * 1024 * 1024,
-            max_output_bytes: 4 * 1024 * 1024,
+            max_output_bytes: 8 * 1024 * 1024,
             max_chunks: 2_048,
             max_chunk_bytes: 4_096,
             chunk_overlap_bytes: 256,
@@ -236,14 +244,15 @@ impl ExtractorProvider for Utf8TextExtractor {
             0
         };
         let content_bytes = &bytes[content_offset..];
-        let output_bytes =
+        let unique_output_bytes =
             u64::try_from(content_bytes.len()).map_err(|_| ExtractionError::OutputTooLarge)?;
-        if output_bytes > limits.max_output_bytes {
+        if unique_output_bytes > limits.max_output_bytes {
             return Err(ExtractionError::OutputTooLarge);
         }
         let content =
             std::str::from_utf8(content_bytes).map_err(|_| ExtractionError::InvalidUtf8)?;
-        let chunks = chunk_utf8(content, content_offset, limits, started, cancellation)?;
+        let (chunks, output_bytes) =
+            chunk_utf8(content, content_offset, limits, started, cancellation)?;
 
         Ok(ExtractionOutput {
             provider_id: self.provider_id(),
@@ -309,8 +318,9 @@ fn chunk_utf8(
     limits: ExtractionLimits,
     started: Instant,
     cancellation: &dyn CancellationSignal,
-) -> Result<Vec<ExtractedChunk>, ExtractionError> {
+) -> Result<(Vec<ExtractedChunk>, u64), ExtractionError> {
     let mut chunks = Vec::new();
+    let mut output_bytes = 0_u64;
     let mut start = 0_usize;
     while start < content.len() {
         check_control(started, limits.max_processing_time, cancellation)?;
@@ -332,6 +342,14 @@ fn chunk_utf8(
         let source_end = content_offset
             .checked_add(end)
             .ok_or(ExtractionError::OutputTooLarge)?;
+        let chunk_bytes =
+            u64::try_from(end - start).map_err(|_| ExtractionError::OutputTooLarge)?;
+        output_bytes = output_bytes
+            .checked_add(chunk_bytes)
+            .ok_or(ExtractionError::OutputTooLarge)?;
+        if output_bytes > limits.max_output_bytes {
+            return Err(ExtractionError::OutputTooLarge);
+        }
         chunks.push(ExtractedChunk {
             ordinal: u32::try_from(chunks.len())
                 .map_err(|_| ExtractionError::ChunkLimitExceeded)?,
@@ -351,7 +369,7 @@ fn chunk_utf8(
         }
         start = if next > start { next } else { end };
     }
-    Ok(chunks)
+    Ok((chunks, output_bytes))
 }
 
 #[cfg(test)]
@@ -447,6 +465,33 @@ mod tests {
         assert_eq!(output.chunks[0].text, "hello");
         assert_eq!(output.chunks[0].source_byte_start, 3);
         assert_eq!(output.chunks[0].source_byte_end, 8);
+    }
+
+    #[test]
+    fn chunk_overlap_is_preserved_and_counted_in_bounded_output() {
+        let bytes = b"0123456789abcdef";
+        let mut source = Cursor::new(bytes);
+        let mut limits = compact_limits();
+        limits.max_chunk_bytes = 8;
+        limits.chunk_overlap_bytes = 2;
+        let output = Utf8TextExtractor
+            .extract(
+                &mut source,
+                request(MediaKind::PlainText, bytes.len()),
+                limits,
+                &NoCancellation,
+            )
+            .expect("overlapping chunks should extract");
+
+        assert_eq!(
+            output
+                .chunks
+                .iter()
+                .map(|chunk| chunk.source_byte_start)
+                .collect::<Vec<_>>(),
+            vec![0, 6, 12]
+        );
+        assert_eq!(output.output_bytes, 20);
     }
 
     #[test]

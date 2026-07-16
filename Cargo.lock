@@ -684,6 +684,13 @@ dependencies = [
 [[package]]
 name = "deskgraph-extractors"
 version = "0.1.0"
+dependencies = [
+ "deskgraph-database",
+ "deskgraph-domain",
+ "deskgraph-identity",
+ "deskgraph-scanner",
+ "tempfile",
+]
 
 [[package]]
 name = "deskgraph-identity"

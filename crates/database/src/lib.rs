@@ -3,7 +3,10 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use deskgraph_domain::{AuthorizedScope, ManifestStats, ScanJobProgress, ScanReport, ScanStatus};
+use deskgraph_domain::{
+    AuthorizedScope, ExtractionJobProgress, ExtractionStats, ExtractionStatus, ManifestStats,
+    ScanJobProgress, ScanReport, ScanStatus,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const MIGRATIONS: &[Migration] = &[
@@ -17,7 +20,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "resumable_scan_jobs",
         sql: include_str!("../../../migrations/0002_resumable_scan_jobs.sql"),
     },
+    Migration {
+        version: 3,
+        name: "content_extraction",
+        sql: include_str!("../../../migrations/0003_content_extraction.sql"),
+    },
 ];
+const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_EXTRACTION_CHUNKS: usize = 65_536;
+const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 
 struct Migration {
     version: i64,
@@ -94,6 +106,28 @@ pub struct QueueEntry {
     pub is_root: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractableFile {
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub location_id: i64,
+    pub path_raw: Vec<u8>,
+    pub path_key: String,
+    pub identity_kind: String,
+    pub identity_key: Vec<u8>,
+    pub size_bytes: u64,
+    pub modified_unix_ns: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentChunkWrite {
+    pub ordinal: u32,
+    pub text: String,
+    pub source_byte_start: u64,
+    pub source_byte_end: u64,
+    pub trust_class: &'static str,
+}
+
 #[derive(Debug)]
 pub enum DatabaseError {
     Io(std::io::Error),
@@ -106,6 +140,13 @@ pub enum DatabaseError {
     InvalidScanJobState,
     ScanJobIncomplete,
     RunnerLeaseLost,
+    ExtractableFileNotFound,
+    ExtractionJobNotFound,
+    ExtractionJobAlreadyActive,
+    ExtractionJobBusy,
+    InvalidExtractionJobState,
+    ExtractionRunnerLeaseLost,
+    ExtractionOutputInvalid,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -124,6 +165,13 @@ impl DatabaseError {
             Self::InvalidScanJobState => "invalid_scan_job_state",
             Self::ScanJobIncomplete => "scan_job_incomplete",
             Self::RunnerLeaseLost => "scan_runner_lease_lost",
+            Self::ExtractableFileNotFound => "extractable_file_not_found",
+            Self::ExtractionJobNotFound => "extraction_job_not_found",
+            Self::ExtractionJobAlreadyActive => "extraction_job_already_active",
+            Self::ExtractionJobBusy => "extraction_job_busy",
+            Self::InvalidExtractionJobState => "invalid_extraction_job_state",
+            Self::ExtractionRunnerLeaseLost => "extraction_runner_lease_lost",
+            Self::ExtractionOutputInvalid => "extraction_output_invalid",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -190,6 +238,7 @@ impl ManifestDatabase {
         let mut database = Self { connection };
         database.apply_migrations()?;
         database.recover_expired_scan_jobs_at(unix_ms()?)?;
+        database.recover_expired_extraction_jobs_at(unix_ms()?)?;
         Ok(database)
     }
 
@@ -348,6 +397,7 @@ impl ManifestDatabase {
             "UPDATE edges SET active = 0 WHERE scope_id = ?1 AND last_seen_scan_id <> ?2",
             params![scope_id, job_id],
         )?;
+        invalidate_stale_content_chunks(&transaction, scope_id)?;
 
         for issue in issues {
             transaction.execute(
@@ -845,6 +895,7 @@ impl ManifestDatabase {
             "UPDATE edges SET active = 0 WHERE scope_id = ?1 AND last_seen_scan_id <> ?2",
             params![scope_id, job_id],
         )?;
+        invalidate_stale_content_chunks(&transaction, scope_id)?;
         transaction.execute(
             "INSERT INTO scan_issues(scan_id, code, path_key, detail_code) \
              SELECT scan_id, code, path_key, detail_code FROM scan_staged_issues WHERE scan_id = ?1",
@@ -878,7 +929,8 @@ impl ManifestDatabase {
         let changed = self.connection.execute(
             "UPDATE scan_jobs SET status = 'failed', control_state = 'ready', runner_token = NULL, \
                 lease_expires_at_unix_ms = NULL, finished_at_unix_ms = ?3, updated_at_unix_ms = ?3 \
-             WHERE id = ?1 AND runner_token = ?2 AND status = 'running'",
+             WHERE id = ?1 AND runner_token = ?2 AND status = 'running' \
+                AND lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms > ?3",
             params![job_id, runner_token, now],
         )?;
         if changed != 1 {
@@ -904,6 +956,496 @@ impl ManifestDatabase {
         )?;
         transaction.commit()?;
         u64::try_from(recovered).map_err(|_| DatabaseError::InvalidCount)
+    }
+
+    pub fn extractable_file(
+        &self,
+        scope_id: i64,
+        node_id: i64,
+    ) -> Result<ExtractableFile, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT l.scope_id, l.node_id, l.id, l.path_raw, l.path_key, \
+                    n.identity_kind, n.identity_key, f.size_bytes, f.modified_unix_ns \
+                 FROM locations l \
+                 JOIN nodes n ON n.id = l.node_id \
+                 JOIN files f ON f.node_id = l.node_id \
+                 WHERE l.scope_id = ?1 AND l.node_id = ?2 AND l.present = 1 AND n.kind = 'file' \
+                 ORDER BY l.id LIMIT 1",
+                params![scope_id, node_id],
+                |row| {
+                    let size_bytes: i64 = row.get(7)?;
+                    Ok(ExtractableFile {
+                        scope_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        path_raw: row.get(3)?,
+                        path_key: row.get(4)?,
+                        identity_kind: row.get(5)?,
+                        identity_key: row.get(6)?,
+                        size_bytes: u64::try_from(size_bytes)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, size_bytes))?,
+                        modified_unix_ns: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::ExtractableFileNotFound)
+    }
+
+    pub fn extractable_file_for_job(&self, job_id: i64) -> Result<ExtractableFile, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT l.scope_id, l.node_id, l.id, l.path_raw, l.path_key, \
+                    n.identity_kind, n.identity_key, j.source_size_bytes, j.source_modified_unix_ns \
+                 FROM extraction_jobs j \
+                 JOIN locations l ON l.id = j.location_id AND l.node_id = j.node_id \
+                 JOIN nodes n ON n.id = l.node_id \
+                 JOIN files f ON f.node_id = l.node_id \
+                 WHERE j.id = ?1 AND l.present = 1 AND n.kind = 'file'",
+                [job_id],
+                |row| {
+                    let size_bytes: i64 = row.get(7)?;
+                    Ok(ExtractableFile {
+                        scope_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        path_raw: row.get(3)?,
+                        path_key: row.get(4)?,
+                        identity_kind: row.get(5)?,
+                        identity_key: row.get(6)?,
+                        size_bytes: u64::try_from(size_bytes)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, size_bytes))?,
+                        modified_unix_ns: row.get(8)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::ExtractableFileNotFound)
+    }
+
+    pub fn create_extraction_job(
+        &mut self,
+        scope_id: i64,
+        node_id: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let source = self.extractable_file(scope_id, node_id)?;
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let active: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM extraction_jobs \
+             WHERE scope_id = ?1 AND node_id = ?2 AND status IN ('queued', 'running', 'interrupted')",
+            params![scope_id, node_id],
+            |row| row.get(0),
+        )?;
+        if active != 0 {
+            return Err(DatabaseError::ExtractionJobAlreadyActive);
+        }
+        transaction.execute(
+            "INSERT INTO extraction_jobs( \
+                scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, \
+                created_at_unix_ms, updated_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?6)",
+            params![
+                source.scope_id,
+                source.node_id,
+                source.location_id,
+                to_i64(source.size_bytes)?,
+                source.modified_unix_ns,
+                now,
+            ],
+        )?;
+        let job_id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        self.extraction_job(job_id)
+    }
+
+    pub fn extraction_job(&self, job_id: i64) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, scope_id, node_id, status, provider_id, provider_version, error_code, \
+                    source_size_bytes, output_bytes, chunk_count, elapsed_ms, cancel_requested \
+                 FROM extraction_jobs WHERE id = ?1",
+                [job_id],
+                extraction_job_from_row,
+            )
+            .optional()?
+            .ok_or(DatabaseError::ExtractionJobNotFound)
+    }
+
+    pub fn recent_extraction_jobs(&self) -> Result<Vec<ExtractionJobProgress>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, scope_id, node_id, status, provider_id, provider_version, error_code, \
+                source_size_bytes, output_bytes, chunk_count, elapsed_ms, cancel_requested \
+             FROM extraction_jobs ORDER BY id DESC LIMIT 20",
+        )?;
+        let jobs = statement.query_map([], extraction_job_from_row)?;
+        jobs.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn request_extraction_cancel(
+        &mut self,
+        job_id: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let status: String = transaction
+            .query_row(
+                "SELECT status FROM extraction_jobs WHERE id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::ExtractionJobNotFound)?;
+        match status.as_str() {
+            "queued" | "interrupted" => {
+                transaction.execute(
+                    "UPDATE extraction_jobs SET status = 'cancelled', cancel_requested = 1, \
+                        finished_at_unix_ms = ?2, updated_at_unix_ms = ?2 \
+                     WHERE id = ?1",
+                    params![job_id, now],
+                )?;
+            }
+            "running" => {
+                transaction.execute(
+                    "UPDATE extraction_jobs SET cancel_requested = 1, updated_at_unix_ms = ?2 \
+                     WHERE id = ?1",
+                    params![job_id, now],
+                )?;
+            }
+            "cancelled" => {}
+            "completed" | "failed" => return Err(DatabaseError::InvalidExtractionJobState),
+            _ => return Err(DatabaseError::InvalidStoredValue),
+        }
+        transaction.commit()?;
+        self.extraction_job(job_id)
+    }
+
+    pub fn resume_extraction_job(
+        &mut self,
+        job_id: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let changed = self.connection.execute(
+            "UPDATE extraction_jobs SET status = 'queued', cancel_requested = 0, error_code = NULL, \
+                runner_token = NULL, lease_expires_at_unix_ms = NULL, updated_at_unix_ms = ?2 \
+             WHERE id = ?1 AND status = 'interrupted'",
+            params![job_id, now],
+        )?;
+        if changed != 1 {
+            self.extraction_job(job_id)?;
+            return Err(DatabaseError::InvalidExtractionJobState);
+        }
+        self.extraction_job(job_id)
+    }
+
+    pub fn claim_extraction_job(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+        lease_ms: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        self.recover_expired_extraction_jobs_at(now)?;
+        let lease_expires = now
+            .checked_add(lease_ms)
+            .ok_or(DatabaseError::InvalidTimestamp)?;
+        let transaction = self.connection.transaction()?;
+        let (status, existing_runner): (String, Option<String>) = transaction
+            .query_row(
+                "SELECT status, runner_token FROM extraction_jobs WHERE id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(DatabaseError::ExtractionJobNotFound)?;
+        match status.as_str() {
+            "queued" => {}
+            "running" if existing_runner.as_deref() == Some(runner_token) => {}
+            "running" => return Err(DatabaseError::ExtractionJobBusy),
+            _ => return Err(DatabaseError::InvalidExtractionJobState),
+        }
+        transaction.execute(
+            "UPDATE extraction_jobs SET status = 'running', runner_token = ?2, \
+                lease_expires_at_unix_ms = ?3, started_at_unix_ms = COALESCE(started_at_unix_ms, ?4), \
+                updated_at_unix_ms = ?4 WHERE id = ?1",
+            params![job_id, runner_token, lease_expires, now],
+        )?;
+        transaction.commit()?;
+        self.extraction_job(job_id)
+    }
+
+    pub fn extraction_cancel_requested(&self, job_id: i64) -> Result<bool, DatabaseError> {
+        let (status, requested): (String, i64) = self
+            .connection
+            .query_row(
+                "SELECT status, cancel_requested FROM extraction_jobs WHERE id = ?1",
+                [job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(DatabaseError::ExtractionJobNotFound)?;
+        Ok(status != "running" || requested != 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_extraction_job(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+        provider_id: &str,
+        provider_version: &str,
+        source_size_bytes: u64,
+        source_modified_unix_ns: Option<i64>,
+        output_bytes: u64,
+        elapsed_ms: u64,
+        chunks: &[ContentChunkWrite],
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        if provider_id.is_empty()
+            || provider_version.is_empty()
+            || source_size_bytes > MAX_EXTRACTION_SOURCE_BYTES
+            || chunks.len() > MAX_EXTRACTION_CHUNKS
+            || chunks
+                .iter()
+                .any(|chunk| chunk.text.len() > MAX_EXTRACTION_CHUNK_BYTES)
+        {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        }
+        let mut computed_output_bytes = 0_u64;
+        for chunk in chunks {
+            let chunk_bytes = u64::try_from(chunk.text.len())
+                .map_err(|_| DatabaseError::ExtractionOutputInvalid)?;
+            computed_output_bytes = computed_output_bytes
+                .checked_add(chunk_bytes)
+                .ok_or(DatabaseError::ExtractionOutputInvalid)?;
+        }
+        if output_bytes > MAX_EXTRACTION_OUTPUT_BYTES || computed_output_bytes != output_bytes {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        }
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        ensure_extraction_runner(&transaction, job_id, runner_token, now)?;
+        let (scope_id, node_id, location_id, stored_size, stored_modified, cancel_requested): (
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+            i64,
+        ) = transaction.query_row(
+            "SELECT scope_id, node_id, location_id, source_size_bytes, source_modified_unix_ns, \
+                cancel_requested FROM extraction_jobs WHERE id = ?1",
+            [job_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        if cancel_requested != 0
+            || u64::try_from(stored_size).map_err(|_| DatabaseError::InvalidStoredValue)?
+                != source_size_bytes
+            || stored_modified != source_modified_unix_ns
+        {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        }
+        let current_source: Option<(i64, Option<i64>)> = transaction
+            .query_row(
+                "SELECT f.size_bytes, f.modified_unix_ns \
+                 FROM locations l JOIN files f ON f.node_id = l.node_id \
+                 WHERE l.id = ?1 AND l.node_id = ?2 AND l.present = 1",
+                params![location_id, node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((current_size, current_modified)) = current_source else {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        };
+        if u64::try_from(current_size).map_err(|_| DatabaseError::InvalidStoredValue)?
+            != source_size_bytes
+            || current_modified != source_modified_unix_ns
+        {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            if usize::try_from(chunk.ordinal).map_err(|_| DatabaseError::ExtractionOutputInvalid)?
+                != index
+                || chunk.trust_class != "untrusted_extracted_text"
+                || chunk.source_byte_start > chunk.source_byte_end
+                || chunk.source_byte_end > source_size_bytes
+            {
+                return Err(DatabaseError::ExtractionOutputInvalid);
+            }
+        }
+
+        transaction.execute(
+            "UPDATE content_chunks SET active = 0 WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+            params![scope_id, node_id],
+        )?;
+        for chunk in chunks {
+            transaction.execute(
+                "INSERT INTO content_chunks( \
+                    scope_id, node_id, location_id, extraction_job_id, ordinal, text, \
+                    source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, \
+                    trust_class, provider_id, provider_version, active, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)",
+                params![
+                    scope_id,
+                    node_id,
+                    location_id,
+                    job_id,
+                    i64::from(chunk.ordinal),
+                    chunk.text,
+                    to_i64(chunk.source_byte_start)?,
+                    to_i64(chunk.source_byte_end)?,
+                    to_i64(source_size_bytes)?,
+                    source_modified_unix_ns,
+                    chunk.trust_class,
+                    provider_id,
+                    provider_version,
+                    now,
+                ],
+            )?;
+        }
+        let completed = transaction.execute(
+            "UPDATE extraction_jobs SET status = 'completed', provider_id = ?3, provider_version = ?4, \
+                error_code = NULL, output_bytes = ?5, chunk_count = ?6, elapsed_ms = ?7, \
+                runner_token = NULL, lease_expires_at_unix_ms = NULL, finished_at_unix_ms = ?8, \
+                updated_at_unix_ms = ?8 WHERE id = ?1 AND runner_token = ?2",
+            params![
+                job_id,
+                runner_token,
+                provider_id,
+                provider_version,
+                to_i64(output_bytes)?,
+                to_i64(chunks.len() as u64)?,
+                to_i64(elapsed_ms)?,
+                now,
+            ],
+        )?;
+        if completed != 1 {
+            return Err(DatabaseError::ExtractionRunnerLeaseLost);
+        }
+        transaction.commit()?;
+        self.extraction_job(job_id)
+    }
+
+    pub fn fail_extraction_job(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+        provider_id: &str,
+        provider_version: &str,
+        error_code: &str,
+        elapsed_ms: u64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let changed = self.connection.execute(
+            "UPDATE extraction_jobs SET status = 'failed', provider_id = ?3, provider_version = ?4, \
+                error_code = ?5, elapsed_ms = ?6, runner_token = NULL, \
+                lease_expires_at_unix_ms = NULL, finished_at_unix_ms = ?7, updated_at_unix_ms = ?7 \
+             WHERE id = ?1 AND runner_token = ?2 AND status = 'running' \
+                AND lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms > ?7",
+            params![
+                job_id,
+                runner_token,
+                provider_id,
+                provider_version,
+                error_code,
+                to_i64(elapsed_ms)?,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ExtractionRunnerLeaseLost);
+        }
+        self.extraction_job(job_id)
+    }
+
+    pub fn cancel_extraction_job_from_runner(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+        provider_id: &str,
+        provider_version: &str,
+        elapsed_ms: u64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let changed = self.connection.execute(
+            "UPDATE extraction_jobs SET status = 'cancelled', cancel_requested = 1, \
+                provider_id = ?3, provider_version = ?4, error_code = NULL, elapsed_ms = ?5, \
+                runner_token = NULL, lease_expires_at_unix_ms = NULL, finished_at_unix_ms = ?6, \
+                updated_at_unix_ms = ?6 \
+             WHERE id = ?1 AND runner_token = ?2 AND status = 'running' \
+                AND lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms > ?6",
+            params![
+                job_id,
+                runner_token,
+                provider_id,
+                provider_version,
+                to_i64(elapsed_ms)?,
+                now,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ExtractionRunnerLeaseLost);
+        }
+        self.extraction_job(job_id)
+    }
+
+    pub fn recover_expired_extraction_jobs_at(&mut self, now: i64) -> Result<u64, DatabaseError> {
+        let recovered = self.connection.execute(
+            "UPDATE extraction_jobs SET status = 'interrupted', runner_token = NULL, \
+                lease_expires_at_unix_ms = NULL, updated_at_unix_ms = ?1 \
+             WHERE status = 'running' AND lease_expires_at_unix_ms IS NOT NULL \
+                AND lease_expires_at_unix_ms <= ?1",
+            [now],
+        )?;
+        u64::try_from(recovered).map_err(|_| DatabaseError::InvalidCount)
+    }
+
+    pub fn extraction_stats(&self) -> Result<ExtractionStats, DatabaseError> {
+        Ok(ExtractionStats {
+            api_version: ExtractionStats::API_VERSION,
+            active_chunk_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM content_chunks WHERE active = 1",
+            )?,
+            extracted_file_count: count(
+                &self.connection,
+                "SELECT COUNT(DISTINCT node_id) FROM content_chunks WHERE active = 1",
+            )?,
+            completed_job_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM extraction_jobs WHERE status = 'completed'",
+            )?,
+            failed_job_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM extraction_jobs WHERE status = 'failed'",
+            )?,
+            cancelled_job_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM extraction_jobs WHERE status = 'cancelled'",
+            )?,
+        })
+    }
+
+    pub fn invalidate_content_for_node(
+        &self,
+        scope_id: i64,
+        node_id: i64,
+    ) -> Result<u64, DatabaseError> {
+        let changed = self.connection.execute(
+            "UPDATE content_chunks SET active = 0 \
+             WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+            params![scope_id, node_id],
+        )?;
+        u64::try_from(changed).map_err(|_| DatabaseError::InvalidCount)
     }
 
     pub fn stats(&self) -> Result<ManifestStats, DatabaseError> {
@@ -984,6 +1526,34 @@ fn scan_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobProgres
     })
 }
 
+fn extraction_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractionJobProgress> {
+    let stored_status: String = row.get(3)?;
+    let status = match stored_status.as_str() {
+        "queued" => ExtractionStatus::Queued,
+        "running" => ExtractionStatus::Running,
+        "completed" => ExtractionStatus::Completed,
+        "failed" => ExtractionStatus::Failed,
+        "cancelled" => ExtractionStatus::Cancelled,
+        "interrupted" => ExtractionStatus::Interrupted,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(ExtractionJobProgress {
+        api_version: ExtractionJobProgress::API_VERSION,
+        job_id: row.get(0)?,
+        scope_id: row.get(1)?,
+        node_id: row.get(2)?,
+        status,
+        provider_id: row.get(4)?,
+        provider_version: row.get(5)?,
+        error_code: row.get(6)?,
+        source_bytes: row_u64(row, 7)?,
+        output_bytes: row_u64(row, 8)?,
+        chunk_count: row_u64(row, 9)?,
+        elapsed_ms: row_u64(row, 10)?,
+        cancel_requested: row.get::<_, i64>(11)? != 0,
+    })
+}
+
 fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(index)?;
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
@@ -1027,6 +1597,48 @@ fn ensure_owned_runner(
     } else {
         Err(DatabaseError::RunnerLeaseLost)
     }
+}
+
+fn ensure_extraction_runner(
+    transaction: &Transaction<'_>,
+    job_id: i64,
+    runner_token: &str,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let owned: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM extraction_jobs WHERE id = ?1 AND status = 'running' \
+            AND runner_token = ?2 AND lease_expires_at_unix_ms IS NOT NULL \
+            AND lease_expires_at_unix_ms > ?3",
+        params![job_id, runner_token, now],
+        |row| row.get(0),
+    )?;
+    if owned == 1 {
+        Ok(())
+    } else {
+        Err(DatabaseError::ExtractionRunnerLeaseLost)
+    }
+}
+
+fn invalidate_stale_content_chunks(
+    transaction: &Transaction<'_>,
+    scope_id: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "UPDATE content_chunks SET active = 0 \
+         WHERE active = 1 AND scope_id = ?1 AND ( \
+            NOT EXISTS ( \
+                SELECT 1 FROM locations l \
+                WHERE l.id = content_chunks.location_id AND l.present = 1 \
+            ) OR NOT EXISTS ( \
+                SELECT 1 FROM files f \
+                WHERE f.node_id = content_chunks.node_id \
+                  AND f.size_bytes = content_chunks.source_size_bytes \
+                  AND f.modified_unix_ns IS content_chunks.source_modified_unix_ns \
+            ) \
+         )",
+        [scope_id],
+    )?;
+    Ok(())
 }
 
 fn upsert_observation(
@@ -1164,6 +1776,80 @@ mod tests {
             modified_unix_ns: Some(1),
             link_count: Some(1),
         }
+    }
+
+    fn publish_manifest_file(
+        database: &mut ManifestDatabase,
+        scope_id: i64,
+        root: &QueuedPath,
+        file_size: u64,
+    ) -> i64 {
+        let job = database
+            .create_resumable_scan_job(scope_id, root)
+            .expect("scan job should create");
+        database
+            .claim_scan_job(job.job_id, "scan-runner", 60_000)
+            .expect("scan should claim");
+        let root_entry = database
+            .next_scan_queue_entry(job.job_id, "scan-runner", 60_000)
+            .expect("queue should load")
+            .expect("root should exist");
+        let root_observation = observation("/scope", NodeKind::Folder, None);
+        let child = QueuedPath {
+            path_raw: b"/scope/file.txt".to_vec(),
+            path_key: "/scope/file.txt".to_string(),
+            parent_identity_key: Some(root_observation.identity_key.clone()),
+            is_root: false,
+        };
+        database
+            .stage_scan_queue_entry(
+                job.job_id,
+                "scan-runner",
+                root_entry.id,
+                Some(&root_observation),
+                std::slice::from_ref(&child),
+                &[],
+                0,
+                1,
+                60_000,
+            )
+            .expect("root should stage");
+        let child_entry = database
+            .next_scan_queue_entry(job.job_id, "scan-runner", 60_000)
+            .expect("queue should load")
+            .expect("child should exist");
+        let mut child_observation = observation(
+            "/scope/file.txt",
+            NodeKind::File,
+            Some(root_observation.identity_key),
+        );
+        child_observation.size_bytes = file_size;
+        database
+            .stage_scan_queue_entry(
+                job.job_id,
+                "scan-runner",
+                child_entry.id,
+                Some(&child_observation),
+                &[],
+                &[],
+                0,
+                1,
+                60_000,
+            )
+            .expect("child should stage");
+        database
+            .finalize_resumable_scan_job(job.job_id, "scan-runner")
+            .expect("scan should publish");
+        database
+            .node_id_for_path_key(scope_id, "/scope/file.txt")
+            .expect("node query should pass")
+            .expect("file node should exist")
+    }
+
+    fn extraction_setup() -> (ManifestDatabase, i64, i64, QueuedPath) {
+        let (mut database, scope_id, root) = resumable_setup();
+        let node_id = publish_manifest_file(&mut database, scope_id, &root, 4);
+        (database, scope_id, node_id, root)
     }
 
     #[test]
@@ -1415,5 +2101,295 @@ mod tests {
             .expect("job should publish");
         assert_eq!(completed.status, ScanStatus::Completed);
         assert_eq!(database.stats().expect("stats should load").node_count, 2);
+    }
+
+    #[test]
+    fn queued_and_running_extractions_can_be_cancelled_durably() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let queued = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+
+        let cancelled = database
+            .request_extraction_cancel(queued.job_id)
+            .expect("queued job should cancel");
+        assert_eq!(cancelled.status, ExtractionStatus::Cancelled);
+
+        let running = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("replacement job should create");
+        database
+            .claim_extraction_job(running.job_id, "extract-runner", 60_000)
+            .expect("job should claim");
+        let requested = database
+            .request_extraction_cancel(running.job_id)
+            .expect("running cancellation should persist");
+        assert_eq!(requested.status, ExtractionStatus::Running);
+        assert!(requested.cancel_requested);
+        let acknowledged = database
+            .cancel_extraction_job_from_runner(
+                running.job_id,
+                "extract-runner",
+                "deskgraph.utf8-text",
+                "1",
+                2,
+            )
+            .expect("runner should acknowledge cancellation");
+        assert_eq!(acknowledged.status, ExtractionStatus::Cancelled);
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should load")
+                .cancelled_job_count,
+            2
+        );
+    }
+
+    #[test]
+    fn complete_extraction_atomically_replaces_only_valid_chunks() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let first = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(first.job_id, "runner-1", 60_000)
+            .expect("job should claim");
+        let first_chunks = vec![
+            ContentChunkWrite {
+                ordinal: 0,
+                text: "ab".to_string(),
+                source_byte_start: 0,
+                source_byte_end: 2,
+                trust_class: "untrusted_extracted_text",
+            },
+            ContentChunkWrite {
+                ordinal: 1,
+                text: "cd".to_string(),
+                source_byte_start: 2,
+                source_byte_end: 4,
+                trust_class: "untrusted_extracted_text",
+            },
+        ];
+        let completed = database
+            .complete_extraction_job(
+                first.job_id,
+                "runner-1",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                3,
+                &first_chunks,
+            )
+            .expect("valid chunks should publish");
+        assert_eq!(completed.status, ExtractionStatus::Completed);
+        assert_eq!(completed.chunk_count, 2);
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should load")
+                .active_chunk_count,
+            2
+        );
+
+        let invalid = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("retry should create");
+        database
+            .claim_extraction_job(invalid.job_id, "runner-2", 60_000)
+            .expect("retry should claim");
+        let bounded_chunk = ContentChunkWrite {
+            ordinal: 0,
+            text: "abcd".to_string(),
+            source_byte_start: 0,
+            source_byte_end: 4,
+            trust_class: "untrusted_extracted_text",
+        };
+        let error = database
+            .complete_extraction_job(
+                invalid.job_id,
+                "runner-2",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                MAX_EXTRACTION_OUTPUT_BYTES + 1,
+                1,
+                std::slice::from_ref(&bounded_chunk),
+            )
+            .expect_err("database must enforce the absolute output cap");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        let error = database
+            .complete_extraction_job(
+                invalid.job_id,
+                "runner-2",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                1,
+                1,
+                &[bounded_chunk],
+            )
+            .expect_err("declared output bytes must match staged chunk bytes");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should load")
+                .active_chunk_count,
+            2
+        );
+        let invalid_chunk = ContentChunkWrite {
+            ordinal: 0,
+            text: "bad".to_string(),
+            source_byte_start: 0,
+            source_byte_end: 3,
+            trust_class: "trusted",
+        };
+        let error = database
+            .complete_extraction_job(
+                invalid.job_id,
+                "runner-2",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                3,
+                1,
+                &[invalid_chunk],
+            )
+            .expect_err("invalid trust class must not publish");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should load")
+                .active_chunk_count,
+            2
+        );
+        database
+            .fail_extraction_job(
+                invalid.job_id,
+                "runner-2",
+                "deskgraph.utf8-text",
+                "1",
+                "extraction_output_invalid",
+                1,
+            )
+            .expect("invalid job should fail");
+
+        let replacement = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("replacement should create");
+        database
+            .claim_extraction_job(replacement.job_id, "runner-3", 60_000)
+            .expect("replacement should claim");
+        let replacement_chunk = ContentChunkWrite {
+            ordinal: 0,
+            text: "abcd".to_string(),
+            source_byte_start: 0,
+            source_byte_end: 4,
+            trust_class: "untrusted_extracted_text",
+        };
+        database
+            .complete_extraction_job(
+                replacement.job_id,
+                "runner-3",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[replacement_chunk],
+            )
+            .expect("replacement should publish");
+        let stats = database.extraction_stats().expect("stats should load");
+        assert_eq!(stats.active_chunk_count, 1);
+        assert_eq!(stats.extracted_file_count, 1);
+        let inactive: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM content_chunks WHERE active = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inactive chunks should count");
+        assert_eq!(inactive, 2);
+    }
+
+    #[test]
+    fn manifest_change_invalidates_prior_content_chunks() {
+        let (mut database, scope_id, node_id, root) = extraction_setup();
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "runner", 60_000)
+            .expect("job should claim");
+        database
+            .complete_extraction_job(
+                job.job_id,
+                "runner",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "abcd".to_string(),
+                    source_byte_start: 0,
+                    source_byte_end: 4,
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("chunks should publish");
+
+        let rescanned_node = publish_manifest_file(&mut database, scope_id, &root, 5);
+
+        assert_eq!(rescanned_node, node_id);
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should load")
+                .active_chunk_count,
+            0
+        );
+    }
+
+    #[test]
+    fn expired_extraction_runner_requires_explicit_resume() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "old-runner", 60_000)
+            .expect("job should claim");
+
+        assert_eq!(
+            database
+                .recover_expired_extraction_jobs_at(i64::MAX)
+                .expect("job should recover"),
+            1
+        );
+        assert_eq!(
+            database
+                .extraction_job(job.job_id)
+                .expect("job should load")
+                .status,
+            ExtractionStatus::Interrupted
+        );
+        let resumed = database
+            .resume_extraction_job(job.job_id)
+            .expect("job should resume");
+        assert_eq!(resumed.status, ExtractionStatus::Queued);
+        database
+            .claim_extraction_job(job.job_id, "new-runner", 60_000)
+            .expect("resumed job should claim");
     }
 }

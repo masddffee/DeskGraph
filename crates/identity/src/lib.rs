@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs::Metadata;
+use std::fs::{File, Metadata};
 use std::path::{Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
@@ -29,6 +29,16 @@ pub fn platform_identity(
     kind: IdentityNodeKind,
 ) -> Result<FileIdentity, IdentityError> {
     platform_identity_impl(path, metadata, kind)
+        .map_err(|_| IdentityError::PlatformMetadataUnavailable)
+}
+
+pub fn platform_identity_for_open_file(
+    file: &File,
+    path: &Path,
+    metadata: &Metadata,
+    kind: IdentityNodeKind,
+) -> Result<FileIdentity, IdentityError> {
+    platform_identity_for_open_file_impl(file, path, metadata, kind)
         .map_err(|_| IdentityError::PlatformMetadataUnavailable)
 }
 
@@ -160,8 +170,8 @@ fn platform_identity_impl(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
     let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -193,9 +203,66 @@ fn platform_identity_impl(
         }
     }
     let handle = OwnedHandle(handle);
+    windows_identity_from_handle(handle.0, kind)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_identity_impl(
+    _path: &Path,
+    _metadata: &Metadata,
+    _kind: IdentityNodeKind,
+) -> Result<FileIdentity, std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "stable filesystem identity unavailable",
+    ))
+}
+
+#[cfg(unix)]
+fn platform_identity_for_open_file_impl(
+    _file: &File,
+    path: &Path,
+    metadata: &Metadata,
+    kind: IdentityNodeKind,
+) -> Result<FileIdentity, std::io::Error> {
+    platform_identity_impl(path, metadata, kind)
+}
+
+#[cfg(windows)]
+fn platform_identity_for_open_file_impl(
+    file: &File,
+    _path: &Path,
+    _metadata: &Metadata,
+    kind: IdentityNodeKind,
+) -> Result<FileIdentity, std::io::Error> {
+    use std::os::windows::io::AsRawHandle;
+
+    windows_identity_from_handle(file.as_raw_handle(), kind)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_identity_for_open_file_impl(
+    _file: &File,
+    path: &Path,
+    metadata: &Metadata,
+    kind: IdentityNodeKind,
+) -> Result<FileIdentity, std::io::Error> {
+    platform_identity_impl(path, metadata, kind)
+}
+
+#[cfg(windows)]
+fn windows_identity_from_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    kind: IdentityNodeKind,
+) -> Result<FileIdentity, std::io::Error> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: the handle is valid and `information` is a correctly sized writable output value.
-    if unsafe { GetFileInformationByHandle(handle.0, &mut information) } == 0 {
+    // SAFETY: the caller supplies a live file handle and `information` is a correctly sized
+    // writable output value. This helper borrows the handle and never closes it.
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -210,18 +277,6 @@ fn platform_identity_impl(
         key,
         link_count: Some(u64::from(information.nNumberOfLinks)),
     })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn platform_identity_impl(
-    _path: &Path,
-    _metadata: &Metadata,
-    _kind: IdentityNodeKind,
-) -> Result<FileIdentity, std::io::Error> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "stable filesystem identity unavailable",
-    ))
 }
 
 fn node_kind_byte(kind: IdentityNodeKind) -> u8 {
