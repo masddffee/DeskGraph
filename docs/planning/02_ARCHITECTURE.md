@@ -72,7 +72,7 @@ Desktop UI
    │
    ├── IPC Commands
    │
-Core Daemon
+Core Runtime
    ├── Scope Policy
    ├── Scanner
    ├── Watcher
@@ -81,7 +81,7 @@ Core Daemon
    ├── Retrieval Engine
    ├── Action Planner
    ├── Transaction Executor
-   └── MCP Server
+   └── Identity-based Read Services
           │
 SQLite + FTS5 + Vector Adapter
           │
@@ -89,7 +89,16 @@ Optional Providers
    ├── OCR Provider
    ├── Embedding Provider
    └── Local LLM Provider
+
+Independent read-only MCP stdio
+   └── Identity-based Read Services + read-only SQLite
 ```
+
+`Core Runtime` 是邏輯責任邊界，不代表 v0.1 已採用獨立 OS daemon。v0.1 預設依 [Tauri process model](https://v2.tauri.app/concept/process-model/) 由 core process 承載 Rust 核心，並可透過官方 [tray](https://v2.tauri.app/learn/system-tray/)／[autostart](https://v2.tauri.app/plugin/autostart/) 能力支援 UI 關閉後的背景工作；CLI 仍直接呼叫相同 domain crates。不得為了架構形式引入 localhost HTTP。
+
+唯讀 MCP 是可由外部 Agent 啟動的獨立 stdio process，直接承載相同 identity-based read services 並以唯讀 SQLite connection 工作，不依賴 daemon IPC，也不取得 background writer lease。Tauri、CLI、Watcher 或未來 daemon 的任何持久寫入 runner 必須透過 durable lease 取得唯一 ownership；程序啟動本身不代表有 writer 權限。
+
+若 Watch Mode 的實測需求證明 Tauri process 無法滿足 UI 關閉、唯一 writer、資源隔離或可靠重啟，才可依 D-014 評估 per-user daemon。拆分前必須同時定義 authenticated local IPC、Unix socket／Windows named-pipe ACL、peer identity、protocol version、app/daemon update skew、啟動競態、clean restart、installer 與 uninstaller acceptance；不能只新增一個常駐程序而把生命週期問題留給使用者。
 
 ## 4. Ingestion Pipeline
 
@@ -168,7 +177,11 @@ Observed Path
   "source_node_id": "node_a",
   "relation": "belongs_to",
   "target_node_id": "node_b",
-  "confidence": 0.91,
+  "score": {
+    "kind": "evidence_score",
+    "basis_points": 9100,
+    "calibration_manifest": null
+  },
   "provenance": [
     {
       "kind": "ocr",
@@ -256,7 +269,15 @@ FTS5 lexical score
 
 所有分數需要可診斷，不得只有最終黑箱分數。
 
+`content_chunks`、內容 hash、provider/model manifest 與 schema version 是語意資料的可追溯真相。SQLite embedding rows 是可重算、可版本化的衍生 cache；版本相符的 embedding rows 可重建 exact／ANN index，而 content hash 加完整 model manifest 可在模型仍可用時重算 embedding rows。exact 或 ANN index 都只是可刪除重建的加速 artifact，不得成為第二份 source of truth。M3 先以有上限的 exact search 建立正確性與 8 GB baseline，再依真實 chunk/vector 數量、recall@k、結果一致性、p95、建索引時間、RSS 與更新吞吐選擇是否需要 ANN；model-version mismatch 必須原子失效，不使用任意檔案數門檻。
+
 ## 9. Local AI
+
+### Intelligence Ladder
+
+每個 domain 依序使用 deterministic facts／rules、專用 OCR／embedding／小型 ML provider、最後才是選配 Local LLM。OCR routing、retrieval fusion 與 Project scoring 留在各自 domain；共用層只負責 provider lifecycle、model manifest、job control 與資源 budget，避免形成可直接操作所有能力的中央「Intelligence Router」。
+
+規則 evidence score、provider confidence、經校準的 probability 與 LLM 自報信心在語意上必須分離。現有 bounded candidate 的 `confidence_basis_points` 視為 legacy evidence score，不是已校準機率；在加入異質推論前，持久化與 API schema 必須帶 `score_kind`，機率還必須帶 calibration manifest。未經版本化 corpus 與 calibration 驗證的值不得宣稱為機率，也不得跨 provider 直接比較或作為自動檔案操作門檻。所有推論仍只是 schema-validated suggestion。
 
 ### Embedding
 
@@ -273,10 +294,10 @@ FTS5 lexical score
 Provider 順序：
 
 1. 平台原生 OCR，可用時優先。
-2. 跨平台輕量 OCR Provider。
-3. 選配 PaddleOCR 高品質模型。
+2. 經同一 corpus、package、RSS、cancellation 與主要釋出平台 gate 選出的 packaged fallback；Linux experimental 的限制另行記錄，不得拖延 macOS／Windows。
+3. 其他選配品質 Provider，只有在同樣 acceptance 下證明淨收益才採用。
 
-禁止將 Python 環境需求暴露給最終使用者；若使用 Sidecar，必須被 Installer 完整包裝。
+禁止將 Python 環境需求暴露給最終使用者。v0.1 不因候選模型已有上游 benchmark 就預設 Tesseract、PaddleOCR、ONNX Runtime 或 Sidecar；若使用 Sidecar，必須被 Installer 完整包裝並通過權限、生命週期、checksum、SBOM 與 clean-machine 驗證。
 
 ### Local LLM
 

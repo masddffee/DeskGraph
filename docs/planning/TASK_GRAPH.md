@@ -80,19 +80,19 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 ### Step 3 — M2 extraction/OCR
 
 - Current: text/Markdown/code, bounded text-layer PDF, allowlisted DOCX/PPTX/XLSX, bounded image header metadata, and macOS arm64 Apple Vision OCR route through durable controlled-source jobs into atomic untrusted SQLite/FTS chunks or structured metadata. Windows `Windows.Media.Ocr` provider code is wired into the same bounded operation without runtime support being claimed. Migration 0016 keeps boxes mandatory and confidence optional. Windows code adds package-identity preflight, requested/resolved language policy, zero-angle source boxes, exact de-duplication, terminal-only close, bounded caller return, and a one-worker cleanup gate. Host policy/state-machine tests and Windows cfg check/Clippy pass; this is not Windows runtime evidence.
-- ADR-024 resolves D-008 architecture, and the path-free macOS provider is locally verified through real Vision→SQLite→FTS. Next: run real Windows/MSIX identity/language/OCR/cancel/cleanup/RSS fixtures, then independently audit and implement the packaged in-process Tesseract/Leptonica `eng` + `chi_tra` fallback. Keep representative Office/PDF/image/OCR corpora, macOS Intel/remote runtimes, scanned-PDF routing, and 8 GB residency as separate required evidence.
+- ADR-024 resolves D-008's native-first architecture, and the path-free macOS provider is locally verified through real Vision→SQLite→FTS. D-015 reopens only the fallback implementation. Next: run real Windows/MSIX identity/language/OCR/cancel/cleanup/RSS fixtures and compare Tesseract `eng`+`chi_tra` with PP-OCRv6 small/tiny through one versioned evaluation corpus and identical package/RSS/cancel gates before accepting a runtime. macOS arm64/Intel and Windows x64 block adoption; Linux experimental evidence is tracked separately and cannot delay them. Do not add fallback routing until the selected provider and capability-preflight/failure-policy E2E tests ship together. Keep representative Office/PDF/image/OCR corpora, scanned-PDF routing, and 8 GB residency as separate required evidence.
 - Exit each provider only with corrupt/active-content/limit/cancel/provenance fixtures and a usable CLI/Desktop entry point.
 
 ### Step 4 — M3 retrieval
 
 - Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, bounded scope/type/date/source filters, CLI/Desktop entry points, and a reproducible synthetic 10k p50/p95/index-size report are verified locally; this is not 100k, real-corpus, 8 GB, or cross-platform evidence.
-- Next: connect project/folder filters only after M4 persists their source-of-truth identities/correction state, extend benchmark/evaluation coverage, then audit a vector adapter/provider before semantic or hybrid implementation.
+- Next: connect project/folder filters only after M4 persists their source-of-truth identities/correction state, then add versioned SQLite embedding rows with a bounded exact-search baseline. Rebuild ANN from version-matched embedding rows; only recompute those rows from content hashes plus the exact model manifest. Audit and adopt an ANN provider only if representative vector-count recall@k/result-consistency and p95/RSS/build/update evidence shows a net release-budget benefit, with atomic model-version invalidation.
 - Exit with no-model deterministic fallback and zh-TW/English evaluation.
 
 ### Step 5 — M4 context graph
 
 - Current: ADR-018 through ADR-023 provide bounded Folder Profiles, stable correctable Project roots, full-byte exact-duplicate suggestions with reverified exact-pair feedback, and explicit numeric filename-version suggestions with evidence-bound directional correction. Version decisions revalidate current files, preserve append-only provenance, and return changed directional evidence to `suggested`; none reads content for ordering or creates a file action.
-- Next: add deterministic related candidates with provenance/current-data invalidation and evaluation. Background duplicate discovery and larger-file hashing need a separate bounded design. Resolve D-013 before cross-root learned scoring or merge/split; add file-membership correction, retrieval filters, and a backend-owned Project page only after those source-of-truth contracts pass.
+- Next: add deterministic related candidates with provenance/current-data invalidation and evaluation. Background duplicate discovery and larger-file hashing need a separate bounded design. Resolve D-013 before cross-root learned scoring and D-016 before merge/split; add file-membership correction, retrieval filters, and a backend-owned Project page only after those source-of-truth contracts pass.
 - Exit with explainable low-confidence behavior and correction feedback evidence.
 
 ### Step 6 — M5 transaction safety
@@ -104,12 +104,12 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 ### Step 7 — M6/M8 continuous product workflow
 
 - Current: ADR-016 and the durable untrusted-hint → per-scope debounce → stability/open-handle identity → atomically linked manifest reconcile core pass locally, including rename and two restart states; CLI/Desktop status is path-free and explicitly adapter-pending.
-- Next: audit and connect native platform adapters or an explicitly documented polling adapter, missed-event reconciliation, incremental extraction/indexing, background resource controls, then the separate suggest-only Smart Inbox state model and full onboarding/search/preview/history flows.
+- Next: keep the v0.1 long-running Rust writer in the Tauri core process behind the durable background-runner lease and audit/connect native platform adapters or an explicitly documented polling adapter, missed-event reconciliation, incremental extraction/indexing, tray/autostart background behavior and resource controls. Revisit a per-user writer daemon under D-014 only if UI-closed Watch acceptance proves the current topology insufficient. Then add the separate suggest-only Smart Inbox state model and full onboarding/search/preview/history flows.
 - Exit only after event/load storms, temporary downloads, rename/move reconciliation, restart, low-memory/8 GB, Windows/macOS/Linux runtime, keyboard/accessibility/loading/empty/partial/paused/error states, and no-file-action-by-default E2E acceptance pass.
 
 ### Step 8 — M7 MCP
 
-- Build stdio server over identity-based read services only.
+- Build an independently launched stdio server over identity-based read services and read-only SQLite connections only; it does not require daemon IPC or acquire a writer lease.
 - Exit with no arbitrary paths, no write tools, scope/injection tests, minimal response fields, and setup docs.
 
 ### Step 9 — M9 release gate
