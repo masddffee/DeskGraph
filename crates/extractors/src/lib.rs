@@ -116,7 +116,7 @@ pub enum ChunkProvenance {
         observation_number: u32,
         fragment_index: u32,
         bounding_box: OcrBoundingBox,
-        confidence_basis_points: u16,
+        confidence_basis_points: Option<u16>,
     },
 }
 

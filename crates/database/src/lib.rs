@@ -96,6 +96,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "ocr_jobs_and_provenance",
         sql: include_str!("../../../migrations/0015_ocr_jobs_and_provenance.sql"),
     },
+    Migration {
+        version: 16,
+        name: "nullable_ocr_confidence",
+        sql: include_str!("../../../migrations/0016_nullable_ocr_confidence.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -329,7 +334,7 @@ pub enum ContentChunkProvenanceWrite {
         bbox_y_ppm: u32,
         bbox_width_ppm: u32,
         bbox_height_ppm: u32,
-        confidence_basis_points: u16,
+        confidence_basis_points: Option<u16>,
     },
 }
 
@@ -1880,7 +1885,7 @@ impl ManifestDatabase {
                         || bbox_y_ppm
                             .checked_add(*bbox_height_ppm)
                             .is_none_or(|top| top > 1_000_000)
-                        || *confidence_basis_points > 10_000
+                        || confidence_basis_points.is_some_and(|value| value > 10_000)
                 }
             };
             if usize::try_from(chunk.ordinal).map_err(|_| DatabaseError::ExtractionOutputInvalid)?
@@ -2033,7 +2038,7 @@ impl ManifestDatabase {
                     Some(i64::from(*bbox_y_ppm)),
                     Some(i64::from(*bbox_width_ppm)),
                     Some(i64::from(*bbox_height_ppm)),
-                    Some(i64::from(*confidence_basis_points)),
+                    confidence_basis_points.map(i64::from),
                 ),
             };
             transaction.execute(
@@ -7083,7 +7088,7 @@ mod tests {
                         bbox_y_ppm: 100_000,
                         bbox_width_ppm: 400_000,
                         bbox_height_ppm: 200_000,
-                        confidence_basis_points: 9_876,
+                        confidence_basis_points: Some(9_876),
                     },
                     trust_class: "untrusted_extracted_text",
                 }],
@@ -7259,7 +7264,7 @@ mod tests {
                         bbox_y_ppm: 0,
                         bbox_width_ppm: 200_000,
                         bbox_height_ppm: 1,
-                        confidence_basis_points: 10_000,
+                        confidence_basis_points: Some(10_000),
                     },
                     trust_class: "untrusted_extracted_text",
                 }],
@@ -7303,13 +7308,82 @@ mod tests {
                         bbox_y_ppm: 0,
                         bbox_width_ppm: 1,
                         bbox_height_ppm: 1,
-                        confidence_basis_points: 10_000,
+                        confidence_basis_points: Some(10_000),
                     },
                     trust_class: "untrusted_extracted_text",
                 }],
             )
             .expect_err("content jobs must reject OCR provenance");
         assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+    }
+
+    #[test]
+    fn ocr_confidence_absence_is_preserved_and_bbox_remains_required() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let job = database
+            .create_screenshot_ocr_job(scope_id, node_id)
+            .expect("OCR job should create");
+        database
+            .claim_extraction_job(job.job_id, "windows-ocr-runner", 60_000)
+            .expect("OCR job should claim");
+        database
+            .complete_extraction_job(
+                job.job_id,
+                "windows-ocr-runner",
+                "deskgraph.windows-media-ocr",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "text".to_string(),
+                    provenance: ContentChunkProvenanceWrite::OcrObservation {
+                        observation_number: 1,
+                        fragment_index: 0,
+                        bbox_x_ppm: 10_000,
+                        bbox_y_ppm: 20_000,
+                        bbox_width_ppm: 300_000,
+                        bbox_height_ppm: 100_000,
+                        confidence_basis_points: None,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("provider without confidence should publish honest provenance");
+
+        let stored: (Option<i64>, i64) = database
+            .connection
+            .query_row(
+                "SELECT source_confidence_basis_points, source_bbox_x_ppm \
+                 FROM content_chunks WHERE extraction_job_id = ?1",
+                [job.job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("OCR provenance should load");
+        assert_eq!(stored, (None, 10_000));
+
+        database
+            .connection
+            .execute(
+                "UPDATE content_chunks SET source_bbox_x_ppm = NULL \
+                 WHERE extraction_job_id = ?1",
+                [job.job_id],
+            )
+            .expect_err("database guard must reject missing OCR bounds");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT source_bbox_x_ppm FROM content_chunks \
+                     WHERE extraction_job_id = ?1",
+                    [job.job_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("valid OCR bounds should remain"),
+            10_000
+        );
     }
 
     #[test]

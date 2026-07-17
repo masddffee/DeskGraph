@@ -65,7 +65,7 @@ impl OcrBoundingBox {
 pub struct OcrObservation {
     pub text: String,
     pub bounding_box: OcrBoundingBox,
-    pub confidence_basis_points: u16,
+    pub confidence_basis_points: Option<u16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,7 +239,9 @@ pub(crate) fn build_ocr_extraction_output(
         if observation.text.is_empty()
             || observation.text.len() > provider_limits.max_observation_bytes
             || !observation.bounding_box.is_valid()
-            || observation.confidence_basis_points > 10_000
+            || observation
+                .confidence_basis_points
+                .is_some_and(|value| value > 10_000)
         {
             return Err(ExtractionError::OcrOutputInvalid);
         }
@@ -443,7 +445,7 @@ mod macos {
                     rectangle.size.height,
                 )?;
                 let confidence_basis_points =
-                    (confidence * 10_000.0).round().clamp(0.0, 10_000.0) as u16;
+                    Some((confidence * 10_000.0).round().clamp(0.0, 10_000.0) as u16);
                 output.push(OcrObservation {
                     text,
                     bounding_box,
@@ -607,7 +609,7 @@ mod tests {
                         width_ppm: 300_000,
                         height_ppm: 100_000,
                     },
-                    confidence_basis_points: 9_000,
+                    confidence_basis_points: Some(9_000),
                 }],
             },
         )
@@ -628,9 +630,41 @@ mod tests {
             assert_eq!(observation_number, 1);
             assert_eq!(fragment_index, index as u32);
             assert_eq!(bounding_box.x_ppm, 10_000);
-            assert_eq!(confidence_basis_points, 9_000);
+            assert_eq!(confidence_basis_points, Some(9_000));
             assert_eq!(chunk.trust_class, UNTRUSTED_TEXT);
         }
+    }
+
+    #[test]
+    fn ocr_output_preserves_absent_provider_confidence() {
+        let output = build_ocr_extraction_output(
+            &FakeProvider,
+            request(),
+            compact_limits(),
+            &OcrControl::new(Duration::from_secs(1)),
+            OcrOutput {
+                observations: vec![OcrObservation {
+                    text: "DeskGraph".to_string(),
+                    bounding_box: OcrBoundingBox {
+                        x_ppm: 10_000,
+                        y_ppm: 20_000,
+                        width_ppm: 300_000,
+                        height_ppm: 100_000,
+                    },
+                    confidence_basis_points: None,
+                }],
+            },
+        )
+        .expect("a provider without a confidence API should remain honest");
+
+        let ChunkProvenance::OcrObservation {
+            confidence_basis_points,
+            ..
+        } = output.chunks[0].provenance
+        else {
+            panic!("OCR chunks must use spatial provenance");
+        };
+        assert_eq!(confidence_basis_points, None);
     }
 
     #[test]
@@ -651,7 +685,7 @@ mod tests {
                         width_ppm: 200_000,
                         height_ppm: 1,
                     },
-                    confidence_basis_points: 10_000,
+                    confidence_basis_points: Some(10_000),
                 }],
             },
         )
@@ -730,7 +764,7 @@ mod tests {
                                 width_ppm: 100_000,
                                 height_ppm: 100_000,
                             },
-                            confidence_basis_points: 9_000,
+                            confidence_basis_points: Some(9_000),
                         },
                         OcrObservation {
                             text: "two".to_string(),
@@ -740,7 +774,7 @@ mod tests {
                                 width_ppm: 100_000,
                                 height_ppm: 100_000,
                             },
-                            confidence_basis_points: 9_000,
+                            confidence_basis_points: Some(9_000),
                         },
                     ],
                 },
@@ -767,7 +801,7 @@ mod tests {
                             width_ppm: 100_000,
                             height_ppm: 100_000,
                         },
-                        confidence_basis_points: 9_000,
+                        confidence_basis_points: Some(9_000),
                     }],
                 },
             ),

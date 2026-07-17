@@ -819,7 +819,7 @@ mod tests {
                             width_ppm: 400_000,
                             height_ppm: 150_000,
                         },
-                        confidence_basis_points: 10_000,
+                        confidence_basis_points: Some(10_000),
                     },
                     crate::OcrObservation {
                         text: "桌面圖譜 安全整理".to_string(),
@@ -829,9 +829,44 @@ mod tests {
                             width_ppm: 500_000,
                             height_ppm: 150_000,
                         },
-                        confidence_basis_points: 8_500,
+                        confidence_basis_points: Some(8_500),
                     },
                 ],
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NoConfidenceOcrProvider;
+
+    impl OcrProvider for NoConfidenceOcrProvider {
+        fn provider_id(&self) -> &'static str {
+            "deskgraph.no-confidence-fake-ocr"
+        }
+
+        fn provider_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn recognize(
+            &self,
+            _encoded_image: &[u8],
+            _request: OcrRequest,
+            _limits: crate::OcrProviderLimits,
+            control: &OcrControl,
+        ) -> Result<crate::OcrOutput, ExtractionError> {
+            control.check()?;
+            Ok(crate::OcrOutput {
+                observations: vec![crate::OcrObservation {
+                    text: "Windows OCR 無分數".to_string(),
+                    bounding_box: crate::OcrBoundingBox {
+                        x_ppm: 100_000,
+                        y_ppm: 200_000,
+                        width_ppm: 500_000,
+                        height_ppm: 100_000,
+                    },
+                    confidence_basis_points: None,
+                }],
             })
         }
     }
@@ -948,7 +983,7 @@ mod tests {
                         width_ppm: 100_000,
                         height_ppm: 100_000,
                     },
-                    confidence_basis_points: 9_000,
+                    confidence_basis_points: Some(9_000),
                 }],
             })
         }
@@ -1292,6 +1327,69 @@ mod tests {
             .expect("OCR text should be searchable");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].node_id, fixture.node_id);
+    }
+
+    #[test]
+    fn screenshot_ocr_without_confidence_atomically_replaces_prior_output() {
+        let fixture = fixture("Screenshot.png", &png_bytes(640, 480));
+        let initial_job =
+            create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("initial OCR job should create");
+        let initial = run_extraction_job_with_ocr_provider_at(
+            &fixture.database_path,
+            initial_job.job_id,
+            ExtractionLimits::default(),
+            &MixedLanguageOcrProvider,
+        )
+        .expect("initial OCR should complete");
+        assert_eq!(initial.status, ExtractionStatus::Completed);
+        assert_eq!(initial.chunk_count, 2);
+
+        let replacement_job =
+            create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("replacement OCR job should create");
+        let replacement = run_extraction_job_with_ocr_provider_at(
+            &fixture.database_path,
+            replacement_job.job_id,
+            ExtractionLimits::default(),
+            &NoConfidenceOcrProvider,
+        )
+        .expect("provider without confidence should replace prior OCR");
+
+        assert_eq!(replacement.status, ExtractionStatus::Completed);
+        assert_eq!(
+            replacement.provider_id.as_deref(),
+            Some("deskgraph.no-confidence-fake-ocr")
+        );
+        assert_eq!(replacement.chunk_count, 1);
+
+        let database =
+            ManifestDatabase::open(&fixture.database_path).expect("OCR database should reopen");
+        let filters = LexicalSearchFilters {
+            scope_id: Some(fixture.scope_id),
+            source: LexicalSearchSource::ExtractedText,
+            extension: None,
+            modified_since_unix_ns: None,
+            modified_before_unix_ns: None,
+        };
+        assert!(
+            database
+                .lexical_search_candidates("\"桌面圖譜\"", filters, 10)
+                .expect("prior OCR query should run")
+                .is_empty(),
+            "the prior complete OCR result must be inactive after replacement"
+        );
+        let replacement_candidates = database
+            .lexical_search_candidates("\"無分數\"", filters, 10)
+            .expect("replacement OCR should be searchable");
+        assert_eq!(replacement_candidates.len(), 1);
+        assert_eq!(replacement_candidates[0].node_id, fixture.node_id);
+        assert_eq!(
+            extraction_stats_at(&fixture.database_path)
+                .expect("replacement stats should load")
+                .active_chunk_count,
+            1
+        );
     }
 
     #[test]
