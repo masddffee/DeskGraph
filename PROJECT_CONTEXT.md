@@ -19,6 +19,7 @@ The 90-day-equivalent success outcome for this repository is a publicly download
 - experimental Linux build that does not delay macOS or Windows;
 - a useful no-model path from explicit scope selection through scan, search, project context, safe preview, journaled move/rename, undo, and read-only MCP;
 - published tests, security evidence, 8 GB benchmarks, checksums, SBOM, documentation, demos, and release operations.
+- a launch and community program designed to earn more than 10,000 organic GitHub stars through real product utility, one-click verified downloads, privacy trust, public evidence, and contributor experience—not vote or star exchanges. Stars are tracked with activated installs, retention, search success, and contribution quality so reach cannot substitute for product value.
 
 Version A is only an internal demonstrable milestone. Version C capabilities remain architectural extension points unless they do not endanger v0.1 delivery.
 

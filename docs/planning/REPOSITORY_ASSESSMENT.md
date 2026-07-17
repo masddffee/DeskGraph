@@ -29,7 +29,7 @@ The correct starting point is M0 Repository Foundation. No later milestone can b
 
 ## Specification integrity observations
 
-- `docs/planning/MANIFEST.json` references `prompts/00_MASTER_ORCHESTRATOR.md`, but that file is absent. The requested execution starts at `prompts/01_FOUNDATION.md`, so this does not block M0; the inconsistency remains recorded.
+- The initial generated planning pack referenced an absent phase-zero orchestrator and template paths. Those stale packaging artifacts were removed after M0; the accepted execution source starts at `prompts/01_FOUNDATION.md`.
 - `apps-desktop.AGENTS.md` and `crates-transactions.AGENTS.md` are instruction templates at repository root. Their intended nested locations did not exist.
 - The accepted ADR set is `docs/planning/09_DECISIONS_ADR.md` (ADR-001 through ADR-007). Its decisions are binding: SQLite, optional LLM, no delete, read-only MCP, graph-as-infrastructure, post-install models, and provider interfaces.
 - The phase prompts and milestone numbering intentionally differ after M7: desktop UX is milestone M8 while Phase 08 is its execution prompt; optional local AI, benchmark/security, packaging, docs, release, and launch are cross-cutting release phases. The task graph preserves milestone names as the status SSOT and uses phase prompts as execution gates.

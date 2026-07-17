@@ -7,7 +7,7 @@
 - 建立可信的開源品牌。
 - 取得高品質 Issues 與 Contributors。
 - 驗證最強 Use Case。
-- 累積 GitHub Stars、Downloads 與 Weekly Active Users。
+- 以超過 10,000 顆 organic GitHub Stars 為公開成長目標，同時累積 verified Downloads、Activated Installations 與 Weekly Active Users；不得用 Stars 取代產品使用與留存證據。
 - 找到產品應該繼續往 File Organizer、Local Search 或 Agent Context 發展。
 
 ## 2. Positioning Variants
