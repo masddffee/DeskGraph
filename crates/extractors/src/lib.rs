@@ -13,8 +13,10 @@ mod service;
 
 pub use image::ImageMetadataExtractor;
 pub use ocr::{
+    ABSOLUTE_MAX_OCR_DIMENSION, ABSOLUTE_MAX_OCR_OBSERVATION_BYTES, ABSOLUTE_MAX_OCR_OBSERVATIONS,
+    ABSOLUTE_MAX_OCR_OUTPUT_BYTES, ABSOLUTE_MAX_OCR_PIXELS, ABSOLUTE_MAX_OCR_SOURCE_BYTES,
     NativeOcrProvider, OcrBoundingBox, OcrCancellation, OcrControl, OcrObservation, OcrOutput,
-    OcrProvider, OcrProviderLimits, OcrRequest,
+    OcrProvider, OcrProviderLimits, OcrRequest, recognize_ocr_image_bytes,
 };
 pub use ooxml::OoxmlTextExtractor;
 pub use pdf::PdfTextExtractor;

@@ -8,7 +8,16 @@ publish = false
 
 [dependencies]
 clap.workspace = true
+deskgraph-domain = { path = "../../crates/domain" }
+deskgraph-extractors = { path = "../../crates/extractors" }
+deskgraph-identity = { path = "../../crates/identity" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 unicode-normalization.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

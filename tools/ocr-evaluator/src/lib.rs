@@ -3,14 +3,45 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
-const CORPUS_API_VERSION: &str = "deskgraph.ocr-corpus.v1";
-const RUN_API_VERSION: &str = "deskgraph.ocr-run.v1";
+pub mod protocol;
+
+#[cfg(target_os = "macos")]
+mod runner;
+
+#[cfg(not(target_os = "macos"))]
+mod runner {
+    use std::path::PathBuf;
+
+    #[derive(Clone, Debug)]
+    pub struct NativeRunnerConfig {
+        pub corpus_path: PathBuf,
+        pub asset_manifest_path: PathBuf,
+        pub images_root: PathBuf,
+        pub output_path: PathBuf,
+        pub run_id: String,
+        pub os_version: String,
+        pub cpu_model: String,
+        pub ram_bytes: u64,
+        pub rust_toolchain: String,
+        pub deskgraph_commit: String,
+        pub runtime_revision: String,
+        pub case_timeout_ms: u64,
+    }
+
+    pub fn run_macos_vision(_config: NativeRunnerConfig) -> Result<(), &'static str> {
+        Err("ocr_native_runner_platform_unsupported")
+    }
+}
+
+pub use runner::{NativeRunnerConfig, run_macos_vision};
+
+use protocol::*;
+
 const REPORT_API_VERSION: &str = "deskgraph.ocr-evaluation-report.v1";
-const NORMALIZATION_VERSION: &str = "nfc_unicode_whitespace_v1";
 const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CASES: usize = 1_000;
 const MAX_OBSERVATIONS_PER_CASE: usize = 4_096;
@@ -19,38 +50,6 @@ const MAX_TEXT_BYTES_PER_CASE: usize = 256 * 1024;
 const MAX_TEXT_UNITS_PER_CASE: usize = 16_384;
 const MAX_TOTAL_TEXT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EDIT_CELLS: u64 = 100_000_000;
-const NORMALIZED_SCALE: u32 = 1_000_000;
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Corpus {
-    api_version: String,
-    corpus_id: String,
-    normalization: String,
-    cases: Vec<CorpusCase>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CorpusCase {
-    case_id: String,
-    image_sha256: String,
-    expected_text: String,
-    tags: Vec<CaseTag>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum CaseTag {
-    TraditionalChinese,
-    English,
-    MixedLanguage,
-    NoText,
-    SmallText,
-    LowContrast,
-    DarkMode,
-    DenseUi,
-}
 
 const ALL_CASE_TAGS: [CaseTag; 8] = [
     CaseTag::TraditionalChinese,
@@ -63,159 +62,12 @@ const ALL_CASE_TAGS: [CaseTag; 8] = [
     CaseTag::DenseUi,
 ];
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderRun {
-    api_version: String,
-    run_id: String,
-    corpus_id: String,
-    corpus_input_sha256: String,
-    provider: ProviderEvidence,
-    host: HostEvidence,
-    rss: RssEvidence,
-    cases: Vec<RunCase>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProviderEvidence {
-    provider_id: String,
-    provider_version: String,
-    runtime: ProviderRuntimeEvidence,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ProviderRuntimeEvidence {
-    OsManaged {
-        runtime_revision: String,
-    },
-    Packaged {
-        artifact_manifest_sha256: String,
-        model_manifest_sha256: String,
-    },
-    Missing,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HostEvidence {
-    os: HostOs,
-    os_version: String,
-    arch: HostArch,
-    cpu_model: String,
-    ram_bytes: u64,
-    rust_toolchain: String,
-    deskgraph_commit: String,
-    harness_id: String,
-    harness_version: String,
-    command: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum HostOs {
-    Macos,
-    Windows,
-    Linux,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum HostArch {
-    Aarch64,
-    X86_64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RssEvidence {
-    scope: Option<RssScope>,
-    before: Option<RssMeasurement>,
-    peak: Option<RssMeasurement>,
-    after_caller: Option<RssMeasurement>,
-    after_cleanup: Option<RssMeasurement>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RssScope {
-    WholeProcess,
-    ProviderSidecarProcess,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct RssMeasurement {
-    bytes: u64,
-    source: RssMeasurementSource,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RssMeasurementSource {
-    MacosTimeL,
-    WindowsProcessMemoryInfo,
-    LinuxProcStatus,
-    ExternalHarness,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunCase {
-    case_id: String,
-    image_sha256: String,
-    status: RunStatus,
-    elapsed_us: u64,
-    error_code: Option<String>,
-    recognized_text: String,
-    observations: Vec<RunObservation>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum RunStatus {
-    Completed,
-    Failed,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunObservation {
-    text: String,
-    bounding_box: BoundingBox,
-    confidence_basis_points: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BoundingBox {
-    x_ppm: u32,
-    y_ppm: u32,
-    width_ppm: u32,
-    height_ppm: u32,
-}
-
-impl BoundingBox {
-    fn is_valid(self) -> bool {
-        self.width_ppm > 0
-            && self.height_ppm > 0
-            && self
-                .x_ppm
-                .checked_add(self.width_ppm)
-                .is_some_and(|right| right <= NORMALIZED_SCALE)
-            && self
-                .y_ppm
-                .checked_add(self.height_ppm)
-                .is_some_and(|bottom| bottom <= NORMALIZED_SCALE)
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub struct EvaluationReport {
     api_version: &'static str,
     corpus_id: String,
     corpus_input_sha256: String,
+    asset_manifest_input_sha256: String,
     run_input_sha256: String,
     run_id: String,
     provider_id: String,
@@ -528,6 +380,7 @@ fn evaluate(
         api_version: REPORT_API_VERSION,
         corpus_id: corpus.corpus_id,
         corpus_input_sha256,
+        asset_manifest_input_sha256: run.asset_manifest_input_sha256,
         run_input_sha256,
         run_id: run.run_id,
         provider_id: run.provider.provider_id,
@@ -668,6 +521,7 @@ fn validate_top_level(
     }
     validate_sha256(corpus_input_sha256)?;
     validate_sha256(&run.corpus_input_sha256)?;
+    validate_sha256(&run.asset_manifest_input_sha256)?;
     if corpus_input_sha256 != run.corpus_input_sha256 {
         return Err("ocr_evaluation_corpus_digest_mismatch");
     }
@@ -1099,6 +953,8 @@ mod tests {
             run_id: "native-macos-1".to_owned(),
             corpus_id: "mixed-v1".to_owned(),
             corpus_input_sha256: CORPUS_SHA.to_owned(),
+            asset_manifest_input_sha256: SHA_B.to_owned(),
+            text_reconstruction: TextReconstruction::ProviderObservationOrderNewlineJoinV1,
             provider: ProviderEvidence {
                 provider_id: "deskgraph.apple-vision".to_owned(),
                 provider_version: "1".to_owned(),

@@ -230,21 +230,39 @@ pub(crate) fn validate_ocr_request(
     })
 }
 
-pub(crate) fn build_ocr_extraction_output(
+/// Runs a bounded OCR provider invocation over core-owned image bytes.
+///
+/// Callers must obtain `encoded_image` through an authorized, bounded source.
+/// This adapter validates the request and every provider-produced observation so
+/// alternate callers cannot accidentally bypass the product OCR safety limits.
+pub fn recognize_ocr_image_bytes(
     provider: &dyn OcrProvider,
+    encoded_image: Vec<u8>,
     request: OcrRequest,
     limits: ExtractionLimits,
     control: &OcrControl,
-    output: OcrOutput,
-) -> Result<ExtractionOutput, ExtractionError> {
+) -> Result<OcrOutput, ExtractionError> {
     control.check()?;
+    if u64::try_from(encoded_image.len()).ok() != Some(request.expected_source_bytes) {
+        return Err(ExtractionError::SourceChanged);
+    }
     let provider_limits = validate_ocr_request(request, limits)?;
+    let output = provider.recognize(encoded_image, request, provider_limits, control)?;
+    validate_ocr_output(&output, provider_limits, control)?;
+    Ok(output)
+}
+
+fn validate_ocr_output(
+    output: &OcrOutput,
+    provider_limits: OcrProviderLimits,
+    control: &OcrControl,
+) -> Result<(), ExtractionError> {
+    control.check()?;
     if output.observations.len() > provider_limits.max_observations {
         return Err(ExtractionError::OcrObservationLimitExceeded);
     }
-    let mut chunks = Vec::new();
     let mut output_bytes = 0_u64;
-    for (observation_index, observation) in output.observations.into_iter().enumerate() {
+    for observation in &output.observations {
         control.check()?;
         if observation.text.is_empty()
             || observation.text.len() > provider_limits.max_observation_bytes
@@ -255,6 +273,32 @@ pub(crate) fn build_ocr_extraction_output(
         {
             return Err(ExtractionError::OcrOutputInvalid);
         }
+        output_bytes = output_bytes
+            .checked_add(
+                u64::try_from(observation.text.len())
+                    .map_err(|_| ExtractionError::OutputTooLarge)?,
+            )
+            .ok_or(ExtractionError::OutputTooLarge)?;
+        if output_bytes > provider_limits.max_output_bytes {
+            return Err(ExtractionError::OutputTooLarge);
+        }
+    }
+    control.check()
+}
+
+pub(crate) fn build_ocr_extraction_output(
+    provider: &dyn OcrProvider,
+    request: OcrRequest,
+    limits: ExtractionLimits,
+    control: &OcrControl,
+    output: OcrOutput,
+) -> Result<ExtractionOutput, ExtractionError> {
+    let provider_limits = validate_ocr_request(request, limits)?;
+    validate_ocr_output(&output, provider_limits, control)?;
+    let mut chunks = Vec::new();
+    let mut output_bytes = 0_u64;
+    for (observation_index, observation) in output.observations.into_iter().enumerate() {
+        control.check()?;
         let observation_number = u32::try_from(observation_index)
             .ok()
             .and_then(|index| index.checked_add(1))
@@ -1270,7 +1314,8 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::{Mutex, mpsc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
 
     use super::*;
 
@@ -1294,6 +1339,46 @@ mod tests {
             _control: &OcrControl,
         ) -> Result<OcrOutput, ExtractionError> {
             unreachable!("core output tests provide fake output directly")
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+        output: OcrOutput,
+    }
+
+    impl OcrProvider for CountingProvider {
+        fn provider_id(&self) -> &'static str {
+            "deskgraph.counting-fake-ocr"
+        }
+
+        fn provider_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn recognize(
+            &self,
+            _encoded_image: Vec<u8>,
+            _request: OcrRequest,
+            _limits: OcrProviderLimits,
+            _control: &OcrControl,
+        ) -> Result<OcrOutput, ExtractionError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(self.output.clone())
+        }
+    }
+
+    fn valid_observation() -> OcrObservation {
+        OcrObservation {
+            text: "DeskGraph".to_string(),
+            bounding_box: OcrBoundingBox {
+                x_ppm: 0,
+                y_ppm: 0,
+                width_ppm: 100_000,
+                height_ppm: 100_000,
+            },
+            confidence_basis_points: Some(9_000),
         }
     }
 
@@ -1378,6 +1463,108 @@ mod tests {
             max_image_pixels: 1_048_576,
             max_processing_time: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn bounded_ocr_adapter_returns_a_valid_provider_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: Arc::clone(&calls),
+            output: OcrOutput {
+                observations: vec![valid_observation()],
+            },
+        };
+
+        let output = recognize_ocr_image_bytes(
+            &provider,
+            vec![0_u8; 64],
+            request(),
+            compact_limits(),
+            &OcrControl::new(Duration::from_secs(1)),
+        )
+        .expect("a bounded valid provider output should pass");
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(output.observations, vec![valid_observation()]);
+    }
+
+    #[test]
+    fn bounded_ocr_adapter_rejects_length_mismatch_before_provider_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: Arc::clone(&calls),
+            output: OcrOutput {
+                observations: vec![valid_observation()],
+            },
+        };
+
+        let error = recognize_ocr_image_bytes(
+            &provider,
+            vec![0_u8; 63],
+            request(),
+            compact_limits(),
+            &OcrControl::new(Duration::from_secs(1)),
+        )
+        .expect_err("mismatched bytes must fail closed before provider invocation");
+
+        assert_eq!(error, ExtractionError::SourceChanged);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn bounded_ocr_adapter_rejects_invalid_provider_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: Arc::clone(&calls),
+            output: OcrOutput {
+                observations: vec![OcrObservation {
+                    bounding_box: OcrBoundingBox {
+                        x_ppm: 900_000,
+                        y_ppm: 0,
+                        width_ppm: 200_000,
+                        height_ppm: 1,
+                    },
+                    ..valid_observation()
+                }],
+            },
+        };
+
+        let error = recognize_ocr_image_bytes(
+            &provider,
+            vec![0_u8; 64],
+            request(),
+            compact_limits(),
+            &OcrControl::new(Duration::from_secs(1)),
+        )
+        .expect_err("invalid provider observations must fail closed");
+
+        assert_eq!(error, ExtractionError::OcrOutputInvalid);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn bounded_ocr_adapter_honors_cancellation_before_provider_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: Arc::clone(&calls),
+            output: OcrOutput {
+                observations: vec![valid_observation()],
+            },
+        };
+        let control = OcrControl::new(Duration::from_secs(1));
+        control.cancellation().cancel();
+
+        let error = recognize_ocr_image_bytes(
+            &provider,
+            vec![0_u8; 64],
+            request(),
+            compact_limits(),
+            &control,
+        )
+        .expect_err("cancelled OCR must not invoke provider");
+
+        assert_eq!(error, ExtractionError::Cancelled);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 
     #[test]

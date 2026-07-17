@@ -815,9 +815,14 @@ name = "deskgraph-ocr-evaluator"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "deskgraph-domain",
+ "deskgraph-extractors",
+ "deskgraph-identity",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "unicode-normalization",
 ]
 

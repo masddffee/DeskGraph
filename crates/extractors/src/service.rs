@@ -22,14 +22,12 @@ use deskgraph_identity::{
     is_symlink_or_reparse_point, path_from_raw, platform_identity_for_open_file,
 };
 
-use crate::ocr::{
-    ABSOLUTE_MAX_OCR_SOURCE_BYTES, build_ocr_extraction_output, validate_ocr_request,
-};
+use crate::ocr::{ABSOLUTE_MAX_OCR_SOURCE_BYTES, build_ocr_extraction_output};
 use crate::{
     CancellationSignal, ChunkProvenance, ExtractionError, ExtractionLimits, ExtractionRequest,
     ExtractorProvider, ImageMetadataExtractor, MediaKind, NativeOcrProvider, OcrCancellation,
     OcrControl, OcrProvider, OcrRequest, OoxmlTextExtractor, PdfTextExtractor, Utf8TextExtractor,
-    media_kind_for_extension,
+    media_kind_for_extension, recognize_ocr_image_bytes,
 };
 
 // The provider's absolute processing cap is 60 seconds. Keep enough lease headroom for
@@ -508,9 +506,8 @@ fn extract_claimed_ocr_job(
             pixel_width: metadata.pixel_width,
             pixel_height: metadata.pixel_height,
         };
-        let provider_limits = validate_ocr_request(request, limits)?;
         let encoded_image = read_ocr_source(file, request, limits, &control)?;
-        let output = provider.recognize(encoded_image, request, provider_limits, &control)?;
+        let output = recognize_ocr_image_bytes(provider, encoded_image, request, limits, &control)?;
         let output = build_ocr_extraction_output(provider, request, limits, &control, output)?;
         validate_open_file(file, source)?;
         Ok(output)

@@ -3,6 +3,8 @@
   "run_id": "synthetic-native-1",
   "corpus_id": "synthetic-contract-v1",
   "corpus_input_sha256": "278a7dbb1035e108a94431eb84fbfa998734363275a20c36b3598ea282f41db4",
+  "asset_manifest_input_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "text_reconstruction": "provider_observation_order_newline_join_v1",
   "provider": {
     "provider_id": "deskgraph.example-native",
     "provider_version": "1",
