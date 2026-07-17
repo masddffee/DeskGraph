@@ -129,6 +129,9 @@ function scanStatusLabel(job: ScanJobProgress): string {
 function extractionStatusLabel(job: ExtractionJobProgress): string {
   if (job.status === 'queued') return 'Waiting to start';
   if (job.status === 'running' && job.cancel_requested) return 'Stopping safely…';
+  if (job.status === 'running' && job.operation === 'screenshot_ocr') {
+    return 'Reading screenshot text locally…';
+  }
   if (job.status === 'running') return 'Extracting bounded text…';
   if (job.status === 'completed') return 'Completed';
   if (job.status === 'cancelled') return 'Cancelled safely';
@@ -919,7 +922,13 @@ export default function App() {
             </div>
             {state.extractionJobs[0] ? (
               <div className="extraction-progress" role="status">
-                <span>Latest job {state.extractionJobs[0].job_id}</span>
+                <span>
+                  Latest{' '}
+                  {state.extractionJobs[0].operation === 'screenshot_ocr'
+                    ? 'Screenshot OCR'
+                    : 'content'}{' '}
+                  job {state.extractionJobs[0].job_id}
+                </span>
                 <strong>{extractionStatusLabel(state.extractionJobs[0])}</strong>
                 <span>
                   {state.extractionJobs[0].chunk_count.toLocaleString()} chunks ·{' '}

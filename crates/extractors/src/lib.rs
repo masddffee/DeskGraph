@@ -6,17 +6,23 @@ use std::time::{Duration, Instant};
 use deskgraph_domain::ImageFormat;
 
 mod image;
+mod ocr;
 mod ooxml;
 mod pdf;
 mod service;
 
 pub use image::ImageMetadataExtractor;
+pub use ocr::{
+    NativeOcrProvider, OcrBoundingBox, OcrCancellation, OcrControl, OcrObservation, OcrOutput,
+    OcrProvider, OcrProviderLimits, OcrRequest,
+};
 pub use ooxml::OoxmlTextExtractor;
 pub use pdf::PdfTextExtractor;
 pub use service::{
-    ExtractionServiceError, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
-    extraction_stats_at, image_metadata_for_job_at, recent_extraction_jobs_at,
-    resume_extraction_job_at, run_extraction_job_at,
+    ExtractionServiceError, cancel_extraction_job_at, create_extraction_job_at,
+    create_screenshot_ocr_job_at, extraction_job_at, extraction_stats_at,
+    image_metadata_for_job_at, recent_extraction_jobs_at, resume_extraction_job_at,
+    run_extraction_job_at,
 };
 
 pub const UNTRUSTED_TEXT: &str = "untrusted_extracted_text";
@@ -106,6 +112,12 @@ pub enum ChunkProvenance {
         cell_reference: String,
         fragment_index: u32,
     },
+    OcrObservation {
+        observation_number: u32,
+        fragment_index: u32,
+        bounding_box: OcrBoundingBox,
+        confidence_basis_points: u16,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +172,11 @@ pub enum ExtractionError {
     ImageFormatMismatch,
     ImageMetadataLimitExceeded,
     ImageDimensionLimitExceeded,
+    OcrProviderUnavailable,
+    OcrLanguageUnavailable,
+    OcrProviderFailed,
+    OcrOutputInvalid,
+    OcrObservationLimitExceeded,
     DecompressionLimitExceeded,
     PageLimitExceeded,
     ChunkLimitExceeded,
@@ -194,6 +211,11 @@ impl ExtractionError {
             Self::ImageFormatMismatch => "extraction_image_format_mismatch",
             Self::ImageMetadataLimitExceeded => "extraction_image_metadata_limit_exceeded",
             Self::ImageDimensionLimitExceeded => "extraction_image_dimension_limit_exceeded",
+            Self::OcrProviderUnavailable => "extraction_ocr_provider_unavailable",
+            Self::OcrLanguageUnavailable => "extraction_ocr_language_unavailable",
+            Self::OcrProviderFailed => "extraction_ocr_provider_failed",
+            Self::OcrOutputInvalid => "extraction_ocr_output_invalid",
+            Self::OcrObservationLimitExceeded => "extraction_ocr_observation_limit_exceeded",
             Self::DecompressionLimitExceeded => "extraction_decompression_limit_exceeded",
             Self::PageLimitExceeded => "extraction_page_limit_exceeded",
             Self::ChunkLimitExceeded => "extraction_chunk_limit_exceeded",
@@ -640,7 +662,8 @@ mod tests {
                     ChunkProvenance::PdfPage { .. }
                     | ChunkProvenance::DocxParagraph { .. }
                     | ChunkProvenance::PptxSlide { .. }
-                    | ChunkProvenance::XlsxCell { .. } => {
+                    | ChunkProvenance::XlsxCell { .. }
+                    | ChunkProvenance::OcrObservation { .. } => {
                         panic!("expected byte provenance")
                     }
                 })

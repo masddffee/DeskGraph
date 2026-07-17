@@ -6,9 +6,10 @@ use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{ExtractionJobProgress, ScanJobProgress, collect_health};
 use deskgraph_domain::{FileRelationDecisionKind, ProjectDecisionKind};
 use deskgraph_extractors::{
-    ExtractionLimits, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
-    extraction_stats_at, image_metadata_for_job_at, recent_extraction_jobs_at,
-    resume_extraction_job_at, run_extraction_job_at,
+    ExtractionLimits, cancel_extraction_job_at, create_extraction_job_at,
+    create_screenshot_ocr_job_at, extraction_job_at, extraction_stats_at,
+    image_metadata_for_job_at, recent_extraction_jobs_at, resume_extraction_job_at,
+    run_extraction_job_at,
 };
 use deskgraph_projects::{
     check_exact_duplicate_at, decide_exact_duplicate_at, decide_file_version_at,
@@ -107,7 +108,7 @@ enum Command {
         #[command(subcommand)]
         command: ScanCommand,
     },
-    /// Extract bounded local text from an already scanned file.
+    /// Extract bounded local content or screenshot text from an already scanned file.
     Extract {
         #[command(subcommand)]
         command: ExtractCommand,
@@ -449,6 +450,28 @@ enum ExtractCommand {
         #[arg(long, conflicts_with = "node", required_unless_present = "node")]
         path: Option<PathBuf>,
     },
+    /// Create and complete one bounded screenshot OCR job in the foreground.
+    OcrStart {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        node: Option<i64>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        path: Option<PathBuf>,
+    },
+    /// Create a durable screenshot OCR job without opening the source file.
+    OcrCreate {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+        #[arg(long, conflicts_with = "path", required_unless_present = "path")]
+        node: Option<i64>,
+        #[arg(long, conflicts_with = "node", required_unless_present = "node")]
+        path: Option<PathBuf>,
+    },
     /// Run one queued extraction job to a terminal state.
     Run {
         #[arg(long)]
@@ -644,6 +667,31 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 let progress = create_extraction_job_at(&database, scope, node)
                     .map_err(|error| error.code())?;
                 emit_extraction_progress(&progress, "content_extraction_created")
+            }
+            ExtractCommand::OcrStart {
+                database,
+                scope,
+                node,
+                path,
+            } => {
+                let node = resolve_extraction_node(&database, scope, node, path.as_deref())?;
+                let created = create_screenshot_ocr_job_at(&database, scope, node)
+                    .map_err(|error| error.code())?;
+                let progress =
+                    run_extraction_job_at(&database, created.job_id, ExtractionLimits::default())
+                        .map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "screenshot_ocr_runner_stopped")
+            }
+            ExtractCommand::OcrCreate {
+                database,
+                scope,
+                node,
+                path,
+            } => {
+                let node = resolve_extraction_node(&database, scope, node, path.as_deref())?;
+                let progress = create_screenshot_ocr_job_at(&database, scope, node)
+                    .map_err(|error| error.code())?;
+                emit_extraction_progress(&progress, "screenshot_ocr_created")
             }
             ExtractCommand::Run { database, job } => {
                 let progress = run_extraction_job_at(&database, job, ExtractionLimits::default())
@@ -1117,6 +1165,7 @@ fn emit_extraction_progress(
         scope_id = progress.scope_id,
         node_id = progress.node_id,
         job_id = progress.job_id,
+        operation = ?progress.operation,
         status = ?progress.status,
         source_bytes = progress.source_bytes,
         output_bytes = progress.output_bytes,
@@ -1148,6 +1197,7 @@ mod tests {
         assert!(Cli::try_parse_from(["deskgraph", "scan", "start"]).is_err());
         assert!(Cli::try_parse_from(["deskgraph", "scan", "run"]).is_err());
         assert!(Cli::try_parse_from(["deskgraph", "extract", "start"]).is_err());
+        assert!(Cli::try_parse_from(["deskgraph", "extract", "ocr-start"]).is_err());
     }
 
     #[test]
@@ -1331,6 +1381,54 @@ mod tests {
         let metadata = image_metadata_for_job_at(&database, job.job_id)
             .expect("metadata should remain queryable");
         assert_eq!((metadata.pixel_width, metadata.pixel_height), (1920, 1080));
+    }
+
+    #[test]
+    fn screenshot_ocr_job_creation_runs_through_cli_without_opening_content() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("authorized");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let source_path = scope_path.join("Screenshot.png");
+        std::fs::write(&source_path, b"manifest-only fixture").expect("fixture should write");
+        let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
+        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        scan_scope(&mut manifest, scope.id).expect("scope should scan");
+        let node_id = manifest
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("source node should exist");
+        drop(manifest);
+
+        execute(Cli {
+            command: Command::Extract {
+                command: ExtractCommand::OcrCreate {
+                    database: database.clone(),
+                    scope: scope.id,
+                    node: Some(node_id),
+                    path: None,
+                },
+            },
+        })
+        .expect("OCR job creation should pass without opening content");
+
+        let job = ManifestDatabase::open(&database)
+            .expect("database should reopen")
+            .recent_extraction_jobs()
+            .expect("job should load")
+            .into_iter()
+            .next()
+            .expect("job should exist");
+        assert_eq!(
+            job.operation,
+            deskgraph_domain::ExtractionOperation::ScreenshotOcr
+        );
+        assert_eq!(job.status, deskgraph_domain::ExtractionStatus::Queued);
     }
 
     #[test]

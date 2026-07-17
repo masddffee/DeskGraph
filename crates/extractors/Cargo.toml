@@ -14,6 +14,12 @@ lopdf.workspace = true
 quick-xml.workspace = true
 zip.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-vision.workspace = true
+
 [dev-dependencies]
 deskgraph-scanner = { path = "../scanner" }
 tempfile.workspace = true
