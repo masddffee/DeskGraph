@@ -1,6 +1,6 @@
 # Decisions Needed
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-18
 
 ## Blocking now
 
@@ -42,7 +42,7 @@ D-008 is resolved by ADR-024; the architecture is native-first with a separately
 - Plain text, Markdown, and source code use a dependency-free built-in UTF-8 provider. Invalid encoding is isolated per file rather than silently guessed.
 - Extraction jobs and content chunks are durable SQLite state. Failure or cancellation preserves the prior complete extraction; a changed source invalidates stale active chunks.
 - Ordinary CLI/Desktop extraction status contains stable IDs, fixed codes, counts, and timings only. Paths and extracted text are excluded.
-- D-008 is resolved by ADR-024: macOS uses Apple Vision first, Windows uses `Windows.Media.Ocr` first, and missing native language capability falls back to a separately audited packaged in-process Tesseract provider. The target-specific macOS `objc2-vision 0.3.2` binding and bounded PNG/JPEG provider now pass local arm64 Manifest→Vision→spatial SQLite/FTS evidence; Windows binding and Tesseract/Leptonica/trained-data dependencies remain unaccepted until their own gates pass. PaddleOCR/ONNX Runtime is deferred and `ocrs` is excluded from v0.1 because it does not meet the Traditional Chinese requirement.
+- D-008 is resolved by ADR-024: macOS uses Apple Vision first; Windows may use `Windows.Media.Ocr` only with package identity and acceptable installed recognizers. Windows requests `zh-TW`/`en-US`, then validates the actual recognizer as Traditional Chinese (never `zh-Hans`) or English. The macOS `objc2-vision 0.3.2` implementation passes local arm64 Manifest→Vision→spatial SQLite/FTS evidence. The existing Microsoft `windows 0.61.3` provider code passes dependency/API/license/RustSec, host policy/state-machine, and Windows cfg check/Clippy gates without adding a lock package; real Windows/MSIX/language/cancellation/cleanup/memory evidence remains open. Missing identity/language currently returns a fixed error—automatic fallback routing is not implemented. Tesseract/Leptonica/trained-data dependencies remain unaccepted. PaddleOCR/ONNX Runtime is deferred and `ocrs` is excluded from v0.1 because it does not meet the Traditional Chinese requirement.
 - PDF text uses exact `lopdf 0.44.0` with default features disabled, strict bounded in-memory APIs, sequential page processing, no password handling, and no active-content traversal (ADR-013).
 - Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page/fragment indexes; DOCX uses paragraph/fragment, PPTX slide/fragment, and XLSX bounded sheet/cell/fragment. Structural formats never receive fabricated byte offsets.
 - D-011 is resolved by accepted ADR-014: exact no-default `zip 8.6.0` with only `deflate-flate2-zlib-rs` and no-default `quick-xml 0.41.0` pass isolated closure, license, RustSec, API, macOS arm64, and Windows x64 compile gates. The implemented provider's adversarial, migration, Manifest→SQLite→FTS, full-lock audit, and local release-build gates pass; representative corpora, remote runtimes, live UI, and 8 GB evidence remain release gates, not open dependency choices.

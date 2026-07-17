@@ -1,6 +1,6 @@
 # External Actions Required
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-18
 
 No external step should block safe local implementation. Do not add real credentials to the repository.
 
@@ -51,7 +51,7 @@ Provide or authorize clean test machines/VMs for:
 - Windows x64;
 - one documented Linux experimental target.
 
-The current macOS host can compile the isolated Windows open-handle identity adapter, but it cannot compile bundled `libsqlite3-sys` for `x86_64-pc-windows-msvc` because no Windows MSVC C headers/toolchain are installed. This is not a request to weaken bundled SQLite or add an unaudited cross toolchain. On the Windows x64 runner or clean VM, run at minimum:
+The current macOS host can compile the isolated Windows adapters. With `LIBSQLITE3_SYS_USE_PKG_CONFIG=1 PKG_CONFIG_ALLOW_CROSS=1`, it also typechecks and runs Clippy over the Windows OCR Rust cfg, but that workaround uses host SQLite metadata and `cargo check` does not link. A normal target check still stops while compiling bundled `libsqlite3-sys` because no Windows MSVC C headers/toolchain are installed. None of this proves a Windows executable or runtime. This is not a request to weaken bundled SQLite or add an unaudited cross toolchain. On the Windows x64 runner or clean VM, run at minimum:
 
 ```text
 cargo fmt --all -- --check
@@ -66,7 +66,9 @@ Windows evidence must include junction/reparse and hidden/system scanner fixture
 
 Image-metadata Windows evidence must cover PNG/JPEG/GIF/WebP/BMP/TIFF routing, extension/signature mismatch, malformed/truncated headers, WebP declared length, source/probe/operation/dimension/pixel limits, cancellation, source change, migration preservation, atomic replacement/invalidation, and path-free CLI output. The isolated Rust Windows compile proves only dependency portability, not the complete SQLite/filesystem runtime.
 
-macOS Screenshot OCR clean-machine evidence must run on arm64 and Intel or the final Universal artifact. It must verify that the packaged app can access Apple Vision, reports both `zh-Hant` and `en-US`, recognizes the controlled mixed fixture, completes a no-text image, persists valid top-left spatial/confidence provenance, returns both languages through FTS, cancels actual native work without partial publication, and records peak/start/end RSS on documented 8 GB hardware. The restricted development runner's fixed provider failure and the outside-sandbox local pass are useful environment evidence but do not prove installer entitlements or clean-machine support. Windows OCR evidence will be specified only after its exact binding and language-feature dependency gate is accepted; do not install or assume an OCR Feature on Demand silently.
+macOS Screenshot OCR clean-machine evidence must run on arm64 and Intel or the final Universal artifact. It must verify that the packaged app can access Apple Vision, reports both `zh-Hant` and `en-US`, recognizes the controlled mixed fixture, completes a no-text image, persists valid top-left spatial/confidence provenance, returns both languages through FTS, cancels actual native work without partial publication, and records peak/start/end RSS on documented 8 GB hardware. The restricted development runner's fixed provider failure and the outside-sandbox local pass are useful environment evidence but do not prove installer entitlements or clean-machine support.
+
+Windows Screenshot OCR evidence must run the production module on Windows 10/11 x64 with both package identity present and absent. Cover MSIX/external-location packaging, an unpackaged CLI path, requested `zh-TW`/`en-US` resolving to acceptable actual recognizers, missing/incompatible language capabilities, mixed Traditional Chinese/English, no-text, corrupt/signature mismatch, source/dimension/pixel/output/observation/word limits, nullable confidence, exact de-duplication, zero/absent and non-zero `TextAngle`, source change, atomic SQLite/FTS replacement, and path-free status/logs. Exercise cancellation and deadline at every WinRT async stage; prove `Close()` occurs only after terminal status, a detached cleanup worker eventually releases the one-worker gate, a stuck cleanup makes later OCR fail closed without accumulating workers, and restart recovers availability. Record CPU plus start/peak/end RSS on documented 8 GB hardware. Do not install OCR Language Features on Demand silently. Missing identity/language currently returns a fixed error; separately verify the packaged fallback only after its dependency/runtime gate is accepted and implemented.
 
 Filename-version Windows evidence must additionally cover separator/case normalization, Traditional Chinese names, extension mismatch, unsupported/leading-zero/same-number suffixes, reparse/hard-link identity denial, stale manifest/open-handle invalidation, migration preservation of existing duplicate feedback, immutable observations and evidence-bound decisions, idempotent retry/opposite correction, changed-direction suggestion reset, unchanged files, and path-free history/log output.
 

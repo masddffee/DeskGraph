@@ -1,6 +1,6 @@
 # DeskGraph v0.1 Task Graph
 
-Last updated: 2026-07-17
+Last updated: 2026-07-18
 
 ## Dependency graph
 
@@ -79,8 +79,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 3 — M2 extraction/OCR
 
-- Current: text/Markdown/code, bounded text-layer PDF, allowlisted DOCX/PPTX/XLSX, bounded PNG/JPEG/GIF/WebP/BMP/TIFF header metadata, and macOS arm64 PNG/JPEG Apple Vision OCR route through durable controlled-source jobs into atomic untrusted SQLite/FTS chunks or structured metadata. Byte, page, paragraph, slide, Excel cell, OCR observation/fragment/box/confidence, source snapshot and provider provenance plus corrupt/encrypted/active/unsafe/overlap/decompression/XML/image-signature/OCR-format/source/pixel/output/observation/deadline/cancel/source-change fixtures pass locally.
-- ADR-024 resolves D-008 architecture, and the first path-free macOS provider is locally verified through real Vision→SQLite→FTS. Next: audit/implement the Windows `Windows.Media.Ocr` binding/runtime/language-feature path, then independently gate a packaged in-process Tesseract/Leptonica `eng` + `chi_tra` fallback. Keep actual native cancellation, representative Office/PDF/image/OCR corpora, macOS Intel/remote runtimes, scanned-PDF routing, and 8 GB residency as separate required evidence.
+- Current: text/Markdown/code, bounded text-layer PDF, allowlisted DOCX/PPTX/XLSX, bounded image header metadata, and macOS arm64 Apple Vision OCR route through durable controlled-source jobs into atomic untrusted SQLite/FTS chunks or structured metadata. Windows `Windows.Media.Ocr` provider code is wired into the same bounded operation without runtime support being claimed. Migration 0016 keeps boxes mandatory and confidence optional. Windows code adds package-identity preflight, requested/resolved language policy, zero-angle source boxes, exact de-duplication, terminal-only close, bounded caller return, and a one-worker cleanup gate. Host policy/state-machine tests and Windows cfg check/Clippy pass; this is not Windows runtime evidence.
+- ADR-024 resolves D-008 architecture, and the path-free macOS provider is locally verified through real Vision→SQLite→FTS. Next: run real Windows/MSIX identity/language/OCR/cancel/cleanup/RSS fixtures, then independently audit and implement the packaged in-process Tesseract/Leptonica `eng` + `chi_tra` fallback. Keep representative Office/PDF/image/OCR corpora, macOS Intel/remote runtimes, scanned-PDF routing, and 8 GB residency as separate required evidence.
 - Exit each provider only with corrupt/active-content/limit/cancel/provenance fixtures and a usable CLI/Desktop entry point.
 
 ### Step 4 — M3 retrieval
