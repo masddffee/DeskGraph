@@ -72,6 +72,32 @@ impl ImageMetadata {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ExtractionOperation {
+    Content,
+    ScreenshotOcr,
+}
+
+impl ExtractionOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::ScreenshotOcr => "screenshot_ocr",
+        }
+    }
+
+    #[must_use]
+    pub fn from_storage(value: &str) -> Option<Self> {
+        match value {
+            "content" => Some(Self::Content),
+            "screenshot_ocr" => Some(Self::ScreenshotOcr),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExtractionStatus {
     Queued,
     Running,
@@ -87,6 +113,7 @@ pub struct ExtractionJobProgress {
     pub job_id: i64,
     pub scope_id: i64,
     pub node_id: i64,
+    pub operation: ExtractionOperation,
     pub status: ExtractionStatus,
     pub provider_id: Option<String>,
     pub provider_version: Option<String>,
@@ -99,7 +126,7 @@ pub struct ExtractionJobProgress {
 }
 
 impl ExtractionJobProgress {
-    pub const API_VERSION: &str = "deskgraph.extraction-job.v1";
+    pub const API_VERSION: &str = "deskgraph.extraction-job.v2";
 
     #[must_use]
     pub fn is_terminal(&self) -> bool {
@@ -155,7 +182,23 @@ pub fn is_valid_xlsx_cell_reference(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageFormat, is_valid_image_dimensions, is_valid_xlsx_cell_reference};
+    use super::{
+        ExtractionOperation, ImageFormat, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
+    };
+
+    #[test]
+    fn extraction_operations_use_a_closed_storage_contract() {
+        for operation in [
+            ExtractionOperation::Content,
+            ExtractionOperation::ScreenshotOcr,
+        ] {
+            assert_eq!(
+                ExtractionOperation::from_storage(operation.as_str()),
+                Some(operation)
+            );
+        }
+        assert_eq!(ExtractionOperation::from_storage("arbitrary"), None);
+    }
 
     #[test]
     fn image_formats_and_dimensions_use_closed_bounded_contracts() {

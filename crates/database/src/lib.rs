@@ -6,17 +6,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use deskgraph_domain::{
     ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyReport, AuthorizedScope, ExplicitFileVersionName,
-    ExtractionJobProgress, ExtractionStats, ExtractionStatus, FileRelationCandidate,
-    FileRelationCandidateState, FileRelationCandidateSummary, FileRelationComparisonKind,
-    FileRelationCreator, FileRelationDecision, FileRelationDecisionCreator,
-    FileRelationDecisionKind, FileRelationEndpoint, FileRelationEvidence, FileRelationKind,
-    FileVersionCandidate, FileVersionDecision, FileVersionEvidence, FileVersionSignalKind,
-    FolderCategoryCount, FolderFileCategory, ImageFormat, ImageMetadata, ManifestStats,
-    ProjectCandidate, ProjectCandidateState, ProjectCandidateSummary, ProjectDecision,
-    ProjectDecisionCreator, ProjectDecisionKind, ProjectSignal, ProjectSignalKind,
-    ProjectSuggestion, ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus,
-    WatchEventProgress, WatchEventReason, WatchEventStatus, is_valid_image_dimensions,
-    is_valid_xlsx_cell_reference, parse_explicit_file_version_name,
+    ExtractionJobProgress, ExtractionOperation, ExtractionStats, ExtractionStatus,
+    FileRelationCandidate, FileRelationCandidateState, FileRelationCandidateSummary,
+    FileRelationComparisonKind, FileRelationCreator, FileRelationDecision,
+    FileRelationDecisionCreator, FileRelationDecisionKind, FileRelationEndpoint,
+    FileRelationEvidence, FileRelationKind, FileVersionCandidate, FileVersionDecision,
+    FileVersionEvidence, FileVersionSignalKind, FolderCategoryCount, FolderFileCategory,
+    ImageFormat, ImageMetadata, ManifestStats, ProjectCandidate, ProjectCandidateState,
+    ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator, ProjectDecisionKind,
+    ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator, ScanJobProgress,
+    ScanReport, ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus,
+    is_valid_image_dimensions, is_valid_xlsx_cell_reference, parse_explicit_file_version_name,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -90,6 +90,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 14,
         name: "image_metadata",
         sql: include_str!("../../../migrations/0014_image_metadata.sql"),
+    },
+    Migration {
+        version: 15,
+        name: "ocr_jobs_and_provenance",
+        sql: include_str!("../../../migrations/0015_ocr_jobs_and_provenance.sql"),
     },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -316,6 +321,15 @@ pub enum ContentChunkProvenanceWrite {
         sheet_number: u32,
         cell_reference: String,
         fragment_index: u32,
+    },
+    OcrObservation {
+        observation_number: u32,
+        fragment_index: u32,
+        bbox_x_ppm: u32,
+        bbox_y_ppm: u32,
+        bbox_width_ppm: u32,
+        bbox_height_ppm: u32,
+        confidence_basis_points: u16,
     },
 }
 
@@ -1457,6 +1471,27 @@ impl ManifestDatabase {
         scope_id: i64,
         node_id: i64,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.create_extraction_job_for_operation(scope_id, node_id, ExtractionOperation::Content)
+    }
+
+    pub fn create_screenshot_ocr_job(
+        &mut self,
+        scope_id: i64,
+        node_id: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.create_extraction_job_for_operation(
+            scope_id,
+            node_id,
+            ExtractionOperation::ScreenshotOcr,
+        )
+    }
+
+    fn create_extraction_job_for_operation(
+        &mut self,
+        scope_id: i64,
+        node_id: i64,
+        operation: ExtractionOperation,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
         let source = self.extractable_file(scope_id, node_id)?;
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
@@ -1472,8 +1507,8 @@ impl ManifestDatabase {
         transaction.execute(
             "INSERT INTO extraction_jobs( \
                 scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, \
-                created_at_unix_ms, updated_at_unix_ms \
-             ) VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?6)",
+                created_at_unix_ms, updated_at_unix_ms, operation \
+             ) VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?6, ?7)",
             params![
                 source.scope_id,
                 source.node_id,
@@ -1481,6 +1516,7 @@ impl ManifestDatabase {
                 to_i64(source.size_bytes)?,
                 source.modified_unix_ns,
                 now,
+                operation.as_str(),
             ],
         )?;
         let job_id = transaction.last_insert_rowid();
@@ -1491,7 +1527,7 @@ impl ManifestDatabase {
     pub fn extraction_job(&self, job_id: i64) -> Result<ExtractionJobProgress, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT id, scope_id, node_id, status, provider_id, provider_version, error_code, \
+                "SELECT id, scope_id, node_id, operation, status, provider_id, provider_version, error_code, \
                     source_size_bytes, output_bytes, chunk_count, elapsed_ms, cancel_requested \
                  FROM extraction_jobs WHERE id = ?1",
                 [job_id],
@@ -1503,7 +1539,7 @@ impl ManifestDatabase {
 
     pub fn recent_extraction_jobs(&self) -> Result<Vec<ExtractionJobProgress>, DatabaseError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, scope_id, node_id, status, provider_id, provider_version, error_code, \
+            "SELECT id, scope_id, node_id, operation, status, provider_id, provider_version, error_code, \
                 source_size_bytes, output_bytes, chunk_count, elapsed_ms, cancel_requested \
              FROM extraction_jobs ORDER BY id DESC LIMIT 20",
         )?;
@@ -1723,28 +1759,20 @@ impl ManifestDatabase {
         if output_bytes > MAX_EXTRACTION_OUTPUT_BYTES || computed_output_bytes != output_bytes {
             return Err(DatabaseError::ExtractionOutputInvalid);
         }
-        if (provider_id == "deskgraph.image-metadata") != image_metadata.is_some()
-            || image_metadata.is_some_and(|metadata| {
-                !chunks.is_empty()
-                    || output_bytes != 0
-                    || !is_valid_image_dimensions(metadata.pixel_width, metadata.pixel_height)
-            })
-        {
-            return Err(DatabaseError::ExtractionOutputInvalid);
-        }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
         ensure_extraction_runner(&transaction, job_id, runner_token, now)?;
-        let (scope_id, node_id, location_id, stored_size, stored_modified, cancel_requested): (
-            i64,
-            i64,
-            i64,
-            i64,
-            Option<i64>,
-            i64,
-        ) = transaction.query_row(
+        let (
+            scope_id,
+            node_id,
+            location_id,
+            stored_size,
+            stored_modified,
+            cancel_requested,
+            stored_operation,
+        ): (i64, i64, i64, i64, Option<i64>, i64, String) = transaction.query_row(
             "SELECT scope_id, node_id, location_id, source_size_bytes, source_modified_unix_ns, \
-                cancel_requested FROM extraction_jobs WHERE id = ?1",
+                cancel_requested, operation FROM extraction_jobs WHERE id = ?1",
             [job_id],
             |row| {
                 Ok((
@@ -1754,9 +1782,46 @@ impl ManifestDatabase {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             },
         )?;
+        let operation = ExtractionOperation::from_storage(&stored_operation)
+            .ok_or(DatabaseError::InvalidStoredValue)?;
+        let is_image_metadata_provider = provider_id == "deskgraph.image-metadata";
+        let contains_ocr = chunks.iter().any(|chunk| {
+            matches!(
+                &chunk.provenance,
+                ContentChunkProvenanceWrite::OcrObservation { .. }
+            )
+        });
+        let invalid_operation_output = match operation {
+            ExtractionOperation::Content => {
+                contains_ocr
+                    || is_image_metadata_provider != image_metadata.is_some()
+                    || image_metadata.is_some_and(|metadata| {
+                        !chunks.is_empty()
+                            || output_bytes != 0
+                            || !is_valid_image_dimensions(
+                                metadata.pixel_width,
+                                metadata.pixel_height,
+                            )
+                    })
+            }
+            ExtractionOperation::ScreenshotOcr => {
+                image_metadata.is_some()
+                    || is_image_metadata_provider
+                    || chunks.iter().any(|chunk| {
+                        !matches!(
+                            &chunk.provenance,
+                            ContentChunkProvenanceWrite::OcrObservation { .. }
+                        )
+                    })
+            }
+        };
+        if invalid_operation_output {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        }
         if cancel_requested != 0
             || u64::try_from(stored_size).map_err(|_| DatabaseError::InvalidStoredValue)?
                 != source_size_bytes
@@ -1797,6 +1862,26 @@ impl ManifestDatabase {
                     cell_reference,
                     ..
                 } => *sheet_number == 0 || !is_valid_xlsx_cell_reference(cell_reference),
+                ContentChunkProvenanceWrite::OcrObservation {
+                    observation_number,
+                    bbox_x_ppm,
+                    bbox_y_ppm,
+                    bbox_width_ppm,
+                    bbox_height_ppm,
+                    confidence_basis_points,
+                    ..
+                } => {
+                    *observation_number == 0
+                        || *bbox_width_ppm == 0
+                        || *bbox_height_ppm == 0
+                        || bbox_x_ppm
+                            .checked_add(*bbox_width_ppm)
+                            .is_none_or(|right| right > 1_000_000)
+                        || bbox_y_ppm
+                            .checked_add(*bbox_height_ppm)
+                            .is_none_or(|top| top > 1_000_000)
+                        || *confidence_basis_points > 10_000
+                }
             };
             if usize::try_from(chunk.ordinal).map_err(|_| DatabaseError::ExtractionOutputInvalid)?
                 != index
@@ -1807,14 +1892,29 @@ impl ManifestDatabase {
             }
         }
 
-        transaction.execute(
-            "UPDATE content_chunks SET active = 0 WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
-            params![scope_id, node_id],
-        )?;
-        transaction.execute(
-            "UPDATE image_metadata SET active = 0 WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
-            params![scope_id, node_id],
-        )?;
+        match operation {
+            ExtractionOperation::Content => {
+                transaction.execute(
+                    "UPDATE content_chunks SET active = 0 \
+                     WHERE scope_id = ?1 AND node_id = ?2 AND active = 1 \
+                        AND provenance_kind <> 'ocr_observation'",
+                    params![scope_id, node_id],
+                )?;
+                transaction.execute(
+                    "UPDATE image_metadata SET active = 0 \
+                     WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+                    params![scope_id, node_id],
+                )?;
+            }
+            ExtractionOperation::ScreenshotOcr => {
+                transaction.execute(
+                    "UPDATE content_chunks SET active = 0 \
+                     WHERE scope_id = ?1 AND node_id = ?2 AND active = 1 \
+                        AND provenance_kind = 'ocr_observation'",
+                    params![scope_id, node_id],
+                )?;
+            }
+        }
         for chunk in chunks {
             let (
                 provenance_kind,
@@ -1824,11 +1924,21 @@ impl ManifestDatabase {
                 source_unit_number,
                 source_cell_reference,
                 source_fragment_index,
+                source_bbox_x_ppm,
+                source_bbox_y_ppm,
+                source_bbox_width_ppm,
+                source_bbox_height_ppm,
+                source_confidence_basis_points,
             ) = match &chunk.provenance {
                 ContentChunkProvenanceWrite::ByteRange { start, end } => (
                     "byte_range",
                     Some(to_i64(*start)?),
                     Some(to_i64(*end)?),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1845,6 +1955,11 @@ impl ManifestDatabase {
                     None,
                     None,
                     Some(i64::from(*fragment_index)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
                 ContentChunkProvenanceWrite::DocxParagraph {
                     paragraph_number,
@@ -1857,6 +1972,11 @@ impl ManifestDatabase {
                     Some(i64::from(*paragraph_number)),
                     None,
                     Some(i64::from(*fragment_index)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
                 ContentChunkProvenanceWrite::PptxSlide {
                     slide_number,
@@ -1869,6 +1989,11 @@ impl ManifestDatabase {
                     Some(i64::from(*slide_number)),
                     None,
                     Some(i64::from(*fragment_index)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
                 ContentChunkProvenanceWrite::XlsxCell {
                     sheet_number,
@@ -1882,6 +2007,33 @@ impl ManifestDatabase {
                     Some(i64::from(*sheet_number)),
                     Some(cell_reference.as_str()),
                     Some(i64::from(*fragment_index)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                ContentChunkProvenanceWrite::OcrObservation {
+                    observation_number,
+                    fragment_index,
+                    bbox_x_ppm,
+                    bbox_y_ppm,
+                    bbox_width_ppm,
+                    bbox_height_ppm,
+                    confidence_basis_points,
+                } => (
+                    "ocr_observation",
+                    None,
+                    None,
+                    None,
+                    Some(i64::from(*observation_number)),
+                    None,
+                    Some(i64::from(*fragment_index)),
+                    Some(i64::from(*bbox_x_ppm)),
+                    Some(i64::from(*bbox_y_ppm)),
+                    Some(i64::from(*bbox_width_ppm)),
+                    Some(i64::from(*bbox_height_ppm)),
+                    Some(i64::from(*confidence_basis_points)),
                 ),
             };
             transaction.execute(
@@ -1889,9 +2041,11 @@ impl ManifestDatabase {
                     scope_id, node_id, location_id, extraction_job_id, ordinal, text, \
                     provenance_kind, source_byte_start, source_byte_end, source_page_number, \
                     source_unit_number, source_cell_reference, source_fragment_index, \
-                    source_size_bytes, source_modified_unix_ns, trust_class, provider_id, \
-                    provider_version, active, created_at_unix_ms \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 1, ?19)",
+                    source_bbox_x_ppm, source_bbox_y_ppm, source_bbox_width_ppm, \
+                    source_bbox_height_ppm, source_confidence_basis_points, source_size_bytes, \
+                    source_modified_unix_ns, trust_class, provider_id, provider_version, active, \
+                    created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 1, ?24)",
                 params![
                     scope_id,
                     node_id,
@@ -1906,6 +2060,11 @@ impl ManifestDatabase {
                     source_unit_number,
                     source_cell_reference,
                     source_fragment_index,
+                    source_bbox_x_ppm,
+                    source_bbox_y_ppm,
+                    source_bbox_width_ppm,
+                    source_bbox_height_ppm,
+                    source_confidence_basis_points,
                     to_i64(source_size_bytes)?,
                     source_modified_unix_ns,
                     chunk.trust_class,
@@ -4531,7 +4690,10 @@ fn watch_reason_from_str(value: &str) -> Result<WatchEventReason, DatabaseError>
 }
 
 fn extraction_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExtractionJobProgress> {
-    let stored_status: String = row.get(3)?;
+    let stored_operation: String = row.get(3)?;
+    let operation = ExtractionOperation::from_storage(&stored_operation)
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    let stored_status: String = row.get(4)?;
     let status = match stored_status.as_str() {
         "queued" => ExtractionStatus::Queued,
         "running" => ExtractionStatus::Running,
@@ -4546,15 +4708,16 @@ fn extraction_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Extracti
         job_id: row.get(0)?,
         scope_id: row.get(1)?,
         node_id: row.get(2)?,
+        operation,
         status,
-        provider_id: row.get(4)?,
-        provider_version: row.get(5)?,
-        error_code: row.get(6)?,
-        source_bytes: row_u64(row, 7)?,
-        output_bytes: row_u64(row, 8)?,
-        chunk_count: row_u64(row, 9)?,
-        elapsed_ms: row_u64(row, 10)?,
-        cancel_requested: row.get::<_, i64>(11)? != 0,
+        provider_id: row.get(5)?,
+        provider_version: row.get(6)?,
+        error_code: row.get(7)?,
+        source_bytes: row_u64(row, 8)?,
+        output_bytes: row_u64(row, 9)?,
+        chunk_count: row_u64(row, 10)?,
+        elapsed_ms: row_u64(row, 11)?,
+        cancel_requested: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -5198,6 +5361,79 @@ mod tests {
                     .get::<_, i64>(0))
                 .expect("new metadata table should exist"),
             0
+        );
+    }
+
+    #[test]
+    fn ocr_migration_preserves_content_metadata_and_search() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("pre-ocr.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at_unix_ms INTEGER NOT NULL);",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..14] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("historical migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("historical migration should register");
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'test', 0); \
+                 INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
+                 INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0); \
+                 INSERT INTO files VALUES (1, 4, 1, 1); \
+                 INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E706E67', '/scope/file.png', '/scope/file.png', 1, 1); \
+                 INSERT INTO extraction_jobs(id, scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, elapsed_ms, created_at_unix_ms, updated_at_unix_ms) VALUES (1, 1, 1, 1, 'completed', 4, 1, 12, 1, 1, 0, 0); \
+                 INSERT INTO content_chunks(id, scope_id, node_id, location_id, extraction_job_id, ordinal, text, provenance_kind, source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, trust_class, provider_id, provider_version, active, created_at_unix_ms) VALUES (1, 1, 1, 1, 1, 0, '保留legacy', 'byte_range', 0, 4, 4, 1, 'untrusted_extracted_text', 'deskgraph.utf8-text', '1', 1, 0); \
+                 INSERT INTO image_metadata(id, scope_id, node_id, location_id, extraction_job_id, format, pixel_width, pixel_height, source_size_bytes, source_modified_unix_ns, provider_id, provider_version, active, created_at_unix_ms) VALUES (1, 1, 1, 1, 1, 'png', 2, 2, 4, 1, 'deskgraph.image-metadata', '1', 1, 0);",
+            )
+            .expect("legacy OCR-boundary fixture should persist");
+        drop(connection);
+
+        let upgraded = ManifestDatabase::open(&path).expect("OCR migration should apply");
+        let job = upgraded.extraction_job(1).expect("legacy job should load");
+        assert_eq!(job.api_version, "deskgraph.extraction-job.v2");
+        assert_eq!(job.operation, ExtractionOperation::Content);
+        let stored: (String, Option<i64>, Option<i64>) = upgraded
+            .connection
+            .query_row(
+                "SELECT text, source_bbox_x_ppm, source_confidence_basis_points \
+                 FROM content_chunks WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("legacy chunk should load");
+        assert_eq!(stored, ("保留legacy".to_string(), None, None));
+        assert_eq!(
+            upgraded
+                .lexical_search_candidates("保留l", lexical_filters(Some(1)), 10)
+                .expect("legacy FTS row should remain searchable")
+                .len(),
+            1
+        );
+        assert_eq!(
+            upgraded
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM image_metadata WHERE active = 1",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("legacy metadata should remain active"),
+            1
         );
     }
 
@@ -6788,6 +7024,292 @@ mod tests {
                 .pixel_width,
             2
         );
+    }
+
+    #[test]
+    fn ocr_jobs_preserve_image_metadata_and_replace_only_ocr_chunks() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let image_job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("image job should create");
+        assert_eq!(image_job.operation, ExtractionOperation::Content);
+        database
+            .claim_extraction_job(image_job.job_id, "image-runner", 60_000)
+            .expect("image job should claim");
+        database
+            .complete_extraction_job_with_image_metadata(
+                image_job.job_id,
+                "image-runner",
+                "deskgraph.image-metadata",
+                "1",
+                4,
+                Some(1),
+                0,
+                1,
+                &[],
+                Some(&ImageMetadataWrite {
+                    format: ImageFormat::Png,
+                    pixel_width: 2,
+                    pixel_height: 2,
+                }),
+            )
+            .expect("metadata should publish");
+
+        let first_ocr = database
+            .create_screenshot_ocr_job(scope_id, node_id)
+            .expect("OCR job should create");
+        assert_eq!(first_ocr.operation, ExtractionOperation::ScreenshotOcr);
+        database
+            .claim_extraction_job(first_ocr.job_id, "ocr-runner-1", 60_000)
+            .expect("OCR job should claim");
+        let first_text = "DeskGraph 桌面圖譜";
+        database
+            .complete_extraction_job(
+                first_ocr.job_id,
+                "ocr-runner-1",
+                "deskgraph.macos-vision-ocr",
+                "1",
+                4,
+                Some(1),
+                u64::try_from(first_text.len()).expect("text length should fit"),
+                2,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: first_text.to_string(),
+                    provenance: ContentChunkProvenanceWrite::OcrObservation {
+                        observation_number: 1,
+                        fragment_index: 0,
+                        bbox_x_ppm: 50_000,
+                        bbox_y_ppm: 100_000,
+                        bbox_width_ppm: 400_000,
+                        bbox_height_ppm: 200_000,
+                        confidence_basis_points: 9_876,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("OCR chunks should publish");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM image_metadata WHERE active = 1",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("metadata should count"),
+            1
+        );
+        let stored: (String, i64, i64, i64, i64, i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT provenance_kind, source_unit_number, source_bbox_x_ppm, \
+                    source_bbox_y_ppm, source_bbox_width_ppm, source_bbox_height_ppm, \
+                    source_confidence_basis_points \
+                 FROM content_chunks WHERE active = 1 AND provenance_kind = 'ocr_observation'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("OCR provenance should load");
+        assert_eq!(
+            stored,
+            (
+                "ocr_observation".to_string(),
+                1,
+                50_000,
+                100_000,
+                400_000,
+                200_000,
+                9_876,
+            )
+        );
+
+        let metadata_refresh = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("metadata refresh should create");
+        database
+            .claim_extraction_job(metadata_refresh.job_id, "image-runner-2", 60_000)
+            .expect("metadata refresh should claim");
+        database
+            .complete_extraction_job_with_image_metadata(
+                metadata_refresh.job_id,
+                "image-runner-2",
+                "deskgraph.image-metadata",
+                "1",
+                4,
+                Some(1),
+                0,
+                1,
+                &[],
+                Some(&ImageMetadataWrite {
+                    format: ImageFormat::Png,
+                    pixel_width: 2,
+                    pixel_height: 2,
+                }),
+            )
+            .expect("metadata refresh should preserve OCR");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM content_chunks \
+                     WHERE active = 1 AND provenance_kind = 'ocr_observation'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("active OCR should count"),
+            1
+        );
+
+        let second_ocr = database
+            .create_screenshot_ocr_job(scope_id, node_id)
+            .expect("replacement OCR should create");
+        database
+            .claim_extraction_job(second_ocr.job_id, "ocr-runner-2", 60_000)
+            .expect("replacement OCR should claim");
+        database
+            .complete_extraction_job(
+                second_ocr.job_id,
+                "ocr-runner-2",
+                "deskgraph.macos-vision-ocr",
+                "1",
+                4,
+                Some(1),
+                0,
+                1,
+                &[],
+            )
+            .expect("no-text OCR should atomically replace prior OCR");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM content_chunks \
+                     WHERE active = 1 AND provenance_kind = 'ocr_observation'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("active OCR should count"),
+            0
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM image_metadata WHERE active = 1",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("metadata should count"),
+            1
+        );
+
+        let invalid = database
+            .create_screenshot_ocr_job(scope_id, node_id)
+            .expect("invalid OCR job should create");
+        database
+            .claim_extraction_job(invalid.job_id, "ocr-invalid", 60_000)
+            .expect("invalid OCR job should claim");
+        let error = database
+            .complete_extraction_job(
+                invalid.job_id,
+                "ocr-invalid",
+                "deskgraph.macos-vision-ocr",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "text".to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect_err("OCR jobs must reject non-OCR provenance");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        let error = database
+            .complete_extraction_job(
+                invalid.job_id,
+                "ocr-invalid",
+                "deskgraph.macos-vision-ocr",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "text".to_string(),
+                    provenance: ContentChunkProvenanceWrite::OcrObservation {
+                        observation_number: 1,
+                        fragment_index: 0,
+                        bbox_x_ppm: 900_000,
+                        bbox_y_ppm: 0,
+                        bbox_width_ppm: 200_000,
+                        bbox_height_ppm: 1,
+                        confidence_basis_points: 10_000,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect_err("out-of-bounds OCR provenance must not publish");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        database
+            .fail_extraction_job(
+                invalid.job_id,
+                "ocr-invalid",
+                "deskgraph.macos-vision-ocr",
+                "1",
+                "extraction_output_invalid",
+                1,
+            )
+            .expect("invalid OCR job should close");
+
+        let invalid_content = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("content job should create");
+        database
+            .claim_extraction_job(invalid_content.job_id, "content-invalid", 60_000)
+            .expect("content job should claim");
+        let error = database
+            .complete_extraction_job(
+                invalid_content.job_id,
+                "content-invalid",
+                "deskgraph.macos-vision-ocr",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "text".to_string(),
+                    provenance: ContentChunkProvenanceWrite::OcrObservation {
+                        observation_number: 1,
+                        fragment_index: 0,
+                        bbox_x_ppm: 0,
+                        bbox_y_ppm: 0,
+                        bbox_width_ppm: 1,
+                        bbox_height_ppm: 1,
+                        confidence_basis_points: 10_000,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect_err("content jobs must reject OCR provenance");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
     }
 
     #[test]

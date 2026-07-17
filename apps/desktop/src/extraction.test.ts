@@ -22,10 +22,11 @@ const stats: ExtractionStats = {
 };
 
 const job: ExtractionJobProgress = {
-  api_version: 'deskgraph.extraction-job.v1',
+  api_version: 'deskgraph.extraction-job.v2',
   job_id: 7,
   scope_id: 2,
   node_id: 9,
+  operation: 'content',
   status: 'completed',
   provider_id: 'deskgraph.utf8-text',
   provider_version: '1',
@@ -57,6 +58,12 @@ describe('extraction contract', () => {
       expect(parseExtractionJob({ ...job, status }).status).toBe(status);
     }
     expect(parseExtractionJobs([job])).toEqual([job]);
+    expect(parseExtractionJob({ ...job, operation: 'screenshot_ocr' }).operation).toBe(
+      'screenshot_ocr',
+    );
+    expect(() => parseExtractionJob({ ...job, operation: 'arbitrary' })).toThrow(
+      'Invalid extraction job response',
+    );
     expect(() => parseExtractionJob({ ...job, output_bytes: -1 })).toThrow(
       'Invalid extraction job response',
     );

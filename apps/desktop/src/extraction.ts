@@ -6,6 +6,8 @@ export const RECENT_EXTRACTIONS_COMMAND = 'recent_content_extractions';
 export type ExtractionStatus =
   'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 
+export type ExtractionOperation = 'content' | 'screenshot_ocr';
+
 export interface ExtractionStats {
   api_version: 'deskgraph.extraction-stats.v1';
   active_chunk_count: number;
@@ -16,10 +18,11 @@ export interface ExtractionStats {
 }
 
 export interface ExtractionJobProgress {
-  api_version: 'deskgraph.extraction-job.v1';
+  api_version: 'deskgraph.extraction-job.v2';
   job_id: number;
   scope_id: number;
   node_id: number;
+  operation: ExtractionOperation;
   status: ExtractionStatus;
   provider_id: string | null;
   provider_version: string | null;
@@ -68,7 +71,8 @@ export function parseExtractionJob(value: unknown): ExtractionJobProgress {
     value.status === 'cancelled' ||
     value.status === 'interrupted';
   const valid =
-    value.api_version === 'deskgraph.extraction-job.v1' &&
+    value.api_version === 'deskgraph.extraction-job.v2' &&
+    (value.operation === 'content' || value.operation === 'screenshot_ocr') &&
     validStatus &&
     isCount(value.job_id) &&
     isCount(value.scope_id) &&
