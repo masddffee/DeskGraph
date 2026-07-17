@@ -20,6 +20,11 @@ objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-vision.workspace = true
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+windows-future.workspace = true
+windows-sys.workspace = true
+
 [dev-dependencies]
 deskgraph-scanner = { path = "../scanner" }
 tempfile.workspace = true

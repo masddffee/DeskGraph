@@ -40,11 +40,18 @@ tempfile = "3.27.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
 unicode-normalization = "0.1.25"
+windows = { version = "=0.61.3", default-features = false, features = ["std", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage_Streams", "Win32_System_WinRT"] }
+windows-future = { version = "=0.2.1", default-features = false }
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [workspace.dependencies.windows-sys]
 version = "0.61.2"
-features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"]
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_Storage_Packaging_Appx",
+]
 
 [profile.release]
 codegen-units = 1

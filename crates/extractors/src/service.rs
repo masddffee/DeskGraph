@@ -510,7 +510,7 @@ fn extract_claimed_ocr_job(
         };
         let provider_limits = validate_ocr_request(request, limits)?;
         let encoded_image = read_ocr_source(file, request, limits, &control)?;
-        let output = provider.recognize(&encoded_image, request, provider_limits, &control)?;
+        let output = provider.recognize(encoded_image, request, provider_limits, &control)?;
         let output = build_ocr_extraction_output(provider, request, limits, &control, output)?;
         validate_open_file(file, source)?;
         Ok(output)
@@ -801,7 +801,7 @@ mod tests {
 
         fn recognize(
             &self,
-            encoded_image: &[u8],
+            encoded_image: Vec<u8>,
             request: OcrRequest,
             _limits: crate::OcrProviderLimits,
             control: &OcrControl,
@@ -850,7 +850,7 @@ mod tests {
 
         fn recognize(
             &self,
-            _encoded_image: &[u8],
+            _encoded_image: Vec<u8>,
             _request: OcrRequest,
             _limits: crate::OcrProviderLimits,
             control: &OcrControl,
@@ -887,7 +887,7 @@ mod tests {
 
         fn recognize(
             &self,
-            _encoded_image: &[u8],
+            _encoded_image: Vec<u8>,
             _request: OcrRequest,
             _limits: crate::OcrProviderLimits,
             control: &OcrControl,
@@ -914,7 +914,7 @@ mod tests {
 
         fn recognize(
             &self,
-            _encoded_image: &[u8],
+            _encoded_image: Vec<u8>,
             _request: OcrRequest,
             _limits: crate::OcrProviderLimits,
             _control: &OcrControl,
@@ -937,7 +937,7 @@ mod tests {
 
         fn recognize(
             &self,
-            _encoded_image: &[u8],
+            _encoded_image: Vec<u8>,
             _request: OcrRequest,
             _limits: crate::OcrProviderLimits,
             control: &OcrControl,
@@ -965,7 +965,7 @@ mod tests {
 
         fn recognize(
             &self,
-            encoded_image: &[u8],
+            encoded_image: Vec<u8>,
             _request: OcrRequest,
             _limits: crate::OcrProviderLimits,
             control: &OcrControl,
