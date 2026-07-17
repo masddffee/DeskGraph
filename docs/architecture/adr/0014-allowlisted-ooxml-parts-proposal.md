@@ -16,7 +16,7 @@ Official package metadata and published source identify `zip 8.6.0` and `quick-x
 
 - Use one shared, path-free OOXML adapter over a bounded in-memory `Read + Seek` source. Never unpack document entries to the filesystem.
 - Use exactly `zip =8.6.0` with `default-features = false` and only `deflate-flate2-zlib-rs`. Stored entries require no feature. Reject prerelease `9.x`, archive writing/extraction-to-disk, encryption, and every other compression feature.
-- Use exactly `quick-xml =0.41.0` with `default-features = false`. Use the streaming plain `Reader`, not `NsReader` or a whole-document DOM; DeskGraph compares only allowlisted OOXML local element names and does not need namespace resolution.
+- Use exactly `quick-xml =0.41.0` with `default-features = false`. Use streaming `NsReader`, cap namespace declarations per element, and accept semantic elements only from the transitional/strict WordprocessingML, DrawingML, or SpreadsheetML namespace expected by that format. This prevents an embedded DrawingML `p`/`t` from being confused with a Word paragraph/text element and supports documents that choose a different namespace prefix. Do not use a whole-document DOM.
 - Reject an archive before text parsing when it is encrypted, overlaps entries, exceeds the entry-count or claimed-total-size limits, contains an unsafe or duplicate selected name, uses an unsupported compression method, or exceeds the selected-entry, actual-decompressed, compression-ratio, time, or cancellation budget.
 - Validate normalized enclosed entry names even though no entry is written to disk. Select only exact allowlisted parts; never recursively discover or follow relationship targets.
 - DOCX initially reads only `word/document.xml`. PPTX reads numerically ordered `ppt/slides/slideN.xml`. XLSX reads numerically ordered `xl/worksheets/sheetN.xml` plus bounded `xl/sharedStrings.xml` when referenced. Additional parts require an explicit adapter change and fixtures.
@@ -31,7 +31,7 @@ One constrained ZIP/XML boundary can serve the three v0.1 Office formats without
 
 The first provider will intentionally omit some user-visible Office content such as headers, notes, charts, comments, and formula results unless each part is explicitly added later. Some valid documents using unusual XML encodings or compression methods will fail closed. XLSX shared strings require bounded random lookup or an explicitly budgeted in-memory table, which must be measured on 8 GB hardware.
 
-The dependency-selection gate is complete, so implementation may depend on this Accepted ADR. The provider is still incomplete until every adversarial fixture and resource gate below passes; acceptance of this architecture is not evidence that DOCX, PPTX, or XLSX extraction works.
+The dependency-selection gate and local provider gate are complete. DOCX, PPTX, and XLSX now route through the controlled Manifest job to structural-provenance chunks and FTS with the adversarial fixtures below. This remains local code evidence, not M2 or release completion: representative corpora, 8 GB residency, live UI, and native remote-platform runtime evidence remain open.
 
 ## Alternatives considered
 
@@ -47,13 +47,18 @@ Completed before accepting the dependency decision or editing the workspace mani
 
 1. An isolated lock resolves 14 registry packages for the two exact dependencies and selected features. Every package has a permissive license expression.
 2. Published source confirms archive entry count, encryption flag, overlap detection, enclosed names, compression method, compressed/uncompressed sizes, bounded `Read`, and explicit XML `Event` variants for DTD, processing instructions, text, and general references.
-3. `cargo audit --no-fetch --json` with 1,160 cached advisories reports zero vulnerabilities and zero warnings for the isolated lock. `quick-xml 0.41.0` contains the fix for `RUSTSEC-2026-0195`; the selected plain `Reader` also avoids the affected namespace-resolver path.
+3. `cargo audit --no-fetch --json` with 1,160 cached advisories reports zero vulnerabilities and zero warnings for the isolated lock. `quick-xml 0.41.0` is required because it contains the fix for namespace-resolver issue `RUSTSEC-2026-0195`; the implemented `NsReader` additionally caps declarations per element and rejects unknown prefixes.
 4. The isolated lock builds and tests on macOS arm64 and checks for `x86_64-pc-windows-msvc`. macOS Intel, Windows runtime, and Linux remain remote gates.
 
-Required before marking the Office provider verified:
+Completed local provider gate:
 
 1. Pass valid Traditional Chinese/English DOCX, PPTX, and XLSX fixtures plus corrupt ZIP/XML, traversal, duplicate/overlap, encryption, unsupported compression, decompression ratio/size, DTD/entity, deep XML, macro-enabled, external-link, embedded-object, formula, cancellation, and structural-provenance fixtures.
-2. Run the complete DeskGraph lockfile audit and all repository gates after integration.
-3. Measure the worst selected corpus on documented 8 GB hardware before claiming M2 complete.
+2. Preserve existing byte/page provenance and FTS through the forward migration, validate Excel cell coordinates independently in the provider/database, and pass Manifest-to-atomic-SQLite-to-FTS integration.
+3. Run the complete DeskGraph lockfile audit and all repository gates after integration. The 491-package lock reports zero vulnerabilities and the same 17 pre-existing Tauri/Linux warnings as the prior 488-package lock; the OOXML delta adds none.
+
+Still required before M2 or release completion:
+
+1. Measure representative real-world Office corpora for fidelity/latency and the worst selected corpus on documented 8 GB hardware.
+2. Pass native macOS Intel/Windows/Linux runtime and latest live Desktop interaction gates. The isolated dependency graph checks for Windows x64, but the complete macOS-host cross-check cannot compile bundled SQLite without Windows MSVC C headers.
 
 Revisit the design if the minimal archive feature graph pulls in an unacceptable advisory/license, the APIs cannot enforce actual decompression limits without unbounded allocation, or real-world Office fidelity requires relationship traversal. No revisit may weaken the controlled-source, no-execution, atomic-publication, or privacy invariants.

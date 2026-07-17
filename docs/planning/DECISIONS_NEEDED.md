@@ -45,8 +45,8 @@ D-013 must be resolved before M4 introduces cross-root learned scoring or merge/
 - Ordinary CLI/Desktop extraction status contains stable IDs, fixed codes, counts, and timings only. Paths and extracted text are excluded.
 - D-008 remains open: the generic extractor contract does not preselect or claim an OCR stack.
 - PDF text uses exact `lopdf 0.44.0` with default features disabled, strict bounded in-memory APIs, sequential page processing, no password handling, and no active-content traversal (ADR-013).
-- Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page and fragment indexes. Structural formats never receive fabricated byte offsets.
-- D-011 is resolved by accepted ADR-014: exact no-default `zip 8.6.0` with only `deflate-flate2-zlib-rs` and no-default `quick-xml 0.41.0` pass isolated closure, license, RustSec, API, macOS arm64, and Windows x64 compile gates. Provider fixtures and release evidence remain implementation gates, not open dependency choices.
+- Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page/fragment indexes; DOCX uses paragraph/fragment, PPTX slide/fragment, and XLSX bounded sheet/cell/fragment. Structural formats never receive fabricated byte offsets.
+- D-011 is resolved by accepted ADR-014: exact no-default `zip 8.6.0` with only `deflate-flate2-zlib-rs` and no-default `quick-xml 0.41.0` pass isolated closure, license, RustSec, API, macOS arm64, and Windows x64 compile gates. The implemented provider's adversarial, migration, Manifest→SQLite→FTS, full-lock audit, and local release-build gates pass; representative corpora, remote runtimes, live UI, and 8 GB evidence remain release gates, not open dependency choices.
 
 ## Decisions made while entering M3
 

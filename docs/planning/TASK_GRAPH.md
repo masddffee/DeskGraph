@@ -79,8 +79,9 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 3 — M2 extraction/OCR
 
-- Build format providers and bounded queue one format at a time.
-- Exit each provider only with corrupt/macro/limit/cancel/provenance fixtures.
+- Current: text/Markdown/code, bounded text-layer PDF, and allowlisted DOCX/PPTX/XLSX providers route through durable controlled-stream jobs into atomic untrusted SQLite/FTS chunks. Byte, page, paragraph, slide, and Excel cell provenance plus corrupt/encrypted/active/unsafe/overlap/decompression/XML/output/cancel fixtures pass locally.
+- Next: audit and implement image metadata independently; resolve D-008 before selecting a packaged no-Python OCR path; add representative Office/PDF corpora, native remote runtimes, and 8 GB residency evidence.
+- Exit each provider only with corrupt/active-content/limit/cancel/provenance fixtures and a usable CLI/Desktop entry point.
 
 ### Step 4 — M3 retrieval
 
