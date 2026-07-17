@@ -108,6 +108,67 @@ fn extraction_command_emits_counts_without_paths_or_content() {
 }
 
 #[test]
+fn ocr_create_command_emits_path_free_durable_job_status() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("private-manifest.sqlite3");
+    let scope_path = directory.path().join("private-screenshots");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let source_path = scope_path.join("private-OCR-Screenshot.png");
+    let mut png = vec![0_u8; 32];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&640_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&480_u32.to_be_bytes());
+    std::fs::write(&source_path, png).expect("fixture should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    drop(database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "extract",
+            "ocr-create",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+            "--scope",
+            &scope.id.to_string(),
+            "--path",
+            source_path.to_str().expect("source path should be UTF-8"),
+        ])
+        .output()
+        .expect("deskgraph OCR create should start");
+
+    assert!(output.status.success());
+    let progress: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(progress["operation"], "screenshot_ocr");
+    assert_eq!(progress["status"], "queued");
+    assert_eq!(progress["provider_id"], serde_json::Value::Null);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in [
+        "private-OCR-Screenshot.png",
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        source_path.to_str().expect("source path should be UTF-8"),
+        database_path
+            .to_str()
+            .expect("database path should be UTF-8"),
+    ] {
+        assert!(!stdout.contains(secret));
+        assert!(!stderr.contains(secret));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}
+
+#[test]
 fn image_metadata_command_returns_only_bounded_structured_fields() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

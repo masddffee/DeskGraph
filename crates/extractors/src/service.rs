@@ -888,6 +888,32 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct NoTextOcrProvider;
+
+    impl OcrProvider for NoTextOcrProvider {
+        fn provider_id(&self) -> &'static str {
+            "deskgraph.no-text-fake-ocr"
+        }
+
+        fn provider_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn recognize(
+            &self,
+            _encoded_image: &[u8],
+            _request: OcrRequest,
+            _limits: crate::OcrProviderLimits,
+            control: &OcrControl,
+        ) -> Result<crate::OcrOutput, ExtractionError> {
+            control.check()?;
+            Ok(crate::OcrOutput {
+                observations: Vec::new(),
+            })
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct MutatingOcrProvider {
         file_path: PathBuf,
@@ -1266,6 +1292,31 @@ mod tests {
             .expect("OCR text should be searchable");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].node_id, fixture.node_id);
+    }
+
+    #[test]
+    fn screenshot_ocr_no_text_is_a_complete_empty_result() {
+        let fixture = fixture("blank.png", &png_bytes(640, 480));
+        let job =
+            create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("OCR job should create");
+        let completed = run_extraction_job_with_ocr_provider_at(
+            &fixture.database_path,
+            job.job_id,
+            ExtractionLimits::default(),
+            &NoTextOcrProvider,
+        )
+        .expect("no-text OCR should complete");
+
+        assert_eq!(completed.status, ExtractionStatus::Completed);
+        assert_eq!(completed.output_bytes, 0);
+        assert_eq!(completed.chunk_count, 0);
+        assert_eq!(
+            extraction_stats_at(&fixture.database_path)
+                .expect("no-text stats should load")
+                .active_chunk_count,
+            0
+        );
     }
 
     #[test]
