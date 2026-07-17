@@ -20,7 +20,6 @@ D-013 must be resolved before M4 introduces cross-root learned scoring or merge/
 | D-008 | OCR provider stack                                          | M2                                    | Native providers plus packaged cross-platform fallback; zh-TW + English                      | No Python/user-installed runtime; no provider selected                     |
 | D-009 | Embedding model/runtime                                     | M3/M9                                 | Multilingual, int8, license, checksum, memory, model-removal support                         | Deterministic lexical retrieval remains required                           |
 | D-010 | Product trademark/name clearance and reverse-DNS identifier | Before signed release                 | DeskGraph availability and legal review                                                      | Development identifier only; no trademark claim                            |
-| D-011 | Exact Office ZIP/XML dependency feature set                  | M2 Office provider                    | Candidate `zip 8.6.0` no-default plus minimal stored/DEFLATE read support and `quick-xml 0.41.0` no-default must pass isolated closure, license, RustSec, API, and platform gates | Proposed ADR-014 only; do not add either dependency until the evidence gate passes |
 | D-013 | Cross-root Project learning and merge/split semantics        | Later M4 scoring and correction slice | Whether/how accepted or rejected roots influence different candidates; merge/split identity and reversal events; explainable bounds and evaluation corpus | Feedback affects only the exact stable root; no cross-root score adjustment, merge, split, or automatic membership |
 
 ## Decisions made in M0
@@ -47,7 +46,7 @@ D-013 must be resolved before M4 introduces cross-root learned scoring or merge/
 - D-008 remains open: the generic extractor contract does not preselect or claim an OCR stack.
 - PDF text uses exact `lopdf 0.44.0` with default features disabled, strict bounded in-memory APIs, sequential page processing, no password handling, and no active-content traversal (ADR-013).
 - Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page and fragment indexes. Structural formats never receive fabricated byte offsets.
-- ADR-014 proposes a shared, path-free, allowlisted OOXML ZIP/XML adapter. D-011 remains open because the exact minimal dependency closures could not be audited after local Cargo registry access was rejected by the exhausted tool quota.
+- D-011 is resolved by accepted ADR-014: exact no-default `zip 8.6.0` with only `deflate-flate2-zlib-rs` and no-default `quick-xml 0.41.0` pass isolated closure, license, RustSec, API, macOS arm64, and Windows x64 compile gates. Provider fixtures and release evidence remain implementation gates, not open dependency choices.
 
 ## Decisions made while entering M3
 

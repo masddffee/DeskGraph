@@ -64,21 +64,21 @@ The load API limits each eagerly decompressed object or cross-reference stream, 
 
 | Capability | Current status | Required evidence before adoption |
 | --- | --- | --- |
-| DOCX / PPTX / XLSX | Unselected | ZIP and XML APIs, traversal/decompression defenses, macro/external-link/embedded-object behavior, structural limits, platform packaging, license, advisories, corrupt fixtures |
+| DOCX / PPTX / XLSX | Selected for implementation | Exact `zip 8.6.0` / `quick-xml 0.41.0` closure and API gates pass; provider adversarial fixtures, full-lock audit, remote runtime, and 8 GB evidence remain required |
 | Image metadata | Unselected | Bounded signature/metadata API, supported formats, malformed/oversized behavior, license, advisories, platform behavior |
 | Screenshot OCR | Unselected; D-008 open | Native API availability plus packaged cross-platform fallback, zh-TW/English quality, model/runtime license, checksums, memory/unload behavior, offline packaging without user-installed Python |
 
-### Office OOXML candidates — not approved
+### Office OOXML dependencies selected
 
-ADR-014 records a Proposed allowlisted-parts design. Official published documentation was inspected for the current stable `zip 8.6.0` (`zip-rs/zip2`, MIT, Rust 1.88+) and `quick-xml 0.41.0` (`tafia/quick-xml`, MIT, streaming pull parser). These are candidates only and have not entered a DeskGraph manifest or lockfile.
+ADR-014 accepts exact `zip =8.6.0` (`zip-rs/zip2`, MIT, Rust 1.88+) with `default-features = false` plus only `deflate-flate2-zlib-rs`, and exact `quick-xml =0.41.0` (`tafia/quick-xml`, MIT, Rust 1.79+) with `default-features = false`. The selected graph contains no archive crypto, Bzip2, Deflate64, LZMA, PPMd, XZ, Zstandard, async, Serde, encoding, or native C compression feature.
 
-The archive candidate exposes central-directory construction, entry count, encrypted status, compressed/uncompressed sizes, overlap detection, and enclosed-name validation. Its default feature set includes multiple compression and cryptography implementations that DeskGraph does not need and would reject. The provisional feature shape is therefore exact `8.6.0`, `default-features = false`, plus only the verified stored/DEFLATE read capability. The XML candidate has no default features and exposes explicit start/text/DTD/general-reference events suitable for a core-owned depth/event/entity policy.
+The archive API exposes central-directory construction, entry count, encrypted status, compressed/uncompressed sizes, overlap detection, enclosed-name validation, compression method, and bounded `Read`. The XML API exposes a streaming plain `Reader` and explicit start/end/text/CDATA/DTD/processing-instruction/general-reference events. DeskGraph does not use namespace resolution, recursive extraction, entry writes, relationship traversal, password APIs, or whole-document deserialization.
 
-Adoption is blocked on evidence, not on a product choice: the local Cargo registry request required to generate isolated exact closures was rejected because the tool quota was exhausted. The missing gate is an isolated lock and source inspection, complete license list, `cargo audit --no-fetch`, macOS arm64 test, Windows x64 check, then a full 483-plus-package lock audit. Until that gate passes, neither crate is selected and no high-level Office crate is accepted as a substitute.
+The isolated exact lock contains 14 registry packages: `adler2 2.0.1`, `cfg-if 1.0.4`, `crc32fast 1.5.0`, `equivalent 1.0.2`, `flate2 1.1.9`, `hashbrown 0.17.1`, `indexmap 2.14.0`, `memchr 2.8.3`, `miniz_oxide 0.8.9`, `quick-xml 0.41.0`, `simd-adler32 0.3.10`, `typed-path 0.12.3`, `zip 8.6.0`, and `zlib-rs 0.6.6`. Their expressions are MIT, Apache-2.0, BSD-like, Unlicense, or Zlib compatible; notices/SBOM remain an M9 gate. With 1,160 cached advisories, `cargo audit --no-fetch --json` reports zero vulnerabilities and zero warnings. `quick-xml 0.41.0` is the patched floor for `RUSTSEC-2026-0195`; DeskGraph uses plain `Reader`, not the affected namespace path. The minimal graph tests on macOS arm64 and checks for Windows x64 using Rust 1.97.0.
 
-The proposed adapter never writes archive entries to disk or follows relationships. It selects only exact DOCX/PPTX/XLSX text parts, rejects encryption/overlap/unsafe or duplicate selected names/unsupported compression, bounds claimed and actual decompression plus structure/output/time, rejects DTD and unsupported entities, keeps macros/formulas/external links/embeddings inert, and requires explicit paragraph/slide/cell provenance.
+The selected adapter never writes archive entries to disk or follows relationships. It selects only exact DOCX/PPTX/XLSX text parts, rejects encryption/overlap/unsafe or duplicate selected names/unsupported compression, bounds claimed and actual decompression plus structure/output/time, rejects DTD and unsupported entities, keeps macros/formulas/external links/embeddings inert, and requires explicit paragraph/slide/cell provenance.
 
-No candidate may enter `Cargo.toml`, `package.json`, build scripts, or release assets until its row is replaced by verified source/API/version/license/security evidence and an accepted provider-specific decision.
+The exact two dependencies may now enter the Rust workspace only with the accepted feature set. No high-level Office parser, additional archive/XML feature, native binary, model, build script, or relationship-following behavior is approved. Provider adversarial fixtures, complete-lock RustSec/license evidence, remote runtimes, and 8 GB measurement remain required before M2 completion.
 
 ## M3 lexical-search dependency decision
 

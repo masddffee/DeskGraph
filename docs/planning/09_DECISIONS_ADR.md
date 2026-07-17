@@ -143,7 +143,7 @@ Canonical detail：
 
 ## ADR-014 — Allowlisted OOXML parts
 
-Status：Proposed，尚未接受。ZIP/XML dependency closure、license、RustSec、平台與 adversarial fixture 證據完成前不得實作或加入 dependency。
+Status：Accepted。只批准 `zip =8.6.0` 的 no-default `deflate-flate2-zlib-rs` 讀取路徑與 `quick-xml =0.41.0` no-default plain streaming reader；只讀 allowlisted in-memory OOXML parts，不跟隨 relationships、不解密、不寫出 archive entries。Provider adversarial fixtures、完整 lock audit、遠端 runtime 與 8 GB 證據仍是完成功能的必要 gate。
 
 Canonical detail：
 `docs/architecture/adr/0014-allowlisted-ooxml-parts-proposal.md`。
