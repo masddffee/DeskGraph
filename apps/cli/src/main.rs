@@ -11,8 +11,8 @@ use deskgraph_extractors::{
     run_extraction_job_at,
 };
 use deskgraph_projects::{
-    check_exact_duplicate_at, decide_exact_duplicate_at, decide_project_candidate_at,
-    folder_profile_at, project_candidate_at, propose_project_at,
+    check_exact_duplicate_at, decide_exact_duplicate_at, decide_file_version_at,
+    decide_project_candidate_at, folder_profile_at, project_candidate_at, propose_project_at,
     recent_file_relation_candidates_at, recent_project_candidates_at, suggest_file_version_at,
     verify_exact_duplicate_at, verify_file_version_at,
 };
@@ -327,6 +327,15 @@ enum RelationCommand {
         database: PathBuf,
         #[arg(long)]
         relation: i64,
+    },
+    /// Revalidate current filename evidence, then append an evidence-bound user correction.
+    VersionDecide {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        relation: i64,
+        #[arg(long, value_enum)]
+        decision: RelationDecisionArg,
     },
 }
 
@@ -935,6 +944,34 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                     older_version = candidate.evidence.older_version,
                     newer_version = candidate.evidence.newer_version,
                     state = ?candidate.state
+                );
+                Ok(())
+            }
+            RelationCommand::VersionDecide {
+                database,
+                relation,
+                decision,
+            } => {
+                let candidate = decide_file_version_at(&database, relation, decision.into())
+                    .map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "file_version_candidate_decided",
+                    relation_id = candidate.relation_id,
+                    scope_id = candidate.older.scope_id,
+                    older_node_id = candidate.older.node_id,
+                    newer_node_id = candidate.newer.node_id,
+                    older_version = candidate.evidence.older_version,
+                    newer_version = candidate.evidence.newer_version,
+                    state = ?candidate.state,
+                    decision_sequence = candidate
+                        .latest_decision
+                        .as_ref()
+                        .map(|decision| decision.sequence),
+                    evidence_observation_id = candidate
+                        .latest_decision
+                        .as_ref()
+                        .map(|decision| decision.evidence_observation_id)
                 );
                 Ok(())
             }

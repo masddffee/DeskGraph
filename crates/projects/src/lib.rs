@@ -318,6 +318,26 @@ pub fn verify_file_version(
     analyze_and_record_file_version(database, first, second)
 }
 
+pub fn decide_file_version_at(
+    database_path: &Path,
+    relation_id: i64,
+    decision: FileRelationDecisionKind,
+) -> Result<FileVersionCandidate, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    decide_file_version(&mut database, relation_id, decision)
+}
+
+pub fn decide_file_version(
+    database: &mut ManifestDatabase,
+    relation_id: i64,
+    decision: FileRelationDecisionKind,
+) -> Result<FileVersionCandidate, ProjectError> {
+    verify_file_version(database, relation_id)?;
+    database
+        .decide_file_version_candidate(relation_id, decision)
+        .map_err(Into::into)
+}
+
 fn open_relation_source(
     database: &ManifestDatabase,
     scope_id: i64,
@@ -1112,12 +1132,41 @@ mod tests {
         let verified = verify_file_version(&mut database, candidate.relation_id)
             .expect("current names and identities should verify");
         assert_eq!(verified.relation_id, candidate.relation_id);
+        let rejected = decide_file_version(
+            &mut database,
+            candidate.relation_id,
+            FileRelationDecisionKind::Rejected,
+        )
+        .expect("a decision should reverify current filename evidence");
+        assert_eq!(rejected.state, FileRelationCandidateState::Rejected);
+        assert_eq!(
+            rejected
+                .latest_decision
+                .as_ref()
+                .expect("decision should exist")
+                .sequence,
+            1
+        );
+        let repeated = decide_file_version(
+            &mut database,
+            candidate.relation_id,
+            FileRelationDecisionKind::Rejected,
+        )
+        .expect("equivalent repeated decision should be idempotent");
+        assert_eq!(
+            repeated
+                .latest_decision
+                .as_ref()
+                .expect("decision should exist")
+                .sequence,
+            1
+        );
         let summaries = database
             .recent_file_relation_candidates()
             .expect("history should load");
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].kind, FileRelationKind::Version);
-        assert_eq!(summaries[0].state, FileRelationCandidateState::Suggested);
+        assert_eq!(summaries[0].state, FileRelationCandidateState::Rejected);
         assert!(summaries[0].verification_required);
 
         for (path, expected_code) in [
@@ -1133,8 +1182,12 @@ mod tests {
         }
 
         std::fs::write(&second_path, b"changed after scan").expect("second should change");
-        let stale = verify_file_version(&mut database, candidate.relation_id)
-            .expect_err("changed metadata must invalidate live verification");
+        let stale = decide_file_version(
+            &mut database,
+            candidate.relation_id,
+            FileRelationDecisionKind::Accepted,
+        )
+        .expect_err("changed metadata must prevent a new decision");
         assert_eq!(stale.code(), "file_relation_source_metadata_changed");
         assert_eq!(
             std::fs::read(&first_path).expect("first should remain"),

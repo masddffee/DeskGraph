@@ -10,12 +10,12 @@ use deskgraph_domain::{
     FileRelationCandidateState, FileRelationCandidateSummary, FileRelationComparisonKind,
     FileRelationCreator, FileRelationDecision, FileRelationDecisionCreator,
     FileRelationDecisionKind, FileRelationEndpoint, FileRelationEvidence, FileRelationKind,
-    FileVersionCandidate, FileVersionEvidence, FileVersionSignalKind, FolderCategoryCount,
-    FolderFileCategory, ManifestStats, ProjectCandidate, ProjectCandidateState,
-    ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator, ProjectDecisionKind,
-    ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator, ScanJobProgress,
-    ScanReport, ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus,
-    parse_explicit_file_version_name,
+    FileVersionCandidate, FileVersionDecision, FileVersionEvidence, FileVersionSignalKind,
+    FolderCategoryCount, FolderFileCategory, ManifestStats, ProjectCandidate,
+    ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
+    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
+    WatchEventReason, WatchEventStatus, parse_explicit_file_version_name,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -74,6 +74,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "file_version_candidates",
         sql: include_str!("../../../migrations/0011_file_version_candidates.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "file_version_feedback",
+        sql: include_str!("../../../migrations/0012_file_version_feedback.sql"),
     },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2694,11 +2699,17 @@ impl ManifestDatabase {
         &self,
         relation_id: i64,
     ) -> Result<FileVersionCandidate, DatabaseError> {
+        Self::file_version_candidate_from_connection(&self.connection, relation_id)
+    }
+
+    fn file_version_candidate_from_connection(
+        connection: &Connection,
+        relation_id: i64,
+    ) -> Result<FileVersionCandidate, DatabaseError> {
         if relation_id <= 0 {
             return Err(DatabaseError::FileRelationCandidateInputInvalid);
         }
-        let row = self
-            .connection
+        let row = connection
             .query_row(
                 "SELECT r.id, r.relation_kind, r.scope_id, r.left_node_id, r.right_node_id, \
                         older_location.node_id, older_location.id, \
@@ -2710,7 +2721,8 @@ impl ManifestDatabase {
                         observation.newer_version, observation.confidence_basis_points, \
                         observation.signal_kind, observation.created_by, \
                         observation.provider_id, observation.provider_version, \
-                        observation.model_version, observation.observed_at_unix_ms, feedback.id \
+                        observation.model_version, observation.observed_at_unix_ms, \
+                        observation.id, feedback.id \
                  FROM file_relation_candidates r \
                  JOIN file_version_observations observation ON observation.id = ( \
                     SELECT latest.id FROM file_version_observations latest \
@@ -2763,7 +2775,8 @@ impl ManifestDatabase {
                         row.get::<_, String>(23)?,
                         row.get::<_, Option<String>>(24)?,
                         row.get::<_, i64>(25)?,
-                        row.get::<_, Option<i64>>(26)?,
+                        row.get::<_, i64>(26)?,
+                        row.get::<_, Option<i64>>(27)?,
                     ))
                 },
             )
@@ -2795,10 +2808,11 @@ impl ManifestDatabase {
             provider_version,
             model_version,
             observed_at_unix_ms,
+            observation_id,
             feedback_id,
         )) = row
         else {
-            let relation_exists = self.connection.query_row(
+            let relation_exists = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM file_relation_candidates WHERE id = ?1)",
                 [relation_id],
                 |row| row.get::<_, i64>(0),
@@ -2829,15 +2843,23 @@ impl ManifestDatabase {
             || provider_id != FileVersionEvidence::PROVIDER_ID
             || provider_version != FileVersionEvidence::PROVIDER_VERSION
             || model_version.is_some()
+            || observation_id <= 0
             || feedback_id.is_some()
         {
             return Err(DatabaseError::InvalidStoredValue);
         }
+        let latest_decision =
+            latest_equivalent_file_version_decision(connection, relation_id, observation_id)?;
+        let state = match latest_decision.as_ref().map(|decision| decision.kind) {
+            None => FileRelationCandidateState::Suggested,
+            Some(FileRelationDecisionKind::Accepted) => FileRelationCandidateState::Accepted,
+            Some(FileRelationDecisionKind::Rejected) => FileRelationCandidateState::Rejected,
+        };
         Ok(FileVersionCandidate {
             api_version: FileVersionCandidate::API_VERSION,
             relation_id,
             kind: FileRelationKind::Version,
-            state: FileRelationCandidateState::Suggested,
+            state,
             older: FileRelationEndpoint {
                 scope_id,
                 node_id: older_node_id,
@@ -2870,7 +2892,7 @@ impl ManifestDatabase {
                 provider_version: FileVersionEvidence::PROVIDER_VERSION,
                 model_version: None,
             },
-            latest_decision: None,
+            latest_decision,
         })
     }
 
@@ -3154,6 +3176,63 @@ impl ManifestDatabase {
         self.file_relation_candidate(relation_id)
     }
 
+    pub fn decide_file_version_candidate(
+        &mut self,
+        relation_id: i64,
+        decision: FileRelationDecisionKind,
+    ) -> Result<FileVersionCandidate, DatabaseError> {
+        if relation_id <= 0 {
+            return Err(DatabaseError::FileRelationCandidateInputInvalid);
+        }
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        Self::file_version_candidate_from_connection(&transaction, relation_id)?;
+        let current_observation_id = transaction.query_row(
+            "SELECT id FROM file_version_observations WHERE relation_id = ?1 \
+             ORDER BY observed_at_unix_ms DESC, id DESC LIMIT 1",
+            [relation_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let latest_equivalent = latest_equivalent_file_version_decision(
+            &transaction,
+            relation_id,
+            current_observation_id,
+        )?;
+        if latest_equivalent
+            .as_ref()
+            .is_some_and(|stored| stored.kind == decision)
+        {
+            transaction.commit()?;
+            return self.file_version_candidate(relation_id);
+        }
+        let latest_sequence = transaction
+            .query_row(
+                "SELECT sequence FROM file_version_feedback_events \
+                 WHERE relation_id = ?1 ORDER BY sequence DESC LIMIT 1",
+                [relation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let sequence = latest_sequence.map_or(Ok(1_i64), |sequence| {
+            sequence.checked_add(1).ok_or(DatabaseError::InvalidCount)
+        })?;
+        transaction.execute(
+            "INSERT INTO file_version_feedback_events( \
+                 relation_id, evidence_observation_id, sequence, decision, created_by, \
+                 created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4, 'user', ?5)",
+            params![
+                relation_id,
+                current_observation_id,
+                sequence,
+                file_relation_decision_kind_str(decision),
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        self.file_version_candidate(relation_id)
+    }
+
     pub fn recent_file_relation_candidates(
         &self,
     ) -> Result<Vec<FileRelationCandidateSummary>, DatabaseError> {
@@ -3214,7 +3293,7 @@ impl ManifestDatabase {
                 },
             )
             .optional()?;
-        let latest_decision = match feedback {
+        let mut latest_decision = match feedback {
             None => None,
             Some((sequence, kind, creator, decided_at_unix_ms)) => {
                 if creator != "user" {
@@ -3268,7 +3347,7 @@ impl ManifestDatabase {
                     return Err(DatabaseError::InvalidStoredValue);
                 }
                 let evidence = self.connection.query_row(
-                    "SELECT base_key, extension_key, older_version, newer_version, \
+                    "SELECT id, base_key, extension_key, older_version, newer_version, \
                             confidence_basis_points, signal_kind, created_by, provider_id, \
                             provider_version, model_version, observed_at_unix_ms \
                      FROM file_version_observations WHERE relation_id = ?1 \
@@ -3276,36 +3355,44 @@ impl ManifestDatabase {
                     [relation_id],
                     |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(2)?,
                             row.get::<_, i64>(3)?,
                             row.get::<_, i64>(4)?,
-                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(5)?,
                             row.get::<_, String>(6)?,
                             row.get::<_, String>(7)?,
                             row.get::<_, String>(8)?,
-                            row.get::<_, Option<String>>(9)?,
-                            row.get::<_, i64>(10)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, Option<String>>(10)?,
+                            row.get::<_, i64>(11)?,
                         ))
                     },
                 )?;
-                if evidence.0.is_empty()
-                    || evidence.0.len() > 1_024
-                    || evidence.1.len() > 64
-                    || evidence.2 < 1
-                    || evidence.2 >= evidence.3
-                    || evidence.3 > 999_999
-                    || evidence.4 != 9_000
-                    || evidence.5 != "explicit_numeric_suffix"
-                    || evidence.6 != "system_rule"
-                    || evidence.7 != FileVersionEvidence::PROVIDER_ID
-                    || evidence.8 != FileVersionEvidence::PROVIDER_VERSION
-                    || evidence.9.is_some()
+                if evidence.0 <= 0
+                    || evidence.1.is_empty()
+                    || evidence.1.len() > 1_024
+                    || evidence.2.len() > 64
+                    || evidence.3 < 1
+                    || evidence.3 >= evidence.4
+                    || evidence.4 > 999_999
+                    || evidence.5 != 9_000
+                    || evidence.6 != "explicit_numeric_suffix"
+                    || evidence.7 != "system_rule"
+                    || evidence.8 != FileVersionEvidence::PROVIDER_ID
+                    || evidence.9 != FileVersionEvidence::PROVIDER_VERSION
+                    || evidence.10.is_some()
                 {
                     return Err(DatabaseError::InvalidStoredValue);
                 }
-                (FileRelationKind::Version, evidence.4, evidence.10)
+                latest_decision = latest_equivalent_file_version_decision(
+                    &self.connection,
+                    relation_id,
+                    evidence.0,
+                )?
+                .map(|decision| (decision.kind, decision.decided_at_unix_ms));
+                (FileRelationKind::Version, evidence.5, evidence.11)
             }
             _ => return Err(DatabaseError::InvalidStoredValue),
         };
@@ -3656,6 +3743,70 @@ fn explicit_version_name_from_display_path(
         .ok_or(DatabaseError::FileRelationCandidateInputInvalid)?;
     parse_explicit_file_version_name(file_name)
         .ok_or(DatabaseError::FileRelationCandidateInputInvalid)
+}
+
+fn latest_equivalent_file_version_decision(
+    connection: &Connection,
+    relation_id: i64,
+    current_observation_id: i64,
+) -> Result<Option<FileVersionDecision>, DatabaseError> {
+    let feedback = connection
+        .query_row(
+            "SELECT feedback.evidence_observation_id, feedback.sequence, feedback.decision, \
+                    feedback.created_by, feedback.created_at_unix_ms \
+             FROM file_version_feedback_events feedback \
+             JOIN file_version_observations bound \
+                ON bound.id = feedback.evidence_observation_id \
+                AND bound.relation_id = feedback.relation_id \
+             JOIN file_version_observations current \
+                ON current.id = ?2 AND current.relation_id = feedback.relation_id \
+             JOIN locations bound_older ON bound_older.id = bound.older_location_id \
+             JOIN locations bound_newer ON bound_newer.id = bound.newer_location_id \
+             JOIN locations current_older ON current_older.id = current.older_location_id \
+             JOIN locations current_newer ON current_newer.id = current.newer_location_id \
+             WHERE feedback.relation_id = ?1 \
+               AND bound_older.node_id = current_older.node_id \
+               AND bound_newer.node_id = current_newer.node_id \
+               AND bound.base_key = current.base_key \
+               AND bound.extension_key = current.extension_key \
+               AND bound.older_version = current.older_version \
+               AND bound.newer_version = current.newer_version \
+               AND bound.confidence_basis_points = current.confidence_basis_points \
+               AND bound.signal_kind = current.signal_kind \
+               AND bound.created_by = current.created_by \
+               AND bound.provider_id = current.provider_id \
+               AND bound.provider_version = current.provider_version \
+               AND bound.model_version IS current.model_version \
+             ORDER BY feedback.sequence DESC LIMIT 1",
+            params![relation_id, current_observation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    feedback
+        .map(
+            |(evidence_observation_id, sequence, kind, creator, decided_at_unix_ms)| {
+                if evidence_observation_id <= 0 || creator != "user" || decided_at_unix_ms < 0 {
+                    return Err(DatabaseError::InvalidStoredValue);
+                }
+                Ok(FileVersionDecision {
+                    sequence: u64::try_from(sequence)
+                        .map_err(|_| DatabaseError::InvalidStoredValue)?,
+                    evidence_observation_id,
+                    kind: file_relation_decision_kind_from_str(&kind)?,
+                    created_by: FileRelationDecisionCreator::User,
+                    decided_at_unix_ms,
+                })
+            },
+        )
+        .transpose()
 }
 
 fn relation_snapshot_matches(
@@ -4695,6 +4846,31 @@ mod tests {
         assert!(stats.database_ready);
         assert_eq!(stats.authorized_scope_count, 0);
         assert_eq!(stats.node_count, 0);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("migration count should load"),
+            i64::try_from(MIGRATIONS.len()).expect("migration count should fit")
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema \
+                     WHERE (type = 'table' AND name = 'file_version_feedback_events') \
+                        OR (type = 'trigger' AND name IN ( \
+                            'file_version_feedback_events_immutable_update', \
+                            'file_version_feedback_events_immutable_delete' \
+                        ))",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("version feedback schema should load"),
+            3
+        );
     }
 
     #[test]
@@ -5334,6 +5510,180 @@ mod tests {
             database.file_version_candidate(candidate.relation_id),
             Err(DatabaseError::FileRelationCandidateNotCurrent)
         ));
+    }
+
+    #[test]
+    fn file_version_feedback_is_append_only_idempotent_and_direction_bound() {
+        let (mut database, first, second) = file_version_setup();
+        let candidate = database
+            .record_file_version_candidate(&first, &second)
+            .expect("version candidate should persist");
+        let rejected = database
+            .decide_file_version_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Rejected,
+            )
+            .expect("current evidence should be rejectable");
+        assert_eq!(rejected.state, FileRelationCandidateState::Rejected);
+        assert_eq!(
+            rejected
+                .latest_decision
+                .as_ref()
+                .expect("decision should exist")
+                .sequence,
+            1
+        );
+
+        let reverified = database
+            .record_file_version_candidate(&first, &second)
+            .expect("equivalent evidence should append an observation");
+        assert_eq!(reverified.state, FileRelationCandidateState::Rejected);
+        let idempotent = database
+            .decide_file_version_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Rejected,
+            )
+            .expect("repeated equivalent decision should succeed");
+        assert_eq!(
+            idempotent
+                .latest_decision
+                .as_ref()
+                .expect("decision should exist")
+                .sequence,
+            1
+        );
+        let accepted = database
+            .decide_file_version_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Accepted,
+            )
+            .expect("opposite decision should append a correction");
+        assert_eq!(accepted.state, FileRelationCandidateState::Accepted);
+        assert_eq!(
+            accepted
+                .latest_decision
+                .as_ref()
+                .expect("decision should exist")
+                .sequence,
+            2
+        );
+
+        let changed_path = "/scope/企劃-v3.md";
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET path_raw = ?1, path_key = ?2, display_path = ?2 \
+                 WHERE id = ?3",
+                params![changed_path.as_bytes(), changed_path, first.location_id,],
+            )
+            .expect("fixture rename should update current location");
+        database
+            .connection
+            .execute(
+                "INSERT INTO file_version_observations( \
+                     relation_id, older_location_id, newer_location_id, older_size_bytes, \
+                     newer_size_bytes, older_modified_unix_ns, newer_modified_unix_ns, \
+                     base_key, extension_key, older_version, newer_version, \
+                     confidence_basis_points, signal_kind, created_by, provider_id, \
+                     provider_version, model_version, observed_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '企劃', 'md', 2, 3, 9000, \
+                     'explicit_numeric_suffix', 'system_rule', 'deskgraph.filename-version', \
+                     '1', NULL, ?8)",
+                params![
+                    candidate.relation_id,
+                    second.location_id,
+                    first.location_id,
+                    to_i64(second.size_bytes).expect("size should fit"),
+                    to_i64(first.size_bytes).expect("size should fit"),
+                    second.modified_unix_ns,
+                    first.modified_unix_ns,
+                    accepted.evidence.observed_at_unix_ms,
+                ],
+            )
+            .expect("new direction should append");
+        let changed = database
+            .file_version_candidate(candidate.relation_id)
+            .expect("changed direction should load");
+        assert_eq!(changed.older.node_id, second.node_id);
+        assert_eq!(changed.newer.node_id, first.node_id);
+        assert_eq!(changed.state, FileRelationCandidateState::Suggested);
+        assert_eq!(changed.latest_decision, None);
+        let changed_rejected = database
+            .decide_file_version_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Rejected,
+            )
+            .expect("new direction should accept its own decision");
+        assert_eq!(changed_rejected.state, FileRelationCandidateState::Rejected);
+        assert_eq!(
+            changed_rejected
+                .latest_decision
+                .as_ref()
+                .expect("changed decision should exist")
+                .sequence,
+            3
+        );
+
+        let original_path = "/scope/企劃-v1.md";
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET path_raw = ?1, path_key = ?2, display_path = ?2 \
+                 WHERE id = ?3",
+                params![original_path.as_bytes(), original_path, first.location_id],
+            )
+            .expect("fixture rename should restore current location");
+        let restored_first = database
+            .action_source_for_path_key(first.scope_id, original_path)
+            .expect("restored source should load");
+        let restored = database
+            .record_file_version_candidate(&restored_first, &second)
+            .expect("restored equivalent evidence should append");
+        assert_eq!(restored.state, FileRelationCandidateState::Accepted);
+        assert_eq!(
+            restored
+                .latest_decision
+                .as_ref()
+                .expect("restored decision should exist")
+                .sequence,
+            2
+        );
+        database
+            .decide_file_version_candidate(
+                candidate.relation_id,
+                FileRelationDecisionKind::Accepted,
+            )
+            .expect("restored repeated decision should remain idempotent");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM file_version_feedback_events WHERE relation_id = ?1",
+                    [candidate.relation_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("feedback events should count"),
+            3
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE file_version_feedback_events SET decision = decision \
+                     WHERE relation_id = ?1",
+                    [candidate.relation_id],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM file_version_feedback_events WHERE relation_id = ?1",
+                    [candidate.relation_id],
+                )
+                .is_err()
+        );
     }
 
     #[test]

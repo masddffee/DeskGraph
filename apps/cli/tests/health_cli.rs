@@ -760,7 +760,7 @@ fn file_version_relation_is_directional_revalidated_and_path_free_in_history() {
         serde_json::from_slice(&suggested.stdout).expect("candidate should be JSON");
     assert_eq!(
         candidate["api_version"],
-        "deskgraph.file-version-candidate.v1"
+        "deskgraph.file-version-candidate.v2"
     );
     assert_eq!(candidate["kind"], "version");
     assert_eq!(candidate["state"], "suggested");
@@ -798,6 +798,67 @@ fn file_version_relation_is_directional_revalidated_and_path_free_in_history() {
     assert_eq!(verified_json["relation_id"], candidate["relation_id"]);
     assert_eq!(verified_json["state"], "suggested");
 
+    let rejected = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "version-decide",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+            "--decision",
+            "reject",
+        ])
+        .output()
+        .expect("deskgraph relation version decide should start");
+    assert!(rejected.status.success());
+    let rejected_json: serde_json::Value =
+        serde_json::from_slice(&rejected.stdout).expect("decision should be JSON");
+    assert_eq!(rejected_json["state"], "rejected");
+    assert_eq!(rejected_json["latest_decision"]["sequence"], 1);
+    assert!(
+        rejected_json["latest_decision"]["evidence_observation_id"]
+            .as_i64()
+            .is_some_and(|value| value > 0)
+    );
+
+    let repeated = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "version-decide",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+            "--decision",
+            "reject",
+        ])
+        .output()
+        .expect("repeated version decision should start");
+    assert!(repeated.status.success());
+    let repeated_json: serde_json::Value =
+        serde_json::from_slice(&repeated.stdout).expect("repeated decision should be JSON");
+    assert_eq!(repeated_json["latest_decision"]["sequence"], 1);
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "version-decide",
+            "--database",
+            database_arg,
+            "--relation",
+            &relation_arg,
+            "--decision",
+            "accept",
+        ])
+        .output()
+        .expect("corrected version decision should start");
+    assert!(accepted.status.success());
+    let accepted_json: serde_json::Value =
+        serde_json::from_slice(&accepted.stdout).expect("correction should be JSON");
+    assert_eq!(accepted_json["state"], "accepted");
+    assert_eq!(accepted_json["latest_decision"]["sequence"], 2);
+
     let list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
         .args(["relation", "list", "--database", database_arg])
         .output()
@@ -807,7 +868,8 @@ fn file_version_relation_is_directional_revalidated_and_path_free_in_history() {
         serde_json::from_slice(&list.stdout).expect("relation list should be JSON");
     assert_eq!(summaries[0]["relation_id"], candidate["relation_id"]);
     assert_eq!(summaries[0]["kind"], "version");
-    assert_eq!(summaries[0]["state"], "suggested");
+    assert_eq!(summaries[0]["state"], "accepted");
+    assert!(summaries[0]["latest_decision_at_unix_ms"].is_i64());
     assert_eq!(summaries[0]["verification_required"], true);
     assert!(summaries[0].get("older").is_none());
     assert!(summaries[0].get("newer").is_none());
@@ -822,7 +884,9 @@ fn file_version_relation_is_directional_revalidated_and_path_free_in_history() {
         newer_content
     );
     let list_stdout = String::from_utf8_lossy(&list.stdout);
-    for output in [&suggested, &verified, &list] {
+    for output in [
+        &suggested, &verified, &rejected, &repeated, &accepted, &list,
+    ] {
         let stderr = String::from_utf8_lossy(&output.stderr);
         for secret in [
             "private-versions",

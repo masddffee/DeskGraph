@@ -186,6 +186,15 @@ pub struct FileRelationDecision {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileVersionDecision {
+    pub sequence: u64,
+    pub evidence_observation_id: i64,
+    pub kind: FileRelationDecisionKind,
+    pub created_by: FileRelationDecisionCreator,
+    pub decided_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileRelationEndpoint {
     pub scope_id: i64,
     pub node_id: i64,
@@ -325,11 +334,11 @@ pub struct FileVersionCandidate {
     pub older: FileRelationEndpoint,
     pub newer: FileRelationEndpoint,
     pub evidence: FileVersionEvidence,
-    pub latest_decision: Option<FileRelationDecision>,
+    pub latest_decision: Option<FileVersionDecision>,
 }
 
 impl FileVersionCandidate {
-    pub const API_VERSION: &str = "deskgraph.file-version-candidate.v1";
+    pub const API_VERSION: &str = "deskgraph.file-version-candidate.v2";
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
