@@ -1,0 +1,55 @@
+{
+  "api_version": "deskgraph.ocr-run.v1",
+  "run_id": "synthetic-native-1",
+  "corpus_id": "synthetic-contract-v1",
+  "corpus_input_sha256": "278a7dbb1035e108a94431eb84fbfa998734363275a20c36b3598ea282f41db4",
+  "provider": {
+    "provider_id": "deskgraph.example-native",
+    "provider_version": "1",
+    "runtime": {
+      "kind": "os_managed",
+      "runtime_revision": "example runtime 1"
+    }
+  },
+  "host": {
+    "os": "macos",
+    "os_version": "macOS 15.5",
+    "arch": "aarch64",
+    "cpu_model": "Apple M4",
+    "ram_bytes": 8589934592,
+    "rust_toolchain": "rustc 1.97.0",
+    "deskgraph_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "harness_id": "deskgraph-ocr-harness",
+    "harness_version": "1",
+    "command": "deskgraph-ocr-harness synthetic-contract-v1"
+  },
+  "rss": {
+    "scope": null,
+    "before": null,
+    "peak": null,
+    "after_caller": null,
+    "after_cleanup": null
+  },
+  "cases": [
+    {
+      "case_id": "mixed-synthetic",
+      "image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": "completed",
+      "elapsed_us": 1000,
+      "error_code": null,
+      "recognized_text": "桌面圖譜 DeskGraph",
+      "observations": [
+        {
+          "text": "桌面圖譜 DeskGraph",
+          "bounding_box": {
+            "x_ppm": 100000,
+            "y_ppm": 100000,
+            "width_ppm": 800000,
+            "height_ppm": 100000
+          },
+          "confidence_basis_points": 9000
+        }
+      ]
+    }
+  ]
+}

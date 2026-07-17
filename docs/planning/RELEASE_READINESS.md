@@ -27,7 +27,7 @@ Overall status: **not release-ready**. Local implementation is in M2 with parall
 | GitHub Release                                 | Blocked externally | Remote, auth, verified assets, public download smoke     |
 | README/demo/launch assets                      | In progress        | Pre-release README exists; demo and launch assets remain |
 | Post-launch issue/hotfix process               | In progress        | Issue/PR templates exist; labels and incident/hotfix drill remain |
-| Critical/high security findings                | In progress        | npm: zero known vulnerabilities; current 493-package RustSec scan has zero vulnerabilities plus 17 existing Tauri/Linux warnings identical to the prior lock; isolated PDF, Office, image-metadata, macOS OCR, and reused Microsoft Windows OCR binding deltas are clean. Upstream warning resolution, full threat model, notices, SBOM, and platform review remain |
+| Critical/high security findings                | In progress        | npm: zero known vulnerabilities; current 494-package RustSec scan has zero vulnerabilities plus the same 17 existing Tauri/Linux warnings as the prior locks; isolated PDF, Office, image-metadata, macOS OCR, reused Microsoft Windows OCR bindings, and the workspace-only evaluator/direct `sha2` edge are clean. Upstream warning resolution, full threat model, notices, SBOM, and platform review remain |
 | Known data-loss bugs                           | Unknown            | Full action/recovery suite; zero known data-loss issues  |
 
 ## M0 readiness gate

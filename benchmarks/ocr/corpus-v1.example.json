@@ -1,0 +1,13 @@
+{
+  "api_version": "deskgraph.ocr-corpus.v1",
+  "corpus_id": "synthetic-contract-v1",
+  "normalization": "nfc_unicode_whitespace_v1",
+  "cases": [
+    {
+      "case_id": "mixed-synthetic",
+      "image_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected_text": "桌面圖譜 DeskGraph",
+      "tags": ["mixed_language"]
+    }
+  ]
+}
