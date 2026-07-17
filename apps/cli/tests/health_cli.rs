@@ -108,6 +108,80 @@ fn extraction_command_emits_counts_without_paths_or_content() {
 }
 
 #[test]
+fn image_metadata_command_returns_only_bounded_structured_fields() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("private-screenshots");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let source_path = scope_path.join("private-Screenshot.png");
+    let mut png = vec![0_u8; 32];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&2560_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&1440_u32.to_be_bytes());
+    std::fs::write(&source_path, png).expect("fixture should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    let node_id = database
+        .node_id_for_path_key(
+            scope.id,
+            &deskgraph_scanner::comparison_key(
+                &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+            ),
+        )
+        .expect("node lookup should pass")
+        .expect("image node should exist");
+    drop(database);
+    let job = create_extraction_job_at(&database_path, scope.id, node_id)
+        .expect("image extraction should create");
+    run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
+        .expect("image extraction should complete");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "extract",
+            "image-metadata",
+            "--database",
+            database_path
+                .to_str()
+                .expect("database path should be UTF-8"),
+            "--job",
+            &job.job_id.to_string(),
+        ])
+        .output()
+        .expect("deskgraph image metadata should start");
+
+    assert!(output.status.success());
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
+    assert_eq!(metadata["api_version"], "deskgraph.image-metadata.v1");
+    assert_eq!(metadata["format"], "png");
+    assert_eq!(metadata["pixel_width"], 2560);
+    assert_eq!(metadata["pixel_height"], 1440);
+    assert_eq!(metadata["provider_id"], "deskgraph.image-metadata");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in [
+        "private-Screenshot.png",
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        source_path.to_str().expect("source path should be UTF-8"),
+        database_path
+            .to_str()
+            .expect("database path should be UTF-8"),
+    ] {
+        assert!(!stdout.contains(secret));
+        assert!(!stderr.contains(secret));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}
+
+#[test]
 fn search_command_returns_requested_local_context_without_logging_it() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

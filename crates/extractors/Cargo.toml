@@ -9,6 +9,7 @@ license.workspace = true
 deskgraph-database = { path = "../database" }
 deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
+imagesize.workspace = true
 lopdf.workspace = true
 quick-xml.workspace = true
 zip.workspace = true

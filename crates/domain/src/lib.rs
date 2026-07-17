@@ -11,7 +11,9 @@ pub use action::{
     ActionPlanSummary, ActionPolicyCheck, ActionPolicyDecision, ActionPolicyReport,
 };
 pub use extraction::{
-    ExtractionJobProgress, ExtractionStats, ExtractionStatus, is_valid_xlsx_cell_reference,
+    ExtractionJobProgress, ExtractionStats, ExtractionStatus, ImageFormat, ImageMetadata,
+    MAX_IMAGE_DIMENSION_PIXELS, MAX_IMAGE_TOTAL_PIXELS, is_valid_image_dimensions,
+    is_valid_xlsx_cell_reference,
 };
 pub use health::{
     ComponentHealth, HealthReport, LifecycleState, PlatformHealth, PrivacyHealth, ProviderHealth,

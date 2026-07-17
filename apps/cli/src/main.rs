@@ -7,8 +7,8 @@ use deskgraph_domain::{ExtractionJobProgress, ScanJobProgress, collect_health};
 use deskgraph_domain::{FileRelationDecisionKind, ProjectDecisionKind};
 use deskgraph_extractors::{
     ExtractionLimits, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
-    extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
-    run_extraction_job_at,
+    extraction_stats_at, image_metadata_for_job_at, recent_extraction_jobs_at,
+    resume_extraction_job_at, run_extraction_job_at,
 };
 use deskgraph_projects::{
     check_exact_duplicate_at, decide_exact_duplicate_at, decide_file_version_at,
@@ -487,6 +487,13 @@ enum ExtractCommand {
         #[arg(long)]
         database: PathBuf,
     },
+    /// Read bounded structured image dimensions for one completed image job.
+    ImageMetadata {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        job: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -664,6 +671,11 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             ExtractCommand::Stats { database } => {
                 let stats = extraction_stats_at(&database).map_err(|error| error.code())?;
                 emit_json(&stats, "content_extraction_stats_read")
+            }
+            ExtractCommand::ImageMetadata { database, job } => {
+                let metadata =
+                    image_metadata_for_job_at(&database, job).map_err(|error| error.code())?;
+                emit_json(&metadata, "image_metadata_read")
             }
         },
         Command::Search {
@@ -1258,6 +1270,67 @@ mod tests {
         let stats = manifest.extraction_stats().expect("stats should load");
         assert_eq!(stats.extracted_file_count, 1);
         assert!(stats.active_chunk_count > 0);
+    }
+
+    #[test]
+    fn image_metadata_runs_through_cli_handler() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("authorized");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let source_path = scope_path.join("Screenshot.png");
+        let mut png = vec![0_u8; 32];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        png[12..16].copy_from_slice(b"IHDR");
+        png[16..20].copy_from_slice(&1920_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&1080_u32.to_be_bytes());
+        std::fs::write(&source_path, png).expect("image fixture should write");
+        let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
+        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        scan_scope(&mut manifest, scope.id).expect("scope should scan");
+        let node_id = manifest
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("source node should exist");
+        drop(manifest);
+
+        execute(Cli {
+            command: Command::Extract {
+                command: ExtractCommand::Start {
+                    database: database.clone(),
+                    scope: scope.id,
+                    node: Some(node_id),
+                    path: None,
+                },
+            },
+        })
+        .expect("image extraction should pass");
+        let manifest = ManifestDatabase::open(&database).expect("database should reopen");
+        let job = manifest
+            .recent_extraction_jobs()
+            .expect("job should load")
+            .into_iter()
+            .next()
+            .expect("job should exist");
+        drop(manifest);
+        execute(Cli {
+            command: Command::Extract {
+                command: ExtractCommand::ImageMetadata {
+                    database: database.clone(),
+                    job: job.job_id,
+                },
+            },
+        })
+        .expect("image metadata command should pass");
+        let metadata = image_metadata_for_job_at(&database, job.job_id)
+            .expect("metadata should remain queryable");
+        assert_eq!((metadata.pixel_width, metadata.pixel_height), (1920, 1080));
     }
 
     #[test]

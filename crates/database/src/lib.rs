@@ -11,12 +11,12 @@ use deskgraph_domain::{
     FileRelationCreator, FileRelationDecision, FileRelationDecisionCreator,
     FileRelationDecisionKind, FileRelationEndpoint, FileRelationEvidence, FileRelationKind,
     FileVersionCandidate, FileVersionDecision, FileVersionEvidence, FileVersionSignalKind,
-    FolderCategoryCount, FolderFileCategory, ManifestStats, ProjectCandidate,
-    ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
-    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
-    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
-    WatchEventReason, WatchEventStatus, is_valid_xlsx_cell_reference,
-    parse_explicit_file_version_name,
+    FolderCategoryCount, FolderFileCategory, ImageFormat, ImageMetadata, ManifestStats,
+    ProjectCandidate, ProjectCandidateState, ProjectCandidateSummary, ProjectDecision,
+    ProjectDecisionCreator, ProjectDecisionKind, ProjectSignal, ProjectSignalKind,
+    ProjectSuggestion, ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus,
+    WatchEventProgress, WatchEventReason, WatchEventStatus, is_valid_image_dimensions,
+    is_valid_xlsx_cell_reference, parse_explicit_file_version_name,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -85,6 +85,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "ooxml_chunk_provenance",
         sql: include_str!("../../../migrations/0013_ooxml_chunk_provenance.sql"),
+    },
+    Migration {
+        version: 14,
+        name: "image_metadata",
+        sql: include_str!("../../../migrations/0014_image_metadata.sql"),
     },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -323,6 +328,13 @@ pub struct ContentChunkWrite {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageMetadataWrite {
+    pub format: ImageFormat,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LexicalCandidateSource {
     MetadataPath,
     ExtractedText,
@@ -373,6 +385,7 @@ pub enum DatabaseError {
     InvalidExtractionJobState,
     ExtractionRunnerLeaseLost,
     ExtractionOutputInvalid,
+    ImageMetadataNotFound,
     SearchInputInvalid,
     WatchEventNotFound,
     InvalidWatchEventState,
@@ -415,6 +428,7 @@ impl DatabaseError {
             Self::InvalidExtractionJobState => "invalid_extraction_job_state",
             Self::ExtractionRunnerLeaseLost => "extraction_runner_lease_lost",
             Self::ExtractionOutputInvalid => "extraction_output_invalid",
+            Self::ImageMetadataNotFound => "image_metadata_not_found",
             Self::SearchInputInvalid => "search_input_invalid",
             Self::WatchEventNotFound => "watch_event_not_found",
             Self::InvalidWatchEventState => "invalid_watch_event_state",
@@ -657,7 +671,7 @@ impl ManifestDatabase {
             "UPDATE edges SET active = 0 WHERE scope_id = ?1 AND last_seen_scan_id <> ?2",
             params![scope_id, job_id],
         )?;
-        invalidate_stale_content_chunks(&transaction, scope_id)?;
+        invalidate_stale_extraction_outputs(&transaction, scope_id)?;
 
         for issue in issues {
             transaction.execute(
@@ -1309,7 +1323,7 @@ impl ManifestDatabase {
             "UPDATE edges SET active = 0 WHERE scope_id = ?1 AND last_seen_scan_id <> ?2",
             params![scope_id, job_id],
         )?;
-        invalidate_stale_content_chunks(&transaction, scope_id)?;
+        invalidate_stale_extraction_outputs(&transaction, scope_id)?;
         transaction.execute(
             "INSERT INTO scan_issues(scan_id, code, path_key, detail_code) \
              SELECT scan_id, code, path_key, detail_code FROM scan_staged_issues WHERE scan_id = ?1",
@@ -1497,6 +1511,51 @@ impl ManifestDatabase {
         jobs.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn image_metadata_for_job(&self, job_id: i64) -> Result<ImageMetadata, DatabaseError> {
+        let stored: (i64, i64, String, i64, i64, i64, String, String) = self
+            .connection
+            .query_row(
+                "SELECT scope_id, node_id, format, pixel_width, pixel_height, source_size_bytes, \
+                    provider_id, provider_version \
+                 FROM image_metadata WHERE extraction_job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::ImageMetadataNotFound)?;
+        let format =
+            ImageFormat::from_storage(&stored.2).ok_or(DatabaseError::InvalidStoredValue)?;
+        let pixel_width = u32::try_from(stored.3).map_err(|_| DatabaseError::InvalidStoredValue)?;
+        let pixel_height =
+            u32::try_from(stored.4).map_err(|_| DatabaseError::InvalidStoredValue)?;
+        if !is_valid_image_dimensions(pixel_width, pixel_height) {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        Ok(ImageMetadata {
+            api_version: ImageMetadata::API_VERSION,
+            extraction_job_id: job_id,
+            scope_id: stored.0,
+            node_id: stored.1,
+            format,
+            pixel_width,
+            pixel_height,
+            source_bytes: u64::try_from(stored.5).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            provider_id: stored.6,
+            provider_version: stored.7,
+        })
+    }
+
     pub fn request_extraction_cancel(
         &mut self,
         job_id: i64,
@@ -1615,6 +1674,34 @@ impl ManifestDatabase {
         elapsed_ms: u64,
         chunks: &[ContentChunkWrite],
     ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.complete_extraction_job_with_image_metadata(
+            job_id,
+            runner_token,
+            provider_id,
+            provider_version,
+            source_size_bytes,
+            source_modified_unix_ns,
+            output_bytes,
+            elapsed_ms,
+            chunks,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_extraction_job_with_image_metadata(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+        provider_id: &str,
+        provider_version: &str,
+        source_size_bytes: u64,
+        source_modified_unix_ns: Option<i64>,
+        output_bytes: u64,
+        elapsed_ms: u64,
+        chunks: &[ContentChunkWrite],
+        image_metadata: Option<&ImageMetadataWrite>,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
         if provider_id.is_empty()
             || provider_version.is_empty()
             || source_size_bytes > MAX_EXTRACTION_SOURCE_BYTES
@@ -1634,6 +1721,15 @@ impl ManifestDatabase {
                 .ok_or(DatabaseError::ExtractionOutputInvalid)?;
         }
         if output_bytes > MAX_EXTRACTION_OUTPUT_BYTES || computed_output_bytes != output_bytes {
+            return Err(DatabaseError::ExtractionOutputInvalid);
+        }
+        if (provider_id == "deskgraph.image-metadata") != image_metadata.is_some()
+            || image_metadata.is_some_and(|metadata| {
+                !chunks.is_empty()
+                    || output_bytes != 0
+                    || !is_valid_image_dimensions(metadata.pixel_width, metadata.pixel_height)
+            })
+        {
             return Err(DatabaseError::ExtractionOutputInvalid);
         }
         let now = unix_ms()?;
@@ -1713,6 +1809,10 @@ impl ManifestDatabase {
 
         transaction.execute(
             "UPDATE content_chunks SET active = 0 WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+            params![scope_id, node_id],
+        )?;
+        transaction.execute(
+            "UPDATE image_metadata SET active = 0 WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
             params![scope_id, node_id],
         )?;
         for chunk in chunks {
@@ -1809,6 +1909,29 @@ impl ManifestDatabase {
                     to_i64(source_size_bytes)?,
                     source_modified_unix_ns,
                     chunk.trust_class,
+                    provider_id,
+                    provider_version,
+                    now,
+                ],
+            )?;
+        }
+        if let Some(metadata) = image_metadata {
+            transaction.execute(
+                "INSERT INTO image_metadata( \
+                    scope_id, node_id, location_id, extraction_job_id, format, pixel_width, \
+                    pixel_height, source_size_bytes, source_modified_unix_ns, provider_id, \
+                    provider_version, active, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12)",
+                params![
+                    scope_id,
+                    node_id,
+                    location_id,
+                    job_id,
+                    metadata.format.as_str(),
+                    i64::from(metadata.pixel_width),
+                    i64::from(metadata.pixel_height),
+                    to_i64(source_size_bytes)?,
+                    source_modified_unix_ns,
                     provider_id,
                     provider_version,
                     now,
@@ -1921,7 +2044,10 @@ impl ManifestDatabase {
             )?,
             extracted_file_count: count(
                 &self.connection,
-                "SELECT COUNT(DISTINCT node_id) FROM content_chunks WHERE active = 1",
+                "SELECT COUNT(*) FROM ( \
+                    SELECT node_id FROM content_chunks WHERE active = 1 \
+                    UNION SELECT node_id FROM image_metadata WHERE active = 1 \
+                 )",
             )?,
             completed_job_count: count(
                 &self.connection,
@@ -2072,12 +2198,24 @@ impl ManifestDatabase {
         scope_id: i64,
         node_id: i64,
     ) -> Result<u64, DatabaseError> {
-        let changed = self.connection.execute(
+        let chunks = self.connection.execute(
             "UPDATE content_chunks SET active = 0 \
              WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
             params![scope_id, node_id],
         )?;
-        u64::try_from(changed).map_err(|_| DatabaseError::InvalidCount)
+        let metadata = self.connection.execute(
+            "UPDATE image_metadata SET active = 0 \
+             WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+            params![scope_id, node_id],
+        )?;
+        u64::try_from(chunks)
+            .ok()
+            .and_then(|chunks| {
+                u64::try_from(metadata)
+                    .ok()
+                    .and_then(|metadata| chunks.checked_add(metadata))
+            })
+            .ok_or(DatabaseError::InvalidCount)
     }
 
     pub fn stats(&self) -> Result<ManifestStats, DatabaseError> {
@@ -4489,7 +4627,7 @@ fn ensure_extraction_runner(
     }
 }
 
-fn invalidate_stale_content_chunks(
+fn invalidate_stale_extraction_outputs(
     transaction: &Transaction<'_>,
     scope_id: i64,
 ) -> Result<(), DatabaseError> {
@@ -4504,6 +4642,21 @@ fn invalidate_stale_content_chunks(
                 WHERE f.node_id = content_chunks.node_id \
                   AND f.size_bytes = content_chunks.source_size_bytes \
                   AND f.modified_unix_ns IS content_chunks.source_modified_unix_ns \
+            ) \
+         )",
+        [scope_id],
+    )?;
+    transaction.execute(
+        "UPDATE image_metadata SET active = 0 \
+         WHERE active = 1 AND scope_id = ?1 AND ( \
+            NOT EXISTS ( \
+                SELECT 1 FROM locations l \
+                WHERE l.id = image_metadata.location_id AND l.present = 1 \
+            ) OR NOT EXISTS ( \
+                SELECT 1 FROM files f \
+                WHERE f.node_id = image_metadata.node_id \
+                  AND f.size_bytes = image_metadata.source_size_bytes \
+                  AND f.modified_unix_ns IS image_metadata.source_modified_unix_ns \
             ) \
          )",
         [scope_id],
@@ -4978,6 +5131,72 @@ mod tests {
                 .stats()
                 .expect("stats should load")
                 .completed_scan_count,
+            0
+        );
+    }
+
+    #[test]
+    fn image_metadata_migration_preserves_existing_chunks_and_fts() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("pre-image-metadata.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at_unix_ms INTEGER NOT NULL);",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..13] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("historical migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("historical migration should register");
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'test', 0); \
+                 INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
+                 INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0); \
+                 INSERT INTO files VALUES (1, 4, 1, 1); \
+                 INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E747874', '/scope/file.txt', '/scope/file.txt', 1, 1); \
+                 INSERT INTO extraction_jobs(id, scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, elapsed_ms, created_at_unix_ms, updated_at_unix_ms) VALUES (1, 1, 1, 1, 'completed', 4, 1, 4, 1, 1, 0, 0); \
+                 INSERT INTO content_chunks(id, scope_id, node_id, location_id, extraction_job_id, ordinal, text, provenance_kind, source_byte_start, source_byte_end, source_size_bytes, source_modified_unix_ns, trust_class, provider_id, provider_version, active, created_at_unix_ms) VALUES (1, 1, 1, 1, 1, 0, '保留text', 'byte_range', 0, 4, 4, 1, 'untrusted_extracted_text', 'deskgraph.utf8-text', '1', 1, 0);",
+            )
+            .expect("legacy content should persist");
+        drop(connection);
+
+        let upgraded =
+            ManifestDatabase::open(&path).expect("image metadata migration should apply");
+        assert_eq!(
+            upgraded
+                .connection
+                .query_row("SELECT text FROM content_chunks WHERE id = 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("legacy chunk should load"),
+            "保留text"
+        );
+        assert_eq!(
+            upgraded
+                .lexical_search_candidates("保留t", lexical_filters(Some(1)), 10)
+                .expect("legacy FTS row should remain searchable")
+                .len(),
+            1
+        );
+        assert_eq!(
+            upgraded
+                .connection
+                .query_row("SELECT COUNT(*) FROM image_metadata", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("new metadata table should exist"),
             0
         );
     }
@@ -6442,6 +6661,133 @@ mod tests {
             )
             .expect("inactive chunks should count");
         assert_eq!(inactive, 2);
+    }
+
+    #[test]
+    fn image_metadata_is_structured_validated_and_atomically_replaced() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let image_job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("image job should create");
+        database
+            .claim_extraction_job(image_job.job_id, "image-runner", 60_000)
+            .expect("image job should claim");
+        database
+            .complete_extraction_job_with_image_metadata(
+                image_job.job_id,
+                "image-runner",
+                "deskgraph.image-metadata",
+                "1",
+                4,
+                Some(1),
+                0,
+                1,
+                &[],
+                Some(&ImageMetadataWrite {
+                    format: ImageFormat::Png,
+                    pixel_width: 2,
+                    pixel_height: 2,
+                }),
+            )
+            .expect("valid image metadata should publish");
+        let stored = database
+            .image_metadata_for_job(image_job.job_id)
+            .expect("image metadata should load");
+        assert_eq!(stored.format, ImageFormat::Png);
+        assert_eq!((stored.pixel_width, stored.pixel_height), (2, 2));
+        let stats = database.extraction_stats().expect("stats should load");
+        assert_eq!(stats.active_chunk_count, 0);
+        assert_eq!(stats.extracted_file_count, 1);
+
+        let invalid_job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("invalid retry should create");
+        database
+            .claim_extraction_job(invalid_job.job_id, "invalid-image", 60_000)
+            .expect("invalid retry should claim");
+        let error = database
+            .complete_extraction_job_with_image_metadata(
+                invalid_job.job_id,
+                "invalid-image",
+                "deskgraph.image-metadata",
+                "1",
+                4,
+                Some(1),
+                0,
+                1,
+                &[],
+                Some(&ImageMetadataWrite {
+                    format: ImageFormat::Png,
+                    pixel_width: 25_000,
+                    pixel_height: 25_000,
+                }),
+            )
+            .expect_err("dimension bomb must not publish");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM image_metadata WHERE active = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("active metadata should count"),
+            1
+        );
+        database
+            .fail_extraction_job(
+                invalid_job.job_id,
+                "invalid-image",
+                "deskgraph.image-metadata",
+                "1",
+                "extraction_output_invalid",
+                1,
+            )
+            .expect("invalid retry should fail");
+
+        let text_job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("replacement should create");
+        database
+            .claim_extraction_job(text_job.job_id, "text-runner", 60_000)
+            .expect("replacement should claim");
+        database
+            .complete_extraction_job(
+                text_job.job_id,
+                "text-runner",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "text".to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("text replacement should publish atomically");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM image_metadata WHERE active = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("active metadata should count"),
+            0
+        );
+        assert_eq!(
+            database
+                .image_metadata_for_job(image_job.job_id)
+                .expect("historical metadata should remain queryable")
+                .pixel_width,
+            2
+        );
     }
 
     #[test]

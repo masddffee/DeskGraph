@@ -94,6 +94,7 @@ impl ExtractorProvider for PdfTextExtractor {
             output_bytes,
             modified_unix_ns: request.modified_unix_ns,
             chunks,
+            image_metadata: None,
         })
     }
 }
@@ -223,6 +224,10 @@ end
             chunk_overlap_bytes: 0,
             max_decompressed_bytes: 1024 * 1024,
             max_pdf_pages: 16,
+            max_image_source_bytes: 1024 * 1024,
+            max_image_probe_bytes: 1024 * 1024,
+            max_image_dimension: 100_000,
+            max_image_pixels: 500_000_000,
             max_processing_time: Duration::from_secs(2),
         }
     }

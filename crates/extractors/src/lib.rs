@@ -3,16 +3,20 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use deskgraph_domain::ImageFormat;
+
+mod image;
 mod ooxml;
 mod pdf;
 mod service;
 
+pub use image::ImageMetadataExtractor;
 pub use ooxml::OoxmlTextExtractor;
 pub use pdf::PdfTextExtractor;
 pub use service::{
     ExtractionServiceError, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
-    extraction_stats_at, recent_extraction_jobs_at, resume_extraction_job_at,
-    run_extraction_job_at,
+    extraction_stats_at, image_metadata_for_job_at, recent_extraction_jobs_at,
+    resume_extraction_job_at, run_extraction_job_at,
 };
 
 pub const UNTRUSTED_TEXT: &str = "untrusted_extracted_text";
@@ -23,6 +27,7 @@ pub const ABSOLUTE_MAX_CHUNK_BYTES: usize = 64 * 1024;
 pub const ABSOLUTE_MAX_PROCESSING_TIME: Duration = Duration::from_secs(60);
 pub const ABSOLUTE_MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 pub const ABSOLUTE_MAX_PDF_PAGES: u32 = 4_096;
+pub const ABSOLUTE_MAX_IMAGE_PROBE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MediaKind {
@@ -33,6 +38,7 @@ pub enum MediaKind {
     Docx,
     Pptx,
     Xlsx,
+    Image(ImageFormat),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +50,10 @@ pub struct ExtractionLimits {
     pub chunk_overlap_bytes: usize,
     pub max_decompressed_bytes: usize,
     pub max_pdf_pages: u32,
+    pub max_image_source_bytes: u64,
+    pub max_image_probe_bytes: usize,
+    pub max_image_dimension: u32,
+    pub max_image_pixels: u64,
     pub max_processing_time: Duration,
 }
 
@@ -57,6 +67,10 @@ impl Default for ExtractionLimits {
             chunk_overlap_bytes: 256,
             max_decompressed_bytes: 8 * 1024 * 1024,
             max_pdf_pages: 512,
+            max_image_source_bytes: ABSOLUTE_MAX_SOURCE_BYTES,
+            max_image_probe_bytes: 2 * 1024 * 1024,
+            max_image_dimension: deskgraph_domain::MAX_IMAGE_DIMENSION_PIXELS,
+            max_image_pixels: deskgraph_domain::MAX_IMAGE_TOTAL_PIXELS,
             max_processing_time: Duration::from_secs(5),
         }
     }
@@ -102,6 +116,13 @@ pub struct ExtractedChunk {
     pub trust_class: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtractedImageMetadata {
+    pub format: ImageFormat,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtractionOutput {
     pub provider_id: &'static str,
@@ -111,6 +132,7 @@ pub struct ExtractionOutput {
     pub output_bytes: u64,
     pub modified_unix_ns: Option<i64>,
     pub chunks: Vec<ExtractedChunk>,
+    pub image_metadata: Option<ExtractedImageMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +156,10 @@ pub enum ExtractionError {
     MissingOoxmlPart,
     InvalidOoxmlXml,
     OoxmlStructureLimitExceeded,
+    InvalidImage,
+    ImageFormatMismatch,
+    ImageMetadataLimitExceeded,
+    ImageDimensionLimitExceeded,
     DecompressionLimitExceeded,
     PageLimitExceeded,
     ChunkLimitExceeded,
@@ -164,6 +190,10 @@ impl ExtractionError {
             Self::MissingOoxmlPart => "extraction_ooxml_required_part_missing",
             Self::InvalidOoxmlXml => "extraction_ooxml_xml_invalid",
             Self::OoxmlStructureLimitExceeded => "extraction_ooxml_structure_limit_exceeded",
+            Self::InvalidImage => "extraction_image_invalid",
+            Self::ImageFormatMismatch => "extraction_image_format_mismatch",
+            Self::ImageMetadataLimitExceeded => "extraction_image_metadata_limit_exceeded",
+            Self::ImageDimensionLimitExceeded => "extraction_image_dimension_limit_exceeded",
             Self::DecompressionLimitExceeded => "extraction_decompression_limit_exceeded",
             Self::PageLimitExceeded => "extraction_page_limit_exceeded",
             Self::ChunkLimitExceeded => "extraction_chunk_limit_exceeded",
@@ -295,6 +325,7 @@ impl ExtractorProvider for Utf8TextExtractor {
             output_bytes,
             modified_unix_ns: request.modified_unix_ns,
             chunks,
+            image_metadata: None,
         })
     }
 }
@@ -313,6 +344,12 @@ pub fn media_kind_for_extension(extension: &str) -> Option<MediaKind> {
         "docx" => Some(MediaKind::Docx),
         "pptx" => Some(MediaKind::Pptx),
         "xlsx" => Some(MediaKind::Xlsx),
+        "png" => Some(MediaKind::Image(ImageFormat::Png)),
+        "jpg" | "jpeg" => Some(MediaKind::Image(ImageFormat::Jpeg)),
+        "gif" => Some(MediaKind::Image(ImageFormat::Gif)),
+        "webp" => Some(MediaKind::Image(ImageFormat::Webp)),
+        "bmp" => Some(MediaKind::Image(ImageFormat::Bmp)),
+        "tif" | "tiff" => Some(MediaKind::Image(ImageFormat::Tiff)),
         _ => None,
     }
 }
@@ -331,6 +368,16 @@ pub(crate) fn validate_limits(limits: ExtractionLimits) -> Result<(), Extraction
         || limits.max_decompressed_bytes > ABSOLUTE_MAX_DECOMPRESSED_BYTES
         || limits.max_pdf_pages == 0
         || limits.max_pdf_pages > ABSOLUTE_MAX_PDF_PAGES
+        || limits.max_image_source_bytes == 0
+        || limits.max_image_source_bytes > ABSOLUTE_MAX_SOURCE_BYTES
+        || limits.max_image_probe_bytes < 32
+        || limits.max_image_probe_bytes > ABSOLUTE_MAX_IMAGE_PROBE_BYTES
+        || u64::try_from(limits.max_image_probe_bytes)
+            .map_or(true, |probe| probe > limits.max_image_source_bytes)
+        || limits.max_image_dimension == 0
+        || limits.max_image_dimension > deskgraph_domain::MAX_IMAGE_DIMENSION_PIXELS
+        || limits.max_image_pixels == 0
+        || limits.max_image_pixels > deskgraph_domain::MAX_IMAGE_TOTAL_PIXELS
         || limits.max_processing_time.is_zero()
         || limits.max_processing_time > ABSOLUTE_MAX_PROCESSING_TIME
     {
@@ -477,6 +524,10 @@ mod tests {
             chunk_overlap_bytes: 3,
             max_decompressed_bytes: 1_024,
             max_pdf_pages: 8,
+            max_image_source_bytes: 1_024,
+            max_image_probe_bytes: 1_024,
+            max_image_dimension: 1_024,
+            max_image_pixels: 1_048_576,
             max_processing_time: Duration::from_secs(1),
         }
     }
@@ -487,6 +538,14 @@ mod tests {
         assert_eq!(media_kind_for_extension("md"), Some(MediaKind::Markdown));
         assert_eq!(media_kind_for_extension("Rs"), Some(MediaKind::SourceCode));
         assert_eq!(media_kind_for_extension("pdf"), Some(MediaKind::Pdf));
+        assert_eq!(
+            media_kind_for_extension("PNG"),
+            Some(MediaKind::Image(ImageFormat::Png))
+        );
+        assert_eq!(
+            media_kind_for_extension("jpeg"),
+            Some(MediaKind::Image(ImageFormat::Jpeg))
+        );
         assert_eq!(media_kind_for_extension("exe"), None);
     }
 

@@ -5,9 +5,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
     ContentChunkProvenanceWrite, ContentChunkWrite, DatabaseError, ExtractableFile,
-    ManifestDatabase,
+    ImageMetadataWrite, ManifestDatabase,
 };
-use deskgraph_domain::{ExtractionJobProgress, ExtractionStats, ExtractionStatus};
+use deskgraph_domain::{ExtractionJobProgress, ExtractionStats, ExtractionStatus, ImageMetadata};
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, fallback_identity, has_hidden_or_system_attribute,
     is_symlink_or_reparse_point, path_from_raw, platform_identity_for_open_file,
@@ -15,8 +15,8 @@ use deskgraph_identity::{
 
 use crate::{
     CancellationSignal, ChunkProvenance, ExtractionError, ExtractionLimits, ExtractionRequest,
-    ExtractorProvider, MediaKind, OoxmlTextExtractor, PdfTextExtractor, Utf8TextExtractor,
-    media_kind_for_extension,
+    ExtractorProvider, ImageMetadataExtractor, MediaKind, OoxmlTextExtractor, PdfTextExtractor,
+    Utf8TextExtractor, media_kind_for_extension,
 };
 
 // The provider's absolute processing cap is 60 seconds. Keep enough lease headroom for
@@ -140,6 +140,15 @@ pub fn extraction_stats_at(
         .map_err(Into::into)
 }
 
+pub fn image_metadata_for_job_at(
+    database_path: &Path,
+    job_id: i64,
+) -> Result<ImageMetadata, ExtractionServiceError> {
+    ManifestDatabase::open(database_path)?
+        .image_metadata_for_job(job_id)
+        .map_err(Into::into)
+}
+
 pub fn cancel_extraction_job_at(
     database_path: &Path,
     job_id: i64,
@@ -239,7 +248,12 @@ pub fn run_extraction_job_at(
                     trust_class: chunk.trust_class,
                 })
                 .collect::<Vec<_>>();
-            match database.complete_extraction_job(
+            let image_metadata = output.image_metadata.map(|metadata| ImageMetadataWrite {
+                format: metadata.format,
+                pixel_width: metadata.pixel_width,
+                pixel_height: metadata.pixel_height,
+            });
+            match database.complete_extraction_job_with_image_metadata(
                 job_id,
                 &runner_token,
                 output.provider_id,
@@ -249,6 +263,7 @@ pub fn run_extraction_job_at(
                 output.output_bytes,
                 elapsed_ms,
                 &chunks,
+                image_metadata.as_ref(),
             ) {
                 Ok(progress) => Ok(progress),
                 Err(error) => {
@@ -328,10 +343,12 @@ fn extract_claimed_job(
     let text_provider = Utf8TextExtractor;
     let pdf_provider = PdfTextExtractor;
     let ooxml_provider = OoxmlTextExtractor;
+    let image_provider = ImageMetadataExtractor;
     let provider: &dyn ExtractorProvider = match media_kind {
         MediaKind::PlainText | MediaKind::Markdown | MediaKind::SourceCode => &text_provider,
         MediaKind::Pdf => &pdf_provider,
         MediaKind::Docx | MediaKind::Pptx | MediaKind::Xlsx => &ooxml_provider,
+        MediaKind::Image(_) => &image_provider,
     };
     let provider_id = provider.provider_id();
     let provider_version = provider.provider_version();
@@ -599,6 +616,16 @@ mod tests {
             .into_inner()
     }
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 32];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn markdown_file_runs_from_manifest_identity_to_atomic_chunks() {
         let fixture = fixture("notes.md", "# DeskGraph\n本機 context\n".as_bytes());
@@ -702,6 +729,92 @@ mod tests {
             assert_eq!(candidates[0].source, LexicalCandidateSource::ExtractedText);
             assert_eq!(candidates[0].node_id, fixture.node_id);
         }
+    }
+
+    #[test]
+    fn image_routes_from_manifest_to_structured_atomic_metadata() {
+        let contents = png_bytes(1920, 1080);
+        let image_fixture = fixture("Screenshot.png", &contents);
+        let job = create_extraction_job_at(
+            &image_fixture.database_path,
+            image_fixture.scope_id,
+            image_fixture.node_id,
+        )
+        .expect("image job should create");
+        let completed = run_extraction_job_at(
+            &image_fixture.database_path,
+            job.job_id,
+            ExtractionLimits::default(),
+        )
+        .expect("image job should run");
+
+        assert_eq!(completed.status, ExtractionStatus::Completed);
+        assert_eq!(
+            completed.provider_id.as_deref(),
+            Some("deskgraph.image-metadata")
+        );
+        assert_eq!(completed.chunk_count, 0);
+        assert_eq!(completed.output_bytes, 0);
+        let metadata = image_metadata_for_job_at(&image_fixture.database_path, job.job_id)
+            .expect("structured metadata should load");
+        assert_eq!(metadata.format, deskgraph_domain::ImageFormat::Png);
+        assert_eq!((metadata.pixel_width, metadata.pixel_height), (1920, 1080));
+        assert_eq!(metadata.node_id, image_fixture.node_id);
+        let stats = extraction_stats_at(&image_fixture.database_path).expect("stats should load");
+        assert_eq!(stats.extracted_file_count, 1);
+        assert_eq!(stats.active_chunk_count, 0);
+
+        let mut changed_image = png_bytes(800, 600);
+        changed_image.push(0);
+        fs::write(&image_fixture.file_path, changed_image).expect("image fixture should change");
+        let stale_job = create_extraction_job_at(
+            &image_fixture.database_path,
+            image_fixture.scope_id,
+            image_fixture.node_id,
+        )
+        .expect("stale image job should create from manifest");
+        let stale = run_extraction_job_at(
+            &image_fixture.database_path,
+            stale_job.job_id,
+            ExtractionLimits::default(),
+        )
+        .expect("stale image should fail safely");
+        assert_eq!(stale.status, ExtractionStatus::Failed);
+        assert_eq!(
+            stale.error_code.as_deref(),
+            Some("extraction_source_metadata_changed")
+        );
+        assert_eq!(
+            extraction_stats_at(&image_fixture.database_path)
+                .expect("stale metadata should invalidate")
+                .extracted_file_count,
+            0
+        );
+
+        let mismatched = fixture("renamed.jpg", &contents);
+        let mismatched_job = create_extraction_job_at(
+            &mismatched.database_path,
+            mismatched.scope_id,
+            mismatched.node_id,
+        )
+        .expect("mismatched job should create");
+        let failed = run_extraction_job_at(
+            &mismatched.database_path,
+            mismatched_job.job_id,
+            ExtractionLimits::default(),
+        )
+        .expect("signature mismatch should be isolated");
+        assert_eq!(failed.status, ExtractionStatus::Failed);
+        assert_eq!(
+            failed.error_code.as_deref(),
+            Some("extraction_image_format_mismatch")
+        );
+        assert_eq!(
+            image_metadata_for_job_at(&mismatched.database_path, mismatched_job.job_id)
+                .expect_err("failed job must not publish metadata")
+                .code(),
+            "image_metadata_not_found"
+        );
     }
 
     #[test]
