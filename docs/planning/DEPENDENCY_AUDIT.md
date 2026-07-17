@@ -46,7 +46,7 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 
 The first M2 provider adds **no external dependency**. Plain text, Markdown, and source code use Rust standard-library `Read + Seek`, UTF-8 validation, bounded buffering, chunking, and time/cancellation checks. Durable jobs and content chunks reuse the already audited `rusqlite` database layer; open-file identity reuses the existing `unicode-normalization` and `windows-sys` boundary; `tempfile` remains test-only. The `Cargo.lock` changes for this slice only connect existing DeskGraph workspace crates and do not introduce a new registry package.
 
-This decision keeps the core usable without Python, Docker, Ollama, a model, an API key, or network access. It does not approve any ZIP/XML, image, OCR, model, or native runtime candidate.
+This initial decision keeps the core usable without Python, Docker, Ollama, a model, an API key, or network access. It did not preapprove later ZIP/XML, image, OCR, model, or native runtime candidates; each accepted later delta is recorded separately below.
 
 ### PDF text dependency selected
 
@@ -60,12 +60,20 @@ The load API limits each eagerly decompressed object or cross-reference stream, 
 
 `pdf-extract 0.12.0` is rejected: its published `extract_text*`/`extract_text_by_pages*` functions call unbounded `Document::load*` and output traversal, use `lopdf 0.42`, and accept no decompression, page, output, time, or cancellation policy.
 
+### Image metadata dependency selected
+
+| Dependency | Scope | Selected version/features | Official source / API evidence | Maintenance and platform evidence | License | Security and decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| `imagesize` | Encoded image format and dimensions only | `0.15.0`, exact, `default-features = false`; only `bmp`, `gif`, `jpeg`, `png`, `tiff`, `webp` | crates.io and `Roughsketch/imagesize`; inspected published `reader_type` plus `ImageType::reader_size` reader APIs and the complete selected-format source | Released 2026-07-09; pure Rust; selected graph has no transitive dependency; isolated test passed on macOS arm64 and `x86_64-pc-windows-msvc` checked with pinned Rust 1.97.0 | MIT | Accepted for bounded header metadata only. DeskGraph never calls the crate's filesystem helper, decodes pixels, enables HEIF/AVIF, or extracts EXIF/GPS/arbitrary strings. |
+
+The adapter receives only a core-controlled in-memory probe cursor. DeskGraph independently caps source/probe bytes, read/seek operations, time/cancellation, each dimension, and total encoded pixels; it verifies extension-to-signature agreement plus stricter format headers before publication. Metadata is stored in a dedicated structured table with source/provider provenance and no path, filename, EXIF, GPS, or fake text chunk. Malformed, mismatched, truncated, over-limit, cancelled, and changed sources publish nothing.
+
+The isolated lock contains only the fixture root and `imagesize`; `cargo tree` confirms the six selected features and no transitive package. The published source scan found no `unsafe`, network, or process execution in the selected parsing path. `cargo audit --no-fetch` against 1,160 cached advisories reports zero findings for the isolated graph. The exact dependency adds one package to DeskGraph's lock and no new full-lock advisory. HEIF/AVIF remains deliberately excluded because its nested box traversal and format-specific size arithmetic have not passed DeskGraph's separate resource/safety contract; support is not implied by upstream capability.
+
 ### M2 dependencies still requiring selection and audit
 
 | Capability | Current status | Required evidence before adoption |
 | --- | --- | --- |
-| DOCX / PPTX / XLSX | Implemented and verified locally | Exact `zip 8.6.0` / `quick-xml 0.41.0` closure, provider adversarial fixtures, migration/integration tests, and current full-lock audit pass; remote runtime, representative corpus, and 8 GB evidence remain required |
-| Image metadata | Unselected | Bounded signature/metadata API, supported formats, malformed/oversized behavior, license, advisories, platform behavior |
 | Screenshot OCR | Unselected; D-008 open | Native API availability plus packaged cross-platform fallback, zh-TW/English quality, model/runtime license, checksums, memory/unload behavior, offline packaging without user-installed Python |
 
 ### Office OOXML dependencies selected
@@ -104,9 +112,9 @@ Only official `actions/*` actions are permitted in M0. `actions/checkout` v4.2.2
 
 ## Executed verification
 
-- Before the PDF dependency, `Cargo.lock` resolved 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review. PDF integration produced 483 packages; local workspace-only retrieval, benchmark, watcher, transaction, and project crates brought the lock to 488. Office integration produces 491 packages by adding `zip 8.6.0` (MIT), `typed-path 0.12.3` (MIT OR Apache-2.0), and `zlib-rs 0.6.6` (Zlib); `quick-xml 0.41.0` was already locked transitively and is now an exact direct dependency.
+- Before the PDF dependency, `Cargo.lock` resolved 457 packages including eight DeskGraph workspace packages. `cargo metadata --offline --no-deps` found no missing workspace license metadata. License expressions include permissive licenses, MPL-2.0, and optional-license expressions containing LGPL; platform-specific redistribution and notices require another M9 review. PDF integration produced 483 packages; local workspace-only retrieval, benchmark, watcher, transaction, and project crates brought the lock to 488. Office integration produced 491 packages by adding `zip 8.6.0` (MIT), `typed-path 0.12.3` (MIT OR Apache-2.0), and `zlib-rs 0.6.6` (Zlib); `quick-xml 0.41.0` was already locked transitively and became an exact direct dependency. Image metadata produces the current 492-package lock by adding only `imagesize 0.15.0` (MIT).
 - `cargo tree --workspace --depth 1` recorded all direct versions. `cargo tree --target all -i ...` traced RustSec warnings to Tauri/Wry's Linux GTK3 stack and Tauri's URL-pattern parser chain.
-- The current full-lock scan loaded 1,160 cached RustSec advisories and scanned 491 lockfile packages: zero known vulnerabilities plus 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. The prior 488-package lock has the identical warning set, so the Office delta adds no advisory. The isolated 53-package PDF and 14-package Office closures separately returned zero findings. R-016 remains open because current evidence does not repair Tauri's Linux transitive stack.
+- The current full-lock scan loaded 1,160 cached RustSec advisories and scanned 492 lockfile packages: zero known vulnerabilities plus 17 warnings—ten unmaintained GTK3 binding crates, `proc-macro-error`, five unmaintained `unic-*` crates, and one `glib` unsound advisory. The prior 491-package lock has the identical warning set, so the image-metadata delta adds no advisory. The isolated 53-package PDF, 14-package Office, and one-package image-metadata closures separately returned zero findings. R-016 remains open because current evidence does not repair Tauri's Linux transitive stack.
 - `pnpm audit --prod` and full `pnpm audit` found zero known vulnerabilities.
 - `pnpm licenses list --json` failed with `ERR_PNPM_MISSING_PACKAGE_INDEX_FILE` under pnpm's SQLite-backed local store. The recorded equivalent scan read all installed package manifests: 145 unique packages, no missing license fields; 106 MIT, 18 Apache-2.0, 6 BSD-2-Clause, 2 BSD-3-Clause, 7 ISC, 2 MPL-2.0, 1 BlueOak-1.0.0, and 3 Apache-2.0 OR MIT.
 - `pnpm peers check` reports no peer dependency issues after pinning TypeScript 6.0.3.

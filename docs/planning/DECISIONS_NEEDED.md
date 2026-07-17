@@ -4,7 +4,7 @@ Last reviewed: 2026-07-17
 
 ## Blocking now
 
-D-013 must be resolved before M4 introduces cross-root learned scoring or merge/split semantics; it does not block deterministic related/duplicate/version work or safe work in other milestones. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
+D-008 must be resolved before Screenshot OCR implementation selects a native or packaged runtime. D-013 must be resolved before M4 introduces cross-root learned scoring or merge/split semantics; neither blocks safe work in other milestones. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
 
 ## Open decisions
 
@@ -47,6 +47,7 @@ D-013 must be resolved before M4 introduces cross-root learned scoring or merge/
 - PDF text uses exact `lopdf 0.44.0` with default features disabled, strict bounded in-memory APIs, sequential page processing, no password handling, and no active-content traversal (ADR-013).
 - Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page/fragment indexes; DOCX uses paragraph/fragment, PPTX slide/fragment, and XLSX bounded sheet/cell/fragment. Structural formats never receive fabricated byte offsets.
 - D-011 is resolved by accepted ADR-014: exact no-default `zip 8.6.0` with only `deflate-flate2-zlib-rs` and no-default `quick-xml 0.41.0` pass isolated closure, license, RustSec, API, macOS arm64, and Windows x64 compile gates. The implemented provider's adversarial, migration, Manifest→SQLite→FTS, full-lock audit, and local release-build gates pass; representative corpora, remote runtimes, live UI, and 8 GB evidence remain release gates, not open dependency choices.
+- Image metadata uses exact no-default `imagesize 0.15.0` with only BMP/GIF/JPEG/PNG/TIFF/WebP. It receives a bounded controlled-byte cursor, adds no transitive package, performs no pixel/EXIF/GPS decode, and publishes only a validated structured record. HEIF/AVIF and OCR remain outside this decision.
 
 ## Decisions made while entering M3
 

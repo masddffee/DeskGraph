@@ -10,13 +10,13 @@ DeskGraph is a local-first computer context graph that will connect, search, and
 
 The repository is implementing M2 Content Intelligence plus bounded M3 lexical, M4 project-graph, M5 rename-preview, and M6 watch-reconciliation slices while M0/M1 external evidence remains open. The CLI and Tauri desktop can initialize a local SQLite manifest, explicitly authorize an existing folder, run a metadata-only initial scan, persist progress, pause or resume safely, recover interrupted work, report graph statistics, and search current local paths and active extracted text. Rescans are idempotent in local tests; hard links share an identity, same-filesystem renames preserve identity, and symlinks and hidden entries are not followed.
 
-The current content slices can extract bounded text from an explicitly selected, already-scanned text, Markdown, source-code, text-layer PDF, DOCX, PPTX, or XLSX file. They revalidate the authorized scope, manifest snapshot, and actual open-file identity; store only provenance-bearing `untrusted_extracted_text` chunks; support durable cancellation/recovery; and atomically preserve the prior complete version on failure. PDF extraction rejects encryption, ignores active content and attachments, and records page/fragment provenance. Office extraction reads only allowlisted in-memory text parts, ignores macros/formulas/relationships/embeddings, rejects unsafe or bomb-like archives/XML, and records paragraph/slide/sheet-cell provenance instead of fabricated byte offsets.
+The current content slices can extract bounded text from an explicitly selected, already-scanned text, Markdown, source-code, text-layer PDF, DOCX, PPTX, or XLSX file. They can also read encoded dimensions and format from PNG, JPEG, GIF, WebP, BMP, and TIFF headers without decoding pixels or collecting EXIF/GPS fields. Every provider revalidates the authorized scope, manifest snapshot, and actual open-file identity; supports durable cancellation/recovery; and atomically preserves the prior complete output on failure. Text is stored only as provenance-bearing `untrusted_extracted_text` chunks. PDF extraction rejects encryption, ignores active content and attachments, and records page/fragment provenance. Office extraction reads only allowlisted in-memory text parts, ignores macros/formulas/relationships/embeddings, rejects unsafe or bomb-like archives/XML, and records paragraph/slide/sheet-cell provenance instead of fabricated byte offsets. Image metadata is stored separately as bounded structured data, not as text or FTS content.
 
 The current search slice uses bundled SQLite FTS5 trigram indexes for Traditional Chinese and English substring queries of 3–256 Unicode characters. It requires no embedding or model, returns bounded text snippets, filters out stale chunks and absent locations, and explains whether filename/path, extracted text, or both matched. Scope, source, extension, and modified-time filters plus a synthetic 10k p50/p95/index-size baseline pass locally. One- and two-character queries, project/folder filters, vector semantic search, hybrid fusion, representative/100k/8 GB evaluation, and cross-platform evidence remain open.
 
 The current M4 slices derive bounded Folder Profiles, persist correctable Project root candidates, compare two explicit current files as a bounded exact-duplicate suggestion, and recognize a conservative filename-version relation. Root, exact-duplicate pair, and version decisions are append-only; every duplicate or version decision repeats its complete live verification. Version inference accepts only matching normalized base/extension names with explicit `-vN`, `_vN`, ` vN`, or `.vN` suffixes and orders the numeric versions. Version feedback is bound to that exact directional evidence, so changed direction or version numbers return to `suggested`. No relation creates file membership or a filesystem action. The M5 slice only journals a same-folder file rename preview, and the M6 slice only reconciles explicit watch hints—neither exposes an automatic file action.
 
-Image metadata, OCR, vector/hybrid retrieval, Project file-membership, related/similarity and general version discovery, background duplicate discovery, cross-pair learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not implemented or shipped**. The Office providers are locally verified development slices, not public-release support; scanned/image-only PDFs still require the future OCR provider. Representative document corpora, peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are open, so this is not a public v0.1 release.
+Screenshot OCR, vector/hybrid retrieval, Project file-membership, related/similarity and general version discovery, background duplicate discovery, cross-pair learning, automatic native Watch Mode, executable organization, recovery/undo, and MCP are **not implemented or shipped**. The Office and image-metadata providers are locally verified development slices, not public-release support; image contents and scanned/image-only PDFs still require the future OCR provider. Representative document/image corpora, peak-memory evidence, complete cross-platform runtime evidence, the latest UI smoke, and the installer/release pipeline are open, so this is not a public v0.1 release.
 
 ## Safety contract
 
@@ -74,7 +74,7 @@ cargo run -p deskgraph-cli -- scan run --database ./deskgraph-dev.sqlite3 --job 
 
 Scan observations stay in job-scoped staging while work is running or paused. The visible manifest is replaced only after the complete job publishes in one SQLite transaction.
 
-Run the current bounded text/PDF/Office extraction slice for one file already discovered by the scan:
+Run the current bounded text/PDF/Office/image-metadata extraction slice for one file already discovered by the scan:
 
 ```bash
 cargo run -p deskgraph-cli -- extract start \
@@ -84,7 +84,15 @@ cargo run -p deskgraph-cli -- extract start \
 cargo run -p deskgraph-cli -- extract stats --database ./deskgraph-dev.sqlite3
 ```
 
-Use the same command with a `.pdf`, `.docx`, `.pptx`, or `.xlsx` path. PDFs must contain a text layer; Office formulas, macros, relationships, external links, and embedded objects are never executed or traversed. `extract start` opens only the manifest-backed file selected by the explicit path. Its JSON response and structured logs contain job IDs, fixed status/error codes, byte counts, chunks, and timing—not the path, filename, or extracted text. Automation may use `--node` instead of `--path`. Durable controls are available through `extract create/run/status/list/cancel/resume`.
+Use the same command with a `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.tif`, or `.tiff` path. PDFs must contain a text layer; Office formulas, macros, relationships, external links, and embedded objects are never executed or traversed. Image inputs are signature-checked and only bounded encoded dimensions are stored; pixels, EXIF, GPS, filenames, and paths are not copied into image metadata. After an image job completes, read that structured result with its returned job ID:
+
+```bash
+cargo run -p deskgraph-cli -- extract image-metadata \
+  --database ./deskgraph-dev.sqlite3 \
+  --job 1
+```
+
+`extract start` opens only the manifest-backed file selected by the explicit path. Its ordinary job JSON and structured logs contain job IDs, fixed status/error codes, byte counts, chunks, and timing—not the path, filename, or extracted text. Automation may use `--node` instead of `--path`. Durable controls are available through `extract create/run/status/list/cancel/resume`.
 
 Search current metadata and active extracted text without a model:
 
