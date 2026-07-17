@@ -15,7 +15,8 @@ use deskgraph_identity::{
 
 use crate::{
     CancellationSignal, ChunkProvenance, ExtractionError, ExtractionLimits, ExtractionRequest,
-    ExtractorProvider, MediaKind, PdfTextExtractor, Utf8TextExtractor, media_kind_for_extension,
+    ExtractorProvider, MediaKind, OoxmlTextExtractor, PdfTextExtractor, Utf8TextExtractor,
+    media_kind_for_extension,
 };
 
 // The provider's absolute processing cap is 60 seconds. Keep enough lease headroom for
@@ -211,6 +212,29 @@ pub fn run_extraction_job_at(
                             page_number,
                             fragment_index,
                         },
+                        ChunkProvenance::DocxParagraph {
+                            paragraph_number,
+                            fragment_index,
+                        } => ContentChunkProvenanceWrite::DocxParagraph {
+                            paragraph_number,
+                            fragment_index,
+                        },
+                        ChunkProvenance::PptxSlide {
+                            slide_number,
+                            fragment_index,
+                        } => ContentChunkProvenanceWrite::PptxSlide {
+                            slide_number,
+                            fragment_index,
+                        },
+                        ChunkProvenance::XlsxCell {
+                            sheet_number,
+                            cell_reference,
+                            fragment_index,
+                        } => ContentChunkProvenanceWrite::XlsxCell {
+                            sheet_number,
+                            cell_reference,
+                            fragment_index,
+                        },
                     },
                     trust_class: chunk.trust_class,
                 })
@@ -303,9 +327,11 @@ fn extract_claimed_job(
     };
     let text_provider = Utf8TextExtractor;
     let pdf_provider = PdfTextExtractor;
+    let ooxml_provider = OoxmlTextExtractor;
     let provider: &dyn ExtractorProvider = match media_kind {
         MediaKind::PlainText | MediaKind::Markdown | MediaKind::SourceCode => &text_provider,
         MediaKind::Pdf => &pdf_provider,
+        MediaKind::Docx | MediaKind::Pptx | MediaKind::Xlsx => &ooxml_provider,
     };
     let provider_id = provider.provider_id();
     let provider_version = provider.provider_version();
@@ -462,11 +488,15 @@ impl CancellationSignal for DatabaseCancellation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deskgraph_database::{LexicalCandidateSource, LexicalSearchFilters, LexicalSearchSource};
     use deskgraph_domain::ExtractionStatus;
     use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
     use lopdf::content::{Content, Operation};
     use lopdf::{Document, Object, Stream, dictionary};
+    use std::io::{Cursor, Write};
     use std::path::PathBuf;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     struct Fixture {
         _directory: tempfile::TempDir,
@@ -551,6 +581,24 @@ mod tests {
         bytes
     }
 
+    fn ooxml_bytes(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, contents) in parts {
+            writer
+                .start_file(*name, options)
+                .expect("OOXML fixture part should start");
+            writer
+                .write_all(contents)
+                .expect("OOXML fixture part should write");
+        }
+        writer
+            .finish()
+            .expect("OOXML fixture should finish")
+            .into_inner()
+    }
+
     #[test]
     fn markdown_file_runs_from_manifest_identity_to_atomic_chunks() {
         let fixture = fixture("notes.md", "# DeskGraph\n本機 context\n".as_bytes());
@@ -596,6 +644,64 @@ mod tests {
         let stats = extraction_stats_at(&fixture.database_path).expect("stats should load");
         assert_eq!(stats.extracted_file_count, 1);
         assert_eq!(stats.active_chunk_count, completed.chunk_count);
+    }
+
+    #[test]
+    fn office_files_route_from_manifest_to_atomic_fts_content() {
+        let docx = ooxml_bytes(&[(
+            "word/document.xml",
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:t>DeskGraph document context</w:t></w:p></w:body></w:document>"#.as_bytes(),
+        )]);
+        let pptx = ooxml_bytes(&[(
+            "ppt/slides/slide1.xml",
+            r#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:p><a:t>DeskGraph slide context</a:t></a:p></p:sld>"#.as_bytes(),
+        )]);
+        let xlsx = ooxml_bytes(&[(
+            "xl/worksheets/sheet1.xml",
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1" t="inlineStr"><is><t>DeskGraph sheet context</t></is></c></row></sheetData></worksheet>"#.as_bytes(),
+        )]);
+
+        for (file_name, contents) in [
+            ("context.docx", docx),
+            ("context.pptx", pptx),
+            ("context.xlsx", xlsx),
+        ] {
+            let fixture = fixture(file_name, &contents);
+            let job =
+                create_extraction_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                    .expect("Office job should create");
+            let completed = run_extraction_job_at(
+                &fixture.database_path,
+                job.job_id,
+                ExtractionLimits::default(),
+            )
+            .expect("Office job should run");
+
+            assert_eq!(completed.status, ExtractionStatus::Completed);
+            assert_eq!(
+                completed.provider_id.as_deref(),
+                Some("deskgraph.ooxml-text")
+            );
+            assert!(completed.chunk_count > 0);
+            let database =
+                ManifestDatabase::open(&fixture.database_path).expect("database should reopen");
+            let candidates = database
+                .lexical_search_candidates(
+                    "\"DeskGraph\"",
+                    LexicalSearchFilters {
+                        scope_id: Some(fixture.scope_id),
+                        source: LexicalSearchSource::ExtractedText,
+                        extension: None,
+                        modified_since_unix_ns: None,
+                        modified_before_unix_ns: None,
+                    },
+                    10,
+                )
+                .expect("Office text should be searchable");
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].source, LexicalCandidateSource::ExtractedText);
+            assert_eq!(candidates[0].node_id, fixture.node_id);
+        }
     }
 
     #[test]

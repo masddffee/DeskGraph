@@ -10,6 +10,8 @@ deskgraph-database = { path = "../database" }
 deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
 lopdf.workspace = true
+quick-xml.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 deskgraph-scanner = { path = "../scanner" }

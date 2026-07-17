@@ -3,9 +3,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+mod ooxml;
 mod pdf;
 mod service;
 
+pub use ooxml::OoxmlTextExtractor;
 pub use pdf::PdfTextExtractor;
 pub use service::{
     ExtractionServiceError, cancel_extraction_job_at, create_extraction_job_at, extraction_job_at,
@@ -28,6 +30,9 @@ pub enum MediaKind {
     Markdown,
     SourceCode,
     Pdf,
+    Docx,
+    Pptx,
+    Xlsx,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,7 +69,7 @@ pub struct ExtractionRequest {
     pub modified_unix_ns: Option<i64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChunkProvenance {
     ByteRange {
         start: u64,
@@ -72,6 +77,19 @@ pub enum ChunkProvenance {
     },
     PdfPage {
         page_number: u32,
+        fragment_index: u32,
+    },
+    DocxParagraph {
+        paragraph_number: u32,
+        fragment_index: u32,
+    },
+    PptxSlide {
+        slide_number: u32,
+        fragment_index: u32,
+    },
+    XlsxCell {
+        sheet_number: u32,
+        cell_reference: String,
         fragment_index: u32,
     },
 }
@@ -107,6 +125,15 @@ pub enum ExtractionError {
     InvalidUtf8,
     InvalidPdf,
     EncryptedPdfUnsupported,
+    InvalidOoxmlArchive,
+    UnsafeOoxmlArchive,
+    EncryptedOoxmlUnsupported,
+    UnsupportedOoxmlCompression,
+    OoxmlEntryLimitExceeded,
+    OoxmlCompressionRatioExceeded,
+    MissingOoxmlPart,
+    InvalidOoxmlXml,
+    OoxmlStructureLimitExceeded,
     DecompressionLimitExceeded,
     PageLimitExceeded,
     ChunkLimitExceeded,
@@ -128,6 +155,15 @@ impl ExtractionError {
             Self::InvalidUtf8 => "extraction_invalid_utf8",
             Self::InvalidPdf => "extraction_pdf_invalid",
             Self::EncryptedPdfUnsupported => "extraction_pdf_encrypted_unsupported",
+            Self::InvalidOoxmlArchive => "extraction_ooxml_archive_invalid",
+            Self::UnsafeOoxmlArchive => "extraction_ooxml_archive_unsafe",
+            Self::EncryptedOoxmlUnsupported => "extraction_ooxml_encrypted_unsupported",
+            Self::UnsupportedOoxmlCompression => "extraction_ooxml_compression_unsupported",
+            Self::OoxmlEntryLimitExceeded => "extraction_ooxml_entry_limit_exceeded",
+            Self::OoxmlCompressionRatioExceeded => "extraction_ooxml_compression_ratio_exceeded",
+            Self::MissingOoxmlPart => "extraction_ooxml_required_part_missing",
+            Self::InvalidOoxmlXml => "extraction_ooxml_xml_invalid",
+            Self::OoxmlStructureLimitExceeded => "extraction_ooxml_structure_limit_exceeded",
             Self::DecompressionLimitExceeded => "extraction_decompression_limit_exceeded",
             Self::PageLimitExceeded => "extraction_page_limit_exceeded",
             Self::ChunkLimitExceeded => "extraction_chunk_limit_exceeded",
@@ -274,6 +310,9 @@ pub fn media_kind_for_extension(extension: &str) -> Option<MediaKind> {
         | "bash" | "zsh" | "fish" | "sql" | "html" | "htm" | "css" | "scss" | "sass" | "less"
         | "json" | "jsonl" | "toml" | "yaml" | "yml" | "xml" => Some(MediaKind::SourceCode),
         "pdf" => Some(MediaKind::Pdf),
+        "docx" => Some(MediaKind::Docx),
+        "pptx" => Some(MediaKind::Pptx),
+        "xlsx" => Some(MediaKind::Xlsx),
         _ => None,
     }
 }
@@ -539,7 +578,12 @@ mod tests {
                 .iter()
                 .map(|chunk| match chunk.provenance {
                     ChunkProvenance::ByteRange { start, .. } => start,
-                    ChunkProvenance::PdfPage { .. } => panic!("expected byte provenance"),
+                    ChunkProvenance::PdfPage { .. }
+                    | ChunkProvenance::DocxParagraph { .. }
+                    | ChunkProvenance::PptxSlide { .. }
+                    | ChunkProvenance::XlsxCell { .. } => {
+                        panic!("expected byte provenance")
+                    }
                 })
                 .collect::<Vec<_>>(),
             vec![0, 6, 12]

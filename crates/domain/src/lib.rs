@@ -10,7 +10,9 @@ pub use action::{
     ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyCheck, ActionPolicyDecision, ActionPolicyReport,
 };
-pub use extraction::{ExtractionJobProgress, ExtractionStats, ExtractionStatus};
+pub use extraction::{
+    ExtractionJobProgress, ExtractionStats, ExtractionStatus, is_valid_xlsx_cell_reference,
+};
 pub use health::{
     ComponentHealth, HealthReport, LifecycleState, PlatformHealth, PrivacyHealth, ProviderHealth,
     collect_health, collect_health_with_manifest,

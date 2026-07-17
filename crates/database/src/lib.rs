@@ -15,7 +15,8 @@ use deskgraph_domain::{
     ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
     ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
     ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
-    WatchEventReason, WatchEventStatus, parse_explicit_file_version_name,
+    WatchEventReason, WatchEventStatus, is_valid_xlsx_cell_reference,
+    parse_explicit_file_version_name,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -79,6 +80,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "file_version_feedback",
         sql: include_str!("../../../migrations/0012_file_version_feedback.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "ooxml_chunk_provenance",
+        sql: include_str!("../../../migrations/0013_ooxml_chunk_provenance.sql"),
     },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -283,7 +289,7 @@ pub struct FolderProfileFacts {
     pub bounded_entry_limit: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContentChunkProvenanceWrite {
     ByteRange {
         start: u64,
@@ -291,6 +297,19 @@ pub enum ContentChunkProvenanceWrite {
     },
     PdfPage {
         page_number: u32,
+        fragment_index: u32,
+    },
+    DocxParagraph {
+        paragraph_number: u32,
+        fragment_index: u32,
+    },
+    PptxSlide {
+        slide_number: u32,
+        fragment_index: u32,
+    },
+    XlsxCell {
+        sheet_number: u32,
+        cell_reference: String,
         fragment_index: u32,
     },
 }
@@ -1668,11 +1687,20 @@ impl ManifestDatabase {
             return Err(DatabaseError::ExtractionOutputInvalid);
         }
         for (index, chunk) in chunks.iter().enumerate() {
-            let invalid_provenance = match chunk.provenance {
+            let invalid_provenance = match &chunk.provenance {
                 ContentChunkProvenanceWrite::ByteRange { start, end } => {
-                    start > end || end > source_size_bytes
+                    start > end || *end > source_size_bytes
                 }
-                ContentChunkProvenanceWrite::PdfPage { page_number, .. } => page_number == 0,
+                ContentChunkProvenanceWrite::PdfPage { page_number, .. } => *page_number == 0,
+                ContentChunkProvenanceWrite::DocxParagraph {
+                    paragraph_number, ..
+                } => *paragraph_number == 0,
+                ContentChunkProvenanceWrite::PptxSlide { slide_number, .. } => *slide_number == 0,
+                ContentChunkProvenanceWrite::XlsxCell {
+                    sheet_number,
+                    cell_reference,
+                    ..
+                } => *sheet_number == 0 || !is_valid_xlsx_cell_reference(cell_reference),
             };
             if usize::try_from(chunk.ordinal).map_err(|_| DatabaseError::ExtractionOutputInvalid)?
                 != index
@@ -1693,12 +1721,16 @@ impl ManifestDatabase {
                 source_byte_start,
                 source_byte_end,
                 source_page_number,
+                source_unit_number,
+                source_cell_reference,
                 source_fragment_index,
-            ) = match chunk.provenance {
+            ) = match &chunk.provenance {
                 ContentChunkProvenanceWrite::ByteRange { start, end } => (
                     "byte_range",
-                    Some(to_i64(start)?),
-                    Some(to_i64(end)?),
+                    Some(to_i64(*start)?),
+                    Some(to_i64(*end)?),
+                    None,
+                    None,
                     None,
                     None,
                 ),
@@ -1709,17 +1741,57 @@ impl ManifestDatabase {
                     "pdf_page",
                     None,
                     None,
-                    Some(i64::from(page_number)),
-                    Some(i64::from(fragment_index)),
+                    Some(i64::from(*page_number)),
+                    None,
+                    None,
+                    Some(i64::from(*fragment_index)),
+                ),
+                ContentChunkProvenanceWrite::DocxParagraph {
+                    paragraph_number,
+                    fragment_index,
+                } => (
+                    "docx_paragraph",
+                    None,
+                    None,
+                    None,
+                    Some(i64::from(*paragraph_number)),
+                    None,
+                    Some(i64::from(*fragment_index)),
+                ),
+                ContentChunkProvenanceWrite::PptxSlide {
+                    slide_number,
+                    fragment_index,
+                } => (
+                    "pptx_slide",
+                    None,
+                    None,
+                    None,
+                    Some(i64::from(*slide_number)),
+                    None,
+                    Some(i64::from(*fragment_index)),
+                ),
+                ContentChunkProvenanceWrite::XlsxCell {
+                    sheet_number,
+                    cell_reference,
+                    fragment_index,
+                } => (
+                    "xlsx_cell",
+                    None,
+                    None,
+                    None,
+                    Some(i64::from(*sheet_number)),
+                    Some(cell_reference.as_str()),
+                    Some(i64::from(*fragment_index)),
                 ),
             };
             transaction.execute(
                 "INSERT INTO content_chunks( \
                     scope_id, node_id, location_id, extraction_job_id, ordinal, text, \
                     provenance_kind, source_byte_start, source_byte_end, source_page_number, \
-                    source_fragment_index, source_size_bytes, source_modified_unix_ns, trust_class, \
-                    provider_id, provider_version, active, created_at_unix_ms \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1, ?17)",
+                    source_unit_number, source_cell_reference, source_fragment_index, \
+                    source_size_bytes, source_modified_unix_ns, trust_class, provider_id, \
+                    provider_version, active, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 1, ?19)",
                 params![
                     scope_id,
                     node_id,
@@ -1731,6 +1803,8 @@ impl ManifestDatabase {
                     source_byte_start,
                     source_byte_end,
                     source_page_number,
+                    source_unit_number,
+                    source_cell_reference,
                     source_fragment_index,
                     to_i64(source_size_bytes)?,
                     source_modified_unix_ns,
@@ -5756,18 +5830,38 @@ mod tests {
 
         let database = ManifestDatabase::from_connection(connection)
             .expect("new provenance migration should apply");
-        let stored: (String, Option<i64>, Option<i64>, Option<i64>, Option<i64>) = database
+        let stored = database
             .connection
             .query_row(
-                "SELECT provenance_kind, source_byte_start, source_byte_end, source_page_number, source_fragment_index FROM content_chunks WHERE id = 1",
+                "SELECT provenance_kind, source_byte_start, source_byte_end, source_page_number, \
+                    source_fragment_index, source_unit_number, source_cell_reference \
+                 FROM content_chunks WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
             )
             .expect("migrated provenance should load");
 
         assert_eq!(
             stored,
-            ("byte_range".to_string(), Some(1), Some(3), None, None)
+            (
+                "byte_range".to_string(),
+                Some(1),
+                Some(3),
+                None,
+                None,
+                None,
+                None,
+            )
         );
         let candidates = database
             .lexical_search_candidates("\"legacy\"", lexical_filters(None), 10)
@@ -6392,6 +6486,130 @@ mod tests {
         assert_eq!(
             stored,
             ("pdf_page".to_string(), None, None, Some(2), Some(0))
+        );
+    }
+
+    #[test]
+    fn complete_extraction_stores_and_validates_office_provenance() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "office-runner", 60_000)
+            .expect("job should claim");
+        let chunks = [
+            ContentChunkWrite {
+                ordinal: 0,
+                text: "docx".to_string(),
+                provenance: ContentChunkProvenanceWrite::DocxParagraph {
+                    paragraph_number: 2,
+                    fragment_index: 0,
+                },
+                trust_class: "untrusted_extracted_text",
+            },
+            ContentChunkWrite {
+                ordinal: 1,
+                text: "pptx".to_string(),
+                provenance: ContentChunkProvenanceWrite::PptxSlide {
+                    slide_number: 3,
+                    fragment_index: 1,
+                },
+                trust_class: "untrusted_extracted_text",
+            },
+            ContentChunkWrite {
+                ordinal: 2,
+                text: "cell".to_string(),
+                provenance: ContentChunkProvenanceWrite::XlsxCell {
+                    sheet_number: 4,
+                    cell_reference: "XFD1048576".to_string(),
+                    fragment_index: 2,
+                },
+                trust_class: "untrusted_extracted_text",
+            },
+        ];
+        database
+            .complete_extraction_job(
+                job.job_id,
+                "office-runner",
+                "deskgraph.ooxml-text",
+                "1",
+                4,
+                Some(1),
+                12,
+                1,
+                &chunks,
+            )
+            .expect("Office provenance should publish");
+        let mut statement = database
+            .connection
+            .prepare(
+                "SELECT provenance_kind, source_unit_number, source_cell_reference, source_fragment_index \
+                 FROM content_chunks WHERE active = 1 ORDER BY ordinal",
+            )
+            .expect("provenance query should prepare");
+        let stored = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .expect("provenance should query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("provenance rows should load");
+        assert_eq!(
+            stored,
+            vec![
+                ("docx_paragraph".to_string(), Some(2), None, Some(0)),
+                ("pptx_slide".to_string(), Some(3), None, Some(1)),
+                (
+                    "xlsx_cell".to_string(),
+                    Some(4),
+                    Some("XFD1048576".to_string()),
+                    Some(2),
+                ),
+            ]
+        );
+        drop(statement);
+
+        let invalid = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("invalid job should create");
+        database
+            .claim_extraction_job(invalid.job_id, "invalid-office-runner", 60_000)
+            .expect("invalid job should claim");
+        let error = database
+            .complete_extraction_job(
+                invalid.job_id,
+                "invalid-office-runner",
+                "deskgraph.ooxml-text",
+                "1",
+                4,
+                Some(1),
+                1,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "x".to_string(),
+                    provenance: ContentChunkProvenanceWrite::XlsxCell {
+                        sheet_number: 1,
+                        cell_reference: "XFE1".to_string(),
+                        fragment_index: 0,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect_err("out-of-range cell reference must not publish");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should remain available")
+                .active_chunk_count,
+            3
         );
     }
 
