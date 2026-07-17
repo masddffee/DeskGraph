@@ -1,6 +1,6 @@
 # DeskGraph v0.1 Task Graph
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
 
 ## Dependency graph
 
@@ -90,8 +90,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 5 — M4 context graph
 
-- Current: ADR-018 through ADR-021 provide bounded Folder Profiles, stable correctable Project roots, full-byte exact-duplicate suggestions, and reverified exact-pair feedback. ADR-022 adds only explicit numeric filename-version suggestions after double current scope/identity/metadata validation; it persists directional immutable evidence, keeps history path-free, preserves existing relation IDs/feedback during migration, and does not read content or create a file action.
-- Next: design evidence-bound directional version feedback, then add deterministic related candidates with provenance/current-data invalidation and evaluation. Background duplicate discovery and larger-file hashing need a separate bounded design. Resolve D-013 before cross-root learned scoring or merge/split; add file-membership correction, retrieval filters, and a backend-owned Project page only after those source-of-truth contracts pass.
+- Current: ADR-018 through ADR-023 provide bounded Folder Profiles, stable correctable Project roots, full-byte exact-duplicate suggestions with reverified exact-pair feedback, and explicit numeric filename-version suggestions with evidence-bound directional correction. Version decisions revalidate current files, preserve append-only provenance, and return changed directional evidence to `suggested`; none reads content for ordering or creates a file action.
+- Next: add deterministic related candidates with provenance/current-data invalidation and evaluation. Background duplicate discovery and larger-file hashing need a separate bounded design. Resolve D-013 before cross-root learned scoring or merge/split; add file-membership correction, retrieval filters, and a backend-owned Project page only after those source-of-truth contracts pass.
 - Exit with explainable low-confidence behavior and correction feedback evidence.
 
 ### Step 6 — M5 transaction safety

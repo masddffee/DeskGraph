@@ -1,6 +1,6 @@
 # Decisions Needed
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-17
 
 ## Blocking now
 
@@ -82,5 +82,6 @@ D-013 must be resolved before M4 introduces cross-root learned scoring or merge/
 - A rejected root remains rejected on later proposals with the same stable identity, and an accepted root remains accepted. This is exact-root feedback only and creates no file membership edge.
 - ADR-020 adds only explicit same-scope exact-duplicate suggestions for non-empty files up to 64 MiB. Full byte equality, fixed provenance, immutable observations and current source revalidation are required; it adds no merge, deletion, hashing dependency, or file action.
 - ADR-021 adds exact-pair feedback only: every explicit accept/reject repeats ADR-020 live verification, events are append-only, retries are idempotent, opposite decisions append corrections, and path-free history never claims current verification. It does not authorize file operations or influence other pairs.
-- ADR-022 adds only explicit numeric filename-version suggestions. Same normalized base/extension plus allowlisted `vN` suffixes determine direction; timestamps, sizes, contents, `final`, and models do not. Version feedback stays disabled until an evidence-bound directional correction contract is accepted.
+- ADR-022 adds only explicit numeric filename-version suggestions. Same normalized base/extension plus allowlisted `vN` suffixes determine direction; timestamps, sizes, contents, `final`, and models do not.
+- ADR-023 binds append-only version feedback to equivalent ordered-node/base/extension/version/provider evidence. Every decision repeats live verification; changed direction returns to `suggested`, and acceptance never authorizes a file action.
 - D-013 remains open for cross-root learning and merge/split behavior; the default is no inferred influence beyond the root the user explicitly corrected.

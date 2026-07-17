@@ -1,6 +1,6 @@
 # External Actions Required
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-17
 
 No external step should block safe local implementation. Do not add real credentials to the repository.
 
@@ -64,23 +64,7 @@ pnpm --filter @deskgraph/desktop tauri build --no-bundle
 
 Windows evidence must include junction/reparse and hidden/system scanner fixtures, open-handle extraction identity, cancellation/interrupted recovery, text/Markdown/code extraction, bounded text-layer PDF extraction with page provenance and adversarial fixtures, Folder Profile separator/marker/limit behavior, Project candidate migration/current-evidence validation, append-only root accept/reject idempotency/correction, rejected-root suppression, and exact-duplicate canonical/junction/hard-link/identity/size/content/stale/limit/append-only behavior. Relation feedback must prove live revalidation before decide, idempotent retry, opposite-decision correction, state retention after a later observation, immutable events, unchanged files, path-free list output, and redacted structured logs. Finish with a privacy-safe Desktop/CLI smoke. A successful Rust-only cross-check on macOS is not a substitute.
 
-Filename-version Windows evidence must additionally cover separator/case normalization, Traditional Chinese names, extension mismatch, unsupported/leading-zero/same-number suffixes, reparse/hard-link identity denial, stale manifest/open-handle invalidation, migration preservation of existing duplicate feedback, immutable observations, unchanged files, and path-free history/log output. Version feedback must remain unavailable until its directional evidence-bound contract is accepted.
-
-## Local workstation capacity required before the next code slice
-
-The data volume had about 397 MiB free after the verified filename-version build, while repository-local `target` used about 12 GB (`target/debug` about 11 GB). A redundant full-test rerun after two temporary nonessential edits failed with `No space left on device`; those edits were reverted to the exact source state whose 126-test suite and Tauri release build had already passed. Automated approval for deleting build cache was unavailable, so no cleanup was performed.
-
-Before changing code again, the owner must free at least 15 GB or explicitly authorize removal of the reproducible repository-local `target/debug` directory. Then validate the cleanly rebuilt state with:
-
-```text
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --offline -- -D warnings
-cargo test --workspace --all-features --offline --quiet
-pnpm check
-PATH=/Users/wetom/.cargo/bin:$PATH pnpm --filter @deskgraph/desktop tauri build --no-bundle
-```
-
-Do not delete source, SQLite fixtures, lockfiles, or `target/release/deskgraph-desktop` as part of this capacity action.
+Filename-version Windows evidence must additionally cover separator/case normalization, Traditional Chinese names, extension mismatch, unsupported/leading-zero/same-number suffixes, reparse/hard-link identity denial, stale manifest/open-handle invalidation, migration preservation of existing duplicate feedback, immutable observations and evidence-bound decisions, idempotent retry/opposite correction, changed-direction suggestion reset, unchanged files, and path-free history/log output.
 
 ## Public release and launch accounts (needed in M10)
 
