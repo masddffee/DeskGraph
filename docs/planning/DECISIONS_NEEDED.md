@@ -4,7 +4,7 @@ Last reviewed: 2026-07-17
 
 ## Blocking now
 
-D-008 must be resolved before Screenshot OCR implementation selects a native or packaged runtime. D-013 must be resolved before M4 introduces cross-root learned scoring or merge/split semantics; neither blocks safe work in other milestones. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
+D-008 is resolved by ADR-024; the architecture is native-first with a separately gated packaged in-process fallback. D-013 must be resolved before M4 introduces cross-root learned scoring or merge/split semantics. GitHub remote ownership blocks only remote CI/Issue/Release evidence.
 
 ## Open decisions
 
@@ -17,7 +17,6 @@ D-008 must be resolved before Screenshot OCR implementation selects a native or 
 | D-005 | Linux experimental artifact                                 | M9                                    | AppImage first, `.deb` optional; cannot delay macOS/Windows                                  | AppImage candidate, explicitly experimental                                |
 | D-006 | Default scope presets and platform Screenshots discovery    | M1/M8                                 | Desktop/Downloads/Documents plus platform-aware screenshots; every path still user-confirmed | Show presets but grant nothing until explicit selection                    |
 | D-007 | Vector adapter after SQLite manifest                        | M3                                    | SQLite binding is decided in ADR-010; evaluate vector API, license, multilingual behavior, and migrations | No vector dependency selected; deterministic lexical fallback required     |
-| D-008 | OCR provider stack                                          | M2                                    | Native providers plus packaged cross-platform fallback; zh-TW + English                      | No Python/user-installed runtime; no provider selected                     |
 | D-009 | Embedding model/runtime                                     | M3/M9                                 | Multilingual, int8, license, checksum, memory, model-removal support                         | Deterministic lexical retrieval remains required                           |
 | D-010 | Product trademark/name clearance and reverse-DNS identifier | Before signed release                 | DeskGraph availability and legal review                                                      | Development identifier only; no trademark claim                            |
 | D-013 | Cross-root Project learning and merge/split semantics        | Later M4 scoring and correction slice | Whether/how accepted or rejected roots influence different candidates; merge/split identity and reversal events; explainable bounds and evaluation corpus | Feedback affects only the exact stable root; no cross-root score adjustment, merge, split, or automatic membership |
@@ -43,7 +42,7 @@ D-008 must be resolved before Screenshot OCR implementation selects a native or 
 - Plain text, Markdown, and source code use a dependency-free built-in UTF-8 provider. Invalid encoding is isolated per file rather than silently guessed.
 - Extraction jobs and content chunks are durable SQLite state. Failure or cancellation preserves the prior complete extraction; a changed source invalidates stale active chunks.
 - Ordinary CLI/Desktop extraction status contains stable IDs, fixed codes, counts, and timings only. Paths and extracted text are excluded.
-- D-008 remains open: the generic extractor contract does not preselect or claim an OCR stack.
+- D-008 is resolved by ADR-024: macOS uses Apple Vision first, Windows uses `Windows.Media.Ocr` first, and missing native language capability falls back to a separately audited packaged in-process Tesseract provider. Only the target-specific macOS `objc2-vision 0.3.2` binding has passed its dependency-selection spike; Windows binding and Tesseract/Leptonica/trained-data dependencies remain unaccepted until their own gates pass. PaddleOCR/ONNX Runtime is deferred and `ocrs` is excluded from v0.1 because it does not meet the Traditional Chinese requirement.
 - PDF text uses exact `lopdf 0.44.0` with default features disabled, strict bounded in-memory APIs, sequential page processing, no password handling, and no active-content traversal (ADR-013).
 - Content-chunk provenance is tagged: source text uses byte ranges; PDF uses page/fragment indexes; DOCX uses paragraph/fragment, PPTX slide/fragment, and XLSX bounded sheet/cell/fragment. Structural formats never receive fabricated byte offsets.
 - D-011 is resolved by accepted ADR-014: exact no-default `zip 8.6.0` with only `deflate-flate2-zlib-rs` and no-default `quick-xml 0.41.0` pass isolated closure, license, RustSec, API, macOS arm64, and Windows x64 compile gates. The implemented provider's adversarial, migration, Manifest→SQLite→FTS, full-lock audit, and local release-build gates pass; representative corpora, remote runtimes, live UI, and 8 GB evidence remain release gates, not open dependency choices.

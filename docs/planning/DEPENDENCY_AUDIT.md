@@ -1,6 +1,6 @@
 # Dependency Audit
 
-Last reviewed: 2026-07-16
+Last reviewed: 2026-07-17
 
 ## Policy
 
@@ -70,11 +70,24 @@ The adapter receives only a core-controlled in-memory probe cursor. DeskGraph in
 
 The isolated lock contains only the fixture root and `imagesize`; `cargo tree` confirms the six selected features and no transitive package. The published source scan found no `unsafe`, network, or process execution in the selected parsing path. `cargo audit --no-fetch` against 1,160 cached advisories reports zero findings for the isolated graph. The exact dependency adds one package to DeskGraph's lock and no new full-lock advisory. HEIF/AVIF remains deliberately excluded because its nested box traversal and format-specific size arithmetic have not passed DeskGraph's separate resource/safety contract; support is not implied by upstream capability.
 
-### M2 dependencies still requiring selection and audit
+### Screenshot OCR architecture and selected macOS binding
+
+ADR-024 selects a native-first architecture, not a blanket approval for every OCR runtime. Apple Vision is the macOS provider, `Windows.Media.Ocr` is the Windows provider after a separate binding/runtime gate, and a packaged in-process Tesseract adapter is the fallback after its native-binary/model gate. PaddleOCR/ONNX Runtime is deferred; `ocrs` is rejected for v0.1 because its official model support does not cover Traditional Chinese.
+
+| Dependency | Scope | Selected version/features | Official source / API evidence | Maintenance and platform evidence | License | Security and decision |
+| --- | --- | --- | --- | --- | --- | --- |
+| `objc2-vision` | macOS OCR runtime binding only | `0.3.2`, exact, `default-features = false`; `VNObservation`, `VNRecognizeTextRequest`, `VNRequest`, `VNRequestHandler`, `VNTypes`, `block2`, `objc2-core-foundation`, `std` | Apple [`VNRecognizeTextRequest`](https://developer.apple.com/documentation/vision/vnrecognizetextrequest)/[`VNImageRequestHandler`](https://developer.apple.com/documentation/vision/vnimagerequesthandler); published crate source and [`docs.rs/objc2-vision`](https://docs.rs/objc2-vision/0.3.2/objc2_vision/); verified bytes-only `initWithData:options:`, language capability, accurate recognition, top candidates, confidence, normalized bounding boxes and synchronous perform APIs; progress-handler-to-`cancel` binding compiles but runtime cancellation remains an implementation gate | [`madsmtm/objc2`](https://github.com/madsmtm/objc2) is the upstream repository; published metadata supports macOS arm64/x64 and Rust 1.71+. Rust 1.97 isolated compile and local macOS arm64 language/recognition probes pass; Intel and clean remote runtime remain | Zlib OR Apache-2.0 OR MIT | Accepted only as a target-specific thin binding. No model, network, subprocess, path/URL input, dynamic discovery, or user-installed runtime. Runtime buffers and output remain DeskGraph-bounded; OS model cache unload cannot be claimed. |
+
+The exact published crate archive is 69,317 bytes with SHA-256 `bfc194758a2d5d7540b1ad283bfb9ca318ec608991892326e95b428230b2689b`. The complete isolated lock has nine packages: the fixture plus `objc2-vision 0.3.2`, `block2 0.6.2`, `dispatch2 0.3.1`, `objc2 0.6.4`, `objc2-core-foundation 0.3.2`, `objc2-encode 4.1.0`, `objc2-foundation 0.3.2`, and `bitflags 2.13.1`. All except `objc2-vision` already exist in DeskGraph's current lock, so adoption adds one package. `cargo audit --no-fetch` scanned the nine-package lock against 1,160 cached advisories and returned no finding.
+
+The local runtime reported both `en-US` and `zh-Hant`. A controlled mixed-language PNG recognized `DeskGraph OCR` and `桌面圖譜 安全整理` with valid normalized bounding boxes when `zh-Hant` was ordered before `en-US`. The restricted runner returned an opaque nil platform error for the recognition call while its language probe still succeeded; the same bytes-only Swift and Rust calls passed outside that sandbox. This is local arm64 dependency/API evidence only, not macOS Intel, clean-machine, memory, corpus, cancellation, release, or M2 completion evidence.
+
+### M2 OCR dependencies still requiring selection and audit
 
 | Capability | Current status | Required evidence before adoption |
 | --- | --- | --- |
-| Screenshot OCR | Unselected; D-008 open | Native API availability plus packaged cross-platform fallback, zh-TW/English quality, model/runtime license, checksums, memory/unload behavior, offline packaging without user-installed Python |
+| Windows native OCR binding | Architecture selected; dependency unaccepted | Exact `windows` feature graph, `OcrEngine`/`SoftwareBitmap` API, Language OCR Feature on Demand present/missing behavior, cancellation, Windows x64 runtime, license and lock audit |
+| Packaged Tesseract fallback | Architecture selected; dependency/runtime/model unaccepted | Exact Tesseract/Leptonica/binding/data versions, `eng` + `chi_tra` bytes-only initialization, hashes, no CLI/dynamic discovery, cancellation/deadline, arm64/x64/Windows/Linux packaging, notices/SBOM, RSS/unload evidence |
 
 ### Office OOXML dependencies selected
 
