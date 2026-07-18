@@ -897,6 +897,7 @@ dependencies = [
  "deskgraph-domain",
  "deskgraph-identity",
  "deskgraph-scanner",
+ "libc",
  "notify",
  "tempfile",
 ]

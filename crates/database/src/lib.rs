@@ -106,6 +106,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "watch_active_deadline_index",
         sql: include_str!("../../../migrations/0017_watch_active_deadline_index.sql"),
     },
+    Migration {
+        version: 18,
+        name: "watch_reconciliation_kind",
+        sql: include_str!("../../../migrations/0018_watch_reconciliation_kind.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -200,6 +205,34 @@ pub enum WatchSnapshotKind {
     Folder,
 }
 
+/// Controls whether a durable watch event may use the narrow file-metadata
+/// publish path or must remain on the existing full-scope reconciliation path.
+///
+/// This is deliberately database-internal state. Ordinary status payloads do
+/// not expose paths or reconciliation strategy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchReconciliationKind {
+    FileDelta,
+    FullScope,
+}
+
+impl WatchReconciliationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FileDelta => "file_delta",
+            Self::FullScope => "full_scope",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "file_delta" => Ok(Self::FileDelta),
+            "full_scope" => Ok(Self::FullScope),
+            _ => Err(DatabaseError::InvalidStoredValue),
+        }
+    }
+}
+
 impl WatchSnapshotKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -230,6 +263,7 @@ pub struct WatchSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchEventRecord {
     pub progress: WatchEventProgress,
+    pub reconciliation_kind: WatchReconciliationKind,
     pub path_raw: Vec<u8>,
     pub path_key: String,
     pub snapshot: WatchSnapshot,
@@ -243,7 +277,43 @@ pub struct WatchObservationWrite<'a> {
     pub snapshot: &'a WatchSnapshot,
     pub stable_after_unix_ms: i64,
     pub ignored_reason: Option<WatchEventReason>,
+    pub reconciliation_kind: WatchReconciliationKind,
     pub observed_at_unix_ms: i64,
+}
+
+/// Immutable binding to the exact current manifest row that a narrow
+/// file-delta publish may update. It is intentionally unavailable for files
+/// with multiple present locations, hard links, missing parent topology, or a
+/// non-file watch snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchFileDeltaBinding {
+    pub event_id: i64,
+    pub scope_id: i64,
+    pub path_raw: Vec<u8>,
+    pub path_key: String,
+    pub stable_after_unix_ms: i64,
+    pub snapshot: WatchSnapshot,
+    pub node_id: i64,
+    pub location_id: i64,
+    pub root_location_id: i64,
+    pub root_node_id: i64,
+    pub root_identity_key: Vec<u8>,
+    pub parent_location_id: i64,
+    pub parent_node_id: i64,
+    pub parent_path_raw: Vec<u8>,
+    pub parent_path_key: String,
+    pub parent_identity_key: Vec<u8>,
+    pub identity_kind: String,
+    pub identity_key: Vec<u8>,
+    pub old_size_bytes: u64,
+    pub old_modified_unix_ns: Option<i64>,
+}
+
+/// Candidate metadata for a bound file-delta publish. This type cannot carry
+/// a location change, a rename, a folder, or a second hard-link location.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchFileDeltaWrite {
+    pub snapshot: WatchSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -415,6 +485,8 @@ pub enum DatabaseError {
     InvalidWatchEventState,
     WatchScopeInitialScanRequired,
     WatchInputInvalid,
+    WatchFileDeltaNotEligible,
+    WatchFileDeltaSnapshotChanged,
     ActionSourceNotFound,
     ActionPlanNotFound,
     ActionPlanInputInvalid,
@@ -459,6 +531,8 @@ impl DatabaseError {
             Self::InvalidWatchEventState => "invalid_watch_event_state",
             Self::WatchScopeInitialScanRequired => "watch_scope_initial_scan_required",
             Self::WatchInputInvalid => "watch_input_invalid",
+            Self::WatchFileDeltaNotEligible => "watch_file_delta_not_eligible",
+            Self::WatchFileDeltaSnapshotChanged => "watch_file_delta_snapshot_changed",
             Self::ActionSourceNotFound => "action_source_not_found",
             Self::ActionPlanNotFound => "action_plan_not_found",
             Self::ActionPlanInputInvalid => "action_plan_input_invalid",
@@ -838,24 +912,62 @@ impl ManifestDatabase {
                     )?;
                     ignored_id
                 }
-                None => {
-                    insert_watch_event(&transaction, observation, status, Some(reason), size_bytes)?
-                }
+                None => insert_watch_event(
+                    &transaction,
+                    observation,
+                    status,
+                    Some(reason),
+                    size_bytes,
+                    WatchReconciliationKind::FullScope,
+                )?,
             }
         } else {
             let existing = transaction
                 .query_row(
-                    "SELECT id FROM watch_events WHERE scope_id = ?1 AND status = 'stabilizing'",
+                    "SELECT id, path_raw, path_key, reconciliation_kind, observed_kind, \
+                        observed_identity_key \
+                     FROM watch_events WHERE scope_id = ?1 AND status = 'stabilizing'",
                     [observation.scope_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<Vec<u8>>>(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            if let Some(event_id) = existing {
+            if let Some((
+                event_id,
+                existing_path_raw,
+                existing_path_key,
+                existing_kind,
+                existing_observed_kind,
+                existing_identity_key,
+            )) = existing
+            {
+                let existing_kind = WatchReconciliationKind::from_db(&existing_kind)?;
+                let reconciliation_kind = if existing_kind == WatchReconciliationKind::FullScope
+                    || observation.reconciliation_kind == WatchReconciliationKind::FullScope
+                    || existing_path_raw != observation.path_raw
+                    || existing_path_key != observation.path_key
+                    || existing_observed_kind != WatchSnapshotKind::File.as_str()
+                    || observation.snapshot.kind != WatchSnapshotKind::File
+                    || existing_identity_key.as_deref()
+                        != observation.snapshot.identity_key.as_deref()
+                {
+                    WatchReconciliationKind::FullScope
+                } else {
+                    WatchReconciliationKind::FileDelta
+                };
                 transaction.execute(
                     "UPDATE watch_events SET path_raw = ?2, path_key = ?3, observed_kind = ?4, \
                         observed_size_bytes = ?5, observed_modified_unix_ns = ?6, \
                         observed_identity_key = ?7, observation_count = observation_count + 1, \
-                        stable_after_unix_ms = ?8, updated_at_unix_ms = ?9 \
+                        stable_after_unix_ms = ?8, reconciliation_kind = ?9, updated_at_unix_ms = ?10 \
                      WHERE id = ?1 AND status = 'stabilizing'",
                     params![
                         event_id,
@@ -866,12 +978,20 @@ impl ManifestDatabase {
                         observation.snapshot.modified_unix_ns,
                         observation.snapshot.identity_key,
                         observation.stable_after_unix_ms,
+                        reconciliation_kind.as_str(),
                         observation.observed_at_unix_ms,
                     ],
                 )?;
                 event_id
             } else {
-                insert_watch_event(&transaction, observation, status, reason, size_bytes)?
+                insert_watch_event(
+                    &transaction,
+                    observation,
+                    status,
+                    reason,
+                    size_bytes,
+                    observation.reconciliation_kind,
+                )?
             }
         };
         transaction.commit()?;
@@ -883,7 +1003,7 @@ impl ManifestDatabase {
             .query_row(
                 "SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
                     scan_job_id, reason, path_raw, path_key, observed_kind, observed_size_bytes, \
-                    observed_modified_unix_ns, observed_identity_key \
+                    observed_modified_unix_ns, observed_identity_key, reconciliation_kind \
                  FROM watch_events WHERE id = ?1",
                 [event_id],
                 watch_event_from_row,
@@ -912,7 +1032,7 @@ impl ManifestDatabase {
         let mut statement = self.connection.prepare(
             "SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
                 scan_job_id, reason, path_raw, path_key, observed_kind, observed_size_bytes, \
-                observed_modified_unix_ns, observed_identity_key \
+                observed_modified_unix_ns, observed_identity_key, reconciliation_kind \
              FROM watch_events ORDER BY updated_at_unix_ms DESC, id DESC LIMIT 20",
         )?;
         let events = statement.query_map([], watch_event_from_row)?;
@@ -962,6 +1082,357 @@ impl ManifestDatabase {
                 |row| row.get::<_, i64>(0).map(|value| value == 1),
             )
             .map_err(Into::into)
+    }
+
+    /// Durably requests the existing full-scope metadata reconciliation path.
+    ///
+    /// The request is monotonic: an existing `full_scope` event can never be
+    /// downgraded by a later file-delta hint, and an existing stabilizing event
+    /// is made due immediately without replacing its local path snapshot.
+    pub fn request_scope_full_reconciliation_at(
+        &mut self,
+        scope_id: i64,
+        now_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event_id =
+            request_scope_full_reconciliation_in_transaction(&transaction, scope_id, now_unix_ms)?;
+        transaction.commit()?;
+        Ok(self.watch_event(event_id)?.progress)
+    }
+
+    /// Applies a durable immediate full-scope request to every currently
+    /// watchable scope. A single immediate transaction guarantees that a
+    /// process crash or source failure cannot leave only some scopes upgraded.
+    pub fn request_all_scope_full_reconciliation_at(
+        &mut self,
+        now_unix_ms: i64,
+    ) -> Result<Vec<WatchEventProgress>, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let scope_ids = watchable_scope_ids_in_transaction(&transaction)?;
+        let mut event_ids = Vec::with_capacity(scope_ids.len());
+        for scope_id in scope_ids {
+            event_ids.push(request_scope_full_reconciliation_in_transaction(
+                &transaction,
+                scope_id,
+                now_unix_ms,
+            )?);
+        }
+        transaction.commit()?;
+        event_ids
+            .into_iter()
+            .map(|event_id| self.watch_event(event_id).map(|event| event.progress))
+            .collect()
+    }
+
+    /// Returns a narrow, immutable manifest binding for a stable file-delta
+    /// event. `None` is a safe fallback signal: callers must use full-scope
+    /// reconciliation rather than widening this fast path.
+    pub fn watch_file_delta_binding_at(
+        &self,
+        event_id: i64,
+        parent_path_raw: &[u8],
+        parent_path_key: &str,
+        now_unix_ms: i64,
+    ) -> Result<Option<WatchFileDeltaBinding>, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let event = self.watch_event(event_id)?;
+        if event.progress.status != WatchEventStatus::Stabilizing
+            || event.reconciliation_kind != WatchReconciliationKind::FileDelta
+            || event.progress.scan_job_id.is_some()
+            || event.progress.stable_after_unix_ms > now_unix_ms
+            || event.snapshot.kind != WatchSnapshotKind::File
+        {
+            return Ok(None);
+        }
+        let Some(expected_identity_key) = event.snapshot.identity_key.as_deref() else {
+            return Ok(None);
+        };
+        if parent_path_raw.is_empty()
+            || parent_path_raw.len() > MAX_WATCH_PATH_BYTES
+            || parent_path_key.is_empty()
+            || parent_path_key.len() > MAX_WATCH_PATH_BYTES
+        {
+            return Ok(None);
+        }
+        let binding = self
+            .connection
+            .query_row(
+                "SELECT locations.id, locations.node_id, nodes.identity_kind, nodes.identity_key, \
+                    files.size_bytes, files.modified_unix_ns, files.link_count, \
+                    root_locations.id, root_locations.node_id, root_nodes.identity_key, \
+                    parent_locations.id, parent_locations.node_id, parent_locations.path_raw, \
+                    parent_locations.path_key, parent_nodes.identity_key \
+                 FROM locations \
+                 JOIN authorized_scopes ON authorized_scopes.id = locations.scope_id \
+                 JOIN nodes ON nodes.id = locations.node_id AND nodes.kind = 'file' \
+                    AND nodes.identity_kind = 'unix_device_inode' \
+                 JOIN files ON files.node_id = nodes.id \
+                 JOIN locations root_locations ON root_locations.scope_id = locations.scope_id \
+                    AND root_locations.path_raw = authorized_scopes.path_raw \
+                    AND root_locations.path_key = authorized_scopes.path_key \
+                    AND root_locations.present = 1 \
+                 JOIN nodes root_nodes ON root_nodes.id = root_locations.node_id \
+                    AND root_nodes.kind = 'folder' AND root_nodes.identity_kind = 'unix_device_inode' \
+                 JOIN locations parent_locations ON parent_locations.scope_id = locations.scope_id \
+                    AND parent_locations.path_raw = ?1 AND parent_locations.path_key = ?2 \
+                    AND parent_locations.present = 1 \
+                 JOIN nodes parent_nodes ON parent_nodes.id = parent_locations.node_id \
+                    AND parent_nodes.kind = 'folder' \
+                    AND parent_nodes.identity_kind = 'unix_device_inode' \
+                 JOIN edges ON edges.scope_id = locations.scope_id \
+                    AND edges.source_node_id = locations.node_id \
+                    AND edges.target_node_id = parent_locations.node_id \
+                    AND edges.kind = 'located_in' AND edges.active = 1 \
+                 WHERE locations.scope_id = ?3 AND locations.path_raw = ?4 \
+                    AND locations.path_key = ?5 AND locations.present = 1 \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM scan_jobs \
+                        WHERE scan_jobs.scope_id = locations.scope_id \
+                            AND scan_jobs.status IN ('running', 'interrupted') \
+                    )",
+                params![
+                    parent_path_raw,
+                    parent_path_key,
+                    event.progress.scope_id,
+                    event.path_raw,
+                    event.path_key
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, Vec<u8>>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, Vec<u8>>(14)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            location_id,
+            node_id,
+            identity_kind,
+            identity_key,
+            old_size_bytes,
+            old_modified_unix_ns,
+            link_count,
+            root_location_id,
+            root_node_id,
+            root_identity_key,
+            parent_location_id,
+            parent_node_id,
+            bound_parent_path_raw,
+            bound_parent_path_key,
+            parent_identity_key,
+        )) = binding
+        else {
+            return Ok(None);
+        };
+        if link_count != Some(1) || identity_key.as_slice() != expected_identity_key {
+            return Ok(None);
+        }
+        let present_location_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM locations WHERE node_id = ?1 AND present = 1",
+            [node_id],
+            |row| row.get(0),
+        )?;
+        if present_location_count != 1 {
+            return Ok(None);
+        }
+        let old_size_bytes =
+            u64::try_from(old_size_bytes).map_err(|_| DatabaseError::InvalidStoredValue)?;
+        Ok(Some(WatchFileDeltaBinding {
+            event_id,
+            scope_id: event.progress.scope_id,
+            path_raw: event.path_raw,
+            path_key: event.path_key,
+            stable_after_unix_ms: event.progress.stable_after_unix_ms,
+            snapshot: event.snapshot,
+            node_id,
+            location_id,
+            root_location_id,
+            root_node_id,
+            root_identity_key,
+            parent_location_id,
+            parent_node_id,
+            parent_path_raw: bound_parent_path_raw,
+            parent_path_key: bound_parent_path_key,
+            parent_identity_key,
+            identity_kind,
+            identity_key,
+            old_size_bytes,
+            old_modified_unix_ns,
+        }))
+    }
+
+    /// Atomically publishes a bound same-identity regular-file metadata delta.
+    /// Any failed compare-and-swap rolls the whole transaction back, including
+    /// content invalidation and the terminal event transition.
+    pub fn publish_watch_file_delta_at(
+        &mut self,
+        binding: &WatchFileDeltaBinding,
+        write: &WatchFileDeltaWrite,
+        published_at_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        validate_watch_file_delta_write(binding, write, published_at_unix_ms)?;
+        let size_bytes = write
+            .snapshot
+            .size_bytes
+            .map(to_i64)
+            .transpose()?
+            .ok_or(DatabaseError::WatchFileDeltaNotEligible)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event_changed = transaction.execute(
+            "UPDATE watch_events SET status = 'completed', scan_job_id = NULL, reason = NULL, \
+                updated_at_unix_ms = ?2 \
+             WHERE id = ?1 AND scope_id = ?3 AND status = 'stabilizing' \
+                AND reconciliation_kind = 'file_delta' AND scan_job_id IS NULL \
+                AND stable_after_unix_ms = ?4 AND path_raw = ?5 AND path_key = ?6 \
+                AND observed_kind = 'file' AND observed_size_bytes = ?7 \
+                AND observed_modified_unix_ns IS ?8 AND observed_identity_key = ?9",
+            params![
+                binding.event_id,
+                published_at_unix_ms,
+                binding.scope_id,
+                binding.stable_after_unix_ms,
+                binding.path_raw,
+                binding.path_key,
+                size_bytes,
+                write.snapshot.modified_unix_ns,
+                write.snapshot.identity_key,
+            ],
+        )?;
+        if event_changed != 1 {
+            return Err(DatabaseError::WatchFileDeltaSnapshotChanged);
+        }
+        let binding_current: i64 = transaction.query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM locations \
+                JOIN nodes ON nodes.id = locations.node_id AND nodes.kind = 'file' \
+                JOIN files ON files.node_id = nodes.id \
+                JOIN authorized_scopes ON authorized_scopes.id = locations.scope_id \
+                JOIN locations root_locations ON root_locations.id = ?1 \
+                    AND root_locations.scope_id = locations.scope_id \
+                    AND root_locations.path_raw = authorized_scopes.path_raw \
+                    AND root_locations.path_key = authorized_scopes.path_key \
+                    AND root_locations.present = 1 AND root_locations.node_id = ?3 \
+                JOIN nodes root_nodes ON root_nodes.id = root_locations.node_id \
+                    AND root_nodes.kind = 'folder' AND root_nodes.identity_kind = 'unix_device_inode' \
+                    AND root_nodes.identity_key = ?2 \
+                JOIN locations parent_locations ON parent_locations.id = ?4 \
+                    AND parent_locations.scope_id = locations.scope_id \
+                    AND parent_locations.present = 1 \
+                    AND parent_locations.node_id = ?5 \
+                    AND parent_locations.path_raw = ?6 AND parent_locations.path_key = ?7 \
+                JOIN nodes parent_nodes ON parent_nodes.id = parent_locations.node_id \
+                    AND parent_nodes.kind = 'folder' \
+                    AND parent_nodes.identity_kind = 'unix_device_inode' \
+                    AND parent_nodes.identity_key = ?8 \
+                JOIN edges ON edges.scope_id = locations.scope_id \
+                    AND edges.source_node_id = locations.node_id \
+                    AND edges.target_node_id = parent_locations.node_id \
+                    AND edges.kind = 'located_in' AND edges.active = 1 \
+                WHERE locations.id = ?9 AND locations.scope_id = ?10 AND locations.node_id = ?11 \
+                    AND locations.path_raw = ?12 AND locations.path_key = ?13 AND locations.present = 1 \
+                    AND nodes.identity_kind = ?14 AND nodes.identity_key = ?15 \
+                    AND files.size_bytes = ?16 AND files.modified_unix_ns IS ?17 \
+                    AND files.link_count = 1 \
+                    AND (SELECT COUNT(*) FROM locations all_locations \
+                         WHERE all_locations.node_id = locations.node_id AND all_locations.present = 1) = 1 \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM scan_jobs \
+                        WHERE scan_jobs.scope_id = locations.scope_id \
+                            AND scan_jobs.status IN ('running', 'interrupted') \
+                    ) \
+             )",
+            params![
+                binding.root_location_id,
+                binding.root_identity_key,
+                binding.root_node_id,
+                binding.parent_location_id,
+                binding.parent_node_id,
+                binding.parent_path_raw,
+                binding.parent_path_key,
+                binding.parent_identity_key,
+                binding.location_id,
+                binding.scope_id,
+                binding.node_id,
+                binding.path_raw,
+                binding.path_key,
+                binding.identity_kind,
+                binding.identity_key,
+                to_i64(binding.old_size_bytes)?,
+                binding.old_modified_unix_ns,
+            ],
+            |row| row.get(0),
+        )?;
+        if binding_current != 1 {
+            return Err(DatabaseError::WatchFileDeltaSnapshotChanged);
+        }
+        let node_changed = transaction.execute(
+            "UPDATE nodes SET updated_at_unix_ms = ?2 \
+             WHERE id = ?1 AND kind = 'file' AND identity_kind = ?3 AND identity_key = ?4",
+            params![
+                binding.node_id,
+                published_at_unix_ms,
+                binding.identity_kind,
+                binding.identity_key,
+            ],
+        )?;
+        if node_changed != 1 {
+            return Err(DatabaseError::WatchFileDeltaSnapshotChanged);
+        }
+        let file_changed = transaction.execute(
+            "UPDATE files SET size_bytes = ?2, modified_unix_ns = ?3, link_count = 1 \
+             WHERE node_id = ?1 AND size_bytes = ?4 AND modified_unix_ns IS ?5 AND link_count = 1",
+            params![
+                binding.node_id,
+                size_bytes,
+                write.snapshot.modified_unix_ns,
+                to_i64(binding.old_size_bytes)?,
+                binding.old_modified_unix_ns,
+            ],
+        )?;
+        if file_changed != 1 {
+            return Err(DatabaseError::WatchFileDeltaSnapshotChanged);
+        }
+        transaction.execute(
+            "UPDATE content_chunks SET active = 0 \
+             WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+            params![binding.scope_id, binding.node_id],
+        )?;
+        transaction.execute(
+            "UPDATE image_metadata SET active = 0 \
+             WHERE scope_id = ?1 AND node_id = ?2 AND active = 1",
+            params![binding.scope_id, binding.node_id],
+        )?;
+        transaction.commit()?;
+        Ok(self.watch_event(binding.event_id)?.progress)
     }
 
     pub fn mark_watch_event_ignored_at(
@@ -4853,6 +5324,8 @@ fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventR
             u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(10, value))
         })
         .transpose()?;
+    let reconciliation_kind = WatchReconciliationKind::from_db(&row.get::<_, String>(13)?)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
     Ok(WatchEventRecord {
         progress: WatchEventProgress {
             api_version: WatchEventProgress::API_VERSION,
@@ -4864,6 +5337,7 @@ fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventR
             scan_job_id: row.get(5)?,
             reason,
         },
+        reconciliation_kind,
         path_raw: row.get(7)?,
         path_key: row.get(8)?,
         snapshot: WatchSnapshot {
@@ -4972,19 +5446,50 @@ fn validate_watch_observation(
     }
 }
 
+fn validate_watch_file_delta_write(
+    binding: &WatchFileDeltaBinding,
+    write: &WatchFileDeltaWrite,
+    published_at_unix_ms: i64,
+) -> Result<(), DatabaseError> {
+    if published_at_unix_ms < binding.stable_after_unix_ms
+        || binding.path_raw.is_empty()
+        || binding.path_raw.len() > MAX_WATCH_PATH_BYTES
+        || binding.path_key.is_empty()
+        || binding.path_key.len() > MAX_WATCH_PATH_BYTES
+        || binding.identity_kind != "unix_device_inode"
+        || binding.identity_key.is_empty()
+        || binding.root_identity_key.is_empty()
+        || binding.parent_path_raw.is_empty()
+        || binding.parent_path_raw.len() > MAX_WATCH_PATH_BYTES
+        || binding.parent_path_key.is_empty()
+        || binding.parent_path_key.len() > MAX_WATCH_PATH_BYTES
+        || binding.parent_identity_key.is_empty()
+        || binding.old_size_bytes > i64::MAX as u64
+        || write.snapshot.kind != WatchSnapshotKind::File
+        || write.snapshot.size_bytes.is_none()
+        || write.snapshot.identity_key.is_none()
+        || write.snapshot != binding.snapshot
+        || write.snapshot.identity_key.as_deref() != Some(binding.identity_key.as_slice())
+    {
+        return Err(DatabaseError::WatchFileDeltaNotEligible);
+    }
+    Ok(())
+}
+
 fn insert_watch_event(
     transaction: &Transaction<'_>,
     observation: WatchObservationWrite<'_>,
     status: &str,
     reason: Option<&str>,
     size_bytes: Option<i64>,
+    reconciliation_kind: WatchReconciliationKind,
 ) -> Result<i64, DatabaseError> {
     transaction.execute(
         "INSERT INTO watch_events( \
             scope_id, status, path_raw, path_key, observed_kind, observed_size_bytes, \
             observed_modified_unix_ns, observed_identity_key, observation_count, \
-            stable_after_unix_ms, reason, created_at_unix_ms, updated_at_unix_ms \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?11)",
+            stable_after_unix_ms, reason, reconciliation_kind, created_at_unix_ms, updated_at_unix_ms \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12)",
         params![
             observation.scope_id,
             status,
@@ -4996,10 +5501,112 @@ fn insert_watch_event(
             observation.snapshot.identity_key,
             observation.stable_after_unix_ms,
             reason,
+            reconciliation_kind.as_str(),
             observation.observed_at_unix_ms,
         ],
     )?;
     Ok(transaction.last_insert_rowid())
+}
+
+fn watchable_scope_ids_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<i64>, DatabaseError> {
+    let mut statement = transaction.prepare(
+        "SELECT authorized_scopes.id \
+         FROM authorized_scopes \
+         WHERE EXISTS ( \
+            SELECT 1 FROM scan_jobs \
+            WHERE scan_jobs.scope_id = authorized_scopes.id \
+                AND scan_jobs.status = 'completed' \
+         ) \
+         ORDER BY authorized_scopes.id ASC",
+    )?;
+    let scope_ids = statement.query_map([], |row| row.get(0))?;
+    scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn request_scope_full_reconciliation_in_transaction(
+    transaction: &Transaction<'_>,
+    scope_id: i64,
+    now_unix_ms: i64,
+) -> Result<i64, DatabaseError> {
+    let completed_scan_exists: i64 = transaction.query_row(
+        "SELECT EXISTS( \
+            SELECT 1 FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed' \
+         )",
+        [scope_id],
+        |row| row.get(0),
+    )?;
+    if completed_scan_exists != 1 {
+        return Err(DatabaseError::WatchScopeInitialScanRequired);
+    }
+
+    let existing = transaction
+        .query_row(
+            "SELECT id FROM watch_events \
+             WHERE scope_id = ?1 AND status = 'stabilizing'",
+            [scope_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if let Some(event_id) = existing {
+        let changed = transaction.execute(
+            "UPDATE watch_events SET reconciliation_kind = 'full_scope', \
+                observation_count = observation_count + 1, stable_after_unix_ms = ?2, \
+                updated_at_unix_ms = ?2 \
+             WHERE id = ?1 AND status = 'stabilizing'",
+            params![event_id, now_unix_ms],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::InvalidWatchEventState);
+        }
+        return Ok(event_id);
+    }
+
+    let root = transaction
+        .query_row(
+            "SELECT scopes.path_raw, scopes.path_key, nodes.identity_key \
+             FROM authorized_scopes scopes \
+             JOIN locations ON locations.scope_id = scopes.id \
+                AND locations.path_raw = scopes.path_raw \
+                AND locations.path_key = scopes.path_key \
+                AND locations.present = 1 \
+             JOIN nodes ON nodes.id = locations.node_id AND nodes.kind = 'folder' \
+             WHERE scopes.id = ?1",
+            [scope_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::WatchFileDeltaNotEligible)?;
+    let snapshot = WatchSnapshot {
+        kind: WatchSnapshotKind::Folder,
+        size_bytes: None,
+        modified_unix_ns: None,
+        identity_key: Some(root.2),
+    };
+    insert_watch_event(
+        transaction,
+        WatchObservationWrite {
+            scope_id,
+            path_raw: &root.0,
+            path_key: &root.1,
+            snapshot: &snapshot,
+            stable_after_unix_ms: now_unix_ms,
+            ignored_reason: None,
+            reconciliation_kind: WatchReconciliationKind::FullScope,
+            observed_at_unix_ms: now_unix_ms,
+        },
+        "stabilizing",
+        None,
+        None,
+        WatchReconciliationKind::FullScope,
+    )
 }
 
 fn insert_resumable_scan_job(
@@ -5178,7 +5785,8 @@ fn invalidate_stale_extraction_outputs(
          WHERE active = 1 AND scope_id = ?1 AND ( \
             NOT EXISTS ( \
                 SELECT 1 FROM locations l \
-                WHERE l.id = content_chunks.location_id AND l.present = 1 \
+                WHERE l.id = content_chunks.location_id AND l.node_id = content_chunks.node_id \
+                    AND l.present = 1 \
             ) OR NOT EXISTS ( \
                 SELECT 1 FROM files f \
                 WHERE f.node_id = content_chunks.node_id \
@@ -5193,7 +5801,8 @@ fn invalidate_stale_extraction_outputs(
          WHERE active = 1 AND scope_id = ?1 AND ( \
             NOT EXISTS ( \
                 SELECT 1 FROM locations l \
-                WHERE l.id = image_metadata.location_id AND l.present = 1 \
+                WHERE l.id = image_metadata.location_id AND l.node_id = image_metadata.node_id \
+                    AND l.present = 1 \
             ) OR NOT EXISTS ( \
                 SELECT 1 FROM files f \
                 WHERE f.node_id = image_metadata.node_id \
@@ -5345,6 +5954,24 @@ mod tests {
         stable_after_unix_ms: i64,
         ignored_reason: Option<WatchEventReason>,
     ) -> WatchEventRecord {
+        record_file_watch_event_with_kind(
+            database,
+            scope_id,
+            path,
+            stable_after_unix_ms,
+            ignored_reason,
+            WatchReconciliationKind::FullScope,
+        )
+    }
+
+    fn record_file_watch_event_with_kind(
+        database: &mut ManifestDatabase,
+        scope_id: i64,
+        path: &str,
+        stable_after_unix_ms: i64,
+        ignored_reason: Option<WatchEventReason>,
+        reconciliation_kind: WatchReconciliationKind,
+    ) -> WatchEventRecord {
         if !database
             .scope_has_completed_scan(scope_id)
             .expect("scope readiness should load")
@@ -5370,6 +5997,7 @@ mod tests {
                 snapshot: &snapshot,
                 stable_after_unix_ms,
                 ignored_reason,
+                reconciliation_kind,
                 observed_at_unix_ms: 1,
             })
             .expect("watch event should persist")
@@ -5592,6 +6220,7 @@ mod tests {
                 snapshot: &latest_snapshot,
                 stable_after_unix_ms: 2_700,
                 ignored_reason: Some(WatchEventReason::TemporaryDownload),
+                reconciliation_kind: WatchReconciliationKind::FullScope,
                 observed_at_unix_ms: 2_700,
             })
             .expect("latest ignored observation should update its terminal aggregate");
@@ -5834,6 +6463,7 @@ mod tests {
             snapshot: &snapshot,
             stable_after_unix_ms: 1_001,
             ignored_reason: None,
+            reconciliation_kind: WatchReconciliationKind::FullScope,
             observed_at_unix_ms: 1,
         });
 
@@ -5845,6 +6475,462 @@ mod tests {
             DatabaseError::WatchScopeInitialScanRequired.code(),
             "watch_scope_initial_scan_required"
         );
+    }
+
+    #[test]
+    fn file_delta_mode_is_path_bound_monotonic_and_reopens_after_terminal_history() {
+        let (mut database, scope_id, root) = resumable_setup();
+        publish_manifest_file(&mut database, scope_id, &root, 4);
+
+        let first = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/file.txt",
+            1_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        assert_eq!(
+            first.reconciliation_kind,
+            WatchReconciliationKind::FileDelta
+        );
+        let same_path = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/file.txt",
+            2_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        assert_eq!(same_path.progress.event_id, first.progress.event_id);
+        assert_eq!(
+            same_path.reconciliation_kind,
+            WatchReconciliationKind::FileDelta
+        );
+
+        let replacement_snapshot = WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(7),
+            modified_unix_ns: Some(11),
+            identity_key: Some(b"identity:/scope/file.txt:replacement".to_vec()),
+        };
+        let atomic_replace = database
+            .record_watch_observation_at(WatchObservationWrite {
+                scope_id,
+                path_raw: b"/scope/file.txt",
+                path_key: "/scope/file.txt",
+                snapshot: &replacement_snapshot,
+                stable_after_unix_ms: 2_500,
+                ignored_reason: None,
+                reconciliation_kind: WatchReconciliationKind::FileDelta,
+                observed_at_unix_ms: 1,
+            })
+            .expect("same-path replacement observation should persist");
+        assert_eq!(atomic_replace.progress.event_id, first.progress.event_id);
+        assert_eq!(
+            atomic_replace.reconciliation_kind,
+            WatchReconciliationKind::FullScope,
+            "same-path inode replacement must not stay on the narrow path"
+        );
+
+        let distinct_path = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/other.txt",
+            3_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        assert_eq!(distinct_path.progress.event_id, first.progress.event_id);
+        assert_eq!(
+            distinct_path.reconciliation_kind,
+            WatchReconciliationKind::FullScope
+        );
+        let upgraded = database
+            .request_scope_full_reconciliation_at(scope_id, 10)
+            .expect("full request should durably upgrade the existing event");
+        assert_eq!(upgraded.event_id, first.progress.event_id);
+        assert_eq!(
+            database
+                .watch_event(upgraded.event_id)
+                .expect("upgraded event should load")
+                .reconciliation_kind,
+            WatchReconciliationKind::FullScope
+        );
+
+        database
+            .connection
+            .execute(
+                "UPDATE watch_events SET status = 'completed' WHERE id = ?1",
+                [upgraded.event_id],
+            )
+            .expect("fixture should close the old history");
+        let reopened = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/file.txt",
+            4_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        assert_ne!(reopened.progress.event_id, upgraded.event_id);
+        assert_eq!(
+            reopened.reconciliation_kind,
+            WatchReconciliationKind::FileDelta
+        );
+    }
+
+    #[test]
+    fn durable_full_scope_requests_create_and_upgrade_watchable_scopes() {
+        let (mut database, scope_id, root) = resumable_setup();
+        publish_manifest_file(&mut database, scope_id, &root, 4);
+
+        let created = database
+            .request_scope_full_reconciliation_at(scope_id, 2_000)
+            .expect("scope request should create a durable event");
+        assert_eq!(created.status, WatchEventStatus::Stabilizing);
+        assert_eq!(created.stable_after_unix_ms, 2_000);
+        let record = database
+            .watch_event(created.event_id)
+            .expect("durable event should load");
+        assert_eq!(
+            record.reconciliation_kind,
+            WatchReconciliationKind::FullScope
+        );
+        assert_eq!(record.snapshot.kind, WatchSnapshotKind::Folder);
+
+        let all = database
+            .request_all_scope_full_reconciliation_at(2_100)
+            .expect("all request should update every watchable scope");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].event_id, created.event_id);
+        assert_eq!(all[0].stable_after_unix_ms, 2_100);
+        assert_eq!(all[0].observation_count, 2);
+    }
+
+    #[test]
+    fn all_scope_full_reconciliation_rolls_back_every_scope_when_one_scope_is_invalid() {
+        let (mut database, healthy_scope_id, root) = resumable_setup();
+        publish_manifest_file(&mut database, healthy_scope_id, &root, 4);
+        let incomplete_scope = database
+            .add_scope(
+                b"/scope-without-root",
+                "/scope-without-root",
+                "/scope-without-root",
+                "test",
+            )
+            .expect("second scope should authorize");
+        let job_id = database
+            .create_scan_job(incomplete_scope.id)
+            .expect("second scope scan should start");
+        database
+            .complete_scan(job_id, incomplete_scope.id, &[], &[], 0, 0)
+            .expect("empty second scope scan should complete");
+
+        let error = database
+            .request_all_scope_full_reconciliation_at(2_000)
+            .expect_err("a missing root manifest row must reject the all-scope request");
+        assert!(matches!(error, DatabaseError::WatchFileDeltaNotEligible));
+        assert!(
+            database
+                .active_watch_events()
+                .expect("events should load")
+                .is_empty(),
+            "the earlier healthy scope update must roll back with the failing scope"
+        );
+    }
+
+    #[test]
+    fn file_delta_publish_keeps_siblings_and_atomically_invalidates_content() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        database
+            .connection
+            .execute("UPDATE nodes SET identity_kind = 'unix_device_inode'", [])
+            .expect("fixture should use an anchored Unix identity");
+        let location_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM locations WHERE scope_id = ?1 AND node_id = ?2 AND present = 1",
+                params![scope_id, node_id],
+                |row| row.get(0),
+            )
+            .expect("target location should exist");
+        let root_node_id = database
+            .node_id_for_path_key(scope_id, "/scope")
+            .expect("root should resolve")
+            .expect("root should be present");
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed'",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should exist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO nodes(kind, identity_kind, identity_key, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES ('file', 'unix_device_inode', 'identity:/scope/sibling.txt', 1, 1)",
+                [],
+            )
+            .expect("sibling node should exist");
+        let sibling_node_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(node_id, size_bytes, modified_unix_ns, link_count) VALUES (?1, 9, 1, 1)",
+                [sibling_node_id],
+            )
+            .expect("sibling file metadata should exist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations(scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id) \
+                 VALUES (?1, ?2, '/scope/sibling.txt', '/scope/sibling.txt', '/scope/sibling.txt', 1, ?3)",
+                params![scope_id, sibling_node_id, scan_id],
+            )
+            .expect("sibling location should exist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO edges(scope_id, source_node_id, target_node_id, kind, active, last_seen_scan_id) \
+                 VALUES (?1, ?2, ?3, 'located_in', 1, ?4)",
+                params![scope_id, sibling_node_id, root_node_id, scan_id],
+            )
+            .expect("sibling edge should exist");
+
+        let extraction = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("content extraction should queue");
+        database
+            .claim_extraction_job(extraction.job_id, "delta-content", 60_000)
+            .expect("content extraction should claim");
+        database
+            .complete_extraction_job(
+                extraction.job_id,
+                "delta-content",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "abcd".to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("content should publish");
+        database
+            .connection
+            .execute(
+                "INSERT INTO image_metadata( \
+                    scope_id, node_id, location_id, extraction_job_id, format, pixel_width, pixel_height, \
+                    source_size_bytes, source_modified_unix_ns, provider_id, provider_version, active, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, 'png', 1, 1, 4, 1, 'fixture', '1', 1, 1)",
+                params![scope_id, node_id, location_id, extraction.job_id],
+            )
+            .expect("fixture image metadata should exist");
+
+        let event = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/file.txt",
+            1_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        assert!(
+            database
+                .watch_file_delta_binding_at(
+                    event.progress.event_id,
+                    b"/wrong-parent",
+                    "/wrong-parent",
+                    1_000,
+                )
+                .expect("wrong parent lookup should not fail")
+                .is_none(),
+            "the parent raw and normalized key are both mandatory CAS inputs"
+        );
+        let binding = database
+            .watch_file_delta_binding_at(event.progress.event_id, b"/scope", "/scope", 1_000)
+            .expect("binding lookup should pass")
+            .expect("single-link file should be eligible");
+        let completed = database
+            .publish_watch_file_delta_at(
+                &binding,
+                &WatchFileDeltaWrite {
+                    snapshot: event.snapshot.clone(),
+                },
+                1_000,
+            )
+            .expect("bound delta should publish atomically");
+        assert_eq!(completed.status, WatchEventStatus::Completed);
+        assert!(completed.scan_job_id.is_none());
+        let (new_size, new_modified): (i64, Option<i64>) = database
+            .connection
+            .query_row(
+                "SELECT size_bytes, modified_unix_ns FROM files WHERE node_id = ?1",
+                [node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("target metadata should load");
+        assert_eq!((new_size, new_modified), (7, Some(11)));
+        let sibling_present: i64 = database
+            .connection
+            .query_row(
+                "SELECT present FROM locations WHERE node_id = ?1",
+                [sibling_node_id],
+                |row| row.get(0),
+            )
+            .expect("sibling should remain present");
+        assert_eq!(sibling_present, 1);
+        assert_eq!(
+            database
+                .extraction_stats()
+                .expect("stats should load")
+                .active_chunk_count,
+            0
+        );
+        let active_image_metadata: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM image_metadata WHERE node_id = ?1 AND active = 1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .expect("image metadata should query");
+        assert_eq!(active_image_metadata, 0);
+    }
+
+    #[test]
+    fn file_delta_publish_rolls_back_when_manifest_metadata_changed_after_binding() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        database
+            .connection
+            .execute("UPDATE nodes SET identity_kind = 'unix_device_inode'", [])
+            .expect("fixture should use an anchored Unix identity");
+        let event = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/file.txt",
+            1_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        let binding = database
+            .watch_file_delta_binding_at(event.progress.event_id, b"/scope", "/scope", 1_000)
+            .expect("binding lookup should pass")
+            .expect("single-link file should be eligible");
+        database
+            .connection
+            .execute(
+                "UPDATE files SET size_bytes = 6 WHERE node_id = ?1",
+                [node_id],
+            )
+            .expect("fixture should invalidate the old metadata CAS");
+
+        let error = database
+            .publish_watch_file_delta_at(
+                &binding,
+                &WatchFileDeltaWrite {
+                    snapshot: event.snapshot.clone(),
+                },
+                1_000,
+            )
+            .expect_err("changed manifest metadata must reject publication");
+        assert!(matches!(
+            error,
+            DatabaseError::WatchFileDeltaSnapshotChanged
+        ));
+        assert_eq!(
+            database
+                .watch_event(event.progress.event_id)
+                .expect("event should remain durable after rollback")
+                .progress
+                .status,
+            WatchEventStatus::Stabilizing
+        );
+        let stored_size: i64 = database
+            .connection
+            .query_row(
+                "SELECT size_bytes FROM files WHERE node_id = ?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .expect("fixture metadata should remain untouched");
+        assert_eq!(stored_size, 6);
+    }
+
+    #[test]
+    fn file_delta_publish_rejects_a_running_or_interrupted_scan_writer() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        database
+            .connection
+            .execute("UPDATE nodes SET identity_kind = 'unix_device_inode'", [])
+            .expect("fixture should use an anchored Unix identity");
+        let event = record_file_watch_event_with_kind(
+            &mut database,
+            scope_id,
+            "/scope/file.txt",
+            1_000,
+            None,
+            WatchReconciliationKind::FileDelta,
+        );
+        let binding = database
+            .watch_file_delta_binding_at(event.progress.event_id, b"/scope", "/scope", 1_000)
+            .expect("binding lookup should pass")
+            .expect("single-link file should be eligible before a scan starts");
+        let running_scan = database
+            .create_scan_job(scope_id)
+            .expect("concurrent full scan should start");
+        assert_eq!(
+            database
+                .scan_job(running_scan)
+                .expect("running scan should load")
+                .status,
+            ScanStatus::Running
+        );
+        assert!(
+            database
+                .watch_file_delta_binding_at(event.progress.event_id, b"/scope", "/scope", 1_000)
+                .expect("binding lookup should pass")
+                .is_none(),
+            "a running scan owns the manifest writer path"
+        );
+        let error = database
+            .publish_watch_file_delta_at(
+                &binding,
+                &WatchFileDeltaWrite {
+                    snapshot: event.snapshot.clone(),
+                },
+                1_000,
+            )
+            .expect_err("a scan that starts after binding must reject the delta CAS");
+        assert!(matches!(
+            error,
+            DatabaseError::WatchFileDeltaSnapshotChanged
+        ));
+        assert_eq!(
+            database
+                .watch_event(event.progress.event_id)
+                .expect("event should survive rollback")
+                .progress
+                .status,
+            WatchEventStatus::Stabilizing
+        );
+        let size: i64 = database
+            .connection
+            .query_row(
+                "SELECT size_bytes FROM files WHERE node_id = ?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .expect("file metadata should remain available");
+        assert_eq!(size, 4);
     }
 
     fn observation(path: &str, kind: NodeKind, parent: Option<Vec<u8>>) -> Observation {

@@ -11,6 +11,9 @@ deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
 deskgraph-scanner = { path = "../scanner" }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 notify = { workspace = true, features = ["macos_fsevent"] }
 

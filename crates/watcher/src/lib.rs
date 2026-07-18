@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, Metadata};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
-    DatabaseError, ManifestDatabase, QueuedPath, WatchObservationWrite, WatchSnapshot,
-    WatchSnapshotKind,
+    DatabaseError, ManifestDatabase, QueuedPath, WatchFileDeltaWrite, WatchObservationWrite,
+    WatchReconciliationKind, WatchSnapshot, WatchSnapshotKind,
 };
 use deskgraph_domain::{ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus};
 use deskgraph_identity::{
@@ -133,7 +139,6 @@ pub struct WatchCoordinator {
     deferred_scope_due_at: BTreeMap<i64, i64>,
     event_retry_at: BTreeMap<i64, i64>,
     scope_errors: BTreeMap<i64, &'static str>,
-    force_reconciliation_scopes: BTreeSet<i64>,
 }
 
 impl WatchCoordinator {
@@ -159,7 +164,6 @@ impl WatchCoordinator {
             deferred_scope_due_at: BTreeMap::new(),
             event_retry_at: BTreeMap::new(),
             scope_errors: BTreeMap::new(),
-            force_reconciliation_scopes: BTreeSet::new(),
         }
     }
 
@@ -180,8 +184,8 @@ impl WatchCoordinator {
                 }
             }
         }
-        self.force_reconciliation_scopes
-            .retain(|scope_id| watchable_scope_set.contains(scope_id));
+        self.next_poll_by_scope
+            .retain(|scope_id, _| watchable_scope_set.contains(scope_id));
         source.synchronize(scopes)
     }
 
@@ -192,9 +196,11 @@ impl WatchCoordinator {
         if now_unix_ms < 0 {
             return Err(WatcherError::InvalidTimestamp);
         }
-        for scope_id in self.database.watchable_scope_ids()? {
+        let scope_ids = self.database.watchable_scope_ids()?;
+        self.database
+            .request_all_scope_full_reconciliation_at(now_unix_ms)?;
+        for scope_id in scope_ids {
             self.next_poll_by_scope.insert(scope_id, now_unix_ms);
-            self.force_reconciliation_scopes.insert(scope_id);
         }
         Ok(())
     }
@@ -234,8 +240,9 @@ impl WatchCoordinator {
         }
         for scope_id in &batch.reconcile_scope_ids {
             if self.database.scope_has_completed_scan(*scope_id)? {
+                self.database
+                    .request_scope_full_reconciliation_at(*scope_id, now_unix_ms)?;
                 self.next_poll_by_scope.insert(*scope_id, now_unix_ms);
-                self.force_reconciliation_scopes.insert(*scope_id);
             }
         }
         let hint_scope_count =
@@ -252,6 +259,8 @@ impl WatchCoordinator {
                 now_unix_ms,
             ) {
                 self.scope_errors.insert(hint.scope_id, error.code());
+                self.database
+                    .request_scope_full_reconciliation_at(hint.scope_id, now_unix_ms)?;
                 self.next_poll_by_scope.insert(hint.scope_id, now_unix_ms);
             }
         }
@@ -293,8 +302,6 @@ impl WatchCoordinator {
             .retain(|scope_id, _| scope_ids.contains(scope_id));
         self.scope_errors
             .retain(|scope_id, _| scope_ids.contains(scope_id));
-        self.force_reconciliation_scopes
-            .retain(|scope_id| scope_ids.contains(scope_id));
         for scope_id in &scope_ids {
             self.next_poll_by_scope
                 .entry(*scope_id)
@@ -345,13 +352,15 @@ impl WatchCoordinator {
             let maximum_stabilizing_age_reached = event.status == WatchEventStatus::Stabilizing
                 && now_unix_ms.saturating_sub(created_at_unix_ms)
                     >= self.polling_policy.poll_interval_ms;
-            let explicit_force_requested =
-                self.force_reconciliation_scopes.contains(&event.scope_id);
+            if maximum_stabilizing_age_reached {
+                self.database
+                    .request_scope_full_reconciliation_at(event.scope_id, now_unix_ms)?;
+            }
+            let durable_event = self.database.watch_event(event.event_id)?;
             let force_reconciliation = event.status == WatchEventStatus::Stabilizing
-                && (explicit_force_requested || maximum_stabilizing_age_reached);
-            let is_due = force_reconciliation
-                || event.status == WatchEventStatus::Reconciling
-                || now_unix_ms >= event.stable_after_unix_ms;
+                && durable_event.reconciliation_kind == WatchReconciliationKind::FullScope;
+            let is_due = event.status == WatchEventStatus::Reconciling
+                || now_unix_ms >= durable_event.progress.stable_after_unix_ms;
             if !is_due {
                 continue;
             }
@@ -360,26 +369,16 @@ impl WatchCoordinator {
                 continue;
             }
 
-            let advanced = if force_reconciliation {
-                force_scope_metadata_reconciliation_batch_at_time(
-                    &mut self.database,
-                    event.event_id,
-                    COORDINATOR_RECONCILIATION_BATCH_SIZE,
-                    now_unix_ms,
-                )
-            } else {
-                advance_watch_event_batch_at_time(
-                    &mut self.database,
-                    event.event_id,
-                    self.watch_policy,
-                    COORDINATOR_RECONCILIATION_BATCH_SIZE,
-                    now_unix_ms,
-                )
-            };
+            let advanced = advance_watch_event_batch_at_time(
+                &mut self.database,
+                event.event_id,
+                self.watch_policy,
+                COORDINATOR_RECONCILIATION_BATCH_SIZE,
+                now_unix_ms,
+            );
             match advanced {
                 Ok(progress) => {
                     if force_reconciliation {
-                        self.force_reconciliation_scopes.remove(&event.scope_id);
                         report.forced_scope_reconciliation_count =
                             report.forced_scope_reconciliation_count.saturating_add(1);
                     }
@@ -395,15 +394,10 @@ impl WatchCoordinator {
                             self.scope_errors
                                 .insert(progress.scope_id, watch_progress_error_code(&progress));
                         }
-                        let next_poll = if self
-                            .force_reconciliation_scopes
-                            .contains(&progress.scope_id)
-                        {
-                            now_unix_ms
-                        } else {
-                            now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms)
-                        };
-                        self.next_poll_by_scope.insert(progress.scope_id, next_poll);
+                        self.next_poll_by_scope.insert(
+                            progress.scope_id,
+                            now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
+                        );
                     }
                 }
                 Err(error) if is_retryable_scan_contention(&error) => {
@@ -467,14 +461,10 @@ impl WatchCoordinator {
             self.deferred_scope_due_at.remove(&scope_id);
             let scheduled = validated_scope_root(&self.database, scope_id)
                 .map_err(WatcherError::from)
-                .and_then(|root| {
-                    observe_watch_path_at_time(
-                        &mut self.database,
-                        scope_id,
-                        &root,
-                        self.watch_policy,
-                        now_unix_ms,
-                    )
+                .and_then(|_| {
+                    self.database
+                        .request_scope_full_reconciliation_at(scope_id, now_unix_ms)
+                        .map_err(WatcherError::from)
                 });
             match scheduled {
                 Ok(_) => {
@@ -682,6 +672,7 @@ pub fn observe_watch_path_at_time(
                 stable_after_unix_ms: stable_after,
                 ignored_reason: None,
                 observed_at_unix_ms: now_unix_ms,
+                reconciliation_kind: reconciliation_kind_for_snapshot(&hint.snapshot),
             })
             .map(|event| event.progress)
             .map_err(Into::into),
@@ -694,6 +685,7 @@ pub fn observe_watch_path_at_time(
                 stable_after_unix_ms: now_unix_ms,
                 ignored_reason: Some(reason),
                 observed_at_unix_ms: now_unix_ms,
+                reconciliation_kind: WatchReconciliationKind::FullScope,
             })
             .map(|event| event.progress)
             .map_err(Into::into),
@@ -748,10 +740,10 @@ fn advance_watch_event_batch_at_time(
     )
 }
 
-fn force_scope_metadata_reconciliation_batch_at_time(
+fn force_scope_metadata_reconciliation_at_time(
     database: &mut ManifestDatabase,
     event_id: i64,
-    batch_size: usize,
+    run_mode: ReconciliationRunMode,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
     if now_unix_ms < 0 {
@@ -778,12 +770,7 @@ fn force_scope_metadata_reconciliation_batch_at_time(
         is_root: true,
     };
     database.begin_forced_watch_metadata_reconciliation_at(event_id, &root, now_unix_ms)?;
-    finish_reconciliation(
-        database,
-        event_id,
-        now_unix_ms,
-        ReconciliationRunMode::Batch(batch_size),
-    )
+    finish_reconciliation(database, event_id, now_unix_ms, run_mode)
 }
 
 #[derive(Clone, Copy)]
@@ -817,17 +804,31 @@ fn advance_watch_event_with_mode(
     if now_unix_ms < event.progress.stable_after_unix_ms {
         return Ok(event.progress);
     }
+    if event.reconciliation_kind == WatchReconciliationKind::FullScope {
+        return force_scope_metadata_reconciliation_at_time(
+            database,
+            event_id,
+            run_mode,
+            now_unix_ms,
+        );
+    }
 
     let observed_path =
         path_from_raw(&event.path_raw).map_err(|_| WatcherError::ObservedPathDecodeFailed)?;
     let evaluated = match evaluate_hint(database, event.progress.scope_id, &observed_path) {
         Ok(evaluated) => evaluated,
-        Err(WatcherError::SourceUnavailable) => {
-            return database
-                .fail_watch_event_at(event_id, WatchEventReason::SourceUnavailable, now_unix_ms)
-                .map_err(Into::into);
+        Err(_) => {
+            // Once a path-local proof becomes unavailable or ambiguous, the
+            // event must durably and monotonically widen before control leaves
+            // this call. Restart can then only resume the full-scope path.
+            database.request_scope_full_reconciliation_at(event.progress.scope_id, now_unix_ms)?;
+            return force_scope_metadata_reconciliation_at_time(
+                database,
+                event_id,
+                run_mode,
+                now_unix_ms,
+            );
         }
-        Err(error) => return Err(error),
     };
     let hint = match evaluated {
         EvaluatedHint::Ignore(_, reason) => {
@@ -843,6 +844,20 @@ fn advance_watch_event_with_mode(
             event.progress.scope_id,
             &hint,
             policy,
+            now_unix_ms,
+        );
+    }
+    if event.reconciliation_kind == WatchReconciliationKind::FileDelta {
+        if let Some(progress) =
+            try_publish_watch_file_delta(database, event_id, &hint, now_unix_ms)?
+        {
+            return Ok(progress);
+        }
+        database.request_scope_full_reconciliation_at(event.progress.scope_id, now_unix_ms)?;
+        return force_scope_metadata_reconciliation_at_time(
+            database,
+            event_id,
+            run_mode,
             now_unix_ms,
         );
     }
@@ -873,6 +888,70 @@ fn advance_watch_event_with_mode(
     };
     database.begin_watch_reconciliation_at(event_id, &root, now_unix_ms)?;
     finish_reconciliation(database, event_id, now_unix_ms, run_mode)
+}
+
+fn try_publish_watch_file_delta(
+    database: &mut ManifestDatabase,
+    event_id: i64,
+    hint: &ValidatedHint,
+    now_unix_ms: i64,
+) -> Result<Option<WatchEventProgress>, WatcherError> {
+    if hint.snapshot.kind != WatchSnapshotKind::File {
+        return Ok(None);
+    }
+    let Some(parent_path) = hint.path.parent() else {
+        return Ok(None);
+    };
+    let parent_path_raw = path_to_raw(parent_path);
+    let parent_path_key = comparison_key(parent_path);
+    let binding = match database.watch_file_delta_binding_at(
+        event_id,
+        &parent_path_raw,
+        &parent_path_key,
+        now_unix_ms,
+    )? {
+        Some(binding) => binding,
+        None => return Ok(None),
+    };
+    if binding.path_raw != hint.path_raw
+        || binding.path_key != hint.path_key
+        || binding.snapshot != hint.snapshot
+    {
+        return Ok(None);
+    }
+    let scope = database.scope_record(binding.scope_id)?;
+    let stored_root =
+        path_from_raw(&scope.path_raw).map_err(|_| WatcherError::ObservedPathDecodeFailed)?;
+    if comparison_key(&stored_root) != scope.path_key {
+        return Ok(None);
+    }
+    let Some(snapshot) = anchored_regular_file_snapshot(&stored_root, &hint.path)? else {
+        return Ok(None);
+    };
+    if snapshot.root_identity_key != binding.root_identity_key
+        || snapshot.parent_identity_key != binding.parent_identity_key
+        || snapshot.file_identity_key != binding.identity_key
+        || snapshot.link_count != Some(1)
+        || snapshot.size_bytes != binding.snapshot.size_bytes.unwrap_or(u64::MAX)
+        || snapshot.modified_unix_ns != binding.snapshot.modified_unix_ns
+    {
+        return Ok(None);
+    }
+    let write = WatchFileDeltaWrite {
+        snapshot: WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(snapshot.size_bytes),
+            modified_unix_ns: snapshot.modified_unix_ns,
+            identity_key: Some(snapshot.file_identity_key.clone()),
+        },
+    };
+    match database.publish_watch_file_delta_at(&binding, &write, now_unix_ms) {
+        Ok(progress) => Ok(Some(progress)),
+        Err(
+            DatabaseError::WatchFileDeltaNotEligible | DatabaseError::WatchFileDeltaSnapshotChanged,
+        ) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub fn watch_event_at(
@@ -957,9 +1036,18 @@ fn record_changed_snapshot(
             stable_after_unix_ms: stable_after(now_unix_ms, policy)?,
             ignored_reason: None,
             observed_at_unix_ms: now_unix_ms,
+            reconciliation_kind: reconciliation_kind_for_snapshot(&hint.snapshot),
         })
         .map(|event| event.progress)
         .map_err(Into::into)
+}
+
+fn reconciliation_kind_for_snapshot(snapshot: &WatchSnapshot) -> WatchReconciliationKind {
+    if snapshot.kind == WatchSnapshotKind::File {
+        WatchReconciliationKind::FileDelta
+    } else {
+        WatchReconciliationKind::FullScope
+    }
 }
 
 fn evaluate_hint(
@@ -1117,6 +1205,222 @@ fn open_file_matches_snapshot(hint: &ValidatedHint) -> Result<bool, WatcherError
             && hint.snapshot.size_bytes == Some(metadata.len())
             && hint.snapshot.modified_unix_ns == modified_unix_ns(&metadata),
     )
+}
+
+#[derive(Debug)]
+struct AnchoredRegularFileSnapshot {
+    root_identity_key: Vec<u8>,
+    parent_identity_key: Vec<u8>,
+    file_identity_key: Vec<u8>,
+    size_bytes: u64,
+    modified_unix_ns: Option<i64>,
+    link_count: Option<u64>,
+    _root: File,
+    _parent: File,
+    _file: File,
+}
+
+/// Opens an existing regular file through held directory descriptors.
+///
+/// A targeted metadata publication is only an optimization. On platforms
+/// without a descriptor-relative, no-follow implementation this returns
+/// `None`, and the caller must durably fall back to a full-scope scan.
+#[cfg(not(unix))]
+fn anchored_regular_file_snapshot(
+    _canonical_root: &Path,
+    _target: &Path,
+) -> Result<Option<AnchoredRegularFileSnapshot>, WatcherError> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn anchored_regular_file_snapshot(
+    canonical_root: &Path,
+    target: &Path,
+) -> Result<Option<AnchoredRegularFileSnapshot>, WatcherError> {
+    let Some(first) = open_anchored_regular_file_once(canonical_root, target)? else {
+        return Ok(None);
+    };
+    let Some(second) = open_anchored_regular_file_once(canonical_root, target)? else {
+        return Ok(None);
+    };
+    if first.root_identity_key != second.root_identity_key
+        || first.parent_identity_key != second.parent_identity_key
+        || first.file_identity_key != second.file_identity_key
+        || first.size_bytes != second.size_bytes
+        || first.modified_unix_ns != second.modified_unix_ns
+        || first.link_count != second.link_count
+    {
+        return Ok(None);
+    }
+    Ok(Some(second))
+}
+
+#[cfg(unix)]
+fn open_anchored_regular_file_once(
+    canonical_root: &Path,
+    target: &Path,
+) -> Result<Option<AnchoredRegularFileSnapshot>, WatcherError> {
+    let relative = match target.strip_prefix(canonical_root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative,
+        _ => return Ok(None),
+    };
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => CString::new(name.as_bytes()).ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(components) = components else {
+        return Ok(None);
+    };
+    let Some((leaf, parent_components)) = components.split_last() else {
+        return Ok(None);
+    };
+
+    let Some(root) = open_absolute_directory_without_links(canonical_root)? else {
+        return Ok(None);
+    };
+    let root_metadata = match root.metadata() {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        _ => return Ok(None),
+    };
+    let root_identity = platform_identity_for_open_file(
+        &root,
+        canonical_root,
+        &root_metadata,
+        IdentityNodeKind::Folder,
+    )
+    .map_err(|_| WatcherError::SourceIdentityChanged)?;
+
+    let current_directory = CString::new(".").expect("static component contains no NUL");
+    // SAFETY: `root` is a held directory descriptor, the component is static
+    // and NUL terminated, and the returned descriptor becomes File-owned.
+    let parent_fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            current_directory.as_ptr(),
+            directory_open_flags(),
+        )
+    };
+    if parent_fd < 0 {
+        return Ok(None);
+    }
+    // SAFETY: `parent_fd` is a newly owned descriptor returned by `openat`.
+    let mut parent = unsafe { File::from_raw_fd(parent_fd) };
+    for component in parent_components {
+        // SAFETY: the directory descriptor is held open, `component` is NUL
+        // terminated, and the returned descriptor is immediately owned by
+        // `File`. O_NOFOLLOW prevents a replaced component from being followed.
+        let next_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                component.as_ptr(),
+                directory_open_flags(),
+            )
+        };
+        if next_fd < 0 {
+            return Ok(None);
+        }
+        // SAFETY: `next_fd` is a newly owned descriptor returned by `openat`.
+        let next = unsafe { File::from_raw_fd(next_fd) };
+        if !next.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+            return Ok(None);
+        }
+        parent = next;
+    }
+
+    let parent_metadata = match parent.metadata() {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        _ => return Ok(None),
+    };
+    let parent_path = target
+        .parent()
+        .ok_or(WatcherError::ObservedPathOutsideScope)?;
+    let parent_identity = platform_identity_for_open_file(
+        &parent,
+        parent_path,
+        &parent_metadata,
+        IdentityNodeKind::Folder,
+    )
+    .map_err(|_| WatcherError::SourceIdentityChanged)?;
+
+    // O_NONBLOCK avoids hanging if the leaf is swapped for a FIFO or device
+    // between the stability check and this anchored open.
+    // SAFETY: `parent` remains alive for this call, `leaf` is NUL terminated,
+    // and the returned descriptor is immediately owned by `File`.
+    let file_fd =
+        unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), regular_file_open_flags()) };
+    if file_fd < 0 {
+        return Ok(None);
+    }
+    // SAFETY: `file_fd` is a newly owned descriptor returned by `openat`.
+    let file = unsafe { File::from_raw_fd(file_fd) };
+    let metadata = match file.metadata() {
+        Ok(metadata) if metadata.is_file() && !is_symlink_or_reparse_point(&metadata) => metadata,
+        _ => return Ok(None),
+    };
+    let file_identity =
+        platform_identity_for_open_file(&file, target, &metadata, IdentityNodeKind::File)
+            .map_err(|_| WatcherError::SourceIdentityChanged)?;
+
+    Ok(Some(AnchoredRegularFileSnapshot {
+        root_identity_key: root_identity.key,
+        parent_identity_key: parent_identity.key,
+        file_identity_key: file_identity.key,
+        size_bytes: metadata.len(),
+        modified_unix_ns: modified_unix_ns(&metadata),
+        link_count: file_identity.link_count,
+        _root: root,
+        _parent: parent,
+        _file: file,
+    }))
+}
+
+#[cfg(unix)]
+fn open_absolute_directory_without_links(path: &Path) -> Result<Option<File>, WatcherError> {
+    if !path.is_absolute() {
+        return Ok(None);
+    }
+    let slash = CString::new("/").expect("static path contains no NUL");
+    // SAFETY: the static path is NUL terminated and the returned descriptor is
+    // immediately wrapped in File.
+    let root_fd = unsafe { libc::open(slash.as_ptr(), directory_open_flags()) };
+    if root_fd < 0 {
+        return Ok(None);
+    }
+    // SAFETY: `root_fd` is a newly owned descriptor returned by `open`.
+    let mut current = unsafe { File::from_raw_fd(root_fd) };
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => {
+                CString::new(name.as_bytes()).map_err(|_| WatcherError::ObservedPathDecodeFailed)?
+            }
+            _ => return Ok(None),
+        };
+        // SAFETY: `current` is a held directory descriptor, `name` is NUL
+        // terminated, and O_NOFOLLOW prevents following the next component.
+        let next_fd =
+            unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), directory_open_flags()) };
+        if next_fd < 0 {
+            return Ok(None);
+        }
+        // SAFETY: `next_fd` is a newly owned descriptor returned by `openat`.
+        current = unsafe { File::from_raw_fd(next_fd) };
+    }
+    Ok(Some(current))
+}
+
+#[cfg(unix)]
+fn directory_open_flags() -> libc::c_int {
+    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NOCTTY
+}
+
+#[cfg(unix)]
+fn regular_file_open_flags() -> libc::c_int {
+    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY
 }
 
 fn stable_after(now_unix_ms: i64, policy: WatchPolicy) -> Result<i64, WatcherError> {
@@ -1296,7 +1600,7 @@ mod tests {
         let completed = coordinator
             .run_cycle_at_time(2_000)
             .expect("startup reconciliation should complete");
-        assert_eq!(completed.completed_event_count, 1);
+        assert_eq!(completed.completed_event_count, 1, "{completed:?}");
 
         let native = coordinator
             .run_cycle_with_native_batch_at_time(
@@ -1312,7 +1616,9 @@ mod tests {
                 3_000,
             )
             .expect("native overflow should use the durable root path");
-        assert_eq!(native.scheduled_scope_count, 1);
+        assert_eq!(native.scheduled_scope_count, 0);
+        assert_eq!(native.forced_scope_reconciliation_count, 1);
+        assert_eq!(native.completed_event_count, 1);
         assert!(native.native_reconcile_all);
         assert_eq!(native.native_overflow_count, 1);
         assert_eq!(native.native_hint_scope_count, 0);
@@ -1330,7 +1636,7 @@ mod tests {
         let mut coordinator =
             WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
 
-        let scheduled = coordinator
+        let reconciled = coordinator
             .run_cycle_with_native_batch_at_time(
                 native::NativeWatchBatch {
                     hints: vec![WatchHint {
@@ -1347,12 +1653,7 @@ mod tests {
                 1_000,
             )
             .expect("ordered rename ambiguity should request bounded scope recovery");
-        assert_eq!(scheduled.scheduled_scope_count, 1);
-        assert_eq!(scheduled.forced_scope_reconciliation_count, 0);
-
-        let reconciled = coordinator
-            .run_cycle_at_time(1_001)
-            .expect("scope recovery should force a fresh root scan");
+        assert_eq!(reconciled.scheduled_scope_count, 0);
         assert_eq!(reconciled.forced_scope_reconciliation_count, 1);
         assert_eq!(reconciled.completed_event_count, 1);
         assert!(
@@ -1460,7 +1761,7 @@ mod tests {
             .expect("recovery intent should survive the existing scan");
         assert_eq!(old_scan_completed.completed_event_count, 1);
         assert_eq!(old_scan_completed.forced_scope_reconciliation_count, 0);
-        assert_eq!(old_scan_completed.scheduled_scope_count, 1);
+        assert_eq!(old_scan_completed.scheduled_scope_count, 0);
         assert_eq!(old_scan_completed.active_event_count, 1);
 
         let followup_started = coordinator
@@ -1519,14 +1820,10 @@ mod tests {
         coordinator
             .request_all_scope_reconciliation_at(1_000)
             .expect("watch-set change should request reconciliation");
-        let scheduled = coordinator
-            .run_cycle_at_time(1_000)
-            .expect("root reconciliation should schedule durably");
-        assert_eq!(scheduled.scheduled_scope_count, 1);
         let completed = coordinator
-            .run_cycle_at_time(1_001)
-            .expect("forced reconciliation should not wait for debounce");
-
+            .run_cycle_at_time(1_000)
+            .expect("durable root reconciliation should run without debounce");
+        assert_eq!(completed.scheduled_scope_count, 0);
         assert_eq!(completed.forced_scope_reconciliation_count, 1);
         assert_eq!(completed.completed_event_count, 1);
         assert_eq!(
@@ -1646,7 +1943,9 @@ mod tests {
             .expect("source failure should degrade to polling");
 
         assert!(report.native_source_failed);
-        assert_eq!(report.scheduled_scope_count, 1);
+        assert_eq!(report.scheduled_scope_count, 0);
+        assert_eq!(report.forced_scope_reconciliation_count, 1);
+        assert_eq!(report.completed_event_count, 1);
         assert_eq!(report.last_error_code, Some("watch_native_source_failed"));
     }
 
@@ -1666,6 +1965,60 @@ mod tests {
             PollingWatchPolicy::new(MAX_POLL_INTERVAL_MS + 1),
             Err(WatcherError::InvalidPollingPolicy)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_file_snapshot_binds_root_parent_and_leaf_without_following_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("fixture root should canonicalize");
+        let nested = root.join("nested");
+        fs::create_dir(&nested).expect("nested folder should create");
+        let file = nested.join("note.md");
+        fs::write(&file, "local").expect("fixture file should write");
+
+        let snapshot = anchored_regular_file_snapshot(&root, &file)
+            .expect("anchored open should not fail")
+            .expect("ordinary file should be eligible");
+        assert_eq!(snapshot.size_bytes, 5);
+        assert_eq!(snapshot.link_count, Some(1));
+        assert_ne!(snapshot.root_identity_key, snapshot.parent_identity_key);
+        assert_ne!(snapshot.parent_identity_key, snapshot.file_identity_key);
+
+        let outside = tempfile::tempdir().expect("outside fixture should exist");
+        let outside_file = outside.path().join("outside.md");
+        fs::write(&outside_file, "private").expect("outside fixture should write");
+        let linked_file = root.join("linked.md");
+        symlink(&outside_file, &linked_file).expect("leaf symlink should create");
+        assert!(
+            anchored_regular_file_snapshot(&root, &linked_file)
+                .expect("leaf denial should not error")
+                .is_none(),
+            "a leaf symlink must never be followed"
+        );
+
+        let linked_parent = root.join("linked-parent");
+        symlink(outside.path(), &linked_parent).expect("parent symlink should create");
+        assert!(
+            anchored_regular_file_snapshot(&root, &linked_parent.join("outside.md"))
+                .expect("parent denial should not error")
+                .is_none(),
+            "an ancestor symlink must never be followed"
+        );
+
+        let alias_parent = directory.path().join("alias-parent");
+        symlink(&root, &alias_parent).expect("root alias should create");
+        assert!(
+            anchored_regular_file_snapshot(&alias_parent, &alias_parent.join("nested/note.md"))
+                .expect("root ancestor denial should not error")
+                .is_none(),
+            "the authorized root path itself must be opened component by component"
+        );
     }
 
     #[test]
@@ -1767,19 +2120,18 @@ mod tests {
             .expect("first polling cycle should be bounded");
         assert_eq!(first.scheduled_scope_count, 4);
         assert_eq!(first.deferred_scope_count, 5);
-        assert_eq!(
-            first.next_wake_unix_ms,
-            1_000 + COORDINATOR_SCOPE_SCHEDULE_RETRY_MS
-        );
+        assert_eq!(first.next_wake_unix_ms, 1_000 + COORDINATOR_ACTIVE_RETRY_MS);
 
         let before_retry = coordinator
             .run_cycle_at_time(1_050)
-            .expect("deferred scopes should not create a burst");
+            .expect("active scope work should remain bounded to one reconciliation");
         assert_eq!(before_retry.scheduled_scope_count, 0);
+        assert_eq!(before_retry.completed_event_count, 1);
+        assert_eq!(before_retry.active_event_count, 3);
         assert_eq!(before_retry.deferred_scope_count, 5);
         assert_eq!(
             before_retry.next_wake_unix_ms,
-            1_000 + COORDINATOR_SCOPE_SCHEDULE_RETRY_MS
+            1_050 + COORDINATOR_ACTIVE_RETRY_MS
         );
 
         for index in 9..13 {
@@ -2018,6 +2370,259 @@ mod tests {
                 .completed_scan_count,
             2
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_single_link_file_modify_uses_atomic_delta_without_rescanning_siblings() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let watched = directory.path().join("watched.md");
+        let sibling = directory.path().join("sibling.md");
+        fs::write(&watched, "before").expect("watched fixture should write");
+        fs::write(&sibling, "sibling").expect("sibling fixture should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("initial scan should complete");
+        let scans_before = database
+            .stats()
+            .expect("manifest stats should load")
+            .completed_scan_count;
+        let sibling_key =
+            comparison_key(&fs::canonicalize(&sibling).expect("sibling should canonicalize"));
+        let sibling_node_before = database
+            .node_id_for_path_key(scope.id, &sibling_key)
+            .expect("sibling lookup should pass")
+            .expect("sibling should be present");
+
+        fs::write(&watched, "after with a different size").expect("watched fixture should change");
+        let event = observe_watch_path_at_time(
+            &mut database,
+            scope.id,
+            &watched,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("modify hint should persist");
+        assert_eq!(
+            database
+                .watch_event(event.event_id)
+                .expect("durable event should load")
+                .reconciliation_kind,
+            WatchReconciliationKind::FileDelta
+        );
+
+        let completed = advance_watch_event_at_time(
+            &mut database,
+            event.event_id,
+            WatchPolicy::default(),
+            2_000,
+        )
+        .expect("same-identity delta should publish");
+        assert_eq!(completed.status, WatchEventStatus::Completed);
+        assert_eq!(completed.scan_job_id, None);
+        assert_eq!(
+            database
+                .stats()
+                .expect("manifest stats should load")
+                .completed_scan_count,
+            scans_before,
+            "the narrow file update must not create a full-scope scan"
+        );
+        let watched_node = database
+            .node_id_for_path_key(
+                scope.id,
+                &comparison_key(
+                    &fs::canonicalize(&watched).expect("watched path should canonicalize"),
+                ),
+            )
+            .expect("watched lookup should pass")
+            .expect("watched file should remain present");
+        assert_eq!(
+            database
+                .extractable_file(scope.id, watched_node)
+                .expect("updated metadata should load")
+                .size_bytes,
+            27
+        );
+        assert_eq!(
+            database
+                .node_id_for_path_key(scope.id, &sibling_key)
+                .expect("sibling lookup should pass"),
+            Some(sibling_node_before),
+            "a file delta must not republish or tombstone a sibling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligible_file_delta_survives_restart_without_becoming_a_full_scan() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("scope");
+        fs::create_dir(&scope_path).expect("scope should create");
+        let watched = scope_path.join("restart.md");
+        fs::write(&watched, "before").expect("fixture should write");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("initial scan should complete");
+        let scans_before = database
+            .stats()
+            .expect("manifest stats should load")
+            .completed_scan_count;
+        fs::write(&watched, "after restart proof").expect("fixture should change");
+        let event = observe_watch_path_at_time(
+            &mut database,
+            scope.id,
+            &watched,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("file delta should persist");
+        drop(database);
+
+        let mut reopened =
+            ManifestDatabase::open(&database_path).expect("database should reopen after restart");
+        let completed = advance_watch_event_at_time(
+            &mut reopened,
+            event.event_id,
+            WatchPolicy::default(),
+            2_000,
+        )
+        .expect("durable file delta should resume");
+        assert_eq!(completed.status, WatchEventStatus::Completed);
+        assert_eq!(completed.scan_job_id, None);
+        assert_eq!(
+            reopened
+                .stats()
+                .expect("manifest stats should load")
+                .completed_scan_count,
+            scans_before
+        );
+    }
+
+    #[test]
+    fn new_file_and_missing_file_fall_back_to_durable_full_scope() {
+        let (directory, mut database, scope_id) = setup();
+        let created = directory.path().join("created.md");
+        fs::write(&created, "new").expect("new fixture should write");
+        let scans_before_create = database
+            .stats()
+            .expect("manifest stats should load")
+            .completed_scan_count;
+        let create_event = observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &created,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("create hint should persist");
+        let create_completed = advance_watch_event_at_time(
+            &mut database,
+            create_event.event_id,
+            WatchPolicy::default(),
+            2_000,
+        )
+        .expect("unbound create should use full-scope recovery");
+        assert_eq!(create_completed.status, WatchEventStatus::Completed);
+        assert!(create_completed.scan_job_id.is_some());
+        assert_eq!(
+            database
+                .stats()
+                .expect("manifest stats should load")
+                .completed_scan_count,
+            scans_before_create + 1
+        );
+
+        fs::remove_file(&created).expect("fixture should be removed");
+        let delete_event = observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &created,
+            WatchPolicy::default(),
+            3_000,
+        )
+        .expect("missing hint should persist");
+        assert_eq!(
+            database
+                .watch_event(delete_event.event_id)
+                .expect("missing event should load")
+                .reconciliation_kind,
+            WatchReconciliationKind::FullScope
+        );
+        let delete_completed = advance_watch_event_at_time(
+            &mut database,
+            delete_event.event_id,
+            WatchPolicy::default(),
+            4_000,
+        )
+        .expect("missing path must use full-scope proof");
+        assert_eq!(delete_completed.status, WatchEventStatus::Completed);
+        assert!(delete_completed.scan_job_id.is_some());
+        assert_eq!(
+            database
+                .node_id_for_path_key(scope_id, &comparison_key(&created))
+                .expect("deleted lookup should pass"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_modify_and_restart_preserve_the_safe_fallback_boundary() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("scope");
+        fs::create_dir(&scope_path).expect("scope should create");
+        let original = scope_path.join("original.md");
+        let linked = scope_path.join("linked.md");
+        fs::write(&original, "before").expect("original should write");
+        fs::hard_link(&original, &linked).expect("hard link should create");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("initial scan should complete");
+        fs::write(&original, "after with a different size").expect("original should change");
+        let event = observe_watch_path_at_time(
+            &mut database,
+            scope.id,
+            &original,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("hard-link hint should persist");
+        drop(database);
+
+        let mut reopened =
+            ManifestDatabase::open(&database_path).expect("database should reopen after restart");
+        let completed = advance_watch_event_at_time(
+            &mut reopened,
+            event.event_id,
+            WatchPolicy::default(),
+            2_000,
+        )
+        .expect("hard links must fall back after restart");
+        assert_eq!(completed.status, WatchEventStatus::Completed);
+        assert!(
+            completed.scan_job_id.is_some(),
+            "multi-link identity is not eligible for a direct file delta"
+        );
+        let original_node = reopened
+            .node_id_for_path_key(
+                scope.id,
+                &comparison_key(
+                    &fs::canonicalize(&original).expect("original should canonicalize"),
+                ),
+            )
+            .expect("original lookup should pass")
+            .expect("original should remain present");
+        let linked_node = reopened
+            .node_id_for_path_key(
+                scope.id,
+                &comparison_key(&fs::canonicalize(&linked).expect("linked should canonicalize")),
+            )
+            .expect("linked lookup should pass")
+            .expect("linked path should remain present");
+        assert_eq!(original_node, linked_node);
     }
 
     #[test]
