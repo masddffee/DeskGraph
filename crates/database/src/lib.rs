@@ -18,7 +18,9 @@ use deskgraph_domain::{
     FolderFileCategory, ImageFormat, ImageMetadata, ManifestStats, ProjectCandidate,
     ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
     ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
-    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
+    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, ScreenshotGroupCandidate,
+    ScreenshotGroupCandidateState, ScreenshotGroupCandidateSummary, ScreenshotGroupCreator,
+    ScreenshotGroupEvidence, ScreenshotGroupMember, ScreenshotGroupRuleKind, WatchEventProgress,
     WatchEventReason, WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
     parse_explicit_file_version_name, reduce_action_journal,
 };
@@ -129,6 +131,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "scope_access_grants",
         sql: include_str!("../../../migrations/0020_scope_access_grants.sql"),
     },
+    Migration {
+        version: 21,
+        name: "screenshot_group_candidates",
+        sql: include_str!("../../../migrations/0021_screenshot_group_candidates.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -148,6 +155,10 @@ const MAX_ACTION_PATH_BYTES: usize = 64 * 1024;
 const MAX_FOLDER_PROFILE_ENTRIES: u64 = 100_000;
 const MAX_FILE_RELATION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SCOPE_ACCESS_GRANT_BYTES: usize = 1024 * 1024;
+const MAX_SCREENSHOT_GROUP_IMAGES: u32 = 2_000;
+const MAX_SCREENSHOT_GROUPS: usize = 20;
+const MAX_SCREENSHOT_GROUP_MEMBERS: usize = 20;
+const SCREENSHOT_GROUP_TIME_WINDOW_NS: i64 = 600 * 1_000_000_000;
 
 struct Migration {
     version: i64,
@@ -563,6 +574,32 @@ pub struct FolderProfileFacts {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ScreenshotGroupSourceRecord {
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub location_id: i64,
+    pub image_metadata_id: i64,
+    pub ocr_extraction_job_id: i64,
+    pub size_bytes: u64,
+    pub modified_unix_ns: i64,
+    pub format: ImageFormat,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub ocr_chunk_count: u32,
+    pub ocr_provider_id: String,
+    pub ocr_provider_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScreenshotGroupObservationRecord {
+    id: i64,
+    evidence_key: String,
+    member_count: i64,
+    confidence_basis_points: i64,
+    observed_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContentChunkProvenanceWrite {
     ByteRange {
         start: u64,
@@ -698,6 +735,12 @@ pub enum DatabaseError {
     FileRelationCandidateNotFound,
     FileRelationCandidateInputInvalid,
     FileRelationCandidateNotCurrent,
+    ScreenshotGroupCandidateNotFound,
+    ScreenshotGroupCandidateInputInvalid,
+    ScreenshotGroupCandidateNotCurrent,
+    ScreenshotGroupImageLimitExceeded,
+    ScreenshotGroupLimitExceeded,
+    ScreenshotGroupMemberLimitExceeded,
     InvalidStoredValue,
     InvalidCount,
     InvalidTimestamp,
@@ -759,6 +802,14 @@ impl DatabaseError {
             Self::FileRelationCandidateNotFound => "file_relation_candidate_not_found",
             Self::FileRelationCandidateInputInvalid => "file_relation_candidate_input_invalid",
             Self::FileRelationCandidateNotCurrent => "file_relation_candidate_not_current",
+            Self::ScreenshotGroupCandidateNotFound => "screenshot_group_candidate_not_found",
+            Self::ScreenshotGroupCandidateInputInvalid => {
+                "screenshot_group_candidate_input_invalid"
+            }
+            Self::ScreenshotGroupCandidateNotCurrent => "screenshot_group_candidate_not_current",
+            Self::ScreenshotGroupImageLimitExceeded => "screenshot_group_image_limit_exceeded",
+            Self::ScreenshotGroupLimitExceeded => "screenshot_group_limit_exceeded",
+            Self::ScreenshotGroupMemberLimitExceeded => "screenshot_group_member_limit_exceeded",
             Self::InvalidStoredValue => "database_invalid_stored_value",
             Self::InvalidCount => "database_count_out_of_range",
             Self::InvalidTimestamp => "system_time_invalid",
@@ -5259,6 +5310,266 @@ impl ManifestDatabase {
         })
     }
 
+    #[cfg(test)]
+    fn screenshot_group_sources(
+        &self,
+        scope_id: i64,
+    ) -> Result<Vec<ScreenshotGroupSourceRecord>, DatabaseError> {
+        ensure_scope_queryable(&self.connection, scope_id)?;
+        ensure_scope_access_permitted(&self.connection, scope_id)?;
+        screenshot_group_sources_from_connection(&self.connection, scope_id)
+    }
+
+    pub fn discover_screenshot_group_candidates(
+        &mut self,
+        scope_id: i64,
+    ) -> Result<(u32, Vec<ScreenshotGroupCandidate>), DatabaseError> {
+        self.discover_screenshot_group_candidates_with_hook(scope_id, || Ok(()))
+    }
+
+    fn discover_screenshot_group_candidates_with_hook<F>(
+        &mut self,
+        scope_id: i64,
+        after_source_snapshot: F,
+    ) -> Result<(u32, Vec<ScreenshotGroupCandidate>), DatabaseError>
+    where
+        F: FnOnce() -> Result<(), DatabaseError>,
+    {
+        if scope_id <= 0 {
+            return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+        }
+        let observed_at = unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_scope_queryable(&transaction, scope_id)?;
+        ensure_scope_access_permitted(&transaction, scope_id)?;
+        let sources = screenshot_group_sources_from_connection(&transaction, scope_id)?;
+        let evaluated_image_count =
+            u32::try_from(sources.len()).map_err(|_| DatabaseError::InvalidCount)?;
+        let groups = group_screenshot_sources(sources)?;
+        after_source_snapshot()?;
+
+        let mut all_nodes = std::collections::BTreeSet::new();
+        for group in &groups {
+            validate_screenshot_group_input(scope_id, group)?;
+            for source in group {
+                if !all_nodes.insert(source.node_id) {
+                    return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+                }
+                if !screenshot_group_source_matches(&transaction, source)? {
+                    return Err(DatabaseError::ScreenshotGroupCandidateNotCurrent);
+                }
+            }
+        }
+
+        let mut group_ids = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let membership_key = screenshot_group_membership_key(group)?;
+            let evidence_key = screenshot_group_evidence_key(group)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO screenshot_group_candidates( \
+                    api_version, scope_id, membership_key, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    ScreenshotGroupCandidate::API_VERSION,
+                    scope_id,
+                    membership_key,
+                    observed_at
+                ],
+            )?;
+            let group_id: i64 = transaction.query_row(
+                "SELECT id FROM screenshot_group_candidates \
+                 WHERE scope_id = ?1 AND membership_key = ?2",
+                params![scope_id, membership_key],
+                |row| row.get(0),
+            )?;
+            let inserted = transaction.execute(
+                "INSERT INTO screenshot_group_observations( \
+                    group_id, evidence_key, member_count, confidence_basis_points, rule_kind, created_by, \
+                    provider_id, provider_version, model_version, observed_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, 6000, 'same_dimensions_time_window_with_ocr', \
+                    'system_rule', 'deskgraph.screenshot-group-rules', '1', NULL, ?4) \
+                 ON CONFLICT(group_id, evidence_key) DO NOTHING",
+                params![
+                    group_id,
+                    evidence_key,
+                    i64::try_from(group.len()).map_err(|_| DatabaseError::InvalidCount)?,
+                    observed_at
+                ],
+            )?;
+            let observation_id = if inserted == 1 {
+                let observation_id = transaction.last_insert_rowid();
+                for (index, source) in group.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO screenshot_group_members( \
+                            observation_id, ordinal, node_id, location_id, image_metadata_id, \
+                            ocr_extraction_job_id, source_size_bytes, source_modified_unix_ns, \
+                            format, pixel_width, pixel_height, ocr_chunk_count, ocr_provider_id, \
+                            ocr_provider_version \
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        params![
+                            observation_id,
+                            i64::try_from(index + 1).map_err(|_| DatabaseError::InvalidCount)?,
+                            source.node_id,
+                            source.location_id,
+                            source.image_metadata_id,
+                            source.ocr_extraction_job_id,
+                            i64::try_from(source.size_bytes)
+                                .map_err(|_| DatabaseError::InvalidCount)?,
+                            source.modified_unix_ns,
+                            source.format.as_str(),
+                            i64::from(source.pixel_width),
+                            i64::from(source.pixel_height),
+                            i64::from(source.ocr_chunk_count),
+                            source.ocr_provider_id,
+                            source.ocr_provider_version,
+                        ],
+                    )?;
+                }
+                observation_id
+            } else {
+                let observation_id: i64 = transaction.query_row(
+                    "SELECT id FROM screenshot_group_observations \
+                     WHERE group_id = ?1 AND evidence_key = ?2",
+                    params![group_id, evidence_key],
+                    |row| row.get(0),
+                )?;
+                let stored = screenshot_group_observation_sources_from_connection(
+                    &transaction,
+                    scope_id,
+                    observation_id,
+                )?;
+                if stored.as_slice() != group.as_slice() {
+                    return Err(DatabaseError::InvalidStoredValue);
+                }
+                observation_id
+            };
+            if observation_id <= 0 {
+                return Err(DatabaseError::InvalidStoredValue);
+            }
+            group_ids.push(group_id);
+        }
+        transaction.commit()?;
+        let candidates = group_ids
+            .into_iter()
+            .map(|group_id| self.screenshot_group_candidate(group_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((evaluated_image_count, candidates))
+    }
+
+    pub fn screenshot_group_candidate(
+        &self,
+        group_id: i64,
+    ) -> Result<ScreenshotGroupCandidate, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (scope_id, membership_key) =
+            screenshot_group_identity_from_connection(&transaction, group_id)?;
+        ensure_scope_queryable(&transaction, scope_id)?;
+        ensure_scope_access_permitted(&transaction, scope_id)?;
+        let sources =
+            current_screenshot_group_for_membership(&transaction, scope_id, &membership_key)?
+                .ok_or(DatabaseError::ScreenshotGroupCandidateNotCurrent)?;
+        let evidence_key = screenshot_group_evidence_key(&sources)?;
+        let observation =
+            screenshot_group_observation_for_evidence(&transaction, group_id, &evidence_key)?
+                .ok_or(DatabaseError::ScreenshotGroupCandidateNotCurrent)?;
+        validate_screenshot_group_observation(
+            &transaction,
+            scope_id,
+            &membership_key,
+            &observation,
+        )?;
+        let candidate = screenshot_group_candidate_from_sources(
+            &transaction,
+            group_id,
+            scope_id,
+            observation.id,
+            observation.confidence_basis_points,
+            observation.observed_at_unix_ms,
+            sources,
+        )?;
+        transaction.commit()?;
+        Ok(candidate)
+    }
+
+    pub fn recent_screenshot_group_candidates(
+        &self,
+    ) -> Result<Vec<ScreenshotGroupCandidateSummary>, DatabaseError> {
+        let group_ids = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id FROM screenshot_group_candidates ORDER BY id DESC LIMIT 20")?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        group_ids
+            .into_iter()
+            .map(|group_id| self.screenshot_group_candidate_summary(group_id))
+            .collect()
+    }
+
+    fn screenshot_group_candidate_summary(
+        &self,
+        group_id: i64,
+    ) -> Result<ScreenshotGroupCandidateSummary, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (scope_id, membership_key) =
+            screenshot_group_identity_from_connection(&transaction, group_id)?;
+        let observation =
+            latest_screenshot_group_observation_from_connection(&transaction, group_id)?;
+        let historical_sources = validate_screenshot_group_observation(
+            &transaction,
+            scope_id,
+            &membership_key,
+            &observation,
+        )?;
+        let mut total_size_bytes = 0_u64;
+        for source in &historical_sources {
+            total_size_bytes = total_size_bytes
+                .checked_add(source.size_bytes)
+                .ok_or(DatabaseError::InvalidCount)?;
+        }
+
+        let current_evidence = match ensure_scope_access_permitted(&transaction, scope_id) {
+            Ok(()) => {
+                current_screenshot_group_for_membership(&transaction, scope_id, &membership_key)?
+                    .map(|sources| {
+                        let evidence_key = screenshot_group_evidence_key(&sources)?;
+                        Ok::<_, DatabaseError>(
+                            screenshot_group_observation_for_evidence(
+                                &transaction,
+                                group_id,
+                                &evidence_key,
+                            )?
+                            .is_some(),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(false)
+            }
+            Err(DatabaseError::ScopeAccessGrantNotActive) => false,
+            Err(error) => return Err(error),
+        };
+        let summary = ScreenshotGroupCandidateSummary {
+            api_version: ScreenshotGroupCandidateSummary::API_VERSION,
+            group_id,
+            scope_id,
+            state: ScreenshotGroupCandidateState::Suggested,
+            current_evidence,
+            member_count: u32::try_from(observation.member_count)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            total_size_bytes,
+            confidence_basis_points: u16::try_from(observation.confidence_basis_points)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            last_observed_at_unix_ms: observation.observed_at_unix_ms,
+            verification_required: true,
+            cleanup_authorized: false,
+        };
+        transaction.commit()?;
+        Ok(summary)
+    }
+
     pub fn exact_duplicate_sources(
         &self,
         relation_id: i64,
@@ -5981,6 +6292,249 @@ impl ManifestDatabase {
             .optional()
             .map_err(Into::into)
     }
+}
+
+fn validate_screenshot_group_input(
+    scope_id: i64,
+    group: &[ScreenshotGroupSourceRecord],
+) -> Result<(), DatabaseError> {
+    if !(2..=MAX_SCREENSHOT_GROUP_MEMBERS).contains(&group.len()) {
+        return Err(DatabaseError::ScreenshotGroupMemberLimitExceeded);
+    }
+    let first = group
+        .first()
+        .ok_or(DatabaseError::ScreenshotGroupCandidateInputInvalid)?;
+    let last = group
+        .last()
+        .ok_or(DatabaseError::ScreenshotGroupCandidateInputInvalid)?;
+    if first.scope_id != scope_id
+        || last
+            .modified_unix_ns
+            .checked_sub(first.modified_unix_ns)
+            .is_none_or(|delta| !(0..=SCREENSHOT_GROUP_TIME_WINDOW_NS).contains(&delta))
+    {
+        return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+    }
+    let mut previous = None;
+    let mut node_ids = std::collections::BTreeSet::new();
+    for source in group {
+        if source.scope_id != scope_id
+            || source.node_id <= 0
+            || source.location_id <= 0
+            || source.image_metadata_id <= 0
+            || source.ocr_extraction_job_id <= 0
+            || source.size_bytes == 0
+            || source.size_bytes > MAX_EXTRACTION_SOURCE_BYTES
+            || source.modified_unix_ns < 0
+            || source.pixel_width != first.pixel_width
+            || source.pixel_height != first.pixel_height
+            || !matches!(
+                source.format,
+                ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Webp
+            )
+            || source.ocr_chunk_count == 0
+            || usize::try_from(source.ocr_chunk_count)
+                .map_or(true, |count| count > MAX_EXTRACTION_CHUNKS)
+            || source.ocr_provider_id.is_empty()
+            || source.ocr_provider_id.len() > 128
+            || source.ocr_provider_version.is_empty()
+            || source.ocr_provider_version.len() > 128
+            || !is_valid_image_dimensions(source.pixel_width, source.pixel_height)
+            || !node_ids.insert(source.node_id)
+        {
+            return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+        }
+        let order = (source.modified_unix_ns, source.node_id);
+        if previous.is_some_and(|previous| previous >= order) {
+            return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+        }
+        previous = Some(order);
+    }
+    Ok(())
+}
+
+fn screenshot_group_membership_key(
+    group: &[ScreenshotGroupSourceRecord],
+) -> Result<String, DatabaseError> {
+    if !(2..=MAX_SCREENSHOT_GROUP_MEMBERS).contains(&group.len()) {
+        return Err(DatabaseError::ScreenshotGroupMemberLimitExceeded);
+    }
+    let mut node_ids = group
+        .iter()
+        .map(|source| source.node_id)
+        .collect::<Vec<_>>();
+    node_ids.sort_unstable();
+    node_ids.dedup();
+    if node_ids.len() != group.len() || node_ids.first().is_none_or(|node_id| *node_id <= 0) {
+        return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+    }
+    let membership_key = node_ids
+        .into_iter()
+        .map(|node_id| node_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !(3..=511).contains(&membership_key.len()) {
+        return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+    }
+    Ok(membership_key)
+}
+
+fn screenshot_group_evidence_key(
+    group: &[ScreenshotGroupSourceRecord],
+) -> Result<String, DatabaseError> {
+    validate_screenshot_group_input(
+        group
+            .first()
+            .ok_or(DatabaseError::ScreenshotGroupCandidateInputInvalid)?
+            .scope_id,
+        group,
+    )?;
+    let mut key = String::from("deskgraph.screenshot-group-evidence.v1|");
+    for source in group {
+        for field in [
+            source.scope_id.to_string(),
+            source.node_id.to_string(),
+            source.location_id.to_string(),
+            source.image_metadata_id.to_string(),
+            source.ocr_extraction_job_id.to_string(),
+            source.size_bytes.to_string(),
+            source.modified_unix_ns.to_string(),
+            source.format.as_str().to_string(),
+            source.pixel_width.to_string(),
+            source.pixel_height.to_string(),
+            source.ocr_chunk_count.to_string(),
+            source.ocr_provider_id.clone(),
+            source.ocr_provider_version.clone(),
+        ] {
+            key.push_str(&field.len().to_string());
+            key.push(':');
+            key.push_str(&field);
+            key.push('|');
+        }
+    }
+    if !(16..=16_384).contains(&key.len()) {
+        return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+    }
+    Ok(key)
+}
+
+fn screenshot_group_source_matches(
+    connection: &Connection,
+    source: &ScreenshotGroupSourceRecord,
+) -> Result<bool, DatabaseError> {
+    let matches: i64 = connection.query_row(
+        "SELECT COUNT(*) \
+         FROM image_metadata im \
+         JOIN extraction_jobs image_job ON image_job.id = im.extraction_job_id \
+            AND image_job.status = 'completed' \
+         JOIN locations l ON l.id = im.location_id AND l.scope_id = im.scope_id \
+            AND l.node_id = im.node_id AND l.present = 1 \
+         JOIN nodes n ON n.id = im.node_id AND n.kind = 'file' \
+         JOIN files f ON f.node_id = im.node_id \
+         JOIN extraction_jobs ocr_job ON ocr_job.id = ?5 \
+            AND ocr_job.scope_id = im.scope_id AND ocr_job.node_id = im.node_id \
+            AND ocr_job.location_id = im.location_id \
+            AND ocr_job.operation = 'screenshot_ocr' AND ocr_job.status = 'completed' \
+            AND ocr_job.source_size_bytes = f.size_bytes \
+            AND ocr_job.source_modified_unix_ns IS f.modified_unix_ns \
+         WHERE im.id = ?4 AND im.scope_id = ?1 AND im.node_id = ?2 \
+            AND im.location_id = ?3 AND im.active = 1 \
+            AND im.source_size_bytes = ?6 AND im.source_modified_unix_ns IS ?7 \
+            AND im.format = ?8 AND im.pixel_width = ?9 AND im.pixel_height = ?10 \
+            AND f.size_bytes = ?6 AND f.modified_unix_ns IS ?7 \
+            AND (SELECT COUNT(*) FROM content_chunks c \
+                 WHERE c.extraction_job_id = ?5 AND c.active = 1) = ?11 \
+            AND (SELECT COUNT(*) FROM content_chunks c \
+                 WHERE c.extraction_job_id = ?5 AND c.active = 1 \
+                   AND c.scope_id = ?1 AND c.node_id = ?2 AND c.location_id = ?3 \
+                   AND c.provenance_kind = 'ocr_observation' \
+                   AND c.source_size_bytes = ?6 AND c.source_modified_unix_ns IS ?7 \
+                   AND c.provider_id = ?12 AND c.provider_version = ?13) = ?11",
+        params![
+            source.scope_id,
+            source.node_id,
+            source.location_id,
+            source.image_metadata_id,
+            source.ocr_extraction_job_id,
+            to_i64(source.size_bytes)?,
+            source.modified_unix_ns,
+            source.format.as_str(),
+            i64::from(source.pixel_width),
+            i64::from(source.pixel_height),
+            i64::from(source.ocr_chunk_count),
+            source.ocr_provider_id,
+            source.ocr_provider_version,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(matches == 1)
+}
+
+fn screenshot_group_candidate_from_sources(
+    connection: &Connection,
+    group_id: i64,
+    scope_id: i64,
+    observation_id: i64,
+    confidence_basis_points: i64,
+    observed_at_unix_ms: i64,
+    sources: Vec<ScreenshotGroupSourceRecord>,
+) -> Result<ScreenshotGroupCandidate, DatabaseError> {
+    let mut total_size_bytes = 0_u64;
+    let mut members = Vec::with_capacity(sources.len());
+    for source in sources {
+        let display_path = connection
+            .query_row(
+                "SELECT display_path FROM locations \
+                 WHERE id = ?1 AND scope_id = ?2 AND node_id = ?3 AND present = 1",
+                params![source.location_id, source.scope_id, source.node_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|path| !path.is_empty())
+            .ok_or(DatabaseError::ScreenshotGroupCandidateNotCurrent)?;
+        total_size_bytes = total_size_bytes
+            .checked_add(source.size_bytes)
+            .ok_or(DatabaseError::InvalidCount)?;
+        members.push(ScreenshotGroupMember {
+            node_id: source.node_id,
+            location_id: source.location_id,
+            display_path,
+            image_metadata_id: source.image_metadata_id,
+            ocr_extraction_job_id: source.ocr_extraction_job_id,
+            size_bytes: source.size_bytes,
+            modified_unix_ns: source.modified_unix_ns,
+            format: source.format,
+            pixel_width: source.pixel_width,
+            pixel_height: source.pixel_height,
+            ocr_chunk_count: source.ocr_chunk_count,
+            ocr_provider_id: source.ocr_provider_id,
+            ocr_provider_version: source.ocr_provider_version,
+        });
+    }
+    Ok(ScreenshotGroupCandidate {
+        api_version: ScreenshotGroupCandidate::API_VERSION,
+        group_id,
+        scope_id,
+        state: ScreenshotGroupCandidateState::Suggested,
+        members,
+        total_size_bytes,
+        members_independently_selectable: true,
+        evidence: ScreenshotGroupEvidence {
+            observation_id,
+            rule_kind: ScreenshotGroupRuleKind::SameDimensionsTimeWindowWithOcr,
+            confidence_basis_points: u16::try_from(confidence_basis_points)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            observed_at_unix_ms,
+            created_by: ScreenshotGroupCreator::SystemRule,
+            provider_id: ScreenshotGroupEvidence::PROVIDER_ID,
+            provider_version: ScreenshotGroupEvidence::PROVIDER_VERSION,
+            model_version: None,
+            time_window_seconds: 600,
+            review_assistance_only: true,
+            content_similarity_claimed: false,
+            cleanup_authorized: false,
+        },
+    })
 }
 
 fn validate_exact_duplicate_sources(
@@ -7579,6 +8133,418 @@ fn ensure_scope_queryable(connection: &Connection, scope_id: i64) -> Result<(), 
     Ok(())
 }
 
+fn ensure_scope_access_permitted(
+    connection: &Connection,
+    scope_id: i64,
+) -> Result<(), DatabaseError> {
+    let state = connection
+        .query_row(
+            "SELECT grant.state \
+             FROM authorized_scopes scope \
+             LEFT JOIN scope_access_grants grant \
+               ON grant.scope_id = scope.id AND grant.platform = scope.platform \
+             WHERE scope.id = ?1",
+            [scope_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScopeNotFound)?;
+    match state.as_deref() {
+        Some("active") => Ok(()),
+        Some("needs_reauthorization" | "revoked") | None => {
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        }
+        Some(_) => Err(DatabaseError::InvalidStoredValue),
+    }
+}
+
+fn screenshot_group_sources_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+) -> Result<Vec<ScreenshotGroupSourceRecord>, DatabaseError> {
+    let query_limit = i64::from(MAX_SCREENSHOT_GROUP_IMAGES) + 1;
+    let mut statement = connection.prepare(
+        "SELECT im.scope_id, im.node_id, im.location_id, im.id, ocr_job.id, \
+                f.size_bytes, f.modified_unix_ns, im.format, im.pixel_width, im.pixel_height, \
+                COUNT(chunk.id), MIN(chunk.provider_id), MIN(chunk.provider_version), \
+                MAX(chunk.provider_id), MAX(chunk.provider_version) \
+         FROM image_metadata im \
+         JOIN extraction_jobs image_job \
+           ON image_job.id = im.extraction_job_id AND image_job.status = 'completed' \
+         JOIN locations location \
+           ON location.id = im.location_id AND location.scope_id = im.scope_id \
+          AND location.node_id = im.node_id AND location.present = 1 \
+         JOIN nodes node ON node.id = im.node_id AND node.kind = 'file' \
+         JOIN files f ON f.node_id = im.node_id \
+         JOIN extraction_jobs ocr_job \
+           ON ocr_job.scope_id = im.scope_id AND ocr_job.node_id = im.node_id \
+          AND ocr_job.location_id = im.location_id \
+          AND ocr_job.operation = 'screenshot_ocr' AND ocr_job.status = 'completed' \
+          AND ocr_job.source_size_bytes = f.size_bytes \
+          AND ocr_job.source_modified_unix_ns IS f.modified_unix_ns \
+         JOIN content_chunks chunk \
+           ON chunk.extraction_job_id = ocr_job.id AND chunk.active = 1 \
+          AND chunk.scope_id = im.scope_id AND chunk.node_id = im.node_id \
+          AND chunk.location_id = im.location_id \
+          AND chunk.provenance_kind = 'ocr_observation' \
+          AND chunk.source_size_bytes = f.size_bytes \
+          AND chunk.source_modified_unix_ns IS f.modified_unix_ns \
+         WHERE im.scope_id = ?1 AND im.active = 1 \
+           AND im.source_size_bytes = f.size_bytes \
+           AND im.source_modified_unix_ns IS f.modified_unix_ns \
+           AND im.format IN ('png', 'jpeg', 'webp') \
+           AND ocr_job.id = ( \
+               SELECT MAX(candidate.id) FROM extraction_jobs candidate \
+               WHERE candidate.scope_id = im.scope_id \
+                 AND candidate.node_id = im.node_id \
+                 AND candidate.location_id = im.location_id \
+                 AND candidate.operation = 'screenshot_ocr' \
+                 AND candidate.status = 'completed' \
+                 AND candidate.source_size_bytes = f.size_bytes \
+                 AND candidate.source_modified_unix_ns IS f.modified_unix_ns \
+                 AND EXISTS ( \
+                     SELECT 1 FROM content_chunks active_chunk \
+                     WHERE active_chunk.extraction_job_id = candidate.id \
+                       AND active_chunk.active = 1 \
+                 ) \
+           ) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM content_chunks invalid_chunk \
+               WHERE invalid_chunk.extraction_job_id = ocr_job.id \
+                 AND invalid_chunk.active = 1 \
+                 AND (invalid_chunk.scope_id != im.scope_id \
+                   OR invalid_chunk.node_id != im.node_id \
+                   OR invalid_chunk.location_id != im.location_id \
+                   OR invalid_chunk.provenance_kind != 'ocr_observation' \
+                   OR invalid_chunk.source_size_bytes != f.size_bytes \
+                   OR invalid_chunk.source_modified_unix_ns IS NOT f.modified_unix_ns) \
+           ) \
+         GROUP BY im.scope_id, im.node_id, im.location_id, im.id, ocr_job.id, \
+                  ocr_job.provider_id, ocr_job.provider_version, \
+                  f.size_bytes, f.modified_unix_ns, im.format, im.pixel_width, im.pixel_height \
+         HAVING COUNT(chunk.id) BETWEEN 1 AND ?2 \
+            AND MIN(chunk.provider_id) = MAX(chunk.provider_id) \
+            AND MIN(chunk.provider_version) = MAX(chunk.provider_version) \
+            AND MIN(chunk.provider_id) = ocr_job.provider_id \
+            AND MIN(chunk.provider_version) = ocr_job.provider_version \
+         ORDER BY im.pixel_width, im.pixel_height, f.modified_unix_ns, im.node_id \
+         LIMIT ?3",
+    )?;
+    let rows = statement.query_map(
+        params![
+            scope_id,
+            i64::try_from(MAX_EXTRACTION_CHUNKS).map_err(|_| DatabaseError::InvalidCount)?,
+            query_limit
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+            ))
+        },
+    )?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let row = row?;
+        if row.11 != row.13 || row.12 != row.14 {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        sources.push(ScreenshotGroupSourceRecord {
+            scope_id: row.0,
+            node_id: row.1,
+            location_id: row.2,
+            image_metadata_id: row.3,
+            ocr_extraction_job_id: row.4,
+            size_bytes: u64::try_from(row.5).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            modified_unix_ns: row.6,
+            format: ImageFormat::from_storage(&row.7).ok_or(DatabaseError::InvalidStoredValue)?,
+            pixel_width: u32::try_from(row.8).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            pixel_height: u32::try_from(row.9).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            ocr_chunk_count: u32::try_from(row.10)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            ocr_provider_id: row.11,
+            ocr_provider_version: row.12,
+        });
+    }
+    if sources.len() > usize::try_from(MAX_SCREENSHOT_GROUP_IMAGES).unwrap_or(usize::MAX) {
+        return Err(DatabaseError::ScreenshotGroupImageLimitExceeded);
+    }
+    Ok(sources)
+}
+
+fn group_screenshot_sources(
+    mut sources: Vec<ScreenshotGroupSourceRecord>,
+) -> Result<Vec<Vec<ScreenshotGroupSourceRecord>>, DatabaseError> {
+    sources.sort_by_key(|source| {
+        (
+            source.pixel_width,
+            source.pixel_height,
+            source.modified_unix_ns,
+            source.node_id,
+        )
+    });
+    let mut node_ids = std::collections::BTreeSet::new();
+    if sources
+        .iter()
+        .any(|source| !node_ids.insert(source.node_id))
+    {
+        return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+    }
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    for source in sources {
+        let belongs = current
+            .first()
+            .is_none_or(|anchor: &ScreenshotGroupSourceRecord| {
+                source.pixel_width == anchor.pixel_width
+                    && source.pixel_height == anchor.pixel_height
+                    && source
+                        .modified_unix_ns
+                        .checked_sub(anchor.modified_unix_ns)
+                        .is_some_and(|delta| (0..=SCREENSHOT_GROUP_TIME_WINDOW_NS).contains(&delta))
+            });
+        if !belongs {
+            push_screenshot_group(&mut groups, std::mem::take(&mut current))?;
+        }
+        current.push(source);
+    }
+    push_screenshot_group(&mut groups, current)?;
+    if groups.len() > MAX_SCREENSHOT_GROUPS {
+        return Err(DatabaseError::ScreenshotGroupLimitExceeded);
+    }
+    Ok(groups)
+}
+
+fn push_screenshot_group(
+    groups: &mut Vec<Vec<ScreenshotGroupSourceRecord>>,
+    group: Vec<ScreenshotGroupSourceRecord>,
+) -> Result<(), DatabaseError> {
+    if group.len() > MAX_SCREENSHOT_GROUP_MEMBERS {
+        return Err(DatabaseError::ScreenshotGroupMemberLimitExceeded);
+    }
+    if group.len() >= 2 {
+        groups.push(group);
+    }
+    Ok(())
+}
+
+fn current_screenshot_group_for_membership(
+    connection: &Connection,
+    scope_id: i64,
+    membership_key: &str,
+) -> Result<Option<Vec<ScreenshotGroupSourceRecord>>, DatabaseError> {
+    for group in group_screenshot_sources(screenshot_group_sources_from_connection(
+        connection, scope_id,
+    )?)? {
+        if screenshot_group_membership_key(&group)? == membership_key {
+            return Ok(Some(group));
+        }
+    }
+    Ok(None)
+}
+
+fn screenshot_group_identity_from_connection(
+    connection: &Connection,
+    group_id: i64,
+) -> Result<(i64, String), DatabaseError> {
+    if group_id <= 0 {
+        return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
+    }
+    connection
+        .query_row(
+            "SELECT scope_id, membership_key FROM screenshot_group_candidates \
+             WHERE id = ?1 AND api_version = ?2",
+            params![group_id, ScreenshotGroupCandidate::API_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScreenshotGroupCandidateNotFound)
+}
+
+fn parse_screenshot_group_observation(
+    stored: (
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ),
+) -> Result<ScreenshotGroupObservationRecord, DatabaseError> {
+    if stored.0 <= 0
+        || !(16..=16_384).contains(&stored.1.len())
+        || !(2..=20).contains(&stored.2)
+        || stored.3 != 6_000
+        || stored.4 < 0
+        || stored.5 != "same_dimensions_time_window_with_ocr"
+        || stored.6 != "system_rule"
+        || stored.7 != ScreenshotGroupEvidence::PROVIDER_ID
+        || stored.8 != ScreenshotGroupEvidence::PROVIDER_VERSION
+        || stored.9.is_some()
+    {
+        return Err(DatabaseError::InvalidStoredValue);
+    }
+    Ok(ScreenshotGroupObservationRecord {
+        id: stored.0,
+        evidence_key: stored.1,
+        member_count: stored.2,
+        confidence_basis_points: stored.3,
+        observed_at_unix_ms: stored.4,
+    })
+}
+
+fn latest_screenshot_group_observation_from_connection(
+    connection: &Connection,
+    group_id: i64,
+) -> Result<ScreenshotGroupObservationRecord, DatabaseError> {
+    let stored = connection.query_row(
+        "SELECT id, evidence_key, member_count, confidence_basis_points, observed_at_unix_ms, \
+                rule_kind, created_by, provider_id, provider_version, model_version \
+         FROM screenshot_group_observations WHERE group_id = ?1 \
+         ORDER BY observed_at_unix_ms DESC, id DESC LIMIT 1",
+        [group_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        },
+    )?;
+    parse_screenshot_group_observation(stored)
+}
+
+fn screenshot_group_observation_for_evidence(
+    connection: &Connection,
+    group_id: i64,
+    evidence_key: &str,
+) -> Result<Option<ScreenshotGroupObservationRecord>, DatabaseError> {
+    let stored = connection
+        .query_row(
+            "SELECT id, evidence_key, member_count, confidence_basis_points, observed_at_unix_ms, \
+                    rule_kind, created_by, provider_id, provider_version, model_version \
+             FROM screenshot_group_observations \
+             WHERE group_id = ?1 AND evidence_key = ?2",
+            params![group_id, evidence_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    stored.map(parse_screenshot_group_observation).transpose()
+}
+
+fn screenshot_group_observation_sources_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+    observation_id: i64,
+) -> Result<Vec<ScreenshotGroupSourceRecord>, DatabaseError> {
+    if scope_id <= 0 || observation_id <= 0 {
+        return Err(DatabaseError::InvalidStoredValue);
+    }
+    let mut statement = connection.prepare(
+        "SELECT member.node_id, member.location_id, member.image_metadata_id, \
+                member.ocr_extraction_job_id, member.source_size_bytes, \
+                member.source_modified_unix_ns, member.format, member.pixel_width, \
+                member.pixel_height, member.ocr_chunk_count, member.ocr_provider_id, \
+                member.ocr_provider_version \
+         FROM screenshot_group_members member \
+         JOIN screenshot_group_observations observation \
+           ON observation.id = member.observation_id \
+         JOIN screenshot_group_candidates candidate \
+           ON candidate.id = observation.group_id AND candidate.scope_id = ?1 \
+         WHERE member.observation_id = ?2 ORDER BY member.ordinal",
+    )?;
+    let rows = statement.query_map(params![scope_id, observation_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let row = row?;
+        Ok(ScreenshotGroupSourceRecord {
+            scope_id,
+            node_id: row.0,
+            location_id: row.1,
+            image_metadata_id: row.2,
+            ocr_extraction_job_id: row.3,
+            size_bytes: u64::try_from(row.4).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            modified_unix_ns: row.5,
+            format: ImageFormat::from_storage(&row.6).ok_or(DatabaseError::InvalidStoredValue)?,
+            pixel_width: u32::try_from(row.7).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            pixel_height: u32::try_from(row.8).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            ocr_chunk_count: u32::try_from(row.9).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            ocr_provider_id: row.10,
+            ocr_provider_version: row.11,
+        })
+    })
+    .collect()
+}
+
+fn validate_screenshot_group_observation(
+    connection: &Connection,
+    scope_id: i64,
+    membership_key: &str,
+    observation: &ScreenshotGroupObservationRecord,
+) -> Result<Vec<ScreenshotGroupSourceRecord>, DatabaseError> {
+    let sources =
+        screenshot_group_observation_sources_from_connection(connection, scope_id, observation.id)?;
+    if usize::try_from(observation.member_count).map_err(|_| DatabaseError::InvalidStoredValue)?
+        != sources.len()
+        || screenshot_group_membership_key(&sources)? != membership_key
+        || screenshot_group_evidence_key(&sources)? != observation.evidence_key
+    {
+        return Err(DatabaseError::InvalidStoredValue);
+    }
+    Ok(sources)
+}
+
 fn lexical_search_candidates_from_connection(
     connection: &Connection,
     match_query: &str,
@@ -9025,6 +9991,176 @@ mod tests {
         let (mut database, scope_id, root) = resumable_setup_in(database);
         let node_id = publish_manifest_file(&mut database, scope_id, &root, 4);
         (database, scope_id, node_id, root)
+    }
+
+    fn synthetic_screenshot_group_source(
+        node_id: i64,
+        modified_unix_ns: i64,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> ScreenshotGroupSourceRecord {
+        ScreenshotGroupSourceRecord {
+            scope_id: 1,
+            node_id,
+            location_id: node_id + 100,
+            image_metadata_id: node_id + 200,
+            ocr_extraction_job_id: node_id + 300,
+            size_bytes: 1_024,
+            modified_unix_ns,
+            format: ImageFormat::Png,
+            pixel_width,
+            pixel_height,
+            ocr_chunk_count: 1,
+            ocr_provider_id: "local-ocr".to_string(),
+            ocr_provider_version: "1".to_string(),
+        }
+    }
+
+    fn insert_screenshot_group_source(
+        database: &ManifestDatabase,
+        scope_id: i64,
+        scan_id: i64,
+        index: i64,
+        ocr_provider_version: &str,
+    ) -> i64 {
+        let path = format!("/scope/screenshot-{index}.png");
+        let identity = format!("screenshot-identity-{index}");
+        database
+            .connection
+            .execute(
+                "INSERT INTO nodes( \
+                    kind, identity_kind, identity_key, created_at_unix_ms, updated_at_unix_ms \
+                 ) VALUES ('file', 'test', ?1, 1, 1)",
+                [identity.as_bytes()],
+            )
+            .expect("image node should persist");
+        let node_id = database.connection.last_insert_rowid();
+        let modified_unix_ns = 1_000_000_000 + index * 60_000_000_000;
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(node_id, size_bytes, modified_unix_ns, link_count) \
+                 VALUES (?1, 1024, ?2, 1)",
+                params![node_id, modified_unix_ns],
+            )
+            .expect("image file facts should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations( \
+                    scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id \
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)",
+                params![scope_id, node_id, path.as_bytes(), path, scan_id],
+            )
+            .expect("image location should persist");
+        let location_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO extraction_jobs( \
+                    scope_id, node_id, location_id, status, provider_id, provider_version, \
+                    source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, \
+                    created_at_unix_ms, started_at_unix_ms, finished_at_unix_ms, updated_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, 'completed', 'deskgraph.image-metadata', '1', \
+                    1024, ?4, 0, 0, 1, 1, 1, 1)",
+                params![scope_id, node_id, location_id, modified_unix_ns],
+            )
+            .expect("image metadata job should persist");
+        let image_job_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO image_metadata( \
+                    scope_id, node_id, location_id, extraction_job_id, format, pixel_width, \
+                    pixel_height, source_size_bytes, source_modified_unix_ns, provider_id, \
+                    provider_version, active, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, 'png', 1440, 900, 1024, ?5, \
+                    'deskgraph.image-metadata', '1', 1, 1)",
+                params![
+                    scope_id,
+                    node_id,
+                    location_id,
+                    image_job_id,
+                    modified_unix_ns
+                ],
+            )
+            .expect("image metadata should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO extraction_jobs( \
+                    scope_id, node_id, location_id, status, provider_id, provider_version, \
+                    source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, \
+                    created_at_unix_ms, started_at_unix_ms, finished_at_unix_ms, updated_at_unix_ms, \
+                    operation \
+                 ) VALUES (?1, ?2, ?3, 'completed', 'local-ocr', ?4, 1024, ?5, \
+                    1, 1, 1, 1, 1, 1, 'screenshot_ocr')",
+                params![
+                    scope_id,
+                    node_id,
+                    location_id,
+                    ocr_provider_version,
+                    modified_unix_ns
+                ],
+            )
+            .expect("OCR job should persist");
+        let ocr_job_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO content_chunks( \
+                    scope_id, node_id, location_id, extraction_job_id, ordinal, text, \
+                    provenance_kind, source_unit_number, source_fragment_index, \
+                    source_bbox_x_ppm, source_bbox_y_ppm, source_bbox_width_ppm, \
+                    source_bbox_height_ppm, source_confidence_basis_points, source_size_bytes, \
+                    source_modified_unix_ns, trust_class, provider_id, provider_version, active, \
+                    created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, 0, 'private OCR text', 'ocr_observation', \
+                    1, 0, 0, 0, 1000000, 1000000, NULL, 1024, ?5, \
+                    'untrusted_extracted_text', 'local-ocr', ?6, 1, 1)",
+                params![
+                    scope_id,
+                    node_id,
+                    location_id,
+                    ocr_job_id,
+                    modified_unix_ns,
+                    ocr_provider_version
+                ],
+            )
+            .expect("OCR provenance should persist");
+        node_id
+    }
+
+    fn screenshot_group_setup() -> (ManifestDatabase, i64, Vec<ScreenshotGroupSourceRecord>) {
+        screenshot_group_setup_in(
+            ManifestDatabase::open_in_memory().expect("database should initialize"),
+        )
+    }
+
+    fn screenshot_group_setup_in(
+        mut database: ManifestDatabase,
+    ) -> (ManifestDatabase, i64, Vec<ScreenshotGroupSourceRecord>) {
+        let scope = database
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
+            .expect("scope should persist");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active test grant should persist");
+        let scan_id = database
+            .create_scan_job(scope.id)
+            .expect("scan should start");
+        database
+            .complete_scan(scan_id, scope.id, &[], &[], 0, 0)
+            .expect("scan should complete");
+
+        for index in 0..2_i64 {
+            insert_screenshot_group_source(&database, scope.id, scan_id, index, "1");
+        }
+
+        let sources = database
+            .screenshot_group_sources(scope.id)
+            .expect("current local screenshot sources should load");
+        (database, scope.id, sources)
     }
 
     fn create_bound_rename_preview(
@@ -10812,6 +11948,487 @@ mod tests {
             }),
             Err(DatabaseError::ActionExecutionBindingUnavailable)
         ));
+    }
+
+    #[test]
+    fn screenshot_groups_use_current_provenance_and_persist_complete_immutable_observations() {
+        let (mut database, scope_id, sources) = screenshot_group_setup();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].pixel_width, 1440);
+        assert_eq!(sources[0].pixel_height, 900);
+        assert_eq!(sources[0].ocr_chunk_count, 1);
+
+        let (evaluated, candidates) = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("complete screenshot group should persist atomically");
+        assert_eq!(evaluated, 2);
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.members.len(), 2);
+        assert_eq!(candidate.evidence.confidence_basis_points, 6_000);
+        assert!(candidate.evidence.review_assistance_only);
+        assert!(!candidate.evidence.content_similarity_claimed);
+        assert!(!candidate.evidence.cleanup_authorized);
+        assert_eq!(candidate.total_size_bytes, 2_048);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM screenshot_group_members", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("members should count"),
+            2
+        );
+
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE screenshot_group_observations SET confidence_basis_points = 7000",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute("DELETE FROM screenshot_group_members", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn screenshot_grouping_is_deterministic_dimensioned_and_time_windowed() {
+        let minute = 60_i64 * 1_000_000_000;
+        let groups = group_screenshot_sources(vec![
+            synthetic_screenshot_group_source(4, 2 * minute, 1440, 900),
+            synthetic_screenshot_group_source(1, 0, 1440, 900),
+            synthetic_screenshot_group_source(5, 20 * minute, 1440, 900),
+            synthetic_screenshot_group_source(3, minute, 1920, 1080),
+            synthetic_screenshot_group_source(2, minute, 1440, 900),
+            synthetic_screenshot_group_source(6, 21 * minute, 1440, 900),
+        ])
+        .expect("bounded groups should build");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0]
+                .iter()
+                .map(|source| source.node_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        assert_eq!(
+            groups[1]
+                .iter()
+                .map(|source| source.node_id)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+    }
+
+    #[test]
+    fn screenshot_grouping_rejects_ambiguous_or_oversized_membership() {
+        let duplicate = synthetic_screenshot_group_source(1, 1, 1440, 900);
+        assert!(matches!(
+            group_screenshot_sources(vec![duplicate.clone(), duplicate]),
+            Err(DatabaseError::ScreenshotGroupCandidateInputInvalid)
+        ));
+        let oversized = (1..=21)
+            .map(|node_id| synthetic_screenshot_group_source(node_id, node_id, 1440, 900))
+            .collect();
+        assert!(matches!(
+            group_screenshot_sources(oversized),
+            Err(DatabaseError::ScreenshotGroupMemberLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn screenshot_group_history_is_path_free_and_currentness_fails_closed() {
+        let (mut database, scope_id, sources) = screenshot_group_setup();
+        let candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("group should persist")
+            .1
+            .remove(0);
+        let summary = database
+            .recent_screenshot_group_candidates()
+            .expect("summary should load")
+            .remove(0);
+        assert!(summary.current_evidence);
+        assert!(summary.verification_required);
+        assert!(!summary.cleanup_authorized);
+
+        database
+            .connection
+            .execute(
+                "UPDATE files SET modified_unix_ns = modified_unix_ns + 1 WHERE node_id = ?1",
+                [sources[0].node_id],
+            )
+            .expect("source mutation should persist");
+        assert!(matches!(
+            database.screenshot_group_candidate(candidate.group_id),
+            Err(DatabaseError::ScreenshotGroupCandidateNotCurrent)
+        ));
+        let summary = database
+            .recent_screenshot_group_candidates()
+            .expect("stale history should remain readable")
+            .remove(0);
+        assert!(!summary.current_evidence);
+        assert!(!summary.cleanup_authorized);
+    }
+
+    #[test]
+    fn screenshot_group_discovery_is_evidence_idempotent() {
+        let (mut database, scope_id, _) = screenshot_group_setup();
+        let first = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("first discovery should persist")
+            .1
+            .remove(0);
+        let second = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("unchanged discovery should be idempotent")
+            .1
+            .remove(0);
+        assert_eq!(first.group_id, second.group_id);
+        assert_eq!(
+            first.evidence.observation_id,
+            second.evidence.observation_id
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM screenshot_group_candidates",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("candidate count should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM screenshot_group_observations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("observation count should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM screenshot_group_members", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("member count should load"),
+            2
+        );
+    }
+
+    #[test]
+    fn screenshot_group_source_query_excludes_missing_or_inactive_ocr_provenance() {
+        let (database, scope_id, sources) = screenshot_group_setup();
+        database
+            .connection
+            .execute(
+                "UPDATE content_chunks SET active = 0 WHERE node_id = ?1",
+                [sources[0].node_id],
+            )
+            .expect("OCR provenance should deactivate");
+        let remaining = database
+            .screenshot_group_sources(scope_id)
+            .expect("eligible sources should reload");
+        assert_eq!(remaining.len(), 1);
+        assert_ne!(remaining[0].node_id, sources[0].node_id);
+        assert!(!format!("{remaining:?}").contains("/scope"));
+    }
+
+    #[test]
+    fn screenshot_group_membership_change_invalidates_the_old_candidate() {
+        let (mut database, scope_id, _) = screenshot_group_setup();
+        let old_candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("initial pair should persist")
+            .1
+            .remove(0);
+        let scan_id = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed'",
+                [scope_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("completed scan should exist");
+        insert_screenshot_group_source(&database, scope_id, scan_id, 2, "1");
+
+        assert!(matches!(
+            database.screenshot_group_candidate(old_candidate.group_id),
+            Err(DatabaseError::ScreenshotGroupCandidateNotCurrent)
+        ));
+        assert!(
+            !database
+                .recent_screenshot_group_candidates()
+                .expect("history should remain readable")
+                .into_iter()
+                .find(|summary| summary.group_id == old_candidate.group_id)
+                .expect("old group should remain in history")
+                .current_evidence
+        );
+
+        let discovery = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("new complete membership should persist");
+        assert_eq!(discovery.0, 3);
+        assert_eq!(discovery.1.len(), 1);
+        assert_eq!(discovery.1[0].members.len(), 3);
+        assert_ne!(discovery.1[0].group_id, old_candidate.group_id);
+    }
+
+    #[test]
+    fn screenshot_group_ocr_refresh_requires_a_new_complete_observation() {
+        let (mut database, scope_id, sources) = screenshot_group_setup();
+        let first = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("initial evidence should persist")
+            .1
+            .remove(0);
+        for source in &sources {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO extraction_jobs( \
+                        scope_id, node_id, location_id, status, provider_id, provider_version, \
+                        source_size_bytes, source_modified_unix_ns, output_bytes, chunk_count, \
+                        created_at_unix_ms, started_at_unix_ms, finished_at_unix_ms, updated_at_unix_ms, \
+                        operation \
+                     ) VALUES (?1, ?2, ?3, 'completed', 'local-ocr', '2', ?4, ?5, \
+                        1, 1, 2, 2, 2, 2, 'screenshot_ocr')",
+                    params![
+                        source.scope_id,
+                        source.node_id,
+                        source.location_id,
+                        to_i64(source.size_bytes).expect("size should fit"),
+                        source.modified_unix_ns
+                    ],
+                )
+                .expect("refreshed OCR job should persist");
+            let job_id = database.connection.last_insert_rowid();
+            database
+                .connection
+                .execute(
+                    "INSERT INTO content_chunks( \
+                        scope_id, node_id, location_id, extraction_job_id, ordinal, text, \
+                        provenance_kind, source_unit_number, source_fragment_index, \
+                        source_bbox_x_ppm, source_bbox_y_ppm, source_bbox_width_ppm, \
+                        source_bbox_height_ppm, source_confidence_basis_points, source_size_bytes, \
+                        source_modified_unix_ns, trust_class, provider_id, provider_version, active, \
+                        created_at_unix_ms \
+                     ) VALUES (?1, ?2, ?3, ?4, 0, 'refreshed private OCR text', \
+                        'ocr_observation', 1, 0, 0, 0, 1000000, 1000000, NULL, ?5, ?6, \
+                        'untrusted_extracted_text', 'local-ocr', '2', 1, 2)",
+                    params![
+                        source.scope_id,
+                        source.node_id,
+                        source.location_id,
+                        job_id,
+                        to_i64(source.size_bytes).expect("size should fit"),
+                        source.modified_unix_ns
+                    ],
+                )
+                .expect("refreshed OCR provenance should persist");
+        }
+
+        assert!(matches!(
+            database.screenshot_group_candidate(first.group_id),
+            Err(DatabaseError::ScreenshotGroupCandidateNotCurrent)
+        ));
+        let refreshed = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("refreshed evidence should persist")
+            .1
+            .remove(0);
+        assert_eq!(refreshed.group_id, first.group_id);
+        assert_ne!(
+            refreshed.evidence.observation_id,
+            first.evidence.observation_id
+        );
+        assert!(
+            refreshed
+                .members
+                .iter()
+                .all(|member| member.ocr_provider_version == "2")
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM screenshot_group_observations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("observation count should load"),
+            2
+        );
+    }
+
+    #[test]
+    fn screenshot_group_platform_grant_revocation_fails_closed_without_paths() {
+        let (mut database, scope_id, _) = screenshot_group_setup();
+        let candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("initial evidence should persist")
+            .1
+            .remove(0);
+        database
+            .mark_scope_access_grant_needs_reauthorization(scope_id)
+            .expect("test grant should become inactive");
+
+        assert!(matches!(
+            database.screenshot_group_sources(scope_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(matches!(
+            database.screenshot_group_candidate(candidate.group_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        let summary = database
+            .recent_screenshot_group_candidates()
+            .expect("path-free history should remain readable")
+            .remove(0);
+        assert!(!summary.current_evidence);
+        assert!(!summary.cleanup_authorized);
+        assert!(!format!("{summary:?}").contains("/scope"));
+    }
+
+    #[test]
+    fn screenshot_group_missing_and_revoked_grants_fail_closed() {
+        let (mut database, scope_id, _) = screenshot_group_setup();
+        let candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("initial evidence should persist")
+            .1
+            .remove(0);
+
+        database
+            .connection
+            .execute(
+                "DELETE FROM scope_access_grants WHERE scope_id = ?1",
+                [scope_id],
+            )
+            .expect("test grant should be removable");
+        assert!(matches!(
+            database.discover_screenshot_group_candidates(scope_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(matches!(
+            database.screenshot_group_candidate(candidate.group_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(
+            !database
+                .recent_screenshot_group_candidates()
+                .expect("missing-grant history should remain readable")
+                .remove(0)
+                .current_evidence
+        );
+
+        database
+            .upsert_scope_access_grant(scope_id, std::env::consts::OS, b"replacement-grant")
+            .expect("test grant should reactivate");
+        database
+            .mark_scope_access_grant_revoked(scope_id)
+            .expect("test grant should revoke");
+        assert!(matches!(
+            database.discover_screenshot_group_candidates(scope_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(matches!(
+            database.screenshot_group_candidate(candidate.group_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        let summary = database
+            .recent_screenshot_group_candidates()
+            .expect("revoked-grant history should remain readable")
+            .remove(0);
+        assert!(!summary.current_evidence);
+        assert!(!format!("{summary:?}").contains("/scope"));
+    }
+
+    #[test]
+    fn screenshot_group_member_removal_invalidates_complete_membership() {
+        let (mut database, scope_id, sources) = screenshot_group_setup();
+        let candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("initial evidence should persist")
+            .1
+            .remove(0);
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET present = 0 WHERE id = ?1",
+                [sources[0].location_id],
+            )
+            .expect("test member should become absent");
+
+        assert!(matches!(
+            database.screenshot_group_candidate(candidate.group_id),
+            Err(DatabaseError::ScreenshotGroupCandidateNotCurrent)
+        ));
+        assert!(
+            !database
+                .recent_screenshot_group_candidates()
+                .expect("removed-member history should remain readable")
+                .remove(0)
+                .current_evidence
+        );
+        let discovery = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("single remaining image should not form a group");
+        assert_eq!(discovery.0, 1);
+        assert!(discovery.1.is_empty());
+    }
+
+    #[test]
+    fn screenshot_group_source_snapshot_and_persistence_share_one_immediate_transaction() {
+        let directory = tempfile::tempdir().expect("fixture directory should exist");
+        let path = directory.path().join("screenshot-groups.sqlite3");
+        let (mut database, scope_id, sources) = screenshot_group_setup_in(
+            ManifestDatabase::open(&path).expect("database should initialize"),
+        );
+        let competing = Connection::open(&path).expect("competing writer should open");
+        competing
+            .busy_timeout(Duration::ZERO)
+            .expect("competing writer should fail immediately");
+        let mut writer_was_blocked = false;
+        let discovery = database
+            .discover_screenshot_group_candidates_with_hook(scope_id, || {
+                match competing.execute(
+                    "UPDATE files SET size_bytes = size_bytes + 1 WHERE node_id = ?1",
+                    [sources[0].node_id],
+                ) {
+                    Err(error)
+                        if matches!(
+                            error.sqlite_error_code(),
+                            Some(
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                        ) =>
+                    {
+                        writer_was_blocked = true;
+                        Ok(())
+                    }
+                    Err(error) => Err(DatabaseError::Sqlite(error)),
+                    Ok(_) => Err(DatabaseError::ScreenshotGroupCandidateNotCurrent),
+                }
+            })
+            .expect("atomic discovery should complete");
+        assert!(writer_was_blocked);
+        assert_eq!(discovery.1.len(), 1);
+        assert_eq!(discovery.1[0].members.len(), 2);
     }
 
     #[test]

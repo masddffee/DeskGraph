@@ -32,7 +32,9 @@ pub use project::{
     FolderFileCategory, FolderProfile, ProjectCandidate, ProjectCandidateState,
     ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator, ProjectDecisionKind,
     ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
-    parse_explicit_file_version_name,
+    ScreenshotGroupCandidate, ScreenshotGroupCandidateState, ScreenshotGroupCandidateSummary,
+    ScreenshotGroupCreator, ScreenshotGroupDiscovery, ScreenshotGroupEvidence,
+    ScreenshotGroupMember, ScreenshotGroupRuleKind, parse_explicit_file_version_name,
 };
 pub use search::{
     SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,

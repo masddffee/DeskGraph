@@ -9,7 +9,8 @@ use deskgraph_domain::{
     FileRelationCandidate, FileRelationCandidateSummary, FileRelationDecisionKind,
     FileVersionCandidate, FolderProfile, ProjectCandidate, ProjectCandidateSummary,
     ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
-    ProjectSuggestionCreator, parse_explicit_file_version_name,
+    ProjectSuggestionCreator, ScreenshotGroupCandidate, ScreenshotGroupCandidateSummary,
+    ScreenshotGroupDiscovery, parse_explicit_file_version_name,
 };
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
@@ -21,6 +22,9 @@ const DEFAULT_ENTRY_LIMIT: u64 = 100_000;
 const MAX_EXACT_DUPLICATE_BYTES: u64 = 64 * 1024 * 1024;
 const DUPLICATE_BUFFER_BYTES: usize = 64 * 1024;
 const DUPLICATE_COMPARE_DEADLINE: Duration = Duration::from_secs(5);
+const MAX_SCREENSHOT_GROUP_IMAGES: u32 = 2_000;
+const MAX_SCREENSHOT_GROUPS: u32 = 20;
+const MAX_SCREENSHOT_GROUP_MEMBERS: u32 = 20;
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -335,6 +339,48 @@ pub fn decide_file_version(
     verify_file_version(database, relation_id)?;
     database
         .decide_file_version_candidate(relation_id, decision)
+        .map_err(Into::into)
+}
+
+pub fn suggest_screenshot_groups_at(
+    database_path: &Path,
+    scope_id: i64,
+) -> Result<ScreenshotGroupDiscovery, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    suggest_screenshot_groups(&mut database, scope_id)
+}
+
+pub fn suggest_screenshot_groups(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+) -> Result<ScreenshotGroupDiscovery, ProjectError> {
+    let (evaluated_image_count, groups) =
+        database.discover_screenshot_group_candidates(scope_id)?;
+    Ok(ScreenshotGroupDiscovery {
+        api_version: ScreenshotGroupDiscovery::API_VERSION,
+        scope_id,
+        evaluated_image_count,
+        groups,
+        bounded_image_limit: MAX_SCREENSHOT_GROUP_IMAGES,
+        bounded_group_limit: MAX_SCREENSHOT_GROUPS,
+        bounded_members_per_group: MAX_SCREENSHOT_GROUP_MEMBERS,
+    })
+}
+
+pub fn screenshot_group_at(
+    database_path: &Path,
+    group_id: i64,
+) -> Result<ScreenshotGroupCandidate, ProjectError> {
+    ManifestDatabase::open(database_path)?
+        .screenshot_group_candidate(group_id)
+        .map_err(Into::into)
+}
+
+pub fn recent_screenshot_groups_at(
+    database_path: &Path,
+) -> Result<Vec<ScreenshotGroupCandidateSummary>, ProjectError> {
+    ManifestDatabase::open(database_path)?
+        .recent_screenshot_group_candidates()
         .map_err(Into::into)
 }
 

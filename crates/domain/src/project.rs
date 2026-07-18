@@ -3,6 +3,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::extraction::ImageFormat;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FolderFileCategory {
@@ -360,6 +362,112 @@ impl FileRelationCandidateSummary {
     pub const API_VERSION: &str = "deskgraph.file-relation-candidate-summary.v1";
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenshotGroupCandidateState {
+    Suggested,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenshotGroupRuleKind {
+    SameDimensionsTimeWindowWithOcr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenshotGroupCreator {
+    SystemRule,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotGroupMember {
+    pub node_id: i64,
+    pub location_id: i64,
+    pub display_path: String,
+    pub image_metadata_id: i64,
+    pub ocr_extraction_job_id: i64,
+    pub size_bytes: u64,
+    pub modified_unix_ns: i64,
+    pub format: ImageFormat,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub ocr_chunk_count: u32,
+    pub ocr_provider_id: String,
+    pub ocr_provider_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotGroupEvidence {
+    pub observation_id: i64,
+    pub rule_kind: ScreenshotGroupRuleKind,
+    pub confidence_basis_points: u16,
+    pub observed_at_unix_ms: i64,
+    pub created_by: ScreenshotGroupCreator,
+    pub provider_id: &'static str,
+    pub provider_version: &'static str,
+    pub model_version: Option<String>,
+    pub time_window_seconds: u32,
+    pub review_assistance_only: bool,
+    pub content_similarity_claimed: bool,
+    pub cleanup_authorized: bool,
+}
+
+impl ScreenshotGroupEvidence {
+    pub const PROVIDER_ID: &str = "deskgraph.screenshot-group-rules";
+    pub const PROVIDER_VERSION: &str = "1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotGroupCandidate {
+    pub api_version: &'static str,
+    pub group_id: i64,
+    pub scope_id: i64,
+    pub state: ScreenshotGroupCandidateState,
+    pub members: Vec<ScreenshotGroupMember>,
+    pub total_size_bytes: u64,
+    pub members_independently_selectable: bool,
+    pub evidence: ScreenshotGroupEvidence,
+}
+
+impl ScreenshotGroupCandidate {
+    pub const API_VERSION: &str = "deskgraph.screenshot-group-candidate.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotGroupCandidateSummary {
+    pub api_version: &'static str,
+    pub group_id: i64,
+    pub scope_id: i64,
+    pub state: ScreenshotGroupCandidateState,
+    pub current_evidence: bool,
+    pub member_count: u32,
+    pub total_size_bytes: u64,
+    pub confidence_basis_points: u16,
+    pub last_observed_at_unix_ms: i64,
+    pub verification_required: bool,
+    pub cleanup_authorized: bool,
+}
+
+impl ScreenshotGroupCandidateSummary {
+    pub const API_VERSION: &str = "deskgraph.screenshot-group-candidate-summary.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenshotGroupDiscovery {
+    pub api_version: &'static str,
+    pub scope_id: i64,
+    pub evaluated_image_count: u32,
+    pub groups: Vec<ScreenshotGroupCandidate>,
+    pub bounded_image_limit: u32,
+    pub bounded_group_limit: u32,
+    pub bounded_members_per_group: u32,
+}
+
+impl ScreenshotGroupDiscovery {
+    pub const API_VERSION: &str = "deskgraph.screenshot-group-discovery.v1";
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderProfile {
     pub api_version: &'static str,
@@ -545,5 +653,69 @@ mod tests {
         assert!(parse_explicit_file_version_name("企劃-v01.md").is_none());
         assert!(parse_explicit_file_version_name("企劃-v1-v2.md").is_none());
         assert!(parse_explicit_file_version_name("folder/企劃-v2.md").is_none());
+    }
+
+    #[test]
+    fn screenshot_group_contract_is_review_only_and_summary_is_path_free() {
+        let candidate = ScreenshotGroupCandidate {
+            api_version: ScreenshotGroupCandidate::API_VERSION,
+            group_id: 1,
+            scope_id: 2,
+            state: ScreenshotGroupCandidateState::Suggested,
+            members: vec![ScreenshotGroupMember {
+                node_id: 3,
+                location_id: 4,
+                display_path: "/private/screenshot.png".to_string(),
+                image_metadata_id: 5,
+                ocr_extraction_job_id: 6,
+                size_bytes: 7,
+                modified_unix_ns: 8,
+                format: ImageFormat::Png,
+                pixel_width: 1440,
+                pixel_height: 900,
+                ocr_chunk_count: 1,
+                ocr_provider_id: "local-ocr".to_string(),
+                ocr_provider_version: "1".to_string(),
+            }],
+            total_size_bytes: 7,
+            members_independently_selectable: true,
+            evidence: ScreenshotGroupEvidence {
+                observation_id: 9,
+                rule_kind: ScreenshotGroupRuleKind::SameDimensionsTimeWindowWithOcr,
+                confidence_basis_points: 6_000,
+                observed_at_unix_ms: 10,
+                created_by: ScreenshotGroupCreator::SystemRule,
+                provider_id: ScreenshotGroupEvidence::PROVIDER_ID,
+                provider_version: ScreenshotGroupEvidence::PROVIDER_VERSION,
+                model_version: None,
+                time_window_seconds: 600,
+                review_assistance_only: true,
+                content_similarity_claimed: false,
+                cleanup_authorized: false,
+            },
+        };
+        let value = serde_json::to_value(candidate).expect("candidate should serialize");
+        assert_eq!(value["evidence"]["review_assistance_only"], true);
+        assert_eq!(value["evidence"]["content_similarity_claimed"], false);
+        assert_eq!(value["evidence"]["cleanup_authorized"], false);
+
+        let summary = ScreenshotGroupCandidateSummary {
+            api_version: ScreenshotGroupCandidateSummary::API_VERSION,
+            group_id: 1,
+            scope_id: 2,
+            state: ScreenshotGroupCandidateState::Suggested,
+            current_evidence: false,
+            member_count: 2,
+            total_size_bytes: 14,
+            confidence_basis_points: 6_000,
+            last_observed_at_unix_ms: 10,
+            verification_required: true,
+            cleanup_authorized: false,
+        };
+        let value = serde_json::to_value(summary).expect("summary should serialize");
+        assert!(value.get("display_path").is_none());
+        assert!(value.get("members").is_none());
+        assert_eq!(value["verification_required"], true);
+        assert_eq!(value["cleanup_authorized"], false);
     }
 }

@@ -14,7 +14,8 @@ use deskgraph_extractors::{
 use deskgraph_projects::{
     check_exact_duplicate_at, decide_exact_duplicate_at, decide_file_version_at,
     decide_project_candidate_at, folder_profile_at, project_candidate_at, propose_project_at,
-    recent_file_relation_candidates_at, recent_project_candidates_at, suggest_file_version_at,
+    recent_file_relation_candidates_at, recent_project_candidates_at, recent_screenshot_groups_at,
+    screenshot_group_at, suggest_file_version_at, suggest_screenshot_groups_at,
     verify_exact_duplicate_at, verify_file_version_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
@@ -159,6 +160,11 @@ enum Command {
     Relation {
         #[command(subcommand)]
         command: RelationCommand,
+    },
+    /// Inspect suggest-only cleanup review candidates. No filesystem action is exposed.
+    Cleanup {
+        #[command(subcommand)]
+        command: CleanupCommand,
     },
     /// Generate a bounded synthetic metadata-scan fixture.
     Fixture {
@@ -337,6 +343,32 @@ enum RelationCommand {
         relation: i64,
         #[arg(long, value_enum)]
         decision: RelationDecisionArg,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CleanupCommand {
+    /// Find explainable screenshot review groups from current local provenance.
+    #[command(name = "screenshot-groups")]
+    Groups {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+    },
+    /// Read one current screenshot group with explicit member paths.
+    #[command(name = "screenshot-group-status")]
+    GroupStatus {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        group: i64,
+    },
+    /// List recent path-free screenshot group histories and currentness.
+    #[command(name = "screenshot-group-list")]
+    GroupList {
+        #[arg(long)]
+        database: PathBuf,
     },
 }
 
@@ -1034,6 +1066,39 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                         .map(|decision| decision.evidence_observation_id)
                 );
                 Ok(())
+            }
+        },
+        Command::Cleanup { command } => match command {
+            CleanupCommand::Groups { database, scope } => {
+                let discovery =
+                    suggest_screenshot_groups_at(&database, scope).map_err(|error| error.code())?;
+                print_json(&discovery)?;
+                info!(
+                    event = "screenshot_group_discovery_completed",
+                    scope_id = discovery.scope_id,
+                    evaluated_image_count = discovery.evaluated_image_count,
+                    group_count = discovery.groups.len(),
+                    cleanup_authorized = false
+                );
+                Ok(())
+            }
+            CleanupCommand::GroupStatus { database, group } => {
+                let candidate =
+                    screenshot_group_at(&database, group).map_err(|error| error.code())?;
+                print_json(&candidate)?;
+                info!(
+                    event = "screenshot_group_status_read",
+                    group_id = candidate.group_id,
+                    scope_id = candidate.scope_id,
+                    member_count = candidate.members.len(),
+                    cleanup_authorized = false
+                );
+                Ok(())
+            }
+            CleanupCommand::GroupList { database } => {
+                let candidates =
+                    recent_screenshot_groups_at(&database).map_err(|error| error.code())?;
+                emit_json(&candidates, "screenshot_group_list_read")
             }
         },
         Command::Fixture { command } => match command {

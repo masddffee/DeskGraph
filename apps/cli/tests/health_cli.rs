@@ -1,7 +1,9 @@
 use std::process::Command;
 
-use deskgraph_database::ManifestDatabase;
-use deskgraph_extractors::{ExtractionLimits, create_extraction_job_at, run_extraction_job_at};
+use deskgraph_database::{ContentChunkProvenanceWrite, ContentChunkWrite, ManifestDatabase};
+use deskgraph_extractors::{
+    ExtractionLimits, create_extraction_job_at, create_screenshot_ocr_job_at, run_extraction_job_at,
+};
 use deskgraph_scanner::{authorize_scope, scan_scope};
 
 #[test]
@@ -166,6 +168,263 @@ fn ocr_create_command_emits_path_free_durable_job_status() {
             .lines()
             .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
     );
+}
+
+#[test]
+fn screenshot_cleanup_groups_are_review_only_current_and_path_free_in_history() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("private-manifest.sqlite3");
+    let scope_path = directory.path().join("private-screenshots");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let private_ocr_text = "不得出現在候選輸出的 OCR 私密文字";
+    let mut png = vec![0_u8; 32];
+    png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+    png[8..12].copy_from_slice(&13_u32.to_be_bytes());
+    png[12..16].copy_from_slice(b"IHDR");
+    png[16..20].copy_from_slice(&1440_u32.to_be_bytes());
+    png[20..24].copy_from_slice(&900_u32.to_be_bytes());
+    let paths = [
+        scope_path.join("private-shot-a.png"),
+        scope_path.join("private-shot-b.png"),
+    ];
+    for path in &paths {
+        std::fs::write(path, &png).expect("image fixture should write");
+    }
+
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    database
+        .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"cli-test-grant")
+        .expect("active native grant should persist");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    let mut node_ids = Vec::new();
+    for path in &paths {
+        let node_id = database
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(path).expect("image should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("image should be scanned");
+        node_ids.push(node_id);
+    }
+    drop(database);
+
+    for node_id in &node_ids {
+        let image_job = create_extraction_job_at(&database_path, scope.id, *node_id)
+            .expect("image metadata job should create");
+        run_extraction_job_at(
+            &database_path,
+            image_job.job_id,
+            ExtractionLimits::default(),
+        )
+        .expect("image metadata should complete");
+        let ocr_job = create_screenshot_ocr_job_at(&database_path, scope.id, *node_id)
+            .expect("OCR job should create");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        let source = database
+            .extractable_file(scope.id, *node_id)
+            .expect("current image source should load");
+        database
+            .claim_extraction_job(ocr_job.job_id, "cli-test-ocr", 60_000)
+            .expect("OCR job should claim");
+        database
+            .complete_extraction_job(
+                ocr_job.job_id,
+                "cli-test-ocr",
+                "local-test-ocr",
+                "1",
+                source.size_bytes,
+                source.modified_unix_ns,
+                u64::try_from(private_ocr_text.len()).expect("text size should fit"),
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: private_ocr_text.to_string(),
+                    provenance: ContentChunkProvenanceWrite::OcrObservation {
+                        observation_number: 1,
+                        fragment_index: 0,
+                        bbox_x_ppm: 0,
+                        bbox_y_ppm: 0,
+                        bbox_width_ppm: 1_000_000,
+                        bbox_height_ppm: 1_000_000,
+                        confidence_basis_points: None,
+                    },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("OCR provenance should complete");
+    }
+
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let suggest = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "cleanup",
+            "screenshot-groups",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope.id.to_string(),
+        ])
+        .output()
+        .expect("screenshot group discovery should start");
+    assert!(suggest.status.success());
+    let discovery: serde_json::Value =
+        serde_json::from_slice(&suggest.stdout).expect("discovery should be JSON");
+    assert_eq!(discovery["groups"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        discovery["groups"][0]["members"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        discovery["groups"][0]["evidence"]["review_assistance_only"],
+        true
+    );
+    assert_eq!(
+        discovery["groups"][0]["evidence"]["cleanup_authorized"],
+        false
+    );
+    let suggest_stdout = String::from_utf8_lossy(&suggest.stdout);
+    let suggest_stderr = String::from_utf8_lossy(&suggest.stderr);
+    assert!(!suggest_stdout.contains(private_ocr_text));
+    assert!(!suggest_stderr.contains(private_ocr_text));
+    for path in &paths {
+        let path = path.to_str().expect("path should be UTF-8");
+        assert!(suggest_stdout.contains(path));
+        assert!(!suggest_stderr.contains(path));
+    }
+    let group_arg = discovery["groups"][0]["group_id"]
+        .as_i64()
+        .expect("group id should exist")
+        .to_string();
+    let status = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "cleanup",
+            "screenshot-group-status",
+            "--database",
+            database_arg,
+            "--group",
+            &group_arg,
+        ])
+        .output()
+        .expect("screenshot group status should start");
+    assert!(status.status.success());
+    let status_stdout = String::from_utf8_lossy(&status.stdout);
+    let status_stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(!status_stdout.contains(private_ocr_text));
+    assert!(!status_stderr.contains(private_ocr_text));
+    for path in &paths {
+        let path = path.to_str().expect("path should be UTF-8");
+        assert!(status_stdout.contains(path));
+        assert!(!status_stderr.contains(path));
+    }
+
+    let list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "cleanup",
+            "screenshot-group-list",
+            "--database",
+            database_arg,
+        ])
+        .output()
+        .expect("screenshot group history should start");
+    assert!(list.status.success());
+    let summaries: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("history should be JSON");
+    assert_eq!(summaries[0]["current_evidence"], true);
+    assert_eq!(summaries[0]["verification_required"], true);
+    assert_eq!(summaries[0]["cleanup_authorized"], false);
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    let list_stderr = String::from_utf8_lossy(&list.stderr);
+    for private_value in [
+        private_ocr_text,
+        "private-shot-a.png",
+        "private-shot-b.png",
+        scope_path.to_str().expect("scope should be UTF-8"),
+    ] {
+        assert!(!list_stdout.contains(private_value));
+        assert!(!list_stderr.contains(private_value));
+    }
+
+    ManifestDatabase::open(&database_path)
+        .expect("database should reopen")
+        .mark_scope_access_grant_needs_reauthorization(scope.id)
+        .expect("native grant should become inactive");
+    let denied = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "cleanup",
+            "screenshot-group-status",
+            "--database",
+            database_arg,
+            "--group",
+            &group_arg,
+        ])
+        .output()
+        .expect("inactive screenshot group status should start");
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    let denied_stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(denied_stderr.contains("scope_access_grant_not_active"));
+    for private_value in [
+        private_ocr_text,
+        "private-shot-a.png",
+        "private-shot-b.png",
+        scope_path.to_str().expect("scope should be UTF-8"),
+        database_arg,
+    ] {
+        assert!(!denied_stderr.contains(private_value));
+    }
+
+    let inactive_list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "cleanup",
+            "screenshot-group-list",
+            "--database",
+            database_arg,
+        ])
+        .output()
+        .expect("inactive screenshot group history should start");
+    assert!(inactive_list.status.success());
+    let inactive_summaries: serde_json::Value =
+        serde_json::from_slice(&inactive_list.stdout).expect("inactive history should be JSON");
+    assert_eq!(inactive_summaries[0]["current_evidence"], false);
+    let inactive_stdout = String::from_utf8_lossy(&inactive_list.stdout);
+    let inactive_stderr = String::from_utf8_lossy(&inactive_list.stderr);
+    for private_value in [
+        private_ocr_text,
+        "private-shot-a.png",
+        "private-shot-b.png",
+        scope_path.to_str().expect("scope should be UTF-8"),
+        database_arg,
+    ] {
+        assert!(!inactive_stdout.contains(private_value));
+        assert!(!inactive_stderr.contains(private_value));
+    }
+}
+
+#[test]
+fn cleanup_help_exposes_review_only_screenshot_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args(["cleanup", "--help"])
+        .output()
+        .expect("cleanup help should start");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(stdout.contains("screenshot-groups"));
+    assert!(stdout.contains("screenshot-group-status"));
+    assert!(stdout.contains("screenshot-group-list"));
+    for forbidden in ["trash", "delete", "execute", "move", "undo", "auto-clean"] {
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(forbidden)),
+            "cleanup help exposed forbidden action command {forbidden}"
+        );
+    }
 }
 
 #[test]
