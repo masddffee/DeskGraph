@@ -16,6 +16,7 @@ Turn your computer into a private, searchable context graph.
 - 看懂散落檔案其實屬於同一個專案。
 - 讓新下載與截圖自動獲得正確情境。
 - 安全地建議歸檔與重新命名。
+- 找出可解釋的重複檔、舊版本與截圖群組，經確認後安全移至系統垃圾桶並可復原。
 - 讓 AI Agent 在使用者授權下取得可靠的本地 Context。
 
 ## 2. 第一目標使用者
@@ -48,7 +49,11 @@ Turn your computer into a private, searchable context graph.
 
 當新檔案出現時，我希望系統提出正確的命名與歸檔建議，而且任何動作都能預覽及復原。
 
-### JTBD-4：提供 Agent Context
+### JTBD-4：安全清理
+
+當重複檔、舊版本或大量截圖佔用空間時，我希望系統顯示可驗證的判斷依據，讓我逐項確認後移至作業系統垃圾桶，並在垃圾桶項目仍存在時可靠復原。
+
+### JTBD-5：提供 Agent Context
 
 當我使用 Codex、ChatGPT、Claude 或其他 AI Agent 時，我希望它能透過標準介面搜尋我授權的本地資料，而不是無限制讀取整顆磁碟。
 
@@ -62,7 +67,7 @@ Turn your computer into a private, searchable context graph.
 6. File、Folder、Project、Topic、Entity、App、Action 節點。
 7. 有 provenance 的 edges。
 8. Project Discovery。
-9. Smart Inbox。
+9. Smart Inbox + Smart Cleanup Inbox：找出精確重複檔、有充分版本證據的舊版本與可解釋的截圖群組；只提出建議，經使用者逐項或有限批次確認後才可移至系統垃圾桶，並提供 durable journal、crash recovery 與 Undo。
 10. 搬移與重新命名 Preview。
 11. Transaction + Undo。
 12. Watch Folder。
@@ -72,7 +77,7 @@ Turn your computer into a private, searchable context graph.
 
 ## 5. v0.1 不做
 
-- 永久刪除檔案。
+- 永久刪除檔案或清空系統垃圾桶。
 - 預設全磁碟掃描。
 - Email、瀏覽器歷史或行事曆深度整合。
 - 完整 Finder / Explorer 替代品。
@@ -94,8 +99,11 @@ Turn your computer into a private, searchable context graph.
 - First Value Time。
 - Search Success Rate。
 - Suggestion Acceptance Rate。
+- Cleanup Suggestion Acceptance Rate。
 - Undo Rate。
 - False Move Rate。
+- False Cleanup Suggestion Rate。
+- Trash Undo Success Rate；使用者或系統已在 DeskGraph 外清空垃圾桶者需獨立標記，不可偽裝為成功。
 - Crash-free Sessions。
 - Indexed Files per Watt / per Minute。
 - GitHub Release Downloads。

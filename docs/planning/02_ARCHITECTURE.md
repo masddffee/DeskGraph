@@ -100,6 +100,10 @@ Independent read-only MCP stdio
 
 若 Watch Mode 的實測需求證明 Tauri process 無法滿足 UI 關閉、唯一 writer、資源隔離或可靠重啟，才可依 D-014 評估 per-user daemon。拆分前必須同時定義 authenticated local IPC、Unix socket／Windows named-pipe ACL、peer identity、protocol version、app/daemon update skew、啟動競態、clean restart、installer 與 uninstaller acceptance；不能只新增一個常駐程序而把生命週期問題留給使用者。
 
+### Restricted System Trash Capability
+
+系統垃圾桶不是可授權、索引或瀏覽的 scope。Platform adapter 只能為一個已由使用者明確確認、綁定 immutable ActionPlan 的來源檔案呼叫原生 Trash／Recycle Bin API；只能保存與驗證該 action 的 opaque receipt 和 exact item identity。DeskGraph 不得列舉、搜尋、匯入或對一般檔案 API 暴露垃圾桶內容與位置，也不得把垃圾桶路徑提供給 MCP、LLM、Graph、Search 或 Smart Inbox。Undo 只能以原 action receipt 指向的 exact item 執行，且仍需 durable journal、identity revalidation、no-overwrite restore 與衝突處理。
+
 ## 4. Ingestion Pipeline
 
 ```text

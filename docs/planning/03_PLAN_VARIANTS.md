@@ -58,7 +58,7 @@ Version A 全部，加上：
 
 - Office 檔案抽取。
 - Watch Folder。
-- Smart Inbox。
+- Smart Inbox + Smart Cleanup Inbox（精確重複檔、證據充分的舊版本、可解釋的截圖群組）。
 - Folder Profiles。
 - Project Discovery。
 - Explainable Relations。
@@ -76,8 +76,10 @@ Version A 全部，加上：
 ### v0.1 Release Gates
 
 - 0 個已知資料遺失 Bug。
-- 不存在無法 Undo 的 Move / Rename。
+- 不存在無法 Undo 的 Move / Rename；移至系統垃圾桶的動作在垃圾桶項目仍存在時必須可 Undo。
 - 自動模式預設關閉。
+- Smart Cleanup 永遠需要使用者確認；不得自動移至垃圾桶、永久刪除或清空垃圾桶。
+- 每個 Cleanup 動作都通過 Preview、Policy Validation、durable journal、執行後驗證與 crash recovery。
 - macOS / Windows Installer 由乾淨 VM 驗證。
 - 10k、100k 檔案 Benchmark 報告。
 - Search p95、Memory、Scan Throughput 有實測。

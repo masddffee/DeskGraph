@@ -44,6 +44,7 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - GRF-006 Project discovery
 - GRF-007 User correction feedback
 - GRF-008 Project merge/split
+- GRF-009 M2-provenance-backed screenshot grouping and current-evidence invalidation
 
 ## Epic: Search
 
@@ -67,6 +68,8 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - ACT-007 Undo
 - ACT-008 Crash recovery
 - ACT-009 Fault injection
+- ACT-010 Cross-platform system-trash ActionPlan and adapter
+- ACT-011 System-trash crash recovery, conflict handling, and idempotent Undo
 
 ## Epic: Watch and Inbox
 
@@ -76,6 +79,7 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - WAT-004 Smart Inbox
 - WAT-005 Resource scheduler
 - WAT-006 Generated rules
+- WAT-007 Smart Cleanup candidate source, M2 evidence dependency, and stale-evidence invalidation
 
 ## Epic: Desktop UX
 
@@ -89,6 +93,7 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - UI-008 History/Undo
 - UI-009 Settings
 - UI-010 Privacy diagnostics
+- UI-011 Smart Cleanup evidence, selection, confirmation, history, and Undo
 
 ## Epic: MCP
 
@@ -111,6 +116,8 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - REL-006 SBOM/checksums
 - REL-007 Clean VM smoke
 - REL-008 GitHub release workflow
+- REL-009 Required macOS Trash and Windows Recycle Bin acceptance matrix
+- REL-010 Linux experimental freedesktop Trash artifact and evidence
 
 ## Epic: Launch
 

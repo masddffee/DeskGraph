@@ -71,6 +71,7 @@ Done：
 - Project cluster。
 - User confirm / merge / split。
 - Edge provenance。
+- Exact duplicate、evidence-backed version 與 screenshot-group candidate provenance；screenshot group 永不單獨證明檔案可丟棄。
 - Project page。
 
 Done：
@@ -84,6 +85,7 @@ Done：
 - Preview。
 - Conflict policy。
 - Move / rename transaction。
+- Move-to-system-trash transaction；不提供 permanent delete 或 empty-trash 路徑。
 - Undo。
 - Crash recovery。
 - Audit log。
@@ -94,6 +96,8 @@ Done：
 - 檔名衝突。
 - 跨 volume move。
 - Undo 後 hash 一致。
+- macOS Trash 與 Windows Recycle Bin adapter 的 identity、collision、crash-recovery、external-empty 與 Undo runtime matrix 通過。
+- Linux freedesktop Trash 僅需獨立 experimental artifact／evidence；未完成或失敗不得拖延 macOS／Windows，也不得宣稱 Linux cleanup 已驗證。
 - 永久刪除不存在於程式碼路徑。
 
 ## M6 — Watch Mode and Smart Inbox
@@ -102,6 +106,7 @@ Done：
 - Stability check。
 - Incremental indexing。
 - Smart Inbox。
+- Smart Cleanup Inbox：從精確重複檔、有充分證據的舊版本與可解釋的截圖群組建立候選。
 - Notification policy。
 - Background resource controls。
 
@@ -109,6 +114,8 @@ Done：
 - 大量事件 debounce。
 - Rename / move event reconciliation。
 - 暫存下載不被提早處理。
+- Cleanup 建議逐項顯示 evidence、keeper、候選、預估數量／容量；群組或規則不得自動授權垃圾桶動作。
+- v0.1 每次確認最多 100 個項目且 expected bytes 合計最多 100 GiB；每檔各自 immutable plan／journal／receipt／Undo，依序執行並在首個非 completed outcome 後停止，剩餘項目標記 `not_started`，不做 batch rollback。
 
 ## M7 — MCP
 
@@ -131,8 +138,9 @@ Done：
 - Dashboard。
 - Search。
 - Project page。
-- Smart Inbox。
+- Smart Inbox + Smart Cleanup Inbox review。
 - Action Preview。
+- Per-item／bounded-batch cleanup selection and confirmation。
 - History / Undo。
 - Settings。
 - Model manager。
@@ -141,6 +149,7 @@ Done：
 Done：
 - Keyboard navigation。
 - Empty / loading / error states。
+- Cleanup evidence、確認、執行、復原、衝突與外部清空垃圾桶狀態皆可理解且可操作。
 - UI 無需理解 GraphRAG 術語。
 
 ## M9 — Release Engineering
