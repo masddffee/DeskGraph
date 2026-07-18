@@ -764,6 +764,7 @@ dependencies = [
  "deskgraph-telemetry",
  "deskgraph-transactions",
  "deskgraph-watcher",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",

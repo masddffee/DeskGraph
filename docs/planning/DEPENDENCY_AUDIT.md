@@ -131,6 +131,19 @@ No vector extension, tokenizer extension, embedding runtime, model, API, or netw
 
 The first M6 slice adds only the local path-based `deskgraph-watcher` workspace crate. It reuses the audited database/domain/identity/scanner layers and Rust standard library; no native watcher, async runtime, network client, or registry package was added. Native adapter candidates remain unapproved until official API, maintenance, platform, license, and security evidence exists.
 
+The second M6 slice also adds no registry package. The Tauri coordinator, bounded schedule, metadata-scan gate, stop flag, worker thread and metadata-only polling fallback use the Rust standard library plus already-locked workspace/Tauri/Serde dependencies. `serde` became an explicit Desktop Rust dependency only for the closed path-free runtime response; it was already present in `Cargo.lock`. Forward migration 0017 adds only a partial SQLite index for active watch status/deadline ordering. The fallback never compares file contents, never watches an unscanned authorization, and routes every scheduled scope root through the existing canonical scope, durable stability and atomic scanner boundaries.
+
+### Native event adapter candidate — researched, not adopted
+
+`notify = "=8.2.0"` is the current pinned candidate, not an approved dependency and not present in `Cargo.lock`.
+
+- Official tag metadata: `notify-8.2.0` declares CC0-1.0, Rust 1.77 through its tagged workspace manifest, default `macos_fsevent`, optional `macos_kqueue`/`serde`/`serialization-compat-6`, Linux/Android inotify, macOS FSEvents, Windows `ReadDirectoryChangesW`, BSD/iOS kqueue, and an all-platform polling backend. Upstream permits raising MSRV in a minor release, so exact-version revalidation remains mandatory before adoption.
+- Intended minimal configuration if later accepted: exact `8.2.0`, default features disabled, and only target-required macOS FSEvents enabled. Do not add `notify-debouncer-mini/full`: ADR-016 already owns durable debounce, identity and stability, and the upstream core emits raw events.
+- Mandatory callback boundary: bounded non-blocking hint forwarding only. No database work, canonicalization, scanning, content access or path logging in the callback. Queue overflow, source error, and upstream `Event::need_rescan()` must schedule a path-free whole-scope reconciliation.
+- Known upstream limits: native events may be incomplete, duplicated or reordered; NFS/WSL/network mounts may emit nothing; macOS FSEvents may miss unowned files; editor save behavior varies; Linux inotify limits and very large trees can lose events. Startup plus periodic fallback reconciliation remains required.
+- Remaining approval gates: generate the exact target-specific lock closure and `cargo tree -e features` for macOS/Windows/Linux; review `windows-sys 0.60.1` alongside the workspace 0.61 line; rerun RustSec/licenses/SBOM; test bounded overflow/shutdown/root replacement/create/modify/delete/rename storms on real target systems; measure large-tree/8 GB CPU, RSS and thermal behavior.
+- Official evidence: [tagged workspace manifest](https://github.com/notify-rs/notify/blob/notify-8.2.0/Cargo.toml), [tagged crate manifest](https://github.com/notify-rs/notify/blob/notify-8.2.0/notify/Cargo.toml), [tagged README/platform/license statement](https://github.com/notify-rs/notify/blob/notify-8.2.0/README.md), and [tagged Event rescan/rename contract](https://github.com/notify-rs/notify/blob/notify-8.2.0/notify-types/src/event.rs).
+
 ## M5 rename-preview dependency decision
 
 The first M5 slice adds only the local path-based `deskgraph-transactions` workspace crate. It reuses the audited database/domain/identity/scanner layers and Rust standard library. No registry package, file-operation plugin, async runtime, model, network client, shell, Python, Docker, or native runtime was added. `serde_json` and `tempfile` remain test-only workspace dependencies.

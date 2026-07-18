@@ -44,7 +44,13 @@ import {
   type SearchResult,
   type SearchSourceFilter,
 } from './search';
-import { loadRecentWatchEvents, type WatchEventProgress, type WatchEventReason } from './watch';
+import {
+  loadRecentWatchEvents,
+  loadWatchRuntimeStatus,
+  type WatchEventProgress,
+  type WatchEventReason,
+  type WatchRuntimeStatus,
+} from './watch';
 import {
   collectLanguagePreferences,
   formatInteger,
@@ -68,6 +74,7 @@ type ReadyState = {
   extraction: ExtractionStats;
   extractionJobs: ExtractionJobProgress[];
   watchEvents: WatchEventProgress[];
+  watchRuntime: WatchRuntimeStatus;
   actionPlans: ActionPlanSummary[];
 };
 type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
@@ -148,17 +155,27 @@ function Metric({ label, value, locale }: { label: string; value: number; locale
 }
 
 async function loadDashboard(): Promise<ReadyState> {
-  const [report, manifest, scopes, jobs, extraction, extractionJobs, watchEvents, actionPlans] =
-    await Promise.all([
-      loadHealthReport(),
-      loadManifestStatus(),
-      loadAuthorizedScopes(),
-      loadRecentScanJobs(),
-      loadExtractionStats(),
-      loadRecentExtractions(),
-      loadRecentWatchEvents(),
-      loadRecentActionPlans(),
-    ]);
+  const [
+    report,
+    manifest,
+    scopes,
+    jobs,
+    extraction,
+    extractionJobs,
+    watchEvents,
+    watchRuntime,
+    actionPlans,
+  ] = await Promise.all([
+    loadHealthReport(),
+    loadManifestStatus(),
+    loadAuthorizedScopes(),
+    loadRecentScanJobs(),
+    loadExtractionStats(),
+    loadRecentExtractions(),
+    loadRecentWatchEvents(),
+    loadWatchRuntimeStatus(),
+    loadRecentActionPlans(),
+  ]);
   return {
     kind: 'ready',
     report,
@@ -168,6 +185,7 @@ async function loadDashboard(): Promise<ReadyState> {
     extraction,
     extractionJobs,
     watchEvents,
+    watchRuntime,
     actionPlans,
   };
 }
@@ -293,6 +311,13 @@ function watchStatusLabel(event: WatchEventProgress, catalog: Catalog): string {
   return watchReasonLabel(event.reason, catalog);
 }
 
+function watchRuntimeLabel(runtime: WatchRuntimeStatus, catalog: Catalog): string {
+  if (runtime.state === 'running') return catalog.watch.adapterActive;
+  if (runtime.state === 'starting') return catalog.watch.adapterStarting;
+  if (runtime.state === 'degraded') return catalog.watch.adapterDegraded;
+  return catalog.watch.adapterStopped;
+}
+
 function actionPolicyCheckLabel(check: ActionPolicyCheck, catalog: Catalog): string {
   if (check === 'explicit_authorized_scope') return catalog.actions.policy.authorizedScope;
   if (check === 'present_manifest_file') return catalog.actions.policy.manifestFile;
@@ -354,6 +379,7 @@ export default function App() {
   const activeExtractionJobIds =
     state.kind === 'ready' ? activeScreenshotOcrJobIds(state.extractionJobs) : [];
   const activeExtractionJobKey = activeExtractionJobIds.join(',');
+  const dashboardReady = state.kind === 'ready';
   const catalog = getCatalog(locale);
 
   useEffect(() => {
@@ -447,6 +473,40 @@ export default function App() {
     };
   }, [activeExtractionJobKey]);
 
+  useEffect(() => {
+    if (!dashboardReady) return;
+    let active = true;
+
+    const poll = async () => {
+      try {
+        const [manifest, watchEvents, watchRuntime] = await Promise.all([
+          loadManifestStatus(),
+          loadRecentWatchEvents(),
+          loadWatchRuntimeStatus(),
+        ]);
+        if (!active) return;
+        setState((current) =>
+          current.kind === 'ready'
+            ? {
+                ...current,
+                manifest,
+                watchEvents,
+                watchRuntime,
+              }
+            : current,
+        );
+      } catch {
+        // Keep the last validated path-free status until the next poll succeeds.
+      }
+    };
+
+    const timer = window.setInterval(() => void poll(), 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [dashboardReady]);
+
   function updateJob(job: ScanJobProgress) {
     setState((current) =>
       current.kind === 'ready' ? { ...current, jobs: replaceJob(current.jobs, job) } : current,
@@ -465,16 +525,25 @@ export default function App() {
   }
 
   async function refreshManifest() {
-    const [manifest, scopes, jobs, extraction, extractionJobs, watchEvents, actionPlans] =
-      await Promise.all([
-        loadManifestStatus(),
-        loadAuthorizedScopes(),
-        loadRecentScanJobs(),
-        loadExtractionStats(),
-        loadRecentExtractions(),
-        loadRecentWatchEvents(),
-        loadRecentActionPlans(),
-      ]);
+    const [
+      manifest,
+      scopes,
+      jobs,
+      extraction,
+      extractionJobs,
+      watchEvents,
+      watchRuntime,
+      actionPlans,
+    ] = await Promise.all([
+      loadManifestStatus(),
+      loadAuthorizedScopes(),
+      loadRecentScanJobs(),
+      loadExtractionStats(),
+      loadRecentExtractions(),
+      loadRecentWatchEvents(),
+      loadWatchRuntimeStatus(),
+      loadRecentActionPlans(),
+    ]);
     setState((current) =>
       current.kind === 'ready'
         ? {
@@ -485,6 +554,7 @@ export default function App() {
             extraction,
             extractionJobs,
             watchEvents,
+            watchRuntime,
             actionPlans,
           }
         : current,
@@ -1331,8 +1401,12 @@ export default function App() {
                 <h2 id="watch-title">{catalog.watch.heading}</h2>
                 <p>{catalog.watch.description}</p>
               </div>
-              <span className="connected-indicator connected-indicator--pending">
-                {catalog.watch.adapterPending}
+              <span
+                className={`connected-indicator${
+                  state.watchRuntime.state === 'running' ? '' : ' connected-indicator--pending'
+                }`}
+              >
+                {watchRuntimeLabel(state.watchRuntime, catalog)}
               </span>
             </div>
             <div className="metrics metrics--content">
@@ -1355,12 +1429,13 @@ export default function App() {
                 locale={locale}
               />
               <Metric
+                label={catalog.watch.metrics.deferred}
+                value={state.watchRuntime.deferred_scope_count}
+                locale={locale}
+              />
+              <Metric
                 label={catalog.watch.metrics.attention}
-                value={
-                  state.watchEvents.filter(
-                    (event) => event.status === 'failed' || event.status === 'reconciling',
-                  ).length
-                }
+                value={state.watchRuntime.degraded_scope_count}
                 locale={locale}
               />
             </div>

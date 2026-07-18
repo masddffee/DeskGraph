@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, Metadata};
@@ -14,12 +15,24 @@ use deskgraph_identity::{
     path_from_raw, path_to_raw, platform_identity, platform_identity_for_open_file,
 };
 use deskgraph_scanner::{
-    ScannerError, resume_scan_job, run_scan_job_to_terminal, validated_scope_root,
+    ScannerError, resume_scan_job, run_scan_job_batch, run_scan_job_to_terminal,
+    validated_scope_root,
 };
 
 const DEFAULT_STABILITY_WINDOW_MS: i64 = 1_000;
 const MIN_STABILITY_WINDOW_MS: i64 = 250;
 const MAX_STABILITY_WINDOW_MS: i64 = 60_000;
+const DEFAULT_POLL_INTERVAL_MS: i64 = 300_000;
+const MIN_POLL_INTERVAL_MS: i64 = 5_000;
+const MAX_POLL_INTERVAL_MS: i64 = 3_600_000;
+const MAX_ACTIVE_EVENTS_PER_CYCLE: usize = 64;
+const MAX_RECONCILIATIONS_PER_CYCLE: usize = 1;
+const MAX_SCOPES_SCHEDULED_PER_CYCLE: usize = 4;
+const COORDINATOR_RECONCILIATION_BATCH_SIZE: usize = 256;
+const COORDINATOR_ACTIVE_RETRY_MS: i64 = 50;
+const COORDINATOR_EVENT_CONTENTION_RETRY_MS: i64 = 1_000;
+const COORDINATOR_SCOPE_SCHEDULE_RETRY_MS: i64 = 1_000;
+const COORDINATOR_SCOPE_ERROR_RETRY_MS: i64 = 30_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WatchPolicy {
@@ -45,6 +58,32 @@ impl Default for WatchPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PollingWatchPolicy {
+    poll_interval_ms: i64,
+}
+
+impl PollingWatchPolicy {
+    pub fn new(poll_interval_ms: i64) -> Result<Self, WatcherError> {
+        if !(MIN_POLL_INTERVAL_MS..=MAX_POLL_INTERVAL_MS).contains(&poll_interval_ms) {
+            return Err(WatcherError::InvalidPollingPolicy);
+        }
+        Ok(Self { poll_interval_ms })
+    }
+
+    pub fn poll_interval_ms(self) -> i64 {
+        self.poll_interval_ms
+    }
+}
+
+impl Default for PollingWatchPolicy {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchHint {
     pub scope_id: i64,
@@ -55,11 +94,294 @@ pub trait WatchEventSource {
     fn next_hint(&mut self) -> Result<Option<WatchHint>, WatcherError>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchCycleReport {
+    pub api_version: &'static str,
+    pub cycle_unix_ms: i64,
+    pub authorized_scope_count: u64,
+    pub active_event_count: u64,
+    pub advanced_event_count: u64,
+    pub completed_event_count: u64,
+    pub deferred_event_count: u64,
+    pub scheduled_scope_count: u64,
+    pub deferred_scope_count: u64,
+    pub degraded_scope_count: u64,
+    pub next_wake_unix_ms: i64,
+    pub last_error_code: Option<&'static str>,
+}
+
+impl WatchCycleReport {
+    pub const API_VERSION: &str = "deskgraph.watch-cycle.v1";
+}
+
+pub struct WatchCoordinator {
+    database: ManifestDatabase,
+    watch_policy: WatchPolicy,
+    polling_policy: PollingWatchPolicy,
+    next_poll_by_scope: BTreeMap<i64, i64>,
+    deferred_scope_due_at: BTreeMap<i64, i64>,
+    event_retry_at: BTreeMap<i64, i64>,
+    scope_errors: BTreeMap<i64, &'static str>,
+}
+
+impl WatchCoordinator {
+    pub fn open(
+        database_path: &Path,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+    ) -> Result<Self, WatcherError> {
+        let database = ManifestDatabase::open(database_path)?;
+        Ok(Self::from_database(database, watch_policy, polling_policy))
+    }
+
+    pub fn from_database(
+        database: ManifestDatabase,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+    ) -> Self {
+        Self {
+            database,
+            watch_policy,
+            polling_policy,
+            next_poll_by_scope: BTreeMap::new(),
+            deferred_scope_due_at: BTreeMap::new(),
+            event_retry_at: BTreeMap::new(),
+            scope_errors: BTreeMap::new(),
+        }
+    }
+
+    pub fn run_cycle(&mut self) -> Result<WatchCycleReport, WatcherError> {
+        self.run_cycle_at_time(unix_ms()?)
+    }
+
+    pub fn run_cycle_at_time(
+        &mut self,
+        now_unix_ms: i64,
+    ) -> Result<WatchCycleReport, WatcherError> {
+        if now_unix_ms < 0 {
+            return Err(WatcherError::InvalidTimestamp);
+        }
+
+        let scopes = self.database.list_scopes()?;
+        let scope_ids = self
+            .database
+            .watchable_scope_ids()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        self.next_poll_by_scope
+            .retain(|scope_id, _| scope_ids.contains(scope_id));
+        self.deferred_scope_due_at
+            .retain(|scope_id, _| scope_ids.contains(scope_id));
+        self.scope_errors
+            .retain(|scope_id, _| scope_ids.contains(scope_id));
+        for scope_id in &scope_ids {
+            self.next_poll_by_scope
+                .entry(*scope_id)
+                .or_insert(now_unix_ms);
+        }
+
+        let active_before = self.database.active_watch_events()?;
+        let mut report = WatchCycleReport {
+            api_version: WatchCycleReport::API_VERSION,
+            cycle_unix_ms: now_unix_ms,
+            authorized_scope_count: u64::try_from(scopes.len())
+                .map_err(|_| WatcherError::InvalidRuntimeCount)?,
+            active_event_count: u64::try_from(active_before.len())
+                .map_err(|_| WatcherError::InvalidRuntimeCount)?,
+            advanced_event_count: 0,
+            completed_event_count: 0,
+            deferred_event_count: 0,
+            scheduled_scope_count: 0,
+            deferred_scope_count: 0,
+            degraded_scope_count: 0,
+            next_wake_unix_ms: now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
+            last_error_code: self.scope_errors.values().next().copied(),
+        };
+        let mut reconciliation_count = 0;
+
+        for event in active_before.iter().take(MAX_ACTIVE_EVENTS_PER_CYCLE) {
+            let next_poll = now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms);
+            self.next_poll_by_scope
+                .entry(event.scope_id)
+                .and_modify(|due_at| *due_at = (*due_at).max(next_poll))
+                .or_insert(next_poll);
+            if self
+                .event_retry_at
+                .get(&event.event_id)
+                .is_some_and(|retry_at| *retry_at > now_unix_ms)
+            {
+                report.deferred_event_count = report.deferred_event_count.saturating_add(1);
+                continue;
+            }
+            let is_due = event.status == WatchEventStatus::Reconciling
+                || now_unix_ms >= event.stable_after_unix_ms;
+            if !is_due {
+                continue;
+            }
+            if reconciliation_count >= MAX_RECONCILIATIONS_PER_CYCLE {
+                report.deferred_event_count = report.deferred_event_count.saturating_add(1);
+                continue;
+            }
+
+            match advance_watch_event_batch_at_time(
+                &mut self.database,
+                event.event_id,
+                self.watch_policy,
+                COORDINATOR_RECONCILIATION_BATCH_SIZE,
+                now_unix_ms,
+            ) {
+                Ok(progress) => {
+                    self.event_retry_at.remove(&event.event_id);
+                    reconciliation_count += 1;
+                    report.advanced_event_count = report.advanced_event_count.saturating_add(1);
+                    if progress.is_terminal() {
+                        if progress.status == WatchEventStatus::Completed {
+                            report.completed_event_count =
+                                report.completed_event_count.saturating_add(1);
+                            self.scope_errors.remove(&progress.scope_id);
+                        } else if progress.status == WatchEventStatus::Failed {
+                            self.scope_errors
+                                .insert(progress.scope_id, watch_progress_error_code(&progress));
+                        }
+                        self.next_poll_by_scope.insert(
+                            progress.scope_id,
+                            now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
+                        );
+                    }
+                }
+                Err(error) if is_retryable_scan_contention(&error) => {
+                    report.deferred_event_count = report.deferred_event_count.saturating_add(1);
+                    self.event_retry_at.insert(
+                        event.event_id,
+                        now_unix_ms.saturating_add(COORDINATOR_EVENT_CONTENTION_RETRY_MS),
+                    );
+                }
+                Err(error) => {
+                    self.scope_errors.insert(event.scope_id, error.code());
+                    self.event_retry_at.insert(
+                        event.event_id,
+                        now_unix_ms.saturating_add(COORDINATOR_SCOPE_ERROR_RETRY_MS),
+                    );
+                }
+            }
+        }
+        let unvisited_active_count = active_before
+            .len()
+            .saturating_sub(MAX_ACTIVE_EVENTS_PER_CYCLE);
+        report.deferred_event_count = report
+            .deferred_event_count
+            .saturating_add(u64::try_from(unvisited_active_count).unwrap_or(u64::MAX));
+
+        let active_scope_ids = self
+            .database
+            .active_watch_events()?
+            .into_iter()
+            .map(|event| event.scope_id)
+            .collect::<BTreeSet<_>>();
+        self.deferred_scope_due_at
+            .retain(|scope_id, _| !active_scope_ids.contains(scope_id));
+        let mut due_scopes = self
+            .next_poll_by_scope
+            .iter()
+            .filter(|(scope_id, due_at)| {
+                **due_at <= now_unix_ms && !active_scope_ids.contains(scope_id)
+            })
+            .map(|(scope_id, due_at)| (*scope_id, *due_at))
+            .collect::<Vec<_>>();
+        due_scopes.sort_unstable_by_key(|(scope_id, due_at)| {
+            self.deferred_scope_due_at
+                .get(scope_id)
+                .map_or((1, *due_at, *scope_id), |original_due_at| {
+                    (0, *original_due_at, *scope_id)
+                })
+        });
+
+        for (scope_id, due_at) in due_scopes.iter().skip(MAX_SCOPES_SCHEDULED_PER_CYCLE) {
+            self.deferred_scope_due_at
+                .entry(*scope_id)
+                .or_insert(*due_at);
+            self.next_poll_by_scope.insert(
+                *scope_id,
+                now_unix_ms.saturating_add(COORDINATOR_SCOPE_SCHEDULE_RETRY_MS),
+            );
+        }
+
+        for (scope_id, _) in due_scopes.into_iter().take(MAX_SCOPES_SCHEDULED_PER_CYCLE) {
+            self.deferred_scope_due_at.remove(&scope_id);
+            let scheduled = validated_scope_root(&self.database, scope_id)
+                .map_err(WatcherError::from)
+                .and_then(|root| {
+                    observe_watch_path_at_time(
+                        &mut self.database,
+                        scope_id,
+                        &root,
+                        self.watch_policy,
+                        now_unix_ms,
+                    )
+                });
+            match scheduled {
+                Ok(_) => {
+                    report.scheduled_scope_count = report.scheduled_scope_count.saturating_add(1);
+                    self.next_poll_by_scope.insert(
+                        scope_id,
+                        now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
+                    );
+                }
+                Err(error) => {
+                    self.scope_errors.insert(scope_id, error.code());
+                    self.next_poll_by_scope.insert(
+                        scope_id,
+                        now_unix_ms.saturating_add(COORDINATOR_SCOPE_ERROR_RETRY_MS),
+                    );
+                }
+            }
+        }
+
+        let active_after = self.database.active_watch_events()?;
+        let active_event_ids = active_after
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<BTreeSet<_>>();
+        self.event_retry_at
+            .retain(|event_id, _| active_event_ids.contains(event_id));
+        report.active_event_count =
+            u64::try_from(active_after.len()).map_err(|_| WatcherError::InvalidRuntimeCount)?;
+        report.degraded_scope_count = u64::try_from(self.scope_errors.len())
+            .map_err(|_| WatcherError::InvalidRuntimeCount)?;
+        report.deferred_scope_count = u64::try_from(self.deferred_scope_due_at.len())
+            .map_err(|_| WatcherError::InvalidRuntimeCount)?;
+        report.last_error_code = self.scope_errors.values().next().copied();
+        let next_active_wake = active_after.iter().map(|event| {
+            let normal_wake = match event.status {
+                WatchEventStatus::Stabilizing => event.stable_after_unix_ms,
+                WatchEventStatus::Reconciling => {
+                    now_unix_ms.saturating_add(COORDINATOR_ACTIVE_RETRY_MS)
+                }
+                _ => now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
+            };
+            self.event_retry_at
+                .get(&event.event_id)
+                .copied()
+                .unwrap_or(normal_wake)
+                .max(normal_wake)
+        });
+        let next_poll_wake = self.next_poll_by_scope.values().copied();
+        report.next_wake_unix_ms = next_active_wake
+            .chain(next_poll_wake)
+            .min()
+            .unwrap_or_else(|| now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms))
+            .max(now_unix_ms.saturating_add(COORDINATOR_ACTIVE_RETRY_MS));
+        Ok(report)
+    }
+}
+
 #[derive(Debug)]
 pub enum WatcherError {
     Database(DatabaseError),
     Scanner(ScannerError),
     InvalidPolicy,
+    InvalidPollingPolicy,
+    InvalidRuntimeCount,
     InvalidTimestamp,
     ObservedPathMustBeAbsolute,
     ObservedPathOutsideScope,
@@ -76,6 +398,8 @@ impl WatcherError {
             Self::Database(error) => error.code(),
             Self::Scanner(error) => error.code(),
             Self::InvalidPolicy => "watch_policy_invalid",
+            Self::InvalidPollingPolicy => "watch_polling_policy_invalid",
+            Self::InvalidRuntimeCount => "watch_runtime_count_out_of_range",
             Self::InvalidTimestamp => "watch_timestamp_invalid",
             Self::ObservedPathMustBeAbsolute => "watch_path_must_be_absolute",
             Self::ObservedPathOutsideScope => "watch_path_outside_scope",
@@ -105,6 +429,24 @@ impl From<DatabaseError> for WatcherError {
 impl From<ScannerError> for WatcherError {
     fn from(error: ScannerError) -> Self {
         Self::Scanner(error)
+    }
+}
+
+fn is_retryable_scan_contention(error: &WatcherError) -> bool {
+    matches!(
+        error,
+        WatcherError::Database(DatabaseError::ScanJobAlreadyActive | DatabaseError::ScanJobBusy)
+            | WatcherError::Scanner(ScannerError::Database(
+                DatabaseError::ScanJobAlreadyActive | DatabaseError::ScanJobBusy
+            ))
+    )
+}
+
+fn watch_progress_error_code(progress: &WatchEventProgress) -> &'static str {
+    match progress.reason {
+        Some(WatchEventReason::SourceUnavailable) => "watch_source_unavailable",
+        Some(WatchEventReason::ReconcileFailed) => "watch_reconciliation_failed",
+        _ => "watch_event_failed",
     }
 }
 
@@ -211,6 +553,44 @@ pub fn advance_watch_event_at_time(
     policy: WatchPolicy,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
+    advance_watch_event_with_mode(
+        database,
+        event_id,
+        policy,
+        now_unix_ms,
+        ReconciliationRunMode::ToTerminal,
+    )
+}
+
+fn advance_watch_event_batch_at_time(
+    database: &mut ManifestDatabase,
+    event_id: i64,
+    policy: WatchPolicy,
+    batch_size: usize,
+    now_unix_ms: i64,
+) -> Result<WatchEventProgress, WatcherError> {
+    advance_watch_event_with_mode(
+        database,
+        event_id,
+        policy,
+        now_unix_ms,
+        ReconciliationRunMode::Batch(batch_size),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ReconciliationRunMode {
+    ToTerminal,
+    Batch(usize),
+}
+
+fn advance_watch_event_with_mode(
+    database: &mut ManifestDatabase,
+    event_id: i64,
+    policy: WatchPolicy,
+    now_unix_ms: i64,
+    run_mode: ReconciliationRunMode,
+) -> Result<WatchEventProgress, WatcherError> {
     if now_unix_ms < 0 {
         return Err(WatcherError::InvalidTimestamp);
     }
@@ -219,7 +599,7 @@ pub fn advance_watch_event_at_time(
         return Ok(event.progress);
     }
     if event.progress.status == WatchEventStatus::Reconciling {
-        return finish_reconciliation(database, event_id, now_unix_ms);
+        return finish_reconciliation(database, event_id, now_unix_ms, run_mode);
     }
     if event.progress.status != WatchEventStatus::Stabilizing {
         return Err(WatcherError::Database(
@@ -284,7 +664,7 @@ pub fn advance_watch_event_at_time(
         is_root: true,
     };
     database.begin_watch_reconciliation_at(event_id, &root, now_unix_ms)?;
-    finish_reconciliation(database, event_id, now_unix_ms)
+    finish_reconciliation(database, event_id, now_unix_ms, run_mode)
 }
 
 pub fn watch_event_at(
@@ -309,6 +689,7 @@ fn finish_reconciliation(
     database: &mut ManifestDatabase,
     event_id: i64,
     now_unix_ms: i64,
+    run_mode: ReconciliationRunMode,
 ) -> Result<WatchEventProgress, WatcherError> {
     let event = database.watch_event(event_id)?;
     let scan_job_id = event
@@ -316,12 +697,18 @@ fn finish_reconciliation(
         .scan_job_id
         .ok_or(DatabaseError::InvalidWatchEventState)?;
     let scan = database.scan_job(scan_job_id)?;
+    let run_scan = |database: &mut ManifestDatabase| match run_mode {
+        ReconciliationRunMode::ToTerminal => run_scan_job_to_terminal(database, scan_job_id),
+        ReconciliationRunMode::Batch(batch_size) => {
+            run_scan_job_batch(database, scan_job_id, batch_size)
+        }
+    };
     let scan = match scan.status {
         ScanStatus::Interrupted => {
             resume_scan_job(database, scan_job_id)?;
-            run_scan_job_to_terminal(database, scan_job_id)
+            run_scan(database)
         }
-        ScanStatus::Running => run_scan_job_to_terminal(database, scan_job_id),
+        ScanStatus::Running => run_scan(database),
         ScanStatus::Paused => return Ok(event.progress),
         ScanStatus::Completed => Ok(scan),
         ScanStatus::Failed => {
@@ -567,7 +954,10 @@ fn unix_ms() -> Result<i64, WatcherError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deskgraph_scanner::{authorize_scope, scan_scope};
+    use deskgraph_scanner::{
+        authorize_scope, create_scan_job, run_scan_job_to_terminal, scan_scope,
+    };
+    use std::collections::VecDeque;
 
     fn setup() -> (tempfile::TempDir, ManifestDatabase, i64) {
         let directory = tempfile::tempdir().expect("fixture root should exist");
@@ -575,6 +965,363 @@ mod tests {
         let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         (directory, database, scope.id)
+    }
+
+    enum ScriptedSourceStep {
+        Hint(WatchHint),
+        Empty,
+        Fail,
+    }
+
+    struct ScriptedWatchEventSource {
+        steps: VecDeque<ScriptedSourceStep>,
+    }
+
+    impl WatchEventSource for ScriptedWatchEventSource {
+        fn next_hint(&mut self) -> Result<Option<WatchHint>, WatcherError> {
+            match self.steps.pop_front().unwrap_or(ScriptedSourceStep::Empty) {
+                ScriptedSourceStep::Hint(hint) => Ok(Some(hint)),
+                ScriptedSourceStep::Empty => Ok(None),
+                ScriptedSourceStep::Fail => Err(WatcherError::EventSourceFailed),
+            }
+        }
+    }
+
+    #[test]
+    fn scripted_source_is_ingested_only_through_the_existing_safety_gate() {
+        let (directory, mut database, scope_id) = setup();
+        let file = directory.path().join("source.md");
+        fs::write(&file, "local").expect("fixture should write");
+        let outside = tempfile::tempdir().expect("outside fixture should exist");
+        let outside_file = outside.path().join("outside.md");
+        fs::write(&outside_file, "outside").expect("outside fixture should write");
+        let mut source = ScriptedWatchEventSource {
+            steps: VecDeque::from([
+                ScriptedSourceStep::Hint(WatchHint {
+                    scope_id,
+                    path: file,
+                }),
+                ScriptedSourceStep::Empty,
+                ScriptedSourceStep::Hint(WatchHint {
+                    scope_id,
+                    path: outside_file,
+                }),
+                ScriptedSourceStep::Fail,
+            ]),
+        };
+
+        let observed = ingest_next_source_hint_at_time(
+            &mut database,
+            &mut source,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("authorized source hint should ingest")
+        .expect("source should yield a hint");
+        assert_eq!(observed.status, WatchEventStatus::Stabilizing);
+        assert_eq!(
+            ingest_next_source_hint_at_time(
+                &mut database,
+                &mut source,
+                WatchPolicy::default(),
+                1_100,
+            )
+            .expect("empty source should be valid"),
+            None
+        );
+        assert!(matches!(
+            ingest_next_source_hint_at_time(
+                &mut database,
+                &mut source,
+                WatchPolicy::default(),
+                1_200,
+            ),
+            Err(WatcherError::ObservedPathOutsideScope)
+        ));
+        assert!(matches!(
+            ingest_next_source_hint_at_time(
+                &mut database,
+                &mut source,
+                WatchPolicy::default(),
+                1_300,
+            ),
+            Err(WatcherError::EventSourceFailed)
+        ));
+    }
+
+    #[test]
+    fn polling_policy_is_bounded_for_resource_safety() {
+        assert!(matches!(
+            PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS - 1),
+            Err(WatcherError::InvalidPollingPolicy)
+        ));
+        assert_eq!(
+            PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+                .expect("minimum interval should be accepted")
+                .poll_interval_ms(),
+            MIN_POLL_INTERVAL_MS
+        );
+        assert!(matches!(
+            PollingWatchPolicy::new(MAX_POLL_INTERVAL_MS + 1),
+            Err(WatcherError::InvalidPollingPolicy)
+        ));
+    }
+
+    #[test]
+    fn polling_never_turns_authorization_into_an_implicit_initial_scan() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("scope");
+        fs::create_dir(&scope_path).expect("scope should create");
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let _scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let before_scan = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("unscanned scope should be skipped");
+        assert_eq!(before_scan.authorized_scope_count, 1);
+        assert_eq!(before_scan.scheduled_scope_count, 0);
+        assert_eq!(before_scan.active_event_count, 0);
+        assert_eq!(before_scan.next_wake_unix_ms, 1_000 + MIN_POLL_INTERVAL_MS);
+    }
+
+    #[test]
+    fn invalid_scope_stays_degraded_until_a_successful_reconciliation() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("scope");
+        let moved_path = directory.path().join("scope-moved");
+        fs::create_dir(&scope_path).expect("scope should create");
+        fs::write(scope_path.join("note.md"), "local").expect("fixture should write");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("initial scan should complete");
+        drop(database);
+        fs::rename(&scope_path, &moved_path).expect("scope should move");
+
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::open(&database_path, WatchPolicy::default(), polling_policy)
+                .expect("coordinator should start");
+        let failed = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("invalid scope should degrade without crashing");
+        assert_eq!(failed.degraded_scope_count, 1);
+        assert_eq!(
+            failed.last_error_code,
+            Some("scope_canonicalization_failed")
+        );
+        assert_eq!(
+            failed.next_wake_unix_ms,
+            1_000 + COORDINATOR_SCOPE_ERROR_RETRY_MS
+        );
+
+        let still_degraded = coordinator
+            .run_cycle_at_time(1_100)
+            .expect("intermediate cycle should retain failure");
+        assert_eq!(still_degraded.degraded_scope_count, 1);
+        assert_eq!(
+            still_degraded.last_error_code,
+            Some("scope_canonicalization_failed")
+        );
+        assert_eq!(still_degraded.scheduled_scope_count, 0);
+
+        fs::rename(&moved_path, &scope_path).expect("scope should restore");
+        let rescheduled = coordinator
+            .run_cycle_at_time(31_000)
+            .expect("restored scope should schedule");
+        assert_eq!(rescheduled.scheduled_scope_count, 1);
+        assert_eq!(rescheduled.degraded_scope_count, 1);
+        let recovered = coordinator
+            .run_cycle_at_time(32_000)
+            .expect("stable restored scope should reconcile");
+        assert_eq!(recovered.completed_event_count, 1);
+        assert_eq!(recovered.degraded_scope_count, 0);
+        assert_eq!(recovered.last_error_code, None);
+    }
+
+    #[test]
+    fn polling_scope_backlog_is_rate_limited_and_reported() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let mut initial_scope_ids = Vec::new();
+        for index in 0..9 {
+            let scope_path = directory.path().join(format!("scope-{index}"));
+            fs::create_dir(&scope_path).expect("scope should create");
+            let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+            scan_scope(&mut database, scope.id).expect("initial scan should complete");
+            initial_scope_ids.push(scope.id);
+        }
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let first = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("first polling cycle should be bounded");
+        assert_eq!(first.scheduled_scope_count, 4);
+        assert_eq!(first.deferred_scope_count, 5);
+        assert_eq!(
+            first.next_wake_unix_ms,
+            1_000 + COORDINATOR_SCOPE_SCHEDULE_RETRY_MS
+        );
+
+        let before_retry = coordinator
+            .run_cycle_at_time(1_050)
+            .expect("deferred scopes should not create a burst");
+        assert_eq!(before_retry.scheduled_scope_count, 0);
+        assert_eq!(before_retry.deferred_scope_count, 5);
+        assert_eq!(
+            before_retry.next_wake_unix_ms,
+            1_000 + COORDINATOR_SCOPE_SCHEDULE_RETRY_MS
+        );
+
+        for index in 9..13 {
+            let scope_path = directory.path().join(format!("scope-{index}"));
+            fs::create_dir(&scope_path).expect("new scope should create");
+            let scope = authorize_scope(&coordinator.database, &scope_path)
+                .expect("scope should authorize");
+            scan_scope(&mut coordinator.database, scope.id)
+                .expect("new initial scan should complete");
+        }
+        let second = coordinator
+            .run_cycle_at_time(2_000)
+            .expect("older backlog should win over new due scopes");
+        assert_eq!(second.scheduled_scope_count, 4);
+        assert_eq!(second.deferred_scope_count, 5);
+        for scope_id in &initial_scope_ids[4..8] {
+            assert!(
+                !coordinator.deferred_scope_due_at.contains_key(scope_id),
+                "the oldest deferred scopes must be scheduled first"
+            );
+        }
+        assert!(
+            coordinator
+                .deferred_scope_due_at
+                .contains_key(&initial_scope_ids[8])
+        );
+
+        for index in 13..17 {
+            let scope_path = directory.path().join(format!("scope-{index}"));
+            fs::create_dir(&scope_path).expect("new scope should create");
+            let scope = authorize_scope(&coordinator.database, &scope_path)
+                .expect("scope should authorize");
+            scan_scope(&mut coordinator.database, scope.id)
+                .expect("new initial scan should complete");
+        }
+        coordinator
+            .run_cycle_at_time(3_000)
+            .expect("continuous arrivals must not starve the oldest backlog");
+        assert!(
+            !coordinator
+                .deferred_scope_due_at
+                .contains_key(&initial_scope_ids[8]),
+            "an older deferred scope must not be starved by continuously arriving scopes"
+        );
+    }
+
+    #[test]
+    fn active_scan_contention_uses_a_bounded_retry_deadline() {
+        let (directory, mut database, scope_id) = setup();
+        let changed_file = directory.path().join("changed.md");
+        fs::write(&changed_file, "changed").expect("fixture should write");
+        observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &changed_file,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("watch event should stabilize");
+        let foreground_scan =
+            create_scan_job(&mut database, scope_id).expect("foreground scan should start");
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let contended = coordinator
+            .run_cycle_at_time(2_000)
+            .expect("scan contention should be deferred");
+        assert_eq!(contended.deferred_event_count, 1);
+        assert_eq!(
+            contended.next_wake_unix_ms,
+            2_000 + COORDINATOR_EVENT_CONTENTION_RETRY_MS
+        );
+
+        let before_retry = coordinator
+            .run_cycle_at_time(2_050)
+            .expect("contention should not create a 50 ms retry loop");
+        assert_eq!(before_retry.deferred_event_count, 1);
+        assert_eq!(
+            before_retry.next_wake_unix_ms,
+            2_000 + COORDINATOR_EVENT_CONTENTION_RETRY_MS
+        );
+
+        run_scan_job_to_terminal(&mut coordinator.database, foreground_scan.job_id)
+            .expect("foreground scan should complete");
+        let recovered = coordinator
+            .run_cycle_at_time(3_000)
+            .expect("watch reconciliation should resume after contention");
+        assert_eq!(recovered.completed_event_count, 1);
+        assert_eq!(recovered.active_event_count, 0);
+    }
+
+    #[test]
+    fn polling_coordinator_recovers_after_restart_and_reconciles_metadata_only() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("scope");
+        fs::create_dir(&scope_path).expect("scope should create");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("initial scan should complete");
+        drop(database);
+
+        let new_file = scope_path.join("automatic.md");
+        fs::write(&new_file, "not extracted").expect("fixture should write");
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut first_runtime =
+            WatchCoordinator::open(&database_path, WatchPolicy::default(), polling_policy)
+                .expect("coordinator should start");
+        let scheduled = first_runtime
+            .run_cycle_at_time(1_000)
+            .expect("first polling cycle should schedule");
+        assert_eq!(scheduled.scheduled_scope_count, 1);
+        assert_eq!(scheduled.active_event_count, 1);
+        drop(first_runtime);
+
+        let mut restarted =
+            WatchCoordinator::open(&database_path, WatchPolicy::default(), polling_policy)
+                .expect("coordinator should restart");
+        let completed = restarted
+            .run_cycle_at_time(2_000)
+            .expect("restart cycle should resume the durable event");
+        assert_eq!(completed.advanced_event_count, 1);
+        assert_eq!(completed.completed_event_count, 1);
+        assert_eq!(completed.active_event_count, 0);
+        assert_eq!(completed.last_error_code, None);
+        drop(restarted);
+
+        let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        assert_eq!(database.stats().expect("stats should load").file_count, 1);
+        let extraction = database
+            .extraction_stats()
+            .expect("extraction stats should load");
+        assert_eq!(extraction.active_chunk_count, 0);
+        assert_eq!(extraction.completed_job_count, 0);
+        assert_eq!(
+            database
+                .active_watch_events()
+                .expect("active events should load"),
+            Vec::new()
+        );
     }
 
     #[test]

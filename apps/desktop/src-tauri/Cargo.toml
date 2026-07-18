@@ -21,6 +21,7 @@ deskgraph-scanner = { path = "../../../crates/scanner" }
 deskgraph-telemetry = { path = "../../../crates/telemetry" }
 deskgraph-transactions = { path = "../../../crates/transactions" }
 deskgraph-watcher = { path = "../../../crates/watcher" }
+serde.workspace = true
 tauri.workspace = true
 tracing.workspace = true
 

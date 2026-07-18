@@ -159,8 +159,17 @@ export type Catalog = {
     kicker: string;
     heading: string;
     description: string;
-    adapterPending: string;
-    metrics: { recent: string; observed: string; reconciled: string; attention: string };
+    adapterActive: string;
+    adapterStarting: string;
+    adapterDegraded: string;
+    adapterStopped: string;
+    metrics: {
+      recent: string;
+      observed: string;
+      reconciled: string;
+      deferred: string;
+      attention: string;
+    };
     empty: string;
     status: { stabilizing: string; reconciling: string; completed: string; noFailure: string };
     reason: {
@@ -413,17 +422,22 @@ const en = {
   },
   watch: {
     kicker: 'Durable watch reconciliation',
-    heading: 'Stable hints, atomic manifest updates',
+    heading: 'Bounded metadata polling fallback',
     description:
-      'The local core can debounce path-free event states, reject temporary downloads, and resume reconciliation after restart. The native OS event adapter and automatic content re-indexing are not connected yet.',
-    adapterPending: 'Core ready · adapter pending',
+      'Uses a five-minute polling interval. Each cycle schedules at most four due, previously scanned folders and advances one reconciliation batch; backlog is shown below. It is not native event watching or incremental content indexing.',
+    adapterActive: '5-minute polling fallback · active',
+    adapterStarting: '5-minute polling fallback · starting',
+    adapterDegraded: '5-minute polling fallback · needs attention',
+    adapterStopped: '5-minute polling fallback · stopped',
     metrics: {
       recent: 'Recent events',
       observed: 'Observed hints',
       reconciled: 'Reconciled',
+      deferred: 'Deferred folders',
       attention: 'Needs attention',
     },
-    empty: 'No event source is enabled. Files are still updated only by an explicit scan.',
+    empty:
+      'No changes observed yet. Due, previously scanned folders are scheduled locally in bounded batches; newly authorized folders still require an explicit initial scan.',
     status: {
       stabilizing: 'Waiting for a stable snapshot',
       reconciling: 'Atomic manifest reconciliation',
@@ -684,17 +698,22 @@ const zhTW = {
   },
   watch: {
     kicker: '可持久化監看協調',
-    heading: '穩定提示，原子化更新清單',
+    heading: '受限的 metadata 輪詢備援',
     description:
-      '本機核心可防抖不含路徑的事件狀態、拒絕暫存下載，並在重新啟動後繼續協調。原生 OS 事件轉接器與自動重新建立內容索引尚未連接。',
-    adapterPending: '核心已就緒 · 轉接器待完成',
+      '採用五分鐘輪詢間隔；每輪最多排程四個已到期且完成初始掃描的資料夾，並推進一個協調批次，延後數量會顯示於下方。這不是原生事件監看，也不是增量內容索引。',
+    adapterActive: '五分鐘輪詢備援 · 運作中',
+    adapterStarting: '五分鐘輪詢備援 · 啟動中',
+    adapterDegraded: '五分鐘輪詢備援 · 需要注意',
+    adapterStopped: '五分鐘輪詢備援 · 已停止',
     metrics: {
       recent: '最近事件',
       observed: '觀察到的提示',
       reconciled: '已協調',
+      deferred: '延後資料夾',
       attention: '需要注意',
     },
-    empty: '未啟用事件來源。檔案仍只會由明確掃描更新。',
+    empty:
+      '尚未觀察到變更。已到期且完成初始掃描的資料夾會在本機分批排程；新授權資料夾仍須先明確執行初始掃描。',
     status: {
       stabilizing: '等待穩定快照',
       reconciling: '原子化清單協調',

@@ -101,6 +101,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "nullable_ocr_confidence",
         sql: include_str!("../../../migrations/0016_nullable_ocr_confidence.sql"),
     },
+    Migration {
+        version: 17,
+        name: "watch_active_deadline_index",
+        sql: include_str!("../../../migrations/0017_watch_active_deadline_index.sql"),
+    },
 ];
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
@@ -847,6 +852,34 @@ impl ManifestDatabase {
             .map(|event| event.map(|event| event.progress))
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn active_watch_events(&self) -> Result<Vec<WatchEventProgress>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
+                scan_job_id, reason \
+             FROM watch_events \
+             WHERE status IN ('stabilizing', 'reconciling') \
+             ORDER BY CASE status WHEN 'reconciling' THEN 0 ELSE 1 END, \
+                 stable_after_unix_ms ASC, id ASC",
+        )?;
+        let events = statement.query_map([], watch_event_progress_from_row)?;
+        events.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn watchable_scope_ids(&self) -> Result<Vec<i64>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT authorized_scopes.id \
+             FROM authorized_scopes \
+             WHERE EXISTS ( \
+                SELECT 1 FROM scan_jobs \
+                WHERE scan_jobs.scope_id = authorized_scopes.id \
+                    AND scan_jobs.status = 'completed' \
+             ) \
+             ORDER BY authorized_scopes.id ASC",
+        )?;
+        let scope_ids = statement.query_map([], |row| row.get(0))?;
+        scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn mark_watch_event_ignored_at(
@@ -4594,14 +4627,7 @@ fn action_plan_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Act
 
 fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventRecord> {
     let stored_status: String = row.get(2)?;
-    let status = match stored_status.as_str() {
-        "stabilizing" => WatchEventStatus::Stabilizing,
-        "reconciling" => WatchEventStatus::Reconciling,
-        "completed" => WatchEventStatus::Completed,
-        "ignored" => WatchEventStatus::Ignored,
-        "failed" => WatchEventStatus::Failed,
-        _ => return Err(rusqlite::Error::InvalidQuery),
-    };
+    let status = watch_status_from_str(&stored_status)?;
     let stored_reason: Option<String> = row.get(6)?;
     let reason = stored_reason
         .as_deref()
@@ -4637,6 +4663,38 @@ fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventR
             identity_key: row.get(12)?,
         },
     })
+}
+
+fn watch_event_progress_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventProgress> {
+    let status = row.get::<_, String>(2)?;
+    let status = watch_status_from_str(&status)?;
+    let reason = row
+        .get::<_, Option<String>>(6)?
+        .as_deref()
+        .map(watch_reason_from_str)
+        .transpose()
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(WatchEventProgress {
+        api_version: WatchEventProgress::API_VERSION,
+        event_id: row.get(0)?,
+        scope_id: row.get(1)?,
+        status,
+        observation_count: row_u64(row, 3)?,
+        stable_after_unix_ms: row.get(4)?,
+        scan_job_id: row.get(5)?,
+        reason,
+    })
+}
+
+fn watch_status_from_str(value: &str) -> rusqlite::Result<WatchEventStatus> {
+    match value {
+        "stabilizing" => Ok(WatchEventStatus::Stabilizing),
+        "reconciling" => Ok(WatchEventStatus::Reconciling),
+        "completed" => Ok(WatchEventStatus::Completed),
+        "ignored" => Ok(WatchEventStatus::Ignored),
+        "failed" => Ok(WatchEventStatus::Failed),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn scan_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanJobProgress> {
@@ -5068,6 +5126,217 @@ mod tests {
             is_root: true,
         };
         (database, scope.id, root)
+    }
+
+    fn record_file_watch_event(
+        database: &mut ManifestDatabase,
+        scope_id: i64,
+        path: &str,
+        stable_after_unix_ms: i64,
+        ignored_reason: Option<WatchEventReason>,
+    ) -> WatchEventRecord {
+        let snapshot = WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(7),
+            modified_unix_ns: Some(11),
+            identity_key: Some(format!("identity:{path}").into_bytes()),
+        };
+        database
+            .record_watch_observation_at(WatchObservationWrite {
+                scope_id,
+                path_raw: path.as_bytes(),
+                path_key: path,
+                snapshot: &snapshot,
+                stable_after_unix_ms,
+                ignored_reason,
+                observed_at_unix_ms: 1,
+            })
+            .expect("watch event should persist")
+    }
+
+    #[test]
+    fn active_watch_events_are_path_free_ordered_and_exclude_terminal_states() {
+        let (mut database, scope_id, root) = resumable_setup();
+        let reconciling = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/private-reconciling.md",
+            1,
+            None,
+        );
+        database
+            .begin_watch_reconciliation_at(reconciling.progress.event_id, &root, 1)
+            .expect("ready watch event should become reconciling");
+
+        let mut stabilizing_ids = Vec::new();
+        for index in 1_i64..=21 {
+            let scope_path = format!("/scope-{index}");
+            let scope = database
+                .add_scope(scope_path.as_bytes(), &scope_path, &scope_path, "test")
+                .expect("scope should persist");
+            let event = record_file_watch_event(
+                &mut database,
+                scope.id,
+                &format!("{scope_path}/private-stabilizing-{index}.md"),
+                200 + (22 - index),
+                None,
+            );
+            stabilizing_ids.push(event.progress.event_id);
+        }
+
+        let ignored_scope = database
+            .add_scope(
+                b"/scope-terminal-ignored",
+                "/scope-terminal-ignored",
+                "/scope-terminal-ignored",
+                "test",
+            )
+            .expect("ignored fixture scope should persist");
+        let ignored = record_file_watch_event(
+            &mut database,
+            ignored_scope.id,
+            "/scope-terminal-ignored/private-ignored.md",
+            300,
+            Some(WatchEventReason::TemporaryDownload),
+        );
+
+        let failed_scope = database
+            .add_scope(
+                b"/scope-terminal-failed",
+                "/scope-terminal-failed",
+                "/scope-terminal-failed",
+                "test",
+            )
+            .expect("failed fixture scope should persist");
+        let failed = record_file_watch_event(
+            &mut database,
+            failed_scope.id,
+            "/scope-terminal-failed/private-failed.md",
+            300,
+            None,
+        );
+        database
+            .fail_watch_event_at(
+                failed.progress.event_id,
+                WatchEventReason::ReconcileFailed,
+                2,
+            )
+            .expect("watch event should fail");
+
+        let active = database
+            .active_watch_events()
+            .expect("active watch events should load");
+        assert_eq!(active.len(), 22, "active list must not be limited to 20");
+        assert_eq!(active[0].event_id, reconciling.progress.event_id);
+        assert_eq!(active[0].status, WatchEventStatus::Reconciling);
+        assert_eq!(
+            active
+                .iter()
+                .skip(1)
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            stabilizing_ids.into_iter().rev().collect::<Vec<_>>(),
+            "stabilizing events should sort by stable deadline, then id"
+        );
+        assert!(active.iter().all(|event| matches!(
+            event.status,
+            WatchEventStatus::Stabilizing | WatchEventStatus::Reconciling
+        )));
+        assert!(
+            active
+                .iter()
+                .all(|event| event.event_id != ignored.progress.event_id
+                    && event.event_id != failed.progress.event_id)
+        );
+
+        let payload = active
+            .iter()
+            .map(|event| {
+                format!(
+                    "{{\"api_version\":\"{}\",\"event_id\":{},\"scope_id\":{},\"status\":\"{:?}\",\"observation_count\":{},\"stable_after_unix_ms\":{},\"scan_job_id\":{:?},\"reason\":{:?}}}",
+                    event.api_version,
+                    event.event_id,
+                    event.scope_id,
+                    event.status,
+                    event.observation_count,
+                    event.stable_after_unix_ms,
+                    event.scan_job_id,
+                    event.reason,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        for private_value in [
+            "private-reconciling.md",
+            "private-stabilizing-1.md",
+            "private-ignored.md",
+            "private-failed.md",
+            "/scope-terminal-ignored",
+            "/scope-terminal-failed",
+        ] {
+            assert!(
+                !payload.contains(private_value),
+                "path-free serialized payload exposed {private_value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_watch_event_query_uses_the_partial_deadline_index() {
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let mut statement = database
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
+                    scan_job_id, reason \
+                 FROM watch_events \
+                 WHERE status IN ('stabilizing', 'reconciling') \
+                 ORDER BY CASE status WHEN 'reconciling' THEN 0 ELSE 1 END, \
+                    stable_after_unix_ms ASC, id ASC",
+            )
+            .expect("query plan should prepare");
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query plan should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("query plan should collect");
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("watch_events_active_deadline_idx")),
+            "active watch lookup must use the partial deadline index: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn watchable_scope_ids_require_a_completed_initial_scan() {
+        let (mut database, scanned_scope_id, root) = resumable_setup();
+        let unscanned_scope = database
+            .add_scope(
+                b"/scope-not-yet-scanned",
+                "/scope-not-yet-scanned",
+                "/scope-not-yet-scanned",
+                "test",
+            )
+            .expect("unscanned scope should authorize");
+
+        assert!(
+            database
+                .watchable_scope_ids()
+                .expect("watchable scopes should load")
+                .is_empty()
+        );
+
+        publish_manifest_file(&mut database, scanned_scope_id, &root, 4);
+
+        assert_eq!(
+            database
+                .watchable_scope_ids()
+                .expect("watchable scopes should load"),
+            vec![scanned_scope_id]
+        );
+        assert_ne!(scanned_scope_id, unscanned_scope.id);
     }
 
     fn observation(path: &str, kind: NodeKind, parent: Option<Vec<u8>>) -> Observation {

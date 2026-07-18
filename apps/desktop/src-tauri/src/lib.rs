@@ -1,9 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
     ActionPlanPreview, ActionPlanSummary, AuthorizedScope, ExtractionJobProgress,
-    ExtractionOperation, ExtractionStats, HealthReport, ManifestStats, ScanJobProgress,
+    ExtractionOperation, ExtractionStats, HealthReport, ManifestStats, ScanJobProgress, ScanStatus,
     SearchFilters, SearchResponse, WatchEventProgress, collect_health_with_manifest,
 };
 use deskgraph_extractors::{
@@ -13,17 +19,328 @@ use deskgraph_extractors::{
     run_extraction_job_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
+#[cfg(test)]
+use deskgraph_scanner::run_scan_job_to_terminal;
 use deskgraph_scanner::{
-    authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_to_terminal,
+    authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_batch,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{create_rename_preview_at, recent_action_plans_at};
-use deskgraph_watcher::recent_watch_events_at as read_recent_watch_events_at;
+use deskgraph_watcher::{
+    PollingWatchPolicy, WatchCoordinator, WatchPolicy,
+    recent_watch_events_at as read_recent_watch_events_at,
+};
+use serde::Serialize;
 use tauri::{Manager, State};
-use tracing::info;
+use tracing::{error, info};
+
+const WATCH_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCH_RUNTIME_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
+const FOREGROUND_SCAN_BATCH_SIZE: usize = 256;
 
 struct ManifestState {
     database_path: PathBuf,
+    database_gate: Arc<Mutex<()>>,
+    watch_status: Arc<Mutex<WatchRuntimeStatus>>,
+    watch_stop: Arc<AtomicBool>,
+    watch_wake: Arc<(Mutex<u64>, Condvar)>,
+    watch_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for ManifestState {
+    fn drop(&mut self) {
+        self.watch_stop.store(true, Ordering::Release);
+        notify_watch_wake(&self.watch_wake);
+        if let Ok(handle) = self.watch_thread.get_mut()
+            && let Some(handle) = handle.take()
+        {
+            let deadline = Instant::now() + WATCH_RUNTIME_SHUTDOWN_TIMEOUT;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(WATCH_RUNTIME_SHUTDOWN_POLL);
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                error!(
+                    event = "watch_runtime_shutdown_timed_out",
+                    error_code = "watch_runtime_shutdown_timed_out"
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WatchRuntimeState {
+    Starting,
+    Running,
+    Degraded,
+    Stopped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct WatchRuntimeStatus {
+    api_version: &'static str,
+    state: WatchRuntimeState,
+    adapter: &'static str,
+    poll_interval_ms: i64,
+    last_cycle_unix_ms: Option<i64>,
+    authorized_scope_count: u64,
+    active_event_count: u64,
+    deferred_scope_count: u64,
+    degraded_scope_count: u64,
+    next_wake_unix_ms: Option<i64>,
+    last_error_code: Option<&'static str>,
+}
+
+impl WatchRuntimeStatus {
+    const API_VERSION: &str = "deskgraph.watch-runtime.v1";
+
+    fn starting(polling_policy: PollingWatchPolicy) -> Self {
+        Self {
+            api_version: Self::API_VERSION,
+            state: WatchRuntimeState::Starting,
+            adapter: "bounded_metadata_polling",
+            poll_interval_ms: polling_policy.poll_interval_ms(),
+            last_cycle_unix_ms: None,
+            authorized_scope_count: 0,
+            active_event_count: 0,
+            deferred_scope_count: 0,
+            degraded_scope_count: 0,
+            next_wake_unix_ms: None,
+            last_error_code: None,
+        }
+    }
+}
+
+fn lock_database(state: &ManifestState) -> Result<MutexGuard<'_, ()>, String> {
+    state
+        .database_gate
+        .lock()
+        .map_err(|_| "manifest_writer_gate_poisoned".to_string())
+}
+
+fn lock_watch_status(
+    status: &Mutex<WatchRuntimeStatus>,
+) -> Result<MutexGuard<'_, WatchRuntimeStatus>, String> {
+    status
+        .lock()
+        .map_err(|_| "watch_runtime_status_poisoned".to_string())
+}
+
+fn notify_watch_wake(wake: &(Mutex<u64>, Condvar)) {
+    if let Ok(mut generation) = wake.0.lock() {
+        *generation = generation.wrapping_add(1);
+        wake.1.notify_all();
+    }
+}
+
+fn wait_for_watch_wake(
+    wake: &(Mutex<u64>, Condvar),
+    stop: &AtomicBool,
+    observed_generation: &mut u64,
+    timeout: Duration,
+) -> Result<(), ()> {
+    let generation = wake.0.lock().map_err(|_| ())?;
+    if *generation != *observed_generation {
+        *observed_generation = *generation;
+        return Ok(());
+    }
+    let (generation, _) = wake
+        .1
+        .wait_timeout_while(generation, timeout, |generation| {
+            *generation == *observed_generation && !stop.load(Ordering::Acquire)
+        })
+        .map_err(|_| ())?;
+    *observed_generation = *generation;
+    Ok(())
+}
+
+fn wake_watch_runtime(state: &ManifestState) {
+    notify_watch_wake(&state.watch_wake);
+}
+
+fn start_manifest_state(database_path: PathBuf) -> ManifestState {
+    let database_gate = Arc::new(Mutex::new(()));
+    let watch_stop = Arc::new(AtomicBool::new(false));
+    let watch_wake = Arc::new((Mutex::new(0), Condvar::new()));
+    let polling_policy = PollingWatchPolicy::default();
+    let watch_status = Arc::new(Mutex::new(WatchRuntimeStatus::starting(polling_policy)));
+    let thread_database_path = database_path.clone();
+    let thread_database_gate = Arc::clone(&database_gate);
+    let thread_watch_stop = Arc::clone(&watch_stop);
+    let thread_watch_wake = Arc::clone(&watch_wake);
+    let thread_watch_status = Arc::clone(&watch_status);
+    let watch_thread = thread::Builder::new()
+        .name("deskgraph-watch-coordinator".to_string())
+        .spawn(move || {
+            run_watch_coordinator(
+                &thread_database_path,
+                &thread_database_gate,
+                &thread_watch_stop,
+                &thread_watch_wake,
+                &thread_watch_status,
+                polling_policy,
+            );
+        });
+    let watch_thread = match watch_thread {
+        Ok(handle) => Some(handle),
+        Err(_) => {
+            if let Ok(mut status) = watch_status.lock() {
+                status.state = WatchRuntimeState::Degraded;
+                status.last_error_code = Some("watch_runtime_thread_start_failed");
+            }
+            None
+        }
+    };
+
+    ManifestState {
+        database_path,
+        database_gate,
+        watch_status,
+        watch_stop,
+        watch_wake,
+        watch_thread: Mutex::new(watch_thread),
+    }
+}
+
+fn run_watch_coordinator(
+    database_path: &Path,
+    database_gate: &Mutex<()>,
+    stop: &AtomicBool,
+    wake: &(Mutex<u64>, Condvar),
+    status: &Mutex<WatchRuntimeStatus>,
+    polling_policy: PollingWatchPolicy,
+) {
+    let mut coordinator =
+        match WatchCoordinator::open(database_path, WatchPolicy::default(), polling_policy) {
+            Ok(coordinator) => coordinator,
+            Err(error) => {
+                if let Ok(mut status) = status.lock() {
+                    status.state = WatchRuntimeState::Degraded;
+                    status.last_error_code = Some(error.code());
+                }
+                error!(
+                    event = "watch_runtime_start_failed",
+                    error_code = error.code()
+                );
+                return;
+            }
+        };
+    if let Ok(mut status) = status.lock() {
+        status.state = WatchRuntimeState::Running;
+    }
+    let mut observed_generation = match wake.0.lock() {
+        Ok(generation) => *generation,
+        Err(_) => {
+            if let Ok(mut status) = status.lock() {
+                status.state = WatchRuntimeState::Degraded;
+                status.last_error_code = Some("watch_runtime_wake_poisoned");
+            }
+            return;
+        }
+    };
+
+    while !stop.load(Ordering::Acquire) {
+        let cycle = match database_gate.lock() {
+            Ok(_database_guard) => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                coordinator.run_cycle()
+            }
+            Err(_) => {
+                if let Ok(mut status) = status.lock() {
+                    status.state = WatchRuntimeState::Degraded;
+                    status.last_error_code = Some("manifest_writer_gate_poisoned");
+                }
+                break;
+            }
+        };
+        match cycle {
+            Ok(report) => {
+                if let Ok(mut status) = status.lock() {
+                    status.state = if report.last_error_code.is_some() {
+                        WatchRuntimeState::Degraded
+                    } else {
+                        WatchRuntimeState::Running
+                    };
+                    status.last_cycle_unix_ms = Some(report.cycle_unix_ms);
+                    status.authorized_scope_count = report.authorized_scope_count;
+                    status.active_event_count = report.active_event_count;
+                    status.deferred_scope_count = report.deferred_scope_count;
+                    status.degraded_scope_count = report.degraded_scope_count;
+                    status.next_wake_unix_ms = Some(report.next_wake_unix_ms);
+                    status.last_error_code = report.last_error_code;
+                }
+                if report.scheduled_scope_count > 0
+                    || report.advanced_event_count > 0
+                    || report.last_error_code.is_some()
+                {
+                    info!(
+                        event = "watch_runtime_cycle",
+                        authorized_scope_count = report.authorized_scope_count,
+                        active_event_count = report.active_event_count,
+                        scheduled_scope_count = report.scheduled_scope_count,
+                        advanced_event_count = report.advanced_event_count,
+                        completed_event_count = report.completed_event_count,
+                        deferred_event_count = report.deferred_event_count,
+                        deferred_scope_count = report.deferred_scope_count,
+                        degraded_scope_count = report.degraded_scope_count,
+                        error_code = report.last_error_code
+                    );
+                }
+
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let wait_ms = report
+                    .next_wake_unix_ms
+                    .saturating_sub(report.cycle_unix_ms)
+                    .max(1);
+                let Ok(wait_duration) = u64::try_from(wait_ms) else {
+                    continue;
+                };
+                if wait_for_watch_wake(
+                    wake,
+                    stop,
+                    &mut observed_generation,
+                    Duration::from_millis(wait_duration),
+                )
+                .is_err()
+                {
+                    if let Ok(mut status) = status.lock() {
+                        status.state = WatchRuntimeState::Degraded;
+                        status.last_error_code = Some("watch_runtime_wake_poisoned");
+                    }
+                    break;
+                }
+            }
+            Err(error) => {
+                if let Ok(mut status) = status.lock() {
+                    status.state = WatchRuntimeState::Degraded;
+                    status.last_error_code = Some(error.code());
+                }
+                error!(
+                    event = "watch_runtime_cycle_failed",
+                    error_code = error.code()
+                );
+                if wait_for_watch_wake(wake, stop, &mut observed_generation, Duration::from_secs(5))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    if let Ok(mut status) = status.lock() {
+        status.state = WatchRuntimeState::Stopped;
+        status.last_error_code = None;
+        status.deferred_scope_count = 0;
+        status.degraded_scope_count = 0;
+        status.next_wake_unix_ms = None;
+    }
 }
 
 #[tauri::command]
@@ -52,8 +369,11 @@ fn authorize_scope_path(
     state: State<'_, ManifestState>,
     path: String,
 ) -> Result<AuthorizedScope, String> {
+    let _database_guard = lock_database(&state)?;
     let scope =
         authorize_scope_at(&state.database_path, Path::new(&path)).map_err(str::to_string)?;
+    drop(_database_guard);
+    wake_watch_runtime(&state);
     info!(event = "scope_authorized", scope_id = scope.id);
     Ok(scope)
 }
@@ -63,8 +383,11 @@ fn create_manifest_scan(
     state: State<'_, ManifestState>,
     scope_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    let _database_guard = lock_database(&state)?;
     let progress =
         create_manifest_scan_at(&state.database_path, scope_id).map_err(str::to_string)?;
+    drop(_database_guard);
+    wake_watch_runtime(&state);
     log_scan_progress("metadata_scan_created", &progress);
     Ok(progress)
 }
@@ -75,8 +398,11 @@ async fn run_manifest_scan(
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
     let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let watch_wake = Arc::clone(&state.watch_wake);
     let progress = tauri::async_runtime::spawn_blocking(move || {
-        run_manifest_scan_at(&database_path, job_id).map_err(str::to_string)
+        run_manifest_scan_with_gate(&database_path, job_id, &database_gate, &watch_wake)
+            .map_err(str::to_string)
     })
     .await
     .map_err(|_| "scan_worker_failed".to_string())??;
@@ -192,6 +518,11 @@ fn recent_watch_events(state: State<'_, ManifestState>) -> Result<Vec<WatchEvent
 }
 
 #[tauri::command]
+fn watch_runtime_status(state: State<'_, ManifestState>) -> Result<WatchRuntimeStatus, String> {
+    lock_watch_status(&state.watch_status).map(|status| status.clone())
+}
+
+#[tauri::command]
 fn create_rename_preview(
     state: State<'_, ManifestState>,
     scope_id: i64,
@@ -248,7 +579,10 @@ fn pause_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    let _database_guard = lock_database(&state)?;
     let progress = pause_manifest_scan_at(&state.database_path, job_id).map_err(str::to_string)?;
+    drop(_database_guard);
+    wake_watch_runtime(&state);
     log_scan_progress("metadata_scan_pause_requested", &progress);
     Ok(progress)
 }
@@ -258,7 +592,10 @@ fn resume_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    let _database_guard = lock_database(&state)?;
     let progress = resume_manifest_scan_at(&state.database_path, job_id).map_err(str::to_string)?;
+    drop(_database_guard);
+    wake_watch_runtime(&state);
     log_scan_progress("metadata_scan_resumed", &progress);
     Ok(progress)
 }
@@ -298,9 +635,43 @@ fn create_manifest_scan_at(path: &Path, scope_id: i64) -> Result<ScanJobProgress
     create_scan_job(&mut database, scope_id).map_err(|error| error.code())
 }
 
+#[cfg(test)]
 fn run_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
     run_scan_job_to_terminal(&mut database, job_id).map_err(|error| error.code())
+}
+
+fn run_manifest_scan_with_gate(
+    path: &Path,
+    job_id: i64,
+    database_gate: &Mutex<()>,
+    watch_wake: &(Mutex<u64>, Condvar),
+) -> Result<ScanJobProgress, &'static str> {
+    let mut database = {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned")?;
+        ManifestDatabase::open(path).map_err(|error| error.code())?
+    };
+    loop {
+        let progress = {
+            let _database_guard = database_gate
+                .lock()
+                .map_err(|_| "manifest_writer_gate_poisoned")?;
+            run_scan_job_batch(&mut database, job_id, FOREGROUND_SCAN_BATCH_SIZE)
+                .map_err(|error| error.code())?
+        };
+        notify_watch_wake(watch_wake);
+        if progress.is_terminal()
+            || matches!(
+                progress.status,
+                ScanStatus::Paused | ScanStatus::Interrupted
+            )
+        {
+            return Ok(progress);
+        }
+        thread::yield_now();
+    }
 }
 
 fn scan_job_status_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
@@ -476,7 +847,7 @@ pub fn run() {
                 .map_err(|_| "app_data_path_unavailable")?;
             let database_path = app_data.join("manifest.sqlite3");
             initialize_manifest(&database_path)?;
-            app.manage(ManifestState { database_path });
+            app.manage(start_manifest_state(database_path));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -497,6 +868,7 @@ pub fn run() {
             cancel_screenshot_ocr_job,
             resume_screenshot_ocr_job,
             recent_watch_events,
+            watch_runtime_status,
             create_rename_preview,
             recent_action_plans,
             search_local,
@@ -563,6 +935,108 @@ mod tests {
         let report = health_at(&database_path).expect("health should load");
         assert_eq!(report.database.state, LifecycleState::Ready);
         assert_eq!(report.privacy.authorized_scope_count, 0);
+    }
+
+    #[test]
+    fn watch_runtime_starts_path_free_and_stops_with_its_managed_state() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let state = start_manifest_state(database_path);
+        let status_handle = Arc::clone(&state.watch_status);
+
+        let mut observed = None;
+        for _ in 0..40 {
+            let status = status_handle
+                .lock()
+                .expect("watch status should not be poisoned")
+                .clone();
+            if status.state == WatchRuntimeState::Running && status.last_cycle_unix_ms.is_some() {
+                observed = Some(status);
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let observed = observed.expect("watch runtime should complete a startup cycle");
+        let payload = serde_json::to_string(&observed).expect("status should serialize");
+        assert_eq!(observed.adapter, "bounded_metadata_polling");
+        assert_eq!(observed.last_error_code, None);
+        assert!(!payload.contains("/Users/"));
+        assert!(!payload.contains("manifest.sqlite3"));
+
+        drop(state);
+        assert_eq!(
+            status_handle
+                .lock()
+                .expect("watch status should remain readable")
+                .state,
+            WatchRuntimeState::Stopped
+        );
+    }
+
+    #[test]
+    fn watch_wait_does_not_lose_a_notification_before_the_wait_lock() {
+        let wake = (Mutex::new(0_u64), Condvar::new());
+        let stop = AtomicBool::new(false);
+        let mut observed_generation = 0;
+        notify_watch_wake(&wake);
+
+        let started = Instant::now();
+        wait_for_watch_wake(
+            &wake,
+            &stop,
+            &mut observed_generation,
+            Duration::from_secs(5),
+        )
+        .expect("notification should remain observable");
+
+        assert_eq!(observed_generation, 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a notification between cycle completion and wait locking must not be lost"
+        );
+    }
+
+    #[test]
+    fn watch_runtime_shutdown_is_bounded_when_the_writer_gate_is_busy() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let state = start_manifest_state(database_path);
+        let status_handle = Arc::clone(&state.watch_status);
+        let gate = Arc::clone(&state.database_gate);
+        let database_guard = gate.lock().expect("test should hold writer gate");
+        wake_watch_runtime(&state);
+        thread::sleep(Duration::from_millis(25));
+        assert!(
+            manifest_status_at(&state.database_path).is_ok(),
+            "read-only status must not wait for the in-process writer gate"
+        );
+        assert!(
+            lock_watch_status(&state.watch_status).is_ok(),
+            "path-free runtime status must remain readable"
+        );
+
+        let started = Instant::now();
+        drop(state);
+        assert!(
+            started.elapsed() < Duration::from_millis(2_500),
+            "managed shutdown must not wait indefinitely for a busy writer"
+        );
+        drop(database_guard);
+
+        for _ in 0..40 {
+            if status_handle
+                .lock()
+                .expect("watch status should remain readable")
+                .state
+                == WatchRuntimeState::Stopped
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("detached worker should stop after the writer gate is released");
     }
 
     #[test]

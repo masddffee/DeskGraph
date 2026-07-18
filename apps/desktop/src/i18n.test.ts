@@ -35,6 +35,15 @@ describe('i18n catalog contract', () => {
     expect(catalogs['zh-TW'].scope.status.scanning).toBe('正在掃描中繼資料…');
     expect(catalogs.en.actions.policyAria).toBe('Passed policy checks');
   });
+
+  it('labels the polling fallback and deferred backlog honestly in both locales', () => {
+    expect(catalogs.en.watch.heading).toBe('Bounded metadata polling fallback');
+    expect(catalogs.en.watch.metrics.deferred).toBe('Deferred folders');
+    expect(catalogs.en.watch.description).toContain('It is not native event watching');
+    expect(catalogs['zh-TW'].watch.heading).toBe('受限的 metadata 輪詢備援');
+    expect(catalogs['zh-TW'].watch.metrics.deferred).toBe('延後資料夾');
+    expect(catalogs['zh-TW'].watch.description).toContain('這不是原生事件監看');
+  });
 });
 
 describe('locale selection and storage', () => {
