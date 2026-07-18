@@ -220,7 +220,14 @@ Canonical detail：
 
 ## ADR-025 — Journaled Rename protocol and fail-closed execution gate
 
-Status：Accepted。批准 immutable SHA-256/root/parent/source execution binding、closed append-only command/recovery state、immutable request receipt 與 lease 作為 M5 內部協定基礎；不批准 production executor 或任何 process-fence 實作。macOS/Linux pathname prototype 僅能在測試使用，因為無法原子綁定 exact source inode。未來 fence 必須位於可信任的私有或不可替換 namespace，並通過 adversarial lock replacement 與 child-process matrix；D-018 通過前，所有 production adapter、CLI/Desktop Execute、recovery 與 Undo 都必須 fail closed／保持不存在。
+Status：Accepted。批准 immutable SHA-256/root/parent/source execution binding、closed append-only command/recovery state、immutable request receipt 與 lease 作為 M5 內部協定基礎；不批准 production executor 或任何 process-fence 實作。macOS/Linux pathname prototype 僅能在測試使用，因為無法原子綁定 exact source inode。一般 Unix adapter 的最終判定由 ADR-026 補充。
 
 Canonical detail：
 `docs/architecture/adr/0025-journaled-direct-rename-execution-and-undo.md`。
+
+## ADR-026 — General Unix Rename and Move remain Preview-only
+
+Status：Accepted。官方 Apple／Linux／POSIX API 與 deterministic counterexample 證明 `renameatx_np`／`renameat2` 即使使用 directory descriptor、no-follow、no-overwrite 與 final identity check，仍不能把 syscall 原子綁定已持有的 source inode。D-018 因此以「一般 macOS/Linux 使用者 scope 的 Rename/Move 在 v0.1 保持 Preview-only」解決，而非降低安全門檻。Process fence 只序列化合作的 DeskGraph processes，不能修補 source race；D-019 另行決定 packaged-private fence。Windows handle adapter 與 D-017 System Trash 保持獨立審查。
+
+Canonical detail：
+`docs/architecture/adr/0026-general-unix-file-actions-remain-preview-only.md`。

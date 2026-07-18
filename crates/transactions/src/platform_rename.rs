@@ -243,6 +243,7 @@ mod tests {
     };
     use std::ffi::CString;
     use std::fs::{self, File};
+    use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
@@ -307,6 +308,46 @@ mod tests {
             unsafe { libc::rename(source.as_ptr(), destination.as_ptr()) },
             0
         );
+    }
+
+    fn raw_leaf_no_replace_rename(parent: &File, source: &OsStr, destination: &OsStr) {
+        let source = CString::new(source.as_bytes()).expect("source leaf should encode");
+        let destination =
+            CString::new(destination.as_bytes()).expect("destination leaf should encode");
+        let parent_descriptor = parent.as_raw_fd();
+
+        #[cfg(target_os = "macos")]
+        let result = {
+            const RENAME_NOFOLLOW_ANY: libc::c_uint = 0x0000_0010;
+            // SAFETY: this is a deliberately isolated counterexample in a temporary directory.
+            // Both names are valid leaves relative to the held parent and destination is absent.
+            unsafe {
+                libc::renameatx_np(
+                    parent_descriptor,
+                    source.as_ptr(),
+                    parent_descriptor,
+                    destination.as_ptr(),
+                    libc::RENAME_EXCL | RENAME_NOFOLLOW_ANY,
+                )
+            }
+        };
+
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let result = {
+            // SAFETY: this is a deliberately isolated counterexample in a temporary directory.
+            // Both names are valid leaves relative to the held parent and destination is absent.
+            unsafe {
+                libc::renameat2(
+                    parent_descriptor,
+                    source.as_ptr(),
+                    parent_descriptor,
+                    destination.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            }
+        };
+
+        assert_eq!(result, 0, "fixture leaf rename should succeed");
     }
 
     #[test]
@@ -460,5 +501,47 @@ mod tests {
             "action_binding_root_identity_changed"
         );
         assert!(displaced_root.join("inbox/Draft.txt").exists());
+    }
+
+    #[test]
+    fn pathname_syscall_counterexample_moves_a_replacement_after_identity_check() {
+        let fixture = Fixture::new();
+        let binding = fixture.binding().expect("binding should succeed");
+        let target = binding
+            .prepare_absent_destination(OsStr::new("Final.txt"))
+            .expect("destination should prepare");
+        binding
+            .revalidate_for_rename(&target)
+            .expect("last userspace identity check should pass");
+
+        let expected_source = fixture.parent.join("Expected.txt");
+        fixture_rename(&fixture.source, &expected_source);
+        fs::write(&fixture.source, "replacement after the last check")
+            .expect("replacement should write");
+
+        raw_leaf_no_replace_rename(
+            binding.parent_file(),
+            OsStr::new("Draft.txt"),
+            OsStr::new("Final.txt"),
+        );
+
+        assert_eq!(
+            fs::read_to_string(&expected_source).expect("expected inode should remain readable"),
+            "identity-bound rename fixture"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.parent.join("Final.txt"))
+                .expect("replacement should have been moved by the pathname syscall"),
+            "replacement after the last check"
+        );
+        assert_eq!(
+            binding
+                .observe_current_and(OsStr::new("Final.txt"))
+                .expect("post-counterexample observation should succeed"),
+            ActionFileObservation {
+                current: ActionEntryObservation::Missing,
+                alternate: ActionEntryObservation::OtherEntry,
+            }
+        );
     }
 }

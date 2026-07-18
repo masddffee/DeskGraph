@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-18
+- General Unix adapter decision: resolved by ADR-026
 
 ## Context
 
@@ -170,8 +171,10 @@ no-replace flags prevent destination overwrite. Unix rename syscalls nevertheles
 source leaf name rather than a source file handle; another actor can replace an ordinary file
 between final observation and the syscall, causing the wrong file to move. Post-action
 verification detects the mismatch only after mutation and is therefore insufficient. The
-prototype is test-only and production stays fail closed. D-018 must select a primitive/threat
-boundary and a superseding ADR before Unix execution can be exposed.
+prototype is test-only and production stays fail closed. ADR-026 resolves D-018 by rejecting
+general Unix Rename/Move execution for user-authorized scopes. Any future reconsideration needs
+a new primitive or genuinely managed namespace and a superseding ADR before Unix execution can
+be exposed.
 
 ## Consequences
 

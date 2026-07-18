@@ -70,8 +70,8 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - ACT-009 Fault injection
 - ACT-010 Cross-platform system-trash ActionPlan and adapter
 - ACT-011 System-trash crash recovery, conflict handling, and idempotent Undo
-- ACT-012 Resolve D-018 exact-source Unix Rename/Move boundary; production remains unavailable
-- ACT-013 Child-process process-fence, lease-expiry, durability, permission, replacement, and platform runtime matrix
+- ACT-012 Closed by ADR-026: retain general Unix Rename/Move Preview-only and keep the source-leaf counterexample as a production-gate regression
+- ACT-013 Resolve D-019 packaged-private process fence; pass pause/kill/fork/exec/descriptor, lock-replacement, lease-expiry, durability, permission, and platform runtime matrix
 
 ## Epic: Watch and Inbox
 
