@@ -1187,6 +1187,16 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    fn bounded_png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 32];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn clap_schema_is_internally_consistent() {
         Cli::command().debug_assert();
@@ -1384,13 +1394,13 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_ocr_job_creation_runs_through_cli_without_opening_content() {
+    fn screenshot_ocr_job_creation_validates_image_without_running_ocr() {
         let directory = tempfile::tempdir().expect("fixture root should exist");
         let database = directory.path().join("manifest.sqlite3");
         let scope_path = directory.path().join("authorized");
         std::fs::create_dir(&scope_path).expect("scope should create");
         let source_path = scope_path.join("Screenshot.png");
-        std::fs::write(&source_path, b"manifest-only fixture").expect("fixture should write");
+        std::fs::write(&source_path, bounded_png_header(640, 480)).expect("fixture should write");
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
         let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
         scan_scope(&mut manifest, scope.id).expect("scope should scan");
@@ -1415,7 +1425,7 @@ mod tests {
                 },
             },
         })
-        .expect("OCR job creation should pass without opening content");
+        .expect("bounded image validation should create the OCR job");
 
         let job = ManifestDatabase::open(&database)
             .expect("database should reopen")

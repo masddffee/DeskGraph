@@ -1479,7 +1479,8 @@ impl ManifestDatabase {
         self.create_extraction_job_for_operation(scope_id, node_id, ExtractionOperation::Content)
     }
 
-    pub fn create_screenshot_ocr_job(
+    #[cfg(test)]
+    fn create_screenshot_ocr_job(
         &mut self,
         scope_id: i64,
         node_id: i64,
@@ -1491,6 +1492,21 @@ impl ManifestDatabase {
         )
     }
 
+    /// Low-level storage compare-and-insert used only after the extraction core
+    /// has validated the authorized scope, open handle, and encoded image.
+    ///
+    /// This method rechecks only the manifest metadata snapshot inside the
+    /// insertion transaction. It does not prove that file bytes are unchanged,
+    /// and it is not a filesystem or image-validation entry point. Workspace
+    /// callers must use `deskgraph_extractors::create_screenshot_ocr_job_at`.
+    #[doc(hidden)]
+    pub fn low_level_insert_screenshot_ocr_job_after_core_validation(
+        &mut self,
+        source: &ExtractableFile,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.create_extraction_job_for_current_source(source, ExtractionOperation::ScreenshotOcr)
+    }
+
     fn create_extraction_job_for_operation(
         &mut self,
         scope_id: i64,
@@ -1498,12 +1514,45 @@ impl ManifestDatabase {
         operation: ExtractionOperation,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
         let source = self.extractable_file(scope_id, node_id)?;
+        self.create_extraction_job_for_current_source(&source, operation)
+    }
+
+    fn create_extraction_job_for_current_source(
+        &mut self,
+        source: &ExtractableFile,
+        operation: ExtractionOperation,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        let current: i64 = transaction.query_row(
+            "SELECT COUNT(*) \
+             FROM locations l \
+             JOIN nodes n ON n.id = l.node_id \
+             JOIN files f ON f.node_id = l.node_id \
+             WHERE l.scope_id = ?1 AND l.node_id = ?2 AND l.id = ?3 \
+                AND l.path_raw = ?4 AND l.path_key = ?5 AND l.present = 1 \
+                AND n.kind = 'file' AND n.identity_kind = ?6 AND n.identity_key = ?7 \
+                AND f.size_bytes = ?8 AND f.modified_unix_ns IS ?9",
+            params![
+                source.scope_id,
+                source.node_id,
+                source.location_id,
+                source.path_raw,
+                source.path_key,
+                source.identity_kind,
+                source.identity_key,
+                to_i64(source.size_bytes)?,
+                source.modified_unix_ns,
+            ],
+            |row| row.get(0),
+        )?;
+        if current != 1 {
+            return Err(DatabaseError::ExtractableFileNotFound);
+        }
         let active: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM extraction_jobs \
              WHERE scope_id = ?1 AND node_id = ?2 AND status IN ('queued', 'running', 'interrupted')",
-            params![scope_id, node_id],
+            params![source.scope_id, source.node_id],
             |row| row.get(0),
         )?;
         if active != 0 {
@@ -1550,6 +1599,37 @@ impl ManifestDatabase {
         )?;
         let jobs = statement.query_map([], extraction_job_from_row)?;
         jobs.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Returns the most actionable screenshot OCR job for one manifest node.
+    ///
+    /// Active or interrupted work wins over terminal history, so an interrupted
+    /// job remains discoverable for recovery even after later terminal rows are
+    /// present. The query deliberately returns only the path-free progress
+    /// projection used by desktop IPC.
+    pub fn screenshot_ocr_job_for_node(
+        &self,
+        scope_id: i64,
+        node_id: i64,
+    ) -> Result<Option<ExtractionJobProgress>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, scope_id, node_id, operation, status, provider_id, provider_version, error_code, \
+                    source_size_bytes, output_bytes, chunk_count, elapsed_ms, cancel_requested \
+                 FROM extraction_jobs \
+                 WHERE scope_id = ?1 AND node_id = ?2 AND operation = 'screenshot_ocr' \
+                 ORDER BY CASE status \
+                    WHEN 'running' THEN 0 \
+                    WHEN 'queued' THEN 1 \
+                    WHEN 'interrupted' THEN 2 \
+                    ELSE 3 \
+                 END, id DESC \
+                 LIMIT 1",
+                params![scope_id, node_id],
+                extraction_job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn image_metadata_for_job(&self, job_id: i64) -> Result<ImageMetadata, DatabaseError> {
@@ -1700,6 +1780,28 @@ impl ManifestDatabase {
             .optional()?
             .ok_or(DatabaseError::ExtractionJobNotFound)?;
         Ok(status != "running" || requested != 0)
+    }
+
+    pub fn requeue_extraction_job_after_capacity_refusal(
+        &mut self,
+        job_id: i64,
+        runner_token: &str,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let changed = self.connection.execute(
+            "UPDATE extraction_jobs SET \
+                status = CASE WHEN cancel_requested != 0 THEN 'cancelled' ELSE 'queued' END, \
+                runner_token = NULL, lease_expires_at_unix_ms = NULL, \
+                finished_at_unix_ms = CASE WHEN cancel_requested != 0 THEN ?4 ELSE NULL END, \
+                updated_at_unix_ms = ?4 \
+             WHERE id = ?1 AND runner_token = ?2 AND status = 'running' \
+                AND lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms > ?3",
+            params![job_id, runner_token, now, now],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ExtractionRunnerLeaseLost);
+        }
+        self.extraction_job(job_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2106,7 +2208,8 @@ impl ManifestDatabase {
             "UPDATE extraction_jobs SET status = 'completed', provider_id = ?3, provider_version = ?4, \
                 error_code = NULL, output_bytes = ?5, chunk_count = ?6, elapsed_ms = ?7, \
                 runner_token = NULL, lease_expires_at_unix_ms = NULL, finished_at_unix_ms = ?8, \
-                updated_at_unix_ms = ?8 WHERE id = ?1 AND runner_token = ?2",
+                updated_at_unix_ms = ?8 WHERE id = ?1 AND runner_token = ?2 \
+                AND status = 'running' AND cancel_requested = 0",
             params![
                 job_id,
                 runner_token,
@@ -2136,9 +2239,12 @@ impl ManifestDatabase {
     ) -> Result<ExtractionJobProgress, DatabaseError> {
         let now = unix_ms()?;
         let changed = self.connection.execute(
-            "UPDATE extraction_jobs SET status = 'failed', provider_id = ?3, provider_version = ?4, \
-                error_code = ?5, elapsed_ms = ?6, runner_token = NULL, \
-                lease_expires_at_unix_ms = NULL, finished_at_unix_ms = ?7, updated_at_unix_ms = ?7 \
+            "UPDATE extraction_jobs SET \
+                status = CASE WHEN cancel_requested != 0 THEN 'cancelled' ELSE 'failed' END, \
+                provider_id = ?3, provider_version = ?4, \
+                error_code = CASE WHEN cancel_requested != 0 THEN NULL ELSE ?5 END, \
+                elapsed_ms = ?6, runner_token = NULL, lease_expires_at_unix_ms = NULL, \
+                finished_at_unix_ms = ?7, updated_at_unix_ms = ?7 \
              WHERE id = ?1 AND runner_token = ?2 AND status = 'running' \
                 AND lease_expires_at_unix_ms IS NOT NULL AND lease_expires_at_unix_ms > ?7",
             params![
@@ -6731,6 +6837,241 @@ mod tests {
                 .expect("stats should load")
                 .cancelled_job_count,
             2
+        );
+    }
+
+    #[test]
+    fn durable_cancel_wins_when_provider_failure_is_recorded_afterward() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "failure-race-runner", 60_000)
+            .expect("job should claim");
+        let requested = database
+            .request_extraction_cancel(job.job_id)
+            .expect("running cancellation should persist");
+        assert_eq!(requested.status, ExtractionStatus::Running);
+        assert!(requested.cancel_requested);
+
+        let terminal = database
+            .fail_extraction_job(
+                job.job_id,
+                "failure-race-runner",
+                "deskgraph.racing-provider",
+                "1",
+                "extraction_ocr_provider_failed",
+                7,
+            )
+            .expect("durable cancellation must win the terminal-state race");
+        assert_eq!(terminal.status, ExtractionStatus::Cancelled);
+        assert!(terminal.cancel_requested);
+        assert_eq!(terminal.error_code, None);
+        assert_eq!(
+            terminal.provider_id.as_deref(),
+            Some("deskgraph.racing-provider")
+        );
+    }
+
+    #[test]
+    fn durable_cancel_prevents_atomic_publication_before_runner_acknowledgement() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let job = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("job should create");
+        database
+            .claim_extraction_job(job.job_id, "completion-race-runner", 60_000)
+            .expect("job should claim");
+        database
+            .request_extraction_cancel(job.job_id)
+            .expect("running cancellation should persist");
+
+        let error = database
+            .complete_extraction_job(
+                job.job_id,
+                "completion-race-runner",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                4,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "text".to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect_err("durable cancellation must reject publication");
+        assert!(matches!(error, DatabaseError::ExtractionOutputInvalid));
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM content_chunks WHERE extraction_job_id = ?1",
+                    [job.job_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("published chunks should count"),
+            0
+        );
+        let terminal = database
+            .cancel_extraction_job_from_runner(
+                job.job_id,
+                "completion-race-runner",
+                "deskgraph.utf8-text",
+                "1",
+                1,
+            )
+            .expect("runner should acknowledge cancellation");
+        assert_eq!(terminal.status, ExtractionStatus::Cancelled);
+    }
+
+    #[test]
+    fn validated_ocr_source_must_still_match_current_manifest_at_insert() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let validated = database
+            .extractable_file(scope_id, node_id)
+            .expect("validated source should load");
+        database
+            .connection
+            .execute(
+                "UPDATE files SET size_bytes = size_bytes + 1 WHERE node_id = ?1",
+                [node_id],
+            )
+            .expect("fixture manifest should change");
+
+        assert!(matches!(
+            database.low_level_insert_screenshot_ocr_job_after_core_validation(&validated),
+            Err(DatabaseError::ExtractableFileNotFound)
+        ));
+        assert!(
+            database
+                .recent_extraction_jobs()
+                .expect("jobs should remain queryable")
+                .is_empty()
+        );
+        let content = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("stale OCR validation must not block a current content job");
+        assert_eq!(content.operation, ExtractionOperation::Content);
+        assert_eq!(content.status, ExtractionStatus::Queued);
+    }
+
+    #[test]
+    fn low_level_ocr_insert_has_one_production_workspace_callsite() {
+        fn collect_calls(
+            root: &Path,
+            workspace: &Path,
+            calls: &mut Vec<String>,
+        ) -> std::io::Result<()> {
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let path = entry.path();
+                if file_type.is_dir() {
+                    collect_calls(&path, workspace, calls)?;
+                } else if path.extension().and_then(|value| value.to_str()) == Some("rs")
+                    && !path.ends_with("crates/database/src/lib.rs")
+                {
+                    let source = fs::read_to_string(&path)?;
+                    let matches = source
+                        .matches("low_level_insert_screenshot_ocr_job_after_core_validation")
+                        .count();
+                    for _ in 0..matches {
+                        calls.push(
+                            path.strip_prefix(workspace)
+                                .unwrap_or(&path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace should canonicalize");
+        let mut calls = Vec::new();
+        for root in ["apps", "crates", "tools"] {
+            collect_calls(&workspace.join(root), &workspace, &mut calls)
+                .expect("workspace Rust sources should remain readable");
+        }
+        assert_eq!(calls, vec!["crates/extractors/src/service.rs"]);
+    }
+
+    #[test]
+    fn screenshot_ocr_lookup_prefers_interrupted_work_over_newer_terminal_history() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let interrupted = database
+            .create_screenshot_ocr_job(scope_id, node_id)
+            .expect("OCR job should create");
+        database
+            .claim_extraction_job(interrupted.job_id, "expired-ocr-runner", 60_000)
+            .expect("OCR job should claim");
+        assert_eq!(
+            database
+                .recover_expired_extraction_jobs_at(i64::MAX)
+                .expect("expired OCR lease should recover"),
+            1
+        );
+
+        let location_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT location_id FROM extraction_jobs WHERE id = ?1",
+                [interrupted.job_id],
+                |row| row.get(0),
+            )
+            .expect("OCR location should load");
+        for ordinal in 0..21_i64 {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO extraction_jobs( \
+                        scope_id, node_id, location_id, status, source_size_bytes, \
+                        created_at_unix_ms, updated_at_unix_ms, operation \
+                     ) VALUES (?1, ?2, ?3, 'completed', 4, ?4, ?4, 'content')",
+                    params![scope_id, node_id, location_id, ordinal],
+                )
+                .expect("newer generic terminal history should insert");
+        }
+        database
+            .connection
+            .execute(
+                "INSERT INTO extraction_jobs( \
+                    scope_id, node_id, location_id, status, source_size_bytes, \
+                    created_at_unix_ms, updated_at_unix_ms, operation \
+                 ) VALUES (?1, ?2, ?3, 'completed', 4, 99, 99, 'screenshot_ocr')",
+                params![scope_id, node_id, location_id],
+            )
+            .expect("newer terminal OCR history should insert");
+
+        let found = database
+            .screenshot_ocr_job_for_node(scope_id, node_id)
+            .expect("OCR lookup should query")
+            .expect("interrupted OCR should remain discoverable");
+        assert_eq!(found.job_id, interrupted.job_id);
+        assert_eq!(found.operation, ExtractionOperation::ScreenshotOcr);
+        assert_eq!(found.status, ExtractionStatus::Interrupted);
+
+        let (mut generic_database, generic_scope_id, generic_node_id, _) = extraction_setup();
+        generic_database
+            .create_extraction_job(generic_scope_id, generic_node_id)
+            .expect("generic job should create");
+        assert_eq!(
+            generic_database
+                .screenshot_ocr_job_for_node(generic_scope_id, generic_node_id)
+                .expect("generic lookup should query"),
+            None
         );
     }
 

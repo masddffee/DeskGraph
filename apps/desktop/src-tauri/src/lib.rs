@@ -2,13 +2,15 @@ use std::path::{Path, PathBuf};
 
 use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
-    ActionPlanPreview, ActionPlanSummary, AuthorizedScope, ExtractionJobProgress, ExtractionStats,
-    HealthReport, ManifestStats, ScanJobProgress, SearchFilters, SearchResponse,
-    WatchEventProgress, collect_health_with_manifest,
+    ActionPlanPreview, ActionPlanSummary, AuthorizedScope, ExtractionJobProgress,
+    ExtractionOperation, ExtractionStats, HealthReport, ManifestStats, ScanJobProgress,
+    SearchFilters, SearchResponse, WatchEventProgress, collect_health_with_manifest,
 };
 use deskgraph_extractors::{
+    ExtractionLimits, cancel_extraction_job_at, create_screenshot_ocr_job_at, extraction_job_at,
     extraction_stats_at as read_extraction_stats_at,
-    recent_extraction_jobs_at as read_recent_extraction_jobs_at,
+    recent_extraction_jobs_at as read_recent_extraction_jobs_at, resume_extraction_job_at,
+    run_extraction_job_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 use deskgraph_scanner::{
@@ -105,6 +107,83 @@ fn recent_content_extractions(
     state: State<'_, ManifestState>,
 ) -> Result<Vec<ExtractionJobProgress>, String> {
     recent_content_extractions_at(&state.database_path).map_err(str::to_string)
+}
+
+/// Queues OCR for an already-scanned image. The core service revalidates the
+/// authorized scope and node identity; callers never provide a filesystem path.
+#[tauri::command]
+fn create_screenshot_ocr_job(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    node_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    let progress = create_screenshot_ocr_job_for_database(&state.database_path, scope_id, node_id)
+        .map_err(str::to_string)?;
+    log_screenshot_ocr_progress("screenshot_ocr_created", &progress);
+    Ok(progress)
+}
+
+/// Runs only a previously-created screenshot OCR job. It deliberately accepts
+/// no path or content and is moved off Tauri's async runtime while native OCR runs.
+#[tauri::command]
+async fn run_screenshot_ocr_job(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    let database_path = state.database_path.clone();
+    let progress = tauri::async_runtime::spawn_blocking(move || {
+        run_screenshot_ocr_job_at(&database_path, job_id).map_err(str::to_string)
+    })
+    .await
+    .map_err(|_| "screenshot_ocr_worker_failed".to_string())??;
+    log_screenshot_ocr_progress("screenshot_ocr_runner_stopped", &progress);
+    Ok(progress)
+}
+
+#[tauri::command]
+fn screenshot_ocr_job_status(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    screenshot_ocr_job_status_at(&state.database_path, job_id).map_err(str::to_string)
+}
+
+/// Looks up only the most actionable screenshot OCR job for one already-scanned
+/// node. This avoids exposing a filesystem path or document text while letting
+/// the desktop recover interrupted work that has fallen outside the recent-jobs
+/// dashboard window.
+#[tauri::command]
+fn screenshot_ocr_job_for_node(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    node_id: i64,
+) -> Result<Option<ExtractionJobProgress>, String> {
+    screenshot_ocr_job_for_node_at(&state.database_path, scope_id, node_id).map_err(str::to_string)
+}
+
+#[tauri::command]
+fn cancel_screenshot_ocr_job(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    let progress =
+        cancel_screenshot_ocr_job_at(&state.database_path, job_id).map_err(str::to_string)?;
+    log_screenshot_ocr_progress("screenshot_ocr_cancel_requested", &progress);
+    Ok(progress)
+}
+
+/// Re-queues only an interrupted screenshot OCR job. The client supplies no
+/// filesystem path or extracted content; the core service revalidates source
+/// identity before returning it to the queue.
+#[tauri::command]
+fn resume_screenshot_ocr_job(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    let progress =
+        resume_screenshot_ocr_job_at(&state.database_path, job_id).map_err(str::to_string)?;
+    log_screenshot_ocr_progress("screenshot_ocr_resume_requested", &progress);
+    Ok(progress)
 }
 
 #[tauri::command]
@@ -244,6 +323,66 @@ fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgres
     read_recent_extraction_jobs_at(path).map_err(|error| error.code())
 }
 
+fn create_screenshot_ocr_job_for_database(
+    path: &Path,
+    scope_id: i64,
+    node_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    create_screenshot_ocr_job_at(path, scope_id, node_id).map_err(|error| error.code())
+}
+
+fn run_screenshot_ocr_job_at(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    require_screenshot_ocr_job(path, job_id)?;
+    run_extraction_job_at(path, job_id, ExtractionLimits::default()).map_err(|error| error.code())
+}
+
+fn screenshot_ocr_job_status_at(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    require_screenshot_ocr_job(path, job_id)
+}
+
+fn screenshot_ocr_job_for_node_at(
+    path: &Path,
+    scope_id: i64,
+    node_id: i64,
+) -> Result<Option<ExtractionJobProgress>, &'static str> {
+    ManifestDatabase::open(path)
+        .and_then(|database| database.screenshot_ocr_job_for_node(scope_id, node_id))
+        .map_err(|error| error.code())
+}
+
+fn cancel_screenshot_ocr_job_at(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    require_screenshot_ocr_job(path, job_id)?;
+    cancel_extraction_job_at(path, job_id).map_err(|error| error.code())
+}
+
+fn resume_screenshot_ocr_job_at(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    require_screenshot_ocr_job(path, job_id)?;
+    resume_extraction_job_at(path, job_id).map_err(|error| error.code())
+}
+
+fn require_screenshot_ocr_job(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    let progress = extraction_job_at(path, job_id).map_err(|error| error.code())?;
+    if progress.operation != ExtractionOperation::ScreenshotOcr {
+        return Err("screenshot_ocr_job_required");
+    }
+    Ok(progress)
+}
+
 fn recent_watch_events_for_database(path: &Path) -> Result<Vec<WatchEventProgress>, &'static str> {
     read_recent_watch_events_at(path).map_err(|error| error.code())
 }
@@ -309,6 +448,21 @@ fn log_scan_progress(event: &'static str, progress: &ScanJobProgress) {
     );
 }
 
+fn log_screenshot_ocr_progress(event: &'static str, progress: &ExtractionJobProgress) {
+    info!(
+        event = event,
+        scope_id = progress.scope_id,
+        job_id = progress.job_id,
+        node_id = progress.node_id,
+        status = ?progress.status,
+        operation = ?progress.operation,
+        output_bytes = progress.output_bytes,
+        chunk_count = progress.chunk_count,
+        elapsed_ms = progress.elapsed_ms,
+        cancel_requested = progress.cancel_requested
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _logger_installed = init_privacy_safe_logging(Service::Desktop);
@@ -336,6 +490,12 @@ pub fn run() {
             recent_scan_jobs,
             content_extraction_stats,
             recent_content_extractions,
+            create_screenshot_ocr_job,
+            run_screenshot_ocr_job,
+            screenshot_ocr_job_status,
+            screenshot_ocr_job_for_node,
+            cancel_screenshot_ocr_job,
+            resume_screenshot_ocr_job,
             recent_watch_events,
             create_rename_preview,
             recent_action_plans,
@@ -350,9 +510,49 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deskgraph_domain::LifecycleState;
+    use deskgraph_domain::{ExtractionOperation, ExtractionStatus, LifecycleState};
     use deskgraph_extractors::{ExtractionLimits, create_extraction_job_at, run_extraction_job_at};
     use deskgraph_watcher::{WatchPolicy, observe_watch_path_at};
+
+    fn scanned_file_fixture(
+        file_name: &str,
+        contents: impl AsRef<[u8]>,
+    ) -> (tempfile::TempDir, PathBuf, AuthorizedScope, i64) {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-private");
+        let source_path = scope_path.join(file_name);
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(&source_path, contents).expect("file should create");
+
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope =
+            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let database = ManifestDatabase::open(&database_path).expect("database should open");
+        let node_id = database
+            .node_id_for_path_key(
+                scope.id,
+                &deskgraph_scanner::comparison_key(
+                    &std::fs::canonicalize(&source_path).expect("source should canonicalize"),
+                ),
+            )
+            .expect("node lookup should pass")
+            .expect("source node should exist");
+        (directory, database_path, scope, node_id)
+    }
+
+    fn png_bytes(width: u32, height: u32, private_marker: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 32];
+        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        bytes[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(private_marker);
+        bytes
+    }
 
     #[test]
     fn initialized_health_uses_the_shared_domain_contract() {
@@ -461,6 +661,228 @@ mod tests {
         assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
         assert!(payload.contains("deskgraph.extraction-stats.v1"));
         assert!(payload.contains("\"status\":\"completed\""));
+    }
+
+    #[test]
+    fn screenshot_ocr_helpers_queue_cancel_and_expose_path_free_progress() {
+        let private_text = "OCR private text must not enter job progress";
+        let image = png_bytes(640, 480, private_text.as_bytes());
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("private-screenshot.png", image);
+
+        let queued = create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
+            .expect("screenshot OCR should queue");
+        assert_eq!(queued.operation, ExtractionOperation::ScreenshotOcr);
+        assert_eq!(queued.status, ExtractionStatus::Queued);
+        assert_eq!(
+            screenshot_ocr_job_status_at(&database_path, queued.job_id)
+                .expect("OCR status should load"),
+            queued
+        );
+
+        let cancelled = cancel_screenshot_ocr_job_at(&database_path, queued.job_id)
+            .expect("queued OCR should cancel durably");
+        assert_eq!(cancelled.status, ExtractionStatus::Cancelled);
+        assert!(cancelled.cancel_requested);
+        assert_eq!(cancelled.chunk_count, 0);
+        assert_eq!(cancelled.output_bytes, 0);
+        assert_eq!(
+            screenshot_ocr_job_status_at(&database_path, queued.job_id)
+                .expect("cancelled OCR status should load"),
+            cancelled
+        );
+
+        let payload = serde_json::to_string(&cancelled).expect("progress should serialize");
+        assert!(payload.contains("deskgraph.extraction-job.v2"));
+        assert!(!payload.contains("private-screenshot.png"));
+        assert!(!payload.contains(private_text));
+        assert!(!payload.contains("authorized-private"));
+        assert!(!payload.contains("\"path\""));
+        assert!(!payload.contains("\"text\""));
+    }
+
+    #[test]
+    fn screenshot_ocr_helpers_reject_unknown_and_non_ocr_jobs() {
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("private-note.md", "private generic content");
+
+        assert_eq!(
+            create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id + 9_999)
+                .expect_err("unknown nodes must be rejected"),
+            "extractable_file_not_found"
+        );
+
+        let generic = create_extraction_job_at(&database_path, scope.id, node_id)
+            .expect("generic extraction should queue");
+        assert_eq!(generic.operation, ExtractionOperation::Content);
+        assert_eq!(
+            screenshot_ocr_job_status_at(&database_path, generic.job_id)
+                .expect_err("OCR status must not expose generic jobs"),
+            "screenshot_ocr_job_required"
+        );
+        assert_eq!(
+            run_screenshot_ocr_job_at(&database_path, generic.job_id)
+                .expect_err("OCR runner must not execute generic jobs"),
+            "screenshot_ocr_job_required"
+        );
+        assert_eq!(
+            cancel_screenshot_ocr_job_at(&database_path, generic.job_id)
+                .expect_err("OCR cancellation must not affect generic jobs"),
+            "screenshot_ocr_job_required"
+        );
+        assert_eq!(
+            extraction_job_at(&database_path, generic.job_id)
+                .expect("generic job should remain readable to core")
+                .status,
+            ExtractionStatus::Queued
+        );
+    }
+
+    #[test]
+    fn screenshot_ocr_creation_rejects_non_images_without_side_effects() {
+        let private_text = "this text must never be OCR job payload";
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("private-format.md", private_text);
+        let before = recent_content_extractions_at(&database_path)
+            .expect("recent jobs should load before failed creation");
+
+        assert_eq!(
+            create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
+                .expect_err("non-image OCR must be rejected before a job is inserted"),
+            "extraction_media_kind_unsupported"
+        );
+        assert_eq!(
+            recent_content_extractions_at(&database_path)
+                .expect("failed creation must not insert a job"),
+            before
+        );
+
+        let generic = create_extraction_job_at(&database_path, scope.id, node_id)
+            .expect("a rejected OCR request must not block ordinary content extraction");
+        assert_eq!(generic.operation, ExtractionOperation::Content);
+        let payload = serde_json::to_string(&generic).expect("progress should serialize");
+        assert!(!payload.contains("private-format.md"));
+        assert!(!payload.contains(private_text));
+        assert!(!payload.contains("authorized-private"));
+        assert!(!payload.contains("\"path\""));
+        assert!(!payload.contains("\"text\""));
+    }
+
+    #[test]
+    fn screenshot_ocr_resume_requires_an_interrupted_ocr_job_and_keeps_payload_private() {
+        let private_text = "interrupted OCR private text must not be exposed";
+        let image = png_bytes(640, 480, private_text.as_bytes());
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("private-interrupted.png", image);
+        let queued = create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
+            .expect("valid screenshot OCR should queue");
+
+        assert_eq!(
+            resume_screenshot_ocr_job_at(&database_path, queued.job_id)
+                .expect_err("a non-interrupted OCR job must not resume"),
+            "invalid_extraction_job_state"
+        );
+        assert_eq!(
+            extraction_job_at(&database_path, queued.job_id)
+                .expect("non-interrupted OCR state should remain readable")
+                .status,
+            ExtractionStatus::Queued
+        );
+
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        database
+            .claim_extraction_job(queued.job_id, "expired-ocr-runner", 60_000)
+            .expect("OCR job should claim for recovery fixture");
+        assert_eq!(
+            database
+                .recover_expired_extraction_jobs_at(i64::MAX)
+                .expect("expired OCR lease should recover"),
+            1
+        );
+        assert_eq!(
+            database
+                .extraction_job(queued.job_id)
+                .expect("interrupted OCR should load")
+                .status,
+            ExtractionStatus::Interrupted
+        );
+        drop(database);
+
+        let resumed = resume_screenshot_ocr_job_at(&database_path, queued.job_id)
+            .expect("interrupted screenshot OCR should requeue");
+        assert_eq!(resumed.operation, ExtractionOperation::ScreenshotOcr);
+        assert_eq!(resumed.status, ExtractionStatus::Queued);
+        assert!(!resumed.cancel_requested);
+
+        let (_generic_directory, generic_database_path, generic_scope, generic_node_id) =
+            scanned_file_fixture("private-generic.md", "private generic content");
+        let generic =
+            create_extraction_job_at(&generic_database_path, generic_scope.id, generic_node_id)
+                .expect("generic extraction should queue");
+        assert_eq!(
+            resume_screenshot_ocr_job_at(&generic_database_path, generic.job_id)
+                .expect_err("generic jobs must not use screenshot OCR resume"),
+            "screenshot_ocr_job_required"
+        );
+        assert_eq!(
+            extraction_job_at(&generic_database_path, generic.job_id)
+                .expect("generic state should remain readable")
+                .status,
+            ExtractionStatus::Queued
+        );
+
+        let payload = serde_json::to_string(&resumed).expect("progress should serialize");
+        assert!(payload.contains("deskgraph.extraction-job.v2"));
+        assert!(!payload.contains("private-interrupted.png"));
+        assert!(!payload.contains(private_text));
+        assert!(!payload.contains("authorized-private"));
+        assert!(!payload.contains("\"path\""));
+        assert!(!payload.contains("\"text\""));
+    }
+
+    #[test]
+    fn screenshot_ocr_node_lookup_is_operation_scoped_and_path_free() {
+        let private_text = "node lookup OCR text must stay private";
+        let image = png_bytes(640, 480, private_text.as_bytes());
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("private-node-lookup.png", image);
+        let queued = create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
+            .expect("valid screenshot OCR should queue");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        database
+            .claim_extraction_job(queued.job_id, "expired-node-lookup-runner", 60_000)
+            .expect("OCR job should claim for recovery fixture");
+        database
+            .recover_expired_extraction_jobs_at(i64::MAX)
+            .expect("expired OCR lease should recover");
+        drop(database);
+
+        let found = screenshot_ocr_job_for_node_at(&database_path, scope.id, node_id)
+            .expect("node lookup should query")
+            .expect("interrupted OCR should be found");
+        assert_eq!(found.job_id, queued.job_id);
+        assert_eq!(found.operation, ExtractionOperation::ScreenshotOcr);
+        assert_eq!(found.status, ExtractionStatus::Interrupted);
+        let payload = serde_json::to_string(&found).expect("progress should serialize");
+        assert!(!payload.contains("private-node-lookup.png"));
+        assert!(!payload.contains(private_text));
+        assert!(!payload.contains("authorized-private"));
+        assert!(!payload.contains("\"path\""));
+        assert!(!payload.contains("\"text\""));
+
+        let (_generic_directory, generic_database_path, generic_scope, generic_node_id) =
+            scanned_file_fixture("private-node-lookup.md", "generic private text");
+        create_extraction_job_at(&generic_database_path, generic_scope.id, generic_node_id)
+            .expect("generic job should queue");
+        assert_eq!(
+            screenshot_ocr_job_for_node_at(
+                &generic_database_path,
+                generic_scope.id,
+                generic_node_id,
+            )
+            .expect("generic node lookup should query"),
+            None
+        );
     }
 
     #[test]

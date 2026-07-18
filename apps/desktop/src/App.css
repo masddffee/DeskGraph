@@ -425,6 +425,50 @@ select:focus-visible {
   font-size: 0.84rem;
 }
 
+.search-result-action {
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+}
+
+.search-result-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.search-result-action-row > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.search-result-action-row > .search-result-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.search-result-action-row strong {
+  color: #235c3a;
+  font-size: 0.84rem;
+}
+
+.search-result-action-row span,
+.ocr-feedback {
+  color: #657269;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.ocr-feedback {
+  margin: 0.65rem 0 0;
+}
+
+.ocr-feedback--error {
+  color: #783d29;
+}
+
 .search-snippet {
   margin: 0.75rem 0 0;
   color: #4f5f56;
@@ -755,6 +799,7 @@ footer {
   .rename-preview-heading,
   .action-plan-list li,
   .search-form-row,
+  .search-result-action-row,
   .scope-list li {
     align-items: stretch;
     flex-direction: column;

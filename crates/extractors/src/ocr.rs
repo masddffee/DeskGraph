@@ -1,10 +1,12 @@
 #[cfg(any(target_os = "windows", test))]
 use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::Path;
 #[cfg(any(target_os = "windows", test))]
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,155 @@ pub const ABSOLUTE_MAX_OCR_PIXELS: u64 = 64 * 1024 * 1024;
 const NORMALIZED_SCALE: u32 = 1_000_000;
 #[cfg(any(target_os = "windows", test))]
 const OCR_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const NATIVE_OCR_RESERVATION_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeOcrOwner {
+    Job { database_key: u64, job_id: i64 },
+    DirectAdapter(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeOcrExecutionPhase {
+    Free,
+    Held,
+    #[cfg(target_os = "windows")]
+    Cleanup,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeOcrReservation {
+    owner: NativeOcrOwner,
+    expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct NativeOcrGateState {
+    phase: NativeOcrExecutionPhase,
+    reservation: Option<NativeOcrReservation>,
+}
+
+impl NativeOcrGateState {
+    const fn new() -> Self {
+        Self {
+            phase: NativeOcrExecutionPhase::Free,
+            reservation: None,
+        }
+    }
+
+    fn try_acquire_at(&mut self, owner: NativeOcrOwner, now: Instant) -> bool {
+        if self.phase != NativeOcrExecutionPhase::Free {
+            if self.reservation.is_none() {
+                self.reservation = Some(NativeOcrReservation {
+                    owner,
+                    expires_at: now,
+                });
+            }
+            return false;
+        }
+        if self
+            .reservation
+            .is_some_and(|reservation| reservation.expires_at <= now)
+        {
+            self.reservation = None;
+        }
+        if self
+            .reservation
+            .is_some_and(|reservation| reservation.owner != owner)
+        {
+            return false;
+        }
+        self.reservation = None;
+        self.phase = NativeOcrExecutionPhase::Held;
+        true
+    }
+
+    fn release_at(&mut self, now: Instant, reservation_ttl: Duration) {
+        self.phase = NativeOcrExecutionPhase::Free;
+        if let Some(reservation) = &mut self.reservation {
+            reservation.expires_at = now.checked_add(reservation_ttl).unwrap_or(now);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeOcrExecutionGate {
+    state: Mutex<NativeOcrGateState>,
+}
+
+impl NativeOcrExecutionGate {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(NativeOcrGateState::new()),
+        }
+    }
+
+    fn try_acquire(&'static self, owner: NativeOcrOwner) -> Option<NativeOcrExecutionPermit> {
+        let mut state = self.state.lock().ok()?;
+        state
+            .try_acquire_at(owner, Instant::now())
+            .then_some(NativeOcrExecutionPermit { gate: self })
+    }
+
+    fn release_after_provider_return(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.phase != NativeOcrExecutionPhase::Held {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            state.phase = NativeOcrExecutionPhase::Cleanup;
+            if !windows_native::worker_is_active() {
+                state.release_at(Instant::now(), NATIVE_OCR_RESERVATION_TTL);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            state.release_at(Instant::now(), NATIVE_OCR_RESERVATION_TTL);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn finish_cleanup(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && state.phase == NativeOcrExecutionPhase::Cleanup
+        {
+            state.release_at(Instant::now(), NATIVE_OCR_RESERVATION_TTL);
+        }
+    }
+}
+
+static NATIVE_OCR_EXECUTION_GATE: OnceLock<NativeOcrExecutionGate> = OnceLock::new();
+static NEXT_DIRECT_NATIVE_OCR_OWNER: AtomicU64 = AtomicU64::new(1);
+
+fn native_ocr_execution_gate() -> &'static NativeOcrExecutionGate {
+    NATIVE_OCR_EXECUTION_GATE.get_or_init(NativeOcrExecutionGate::new)
+}
+
+struct NativeOcrExecutionPermit {
+    gate: &'static NativeOcrExecutionGate,
+}
+
+impl Drop for NativeOcrExecutionPermit {
+    fn drop(&mut self) {
+        self.gate.release_after_provider_return();
+    }
+}
+
+fn acquire_native_ocr_execution(
+    control: &OcrControl,
+) -> Result<NativeOcrExecutionPermit, ExtractionError> {
+    native_ocr_execution_gate()
+        .try_acquire(control.native_owner)
+        .ok_or(ExtractionError::OcrCapacityBusy)
+}
+
+#[cfg(target_os = "windows")]
+fn finish_native_ocr_cleanup() {
+    native_ocr_execution_gate().finish_cleanup();
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OcrRequest {
@@ -100,6 +251,7 @@ pub struct OcrControl {
     cancellation: OcrCancellation,
     started: Instant,
     deadline: Instant,
+    native_owner: NativeOcrOwner,
 }
 
 impl OcrControl {
@@ -113,7 +265,25 @@ impl OcrControl {
             },
             started,
             deadline,
+            native_owner: NativeOcrOwner::DirectAdapter(
+                NEXT_DIRECT_NATIVE_OCR_OWNER.fetch_add(1, Ordering::Relaxed),
+            ),
         }
+    }
+
+    pub(crate) fn for_job(
+        max_processing_time: Duration,
+        database_path: &Path,
+        job_id: i64,
+    ) -> Self {
+        let mut control = Self::new(max_processing_time);
+        let mut hasher = DefaultHasher::new();
+        database_path.hash(&mut hasher);
+        control.native_owner = NativeOcrOwner::Job {
+            database_key: hasher.finish(),
+            job_id,
+        };
+        control
     }
 
     #[must_use]
@@ -181,8 +351,9 @@ impl OcrProvider for NativeOcrProvider {
         _encoded_image: Vec<u8>,
         _request: OcrRequest,
         _limits: OcrProviderLimits,
-        _control: &OcrControl,
+        control: &OcrControl,
     ) -> Result<OcrOutput, ExtractionError> {
+        let _permit = acquire_native_ocr_execution(control)?;
         Err(ExtractionError::OcrProviderUnavailable)
     }
 }
@@ -632,9 +803,9 @@ mod windows_native {
     use super::{
         NativeOcrProvider, OcrAsyncOperation, OcrAsyncStatus, OcrBoundingBox, OcrControl,
         OcrObservation, OcrOutput, OcrProvider, OcrProviderLimits, OcrRequest, RequiredOcrLanguage,
-        normalized_pixel_box, push_unique_observation, receive_bounded_worker_result,
-        resolved_language_satisfies, validate_source_aligned_text_angle,
-        wait_for_bounded_operation,
+        acquire_native_ocr_execution, normalized_pixel_box, push_unique_observation,
+        receive_bounded_worker_result, resolved_language_satisfies,
+        validate_source_aligned_text_angle, wait_for_bounded_operation,
     };
     use crate::ExtractionError;
 
@@ -665,6 +836,7 @@ mod windows_native {
             control: &OcrControl,
         ) -> Result<OcrOutput, ExtractionError> {
             control.check()?;
+            let _permit = acquire_native_ocr_execution(control)?;
             if u64::try_from(encoded_image.len()).ok() != Some(request.expected_source_bytes) {
                 return Err(ExtractionError::SourceChanged);
             }
@@ -685,6 +857,7 @@ mod windows_native {
                     let result =
                         recognize_on_mta_worker(&encoded_image, request, limits, &worker_control);
                     let _ = sender.send(result);
+                    drop(encoded_image);
                 }) {
                 Ok(worker) => worker,
                 Err(_) => {
@@ -715,7 +888,12 @@ mod windows_native {
     impl Drop for ActiveWorkerGuard {
         fn drop(&mut self) {
             WINDOWS_OCR_WORKER_ACTIVE.store(false, Ordering::Release);
+            super::finish_native_ocr_cleanup();
         }
+    }
+
+    pub(super) fn worker_is_active() -> bool {
+        WINDOWS_OCR_WORKER_ACTIVE.load(Ordering::Acquire)
     }
 
     fn recognize_on_mta_worker(
@@ -1109,7 +1287,7 @@ mod macos {
 
     use super::{
         NORMALIZED_SCALE, NativeOcrProvider, OcrBoundingBox, OcrControl, OcrObservation, OcrOutput,
-        OcrProvider, OcrProviderLimits, OcrRequest,
+        OcrProvider, OcrProviderLimits, OcrRequest, acquire_native_ocr_execution,
     };
     use crate::ExtractionError;
 
@@ -1133,6 +1311,7 @@ mod macos {
             control: &OcrControl,
         ) -> Result<OcrOutput, ExtractionError> {
             control.check()?;
+            let _permit = acquire_native_ocr_execution(control)?;
             if u64::try_from(encoded_image.len()).ok() != Some(request.expected_source_bytes) {
                 return Err(ExtractionError::SourceChanged);
             }
@@ -1463,6 +1642,68 @@ mod tests {
             max_image_pixels: 1_048_576,
             max_processing_time: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn native_gate_reserves_the_released_slot_for_the_first_busy_owner() {
+        let first = NativeOcrOwner::Job {
+            database_key: 1,
+            job_id: 1,
+        };
+        let first_waiter = NativeOcrOwner::Job {
+            database_key: 2,
+            job_id: 2,
+        };
+        let late_waiter = NativeOcrOwner::Job {
+            database_key: 3,
+            job_id: 3,
+        };
+        let started = Instant::now();
+        let mut state = NativeOcrGateState::new();
+
+        assert!(state.try_acquire_at(first, started));
+        assert!(!state.try_acquire_at(first_waiter, started));
+        assert!(!state.try_acquire_at(late_waiter, started + Duration::from_secs(60)));
+        assert_eq!(
+            state.reservation.map(|reservation| reservation.owner),
+            Some(first_waiter)
+        );
+
+        let released = started + Duration::from_secs(120);
+        state.release_at(released, Duration::from_secs(5));
+        assert!(!state.try_acquire_at(late_waiter, released + Duration::from_secs(1)));
+        assert!(state.try_acquire_at(first_waiter, released + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn abandoned_native_gate_reservation_expires_without_blocking_forever() {
+        let first = NativeOcrOwner::Job {
+            database_key: 1,
+            job_id: 1,
+        };
+        let abandoned = NativeOcrOwner::Job {
+            database_key: 2,
+            job_id: 2,
+        };
+        let later = NativeOcrOwner::Job {
+            database_key: 3,
+            job_id: 3,
+        };
+        let started = Instant::now();
+        let mut state = NativeOcrGateState::new();
+
+        assert!(state.try_acquire_at(first, started));
+        assert!(!state.try_acquire_at(abandoned, started));
+        state.release_at(started, Duration::from_secs(5));
+        assert!(!state.try_acquire_at(later, started + Duration::from_secs(4)));
+        assert!(state.try_acquire_at(later, started + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn direct_native_controls_receive_distinct_gate_owners() {
+        let first = OcrControl::new(Duration::from_secs(1));
+        let second = OcrControl::new(Duration::from_secs(1));
+        assert_ne!(first.native_owner, second.native_owner);
     }
 
     #[test]

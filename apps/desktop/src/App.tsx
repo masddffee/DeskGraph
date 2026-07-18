@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { lifecycleLabel, loadHealthReport, type HealthReport } from './health';
 import {
@@ -9,8 +9,18 @@ import {
   type ActionPolicyCheck,
 } from './action';
 import {
+  activeScreenshotOcrJobIds,
+  cancelScreenshotOcrJob,
+  createScreenshotOcrJob,
+  isScreenshotOcrCapacityBusy,
+  isScreenshotCandidateDisplayPath,
+  loadScreenshotOcrJobForNode,
+  loadScreenshotOcrJobStatus,
   loadExtractionStats,
   loadRecentExtractions,
+  mergePolledScreenshotOcrJob,
+  resumeScreenshotOcrJob,
+  runScreenshotOcrJob,
   type ExtractionJobProgress,
   type ExtractionStats,
 } from './extraction';
@@ -63,6 +73,11 @@ type RenamePreviewState =
   | { kind: 'working' }
   | { kind: 'ready'; preview: ActionPlanPreview }
   | { kind: 'error'; message: string };
+type OcrActionState =
+  | { kind: 'idle' }
+  | { kind: 'working'; scopeId: number; nodeId: number }
+  | { kind: 'success'; scopeId: number; nodeId: number; message: string }
+  | { kind: 'error'; scopeId: number; nodeId: number; message: string };
 
 interface StatusRowProps {
   label: string;
@@ -117,6 +132,25 @@ function replaceJob(jobs: ScanJobProgress[], job: ScanJobProgress): ScanJobProgr
   return [job, ...jobs.filter((candidate) => candidate.job_id !== job.job_id)];
 }
 
+function replaceExtractionJob(
+  jobs: ExtractionJobProgress[],
+  job: ExtractionJobProgress,
+): ExtractionJobProgress[] {
+  return [job, ...jobs.filter((candidate) => candidate.job_id !== job.job_id)];
+}
+
+function screenshotOcrJobForResult(
+  jobs: ExtractionJobProgress[],
+  result: SearchResult,
+): ExtractionJobProgress | undefined {
+  return jobs.find(
+    (job) =>
+      job.operation === 'screenshot_ocr' &&
+      job.scope_id === result.scope_id &&
+      job.node_id === result.node_id,
+  );
+}
+
 function scanStatusLabel(job: ScanJobProgress): string {
   if (job.status === 'running' && job.pause_requested) return 'Pausing safely…';
   if (job.status === 'running') return 'Scanning metadata…';
@@ -133,9 +167,13 @@ function extractionStatusLabel(job: ExtractionJobProgress): string {
     return 'Reading screenshot text locally…';
   }
   if (job.status === 'running') return 'Extracting bounded text…';
+  if (job.status === 'completed' && job.operation === 'screenshot_ocr') {
+    return 'Screenshot text indexed locally';
+  }
   if (job.status === 'completed') return 'Completed';
   if (job.status === 'cancelled') return 'Cancelled safely';
   if (job.status === 'interrupted') return 'Interrupted safely';
+  if (job.operation === 'screenshot_ocr') return 'Screenshot OCR unavailable or skipped safely';
   return 'File skipped safely';
 }
 
@@ -229,11 +267,16 @@ export default function App() {
   const [renameSourcePath, setRenameSourcePath] = useState('');
   const [renameNewName, setRenameNewName] = useState('');
   const [renameState, setRenameState] = useState<RenamePreviewState>({ kind: 'idle' });
+  const [ocrAction, setOcrAction] = useState<OcrActionState>({ kind: 'idle' });
+  const ocrRequestInFlight = useRef(new Set<string>());
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
       : [];
   const runningJobKey = runningJobIds.join(',');
+  const activeExtractionJobIds =
+    state.kind === 'ready' ? activeScreenshotOcrJobIds(state.extractionJobs) : [];
+  const activeExtractionJobKey = activeExtractionJobIds.join(',');
 
   useEffect(() => {
     let active = true;
@@ -279,9 +322,49 @@ export default function App() {
     };
   }, [runningJobKey]);
 
+  useEffect(() => {
+    if (!activeExtractionJobKey) return;
+    let active = true;
+
+    const poll = async () => {
+      try {
+        const jobs = await Promise.all(
+          activeExtractionJobIds.map((jobId) => loadScreenshotOcrJobStatus(jobId)),
+        );
+        if (!active) return;
+        setState((current) => {
+          if (current.kind !== 'ready') return current;
+          return {
+            ...current,
+            extractionJobs: jobs.reduce(mergePolledScreenshotOcrJob, current.extractionJobs),
+          };
+        });
+      } catch {
+        // The foreground runner publishes a validated terminal state or a generic UI error.
+      }
+    };
+
+    const timer = window.setInterval(() => void poll(), 300);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [activeExtractionJobKey]);
+
   function updateJob(job: ScanJobProgress) {
     setState((current) =>
       current.kind === 'ready' ? { ...current, jobs: replaceJob(current.jobs, job) } : current,
+    );
+  }
+
+  function updateExtractionJob(job: ExtractionJobProgress) {
+    setState((current) =>
+      current.kind === 'ready'
+        ? {
+            ...current,
+            extractionJobs: replaceExtractionJob(current.extractionJobs, job),
+          }
+        : current,
     );
   }
 
@@ -453,10 +536,182 @@ export default function App() {
         modifiedBeforeUnixSeconds,
       });
       setSearchState({ kind: 'ready', response });
+      const ocrJobs = await Promise.all(
+        response.results
+          .filter((result) => isScreenshotCandidateDisplayPath(result.display_path))
+          .map(async (result) => {
+            try {
+              return await loadScreenshotOcrJobForNode(result.scope_id, result.node_id);
+            } catch {
+              return null;
+            }
+          }),
+      );
+      setState((current) => {
+        if (current.kind !== 'ready') return current;
+        return {
+          ...current,
+          extractionJobs: ocrJobs
+            .filter((job): job is ExtractionJobProgress => job !== null)
+            .reduce(replaceExtractionJob, current.extractionJobs),
+        };
+      });
     } catch {
       setSearchState({
         kind: 'error',
         message: 'Search stopped safely. Try a shorter query or refresh the local manifest.',
+      });
+    }
+  }
+
+  async function runScreenshotOcr(job: ExtractionJobProgress) {
+    setOcrAction({ kind: 'working', scopeId: job.scope_id, nodeId: job.node_id });
+    try {
+      const progress = await runScreenshotOcrJob(job.job_id);
+      updateExtractionJob(progress);
+      setOcrFeedbackFromProgress(progress);
+      await refreshManifest().catch(() => undefined);
+    } catch (error) {
+      await refreshManifest().catch(() => undefined);
+      if (isScreenshotOcrCapacityBusy(error)) {
+        setOcrAction({
+          kind: 'error',
+          scopeId: job.scope_id,
+          nodeId: job.node_id,
+          message:
+            'Another local OCR is still finishing. This job remains queued; retry it safely.',
+        });
+        return;
+      }
+      setOcrAction({
+        kind: 'error',
+        scopeId: job.scope_id,
+        nodeId: job.node_id,
+        message:
+          'Screenshot OCR stopped safely. The local provider may be unavailable on this computer.',
+      });
+    }
+  }
+
+  function setOcrFeedbackFromProgress(progress: ExtractionJobProgress) {
+    if (progress.status === 'completed') {
+      setOcrAction({
+        kind: 'success',
+        scopeId: progress.scope_id,
+        nodeId: progress.node_id,
+        message: 'Screenshot text was indexed locally. Search again to find its contents.',
+      });
+      return;
+    }
+    if (progress.status === 'cancelled') {
+      setOcrAction({
+        kind: 'success',
+        scopeId: progress.scope_id,
+        nodeId: progress.node_id,
+        message: 'Screenshot OCR was cancelled safely. No partial text was published.',
+      });
+      return;
+    }
+    if (progress.status === 'interrupted') {
+      setOcrAction({
+        kind: 'error',
+        scopeId: progress.scope_id,
+        nodeId: progress.node_id,
+        message: 'Screenshot OCR was interrupted safely. Resume it to continue locally.',
+      });
+      return;
+    }
+    if (progress.status === 'failed') {
+      setOcrAction({
+        kind: 'error',
+        scopeId: progress.scope_id,
+        nodeId: progress.node_id,
+        message: 'Screenshot OCR stopped safely. The previous complete local index was preserved.',
+      });
+    }
+  }
+
+  async function startScreenshotOcr(result: SearchResult) {
+    const requestKey = `${result.scope_id}:${result.node_id}`;
+    if (activeExtractionJobIds.length > 0 || ocrRequestInFlight.current.size > 0) return;
+    ocrRequestInFlight.current.add(requestKey);
+    setOcrAction({ kind: 'working', scopeId: result.scope_id, nodeId: result.node_id });
+    try {
+      const job = await createScreenshotOcrJob(result.scope_id, result.node_id);
+      updateExtractionJob(job);
+      await runScreenshotOcr(job);
+    } catch {
+      await refreshManifest().catch(() => undefined);
+      setOcrAction({
+        kind: 'error',
+        scopeId: result.scope_id,
+        nodeId: result.node_id,
+        message:
+          'OCR was denied safely. Rescan the file if it changed and confirm it is a supported screenshot.',
+      });
+    } finally {
+      ocrRequestInFlight.current.delete(requestKey);
+    }
+  }
+
+  async function resumeScreenshotOcr(job: ExtractionJobProgress) {
+    const requestKey = `${job.scope_id}:${job.node_id}`;
+    if (activeExtractionJobIds.length > 0 || ocrRequestInFlight.current.size > 0) return;
+    ocrRequestInFlight.current.add(requestKey);
+    setOcrAction({ kind: 'working', scopeId: job.scope_id, nodeId: job.node_id });
+    try {
+      const queued = await resumeScreenshotOcrJob(job.job_id);
+      updateExtractionJob(queued);
+      await runScreenshotOcr(queued);
+    } catch {
+      await refreshManifest().catch(() => undefined);
+      setOcrAction({
+        kind: 'error',
+        scopeId: job.scope_id,
+        nodeId: job.node_id,
+        message: 'Resume was denied safely. Refresh the local manifest before trying again.',
+      });
+    } finally {
+      ocrRequestInFlight.current.delete(requestKey);
+    }
+  }
+
+  async function retryQueuedScreenshotOcr(job: ExtractionJobProgress) {
+    const requestKey = `${job.scope_id}:${job.node_id}`;
+    if (ocrRequestInFlight.current.size > 0) return;
+    ocrRequestInFlight.current.add(requestKey);
+    try {
+      await runScreenshotOcr(job);
+    } finally {
+      ocrRequestInFlight.current.delete(requestKey);
+    }
+  }
+
+  async function cancelScreenshotOcr(job: ExtractionJobProgress) {
+    try {
+      const progress = await cancelScreenshotOcrJob(job.job_id);
+      updateExtractionJob(progress);
+      if (progress.status === 'cancelled') {
+        setOcrFeedbackFromProgress(progress);
+        await refreshManifest().catch(() => undefined);
+      }
+    } catch {
+      try {
+        const progress = await loadScreenshotOcrJobStatus(job.job_id);
+        updateExtractionJob(progress);
+        if (progress.status !== 'queued' && progress.status !== 'running') {
+          setOcrFeedbackFromProgress(progress);
+          await refreshManifest().catch(() => undefined);
+          return;
+        }
+      } catch {
+        // Fall through to a path-free generic error.
+      }
+      setOcrAction({
+        kind: 'error',
+        scopeId: job.scope_id,
+        nodeId: job.node_id,
+        message: 'The cancellation request could not be recorded safely.',
       });
     }
   }
@@ -680,21 +935,117 @@ export default function App() {
             ) : null}
             {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
               <ol className="search-results">
-                {searchState.response.results.map((result) => (
-                  <li key={`${result.node_id}:${result.location_id}`}>
-                    <div className="search-result-heading">
-                      <span className="search-rank">#{result.lexical_rank}</span>
-                      <strong>{searchExplanation(result)}</strong>
-                    </div>
-                    <code>{result.display_path}</code>
-                    {result.snippet ? (
-                      <p className="search-snippet">
-                        <span>Untrusted local text</span>
-                        {result.snippet}
-                      </p>
-                    ) : null}
-                  </li>
-                ))}
+                {searchState.response.results.map((result) => {
+                  const ocrJob = screenshotOcrJobForResult(state.extractionJobs, result);
+                  const ocrIsRunning = ocrJob?.status === 'running';
+                  const ocrIsQueued = ocrJob?.status === 'queued';
+                  const anotherOcrIsRunning = state.extractionJobs.some(
+                    (job) =>
+                      job.operation === 'screenshot_ocr' &&
+                      job.status === 'running' &&
+                      job.job_id !== ocrJob?.job_id,
+                  );
+                  const feedbackMatches =
+                    ocrAction.kind !== 'idle' &&
+                    ocrAction.scopeId === result.scope_id &&
+                    ocrAction.nodeId === result.node_id;
+                  return (
+                    <li key={`${result.node_id}:${result.location_id}`}>
+                      <div className="search-result-heading">
+                        <span className="search-rank">#{result.lexical_rank}</span>
+                        <strong>{searchExplanation(result)}</strong>
+                      </div>
+                      <code>{result.display_path}</code>
+                      {isScreenshotCandidateDisplayPath(result.display_path) ? (
+                        <div
+                          className="search-result-action"
+                          aria-label="Local screenshot OCR controls"
+                        >
+                          <div className="search-result-action-row">
+                            <div>
+                              <strong>
+                                {ocrJob
+                                  ? extractionStatusLabel(ocrJob)
+                                  : 'Screenshot text has not been read'}
+                              </strong>
+                              <span>
+                                Only this already-scanned screenshot is revalidated and read on this
+                                computer.
+                              </span>
+                            </div>
+                            {ocrIsRunning && ocrJob ? (
+                              <button
+                                type="button"
+                                disabled={ocrJob.cancel_requested}
+                                onClick={() => void cancelScreenshotOcr(ocrJob)}
+                              >
+                                {ocrJob.cancel_requested ? 'Stopping safely…' : 'Cancel OCR'}
+                              </button>
+                            ) : ocrIsQueued && ocrJob ? (
+                              <div className="search-result-action-buttons">
+                                <button
+                                  type="button"
+                                  disabled={
+                                    anotherOcrIsRunning ||
+                                    (feedbackMatches && ocrAction.kind === 'working')
+                                  }
+                                  onClick={() => void retryQueuedScreenshotOcr(ocrJob)}
+                                >
+                                  Retry queued OCR
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={ocrJob.cancel_requested}
+                                  onClick={() => void cancelScreenshotOcr(ocrJob)}
+                                >
+                                  Cancel OCR
+                                </button>
+                              </div>
+                            ) : ocrJob?.status === 'interrupted' ? (
+                              <button
+                                type="button"
+                                disabled={
+                                  activeExtractionJobIds.length > 0 ||
+                                  (feedbackMatches && ocrAction.kind === 'working')
+                                }
+                                onClick={() => void resumeScreenshotOcr(ocrJob)}
+                              >
+                                Resume screenshot OCR
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={
+                                  activeExtractionJobIds.length > 0 ||
+                                  (feedbackMatches && ocrAction.kind === 'working')
+                                }
+                                onClick={() => void startScreenshotOcr(result)}
+                              >
+                                {ocrJob ? 'Read screenshot again' : 'Read screenshot text locally'}
+                              </button>
+                            )}
+                          </div>
+                          {feedbackMatches && ocrAction.kind === 'error' ? (
+                            <p className="ocr-feedback ocr-feedback--error" role="alert">
+                              {ocrAction.message}
+                            </p>
+                          ) : null}
+                          {feedbackMatches && ocrAction.kind === 'success' ? (
+                            <p className="ocr-feedback" role="status">
+                              {ocrAction.message}
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {result.snippet ? (
+                        <p className="search-snippet">
+                          <span>Untrusted local text</span>
+                          {result.snippet}
+                        </p>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ol>
             ) : null}
           </section>
@@ -904,9 +1255,9 @@ export default function App() {
                     : 'Local text is ready'}
                 </h2>
                 <p>
-                  Only already-scanned text, Markdown, and code files are eligible. Every source is
-                  revalidated, output is size-limited, and a failed job cannot replace the last
-                  complete text.
+                  Only already-scanned supported documents and explicitly selected screenshots are
+                  eligible. Every source is revalidated, output is size-limited, and a failed job
+                  cannot replace the last complete text.
                 </p>
               </div>
               <span className="connected-indicator">Never uploaded</span>

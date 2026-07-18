@@ -25,9 +25,9 @@ use deskgraph_identity::{
 use crate::ocr::{ABSOLUTE_MAX_OCR_SOURCE_BYTES, build_ocr_extraction_output};
 use crate::{
     CancellationSignal, ChunkProvenance, ExtractionError, ExtractionLimits, ExtractionRequest,
-    ExtractorProvider, ImageMetadataExtractor, MediaKind, NativeOcrProvider, OcrCancellation,
-    OcrControl, OcrProvider, OcrRequest, OoxmlTextExtractor, PdfTextExtractor, Utf8TextExtractor,
-    media_kind_for_extension, recognize_ocr_image_bytes,
+    ExtractorProvider, ImageMetadataExtractor, MediaKind, NativeOcrProvider, NoCancellation,
+    OcrCancellation, OcrControl, OcrProvider, OcrRequest, OoxmlTextExtractor, PdfTextExtractor,
+    Utf8TextExtractor, media_kind_for_extension, recognize_ocr_image_bytes,
 };
 
 // The provider's absolute processing cap is 60 seconds. Keep enough lease headroom for
@@ -52,6 +52,7 @@ pub enum ExtractionServiceError {
     SourceMetadataChanged,
     SourceIdentityChanged,
     UnsupportedMediaKind,
+    OcrCapacityBusy,
     OcrCancellationMonitorFailed,
     InvalidSystemTime,
     Extraction(ExtractionError),
@@ -75,6 +76,7 @@ impl ExtractionServiceError {
             Self::SourceMetadataChanged => "extraction_source_metadata_changed",
             Self::SourceIdentityChanged => "extraction_source_identity_changed",
             Self::UnsupportedMediaKind => "extraction_media_kind_unsupported",
+            Self::OcrCapacityBusy => "extraction_ocr_capacity_busy",
             Self::OcrCancellationMonitorFailed => "extraction_ocr_cancel_monitor_failed",
             Self::InvalidSystemTime => "system_time_invalid",
             Self::Extraction(error) => error.code(),
@@ -93,6 +95,7 @@ impl ExtractionServiceError {
                 | Self::SourceOpenFailed
                 | Self::SourceMetadataChanged
                 | Self::SourceIdentityChanged
+                | Self::Extraction(ExtractionError::SourceChanged)
         )
     }
 }
@@ -134,8 +137,45 @@ pub fn create_screenshot_ocr_job_at(
     node_id: i64,
 ) -> Result<ExtractionJobProgress, ExtractionServiceError> {
     let mut database = ManifestDatabase::open(database_path)?;
+    let source = database.extractable_file(scope_id, node_id)?;
+    let (mut file, media_kind) = validate_source(&database, &source)?;
+    if !matches!(
+        media_kind,
+        MediaKind::Image(deskgraph_domain::ImageFormat::Png)
+            | MediaKind::Image(deskgraph_domain::ImageFormat::Jpeg)
+    ) {
+        return Err(ExtractionServiceError::UnsupportedMediaKind);
+    }
+    let limits = ExtractionLimits::default();
+    let image_metadata = ImageMetadataExtractor
+        .extract(
+            &mut file,
+            ExtractionRequest {
+                media_kind,
+                expected_source_bytes: source.size_bytes,
+                modified_unix_ns: source.modified_unix_ns,
+            },
+            limits,
+            &NoCancellation,
+        )?
+        .image_metadata
+        .ok_or(ExtractionError::OcrOutputInvalid)?;
+    let MediaKind::Image(format) = media_kind else {
+        return Err(ExtractionServiceError::UnsupportedMediaKind);
+    };
+    crate::ocr::validate_ocr_request(
+        OcrRequest {
+            format,
+            expected_source_bytes: source.size_bytes,
+            modified_unix_ns: source.modified_unix_ns,
+            pixel_width: image_metadata.pixel_width,
+            pixel_height: image_metadata.pixel_height,
+        },
+        limits,
+    )?;
+    validate_open_file(&file, &source)?;
     database
-        .create_screenshot_ocr_job(scope_id, node_id)
+        .low_level_insert_screenshot_ocr_job_after_core_validation(&source)
         .map_err(Into::into)
 }
 
@@ -348,11 +388,23 @@ fn run_extraction_job_with_ocr_provider_at(
                 }
             }
         }
+        Err(ExtractionServiceError::Extraction(ExtractionError::OcrCapacityBusy)) => {
+            let progress =
+                database.requeue_extraction_job_after_capacity_refusal(job_id, &runner_token)?;
+            if progress.status == ExtractionStatus::Cancelled {
+                Ok(progress)
+            } else {
+                Err(ExtractionServiceError::OcrCapacityBusy)
+            }
+        }
         Err(error) => {
             if matches!(
                 error,
                 ExtractionServiceError::Extraction(ExtractionError::Cancelled)
-            ) {
+            ) || database
+                .extraction_cancel_requested(job_id)
+                .unwrap_or(false)
+            {
                 return database
                     .cancel_extraction_job_from_runner(
                         job_id,
@@ -470,7 +522,7 @@ fn extract_claimed_ocr_job(
             result: Err(ExtractionServiceError::UnsupportedMediaKind),
         };
     };
-    let control = OcrControl::new(limits.max_processing_time);
+    let control = OcrControl::for_job(limits.max_processing_time, database_path, job_id);
     let mut monitor = match DurableOcrCancellationMonitor::start(
         database_path.to_path_buf(),
         job_id,
@@ -507,8 +559,10 @@ fn extract_claimed_ocr_job(
             pixel_height: metadata.pixel_height,
         };
         let encoded_image = read_ocr_source(file, request, limits, &control)?;
+        let validated_source_bytes = encoded_image.clone();
         let output = recognize_ocr_image_bytes(provider, encoded_image, request, limits, &control)?;
         let output = build_ocr_extraction_output(provider, request, limits, &control, output)?;
+        validate_source_bytes_unchanged(file, &validated_source_bytes, &control)?;
         validate_open_file(file, source)?;
         Ok(output)
     })();
@@ -568,6 +622,39 @@ fn read_ocr_source(
         return Err(ExtractionError::SourceChanged);
     }
     Ok(bytes)
+}
+
+fn validate_source_bytes_unchanged(
+    source: &mut File,
+    expected: &[u8],
+    control: &OcrControl,
+) -> Result<(), ExtractionError> {
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ExtractionError::SourceSeekFailed)?;
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        control.check()?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| ExtractionError::SourceReadFailed)?;
+        if read == 0 {
+            break;
+        }
+        let end = offset
+            .checked_add(read)
+            .ok_or(ExtractionError::SourceChanged)?;
+        if expected.get(offset..end) != Some(&buffer[..read]) {
+            return Err(ExtractionError::SourceChanged);
+        }
+        offset = end;
+    }
+    control.check()?;
+    if offset != expected.len() {
+        return Err(ExtractionError::SourceChanged);
+    }
+    Ok(())
 }
 
 struct DurableOcrCancellationMonitor {
@@ -897,12 +984,15 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
-    struct NeverCalledOcrProvider;
+    #[derive(Clone, Debug)]
+    struct FailureAfterCancelOcrProvider {
+        started: Arc<AtomicBool>,
+        release_failure: Arc<AtomicBool>,
+    }
 
-    impl OcrProvider for NeverCalledOcrProvider {
+    impl OcrProvider for FailureAfterCancelOcrProvider {
         fn provider_id(&self) -> &'static str {
-            "deskgraph.never-called-ocr"
+            "deskgraph.cancel-race-fake-ocr"
         }
 
         fn provider_version(&self) -> &'static str {
@@ -916,7 +1006,34 @@ mod tests {
             _limits: crate::OcrProviderLimits,
             _control: &OcrControl,
         ) -> Result<crate::OcrOutput, ExtractionError> {
-            panic!("invalid image input must fail before the OCR provider")
+            self.started.store(true, Ordering::Release);
+            while !self.release_failure.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(ExtractionError::OcrProviderFailed)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct CapacityBusyOcrProvider;
+
+    impl OcrProvider for CapacityBusyOcrProvider {
+        fn provider_id(&self) -> &'static str {
+            "deskgraph.capacity-busy-fake-ocr"
+        }
+
+        fn provider_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn recognize(
+            &self,
+            _encoded_image: Vec<u8>,
+            _request: OcrRequest,
+            _limits: crate::OcrProviderLimits,
+            _control: &OcrControl,
+        ) -> Result<crate::OcrOutput, ExtractionError> {
+            Err(ExtractionError::OcrCapacityBusy)
         }
     }
 
@@ -949,6 +1066,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct MutatingOcrProvider {
         file_path: PathBuf,
+        original_modified: SystemTime,
     }
 
     impl OcrProvider for MutatingOcrProvider {
@@ -968,9 +1086,17 @@ mod tests {
             control: &OcrControl,
         ) -> Result<crate::OcrOutput, ExtractionError> {
             control.check()?;
-            let mut changed = encoded_image.to_vec();
-            changed.push(0);
+            let mut changed = encoded_image;
+            let last = changed
+                .last_mut()
+                .expect("test image should contain at least one byte");
+            *last ^= 1;
             fs::write(&self.file_path, changed).expect("test provider should mutate fixture");
+            File::open(&self.file_path)
+                .and_then(|file| {
+                    file.set_times(fs::FileTimes::new().set_modified(self.original_modified))
+                })
+                .expect("test provider should restore source metadata");
             Ok(crate::OcrOutput {
                 observations: vec![crate::OcrObservation {
                     text: "stale OCR must not publish".to_string(),
@@ -1086,6 +1212,17 @@ mod tests {
         bytes[12..16].copy_from_slice(b"IHDR");
         bytes[16..20].copy_from_slice(&width.to_be_bytes());
         bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
+    fn jpeg_bytes(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 16];
+        bytes[..2].copy_from_slice(b"\xff\xd8");
+        bytes[2..4].copy_from_slice(b"\xff\xc0");
+        bytes[4..6].copy_from_slice(&17_u16.to_be_bytes());
+        bytes[6] = 8;
+        bytes[7..9].copy_from_slice(&height.to_be_bytes());
+        bytes[9..11].copy_from_slice(&width.to_be_bytes());
         bytes
     }
 
@@ -1415,8 +1552,33 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_ocr_rejects_unsupported_and_corrupt_images_before_provider() {
+    fn screenshot_ocr_creation_accepts_only_valid_png_and_jpeg() {
+        for (file_name, contents) in [
+            ("Screenshot.png", png_bytes(640, 480)),
+            ("Screenshot.jpeg", jpeg_bytes(640, 480)),
+        ] {
+            let fixture = fixture(file_name, &contents);
+            let job = create_screenshot_ocr_job_at(
+                &fixture.database_path,
+                fixture.scope_id,
+                fixture.node_id,
+            )
+            .expect("valid PNG/JPEG should create a durable OCR job");
+            assert_eq!(job.status, ExtractionStatus::Queued);
+            assert_eq!(job.operation, ExtractionOperation::ScreenshotOcr);
+        }
+    }
+
+    #[test]
+    fn screenshot_ocr_rejects_invalid_sources_without_leaving_a_job() {
+        let mut oversized_png = png_bytes(640, 480);
+        oversized_png.resize(ABSOLUTE_MAX_OCR_SOURCE_BYTES as usize + 1, 0);
         for (file_name, contents, expected_error) in [
+            (
+                "notes.md",
+                b"# not an image".to_vec(),
+                "extraction_media_kind_unsupported",
+            ),
             (
                 "animated.gif",
                 gif_bytes(640, 480),
@@ -1427,24 +1589,54 @@ mod tests {
                 b"not a png".to_vec(),
                 "extraction_image_invalid",
             ),
+            (
+                "mismatched.png",
+                gif_bytes(640, 480),
+                "extraction_image_format_mismatch",
+            ),
+            (
+                "oversized.png",
+                oversized_png,
+                "extraction_source_too_large",
+            ),
+            (
+                "too-wide.png",
+                png_bytes(crate::ABSOLUTE_MAX_OCR_DIMENSION + 1, 1),
+                "extraction_image_dimension_limit_exceeded",
+            ),
+            (
+                "too-many-pixels.png",
+                png_bytes(
+                    crate::ABSOLUTE_MAX_OCR_DIMENSION,
+                    u32::try_from(
+                        crate::ABSOLUTE_MAX_OCR_PIXELS
+                            / u64::from(crate::ABSOLUTE_MAX_OCR_DIMENSION)
+                            + 1,
+                    )
+                    .expect("pixel-limit test height should fit u32"),
+                ),
+                "extraction_image_dimension_limit_exceeded",
+            ),
         ] {
             let fixture = fixture(file_name, &contents);
-            let job = create_screenshot_ocr_job_at(
+            let error = create_screenshot_ocr_job_at(
                 &fixture.database_path,
                 fixture.scope_id,
                 fixture.node_id,
             )
-            .expect("OCR job should create");
-            let failed = run_extraction_job_with_ocr_provider_at(
-                &fixture.database_path,
-                job.job_id,
-                ExtractionLimits::default(),
-                &NeverCalledOcrProvider,
-            )
-            .expect("invalid OCR source should fail as a terminal job");
-
-            assert_eq!(failed.status, ExtractionStatus::Failed);
-            assert_eq!(failed.error_code.as_deref(), Some(expected_error));
+            .expect_err("invalid OCR input must fail before durable insert");
+            assert_eq!(error.code(), expected_error);
+            assert!(
+                recent_extraction_jobs_at(&fixture.database_path)
+                    .expect("jobs should remain queryable")
+                    .is_empty(),
+                "rejected OCR input must not leave a job"
+            );
+            let content =
+                create_extraction_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                    .expect("rejected OCR must not block content extraction");
+            assert_eq!(content.operation, ExtractionOperation::Content);
+            assert_eq!(content.status, ExtractionStatus::Queued);
             assert_eq!(
                 extraction_stats_at(&fixture.database_path)
                     .expect("stats should load")
@@ -1454,9 +1646,75 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn screenshot_ocr_creation_revalidates_open_handle_identity_before_insert() {
+        let contents = png_bytes(640, 480);
+        let fixture = fixture("Screenshot.png", &contents);
+        let original_modified = fs::metadata(&fixture.file_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("original modification time should load");
+        let moved_original = fixture._directory.path().join("original.png");
+        let replacement = fixture._directory.path().join("replacement.png");
+        fs::write(&replacement, &contents).expect("replacement should write");
+        File::open(&replacement)
+            .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(original_modified)))
+            .expect("replacement modification time should match");
+        fs::rename(&fixture.file_path, moved_original).expect("original should remain preserved");
+        fs::rename(replacement, &fixture.file_path).expect("replacement should move into place");
+
+        let error =
+            create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect_err("replacement identity must fail before durable insert");
+        assert_eq!(error.code(), "extraction_source_identity_changed");
+        assert!(
+            recent_extraction_jobs_at(&fixture.database_path)
+                .expect("jobs should remain queryable")
+                .is_empty()
+        );
+        let content =
+            create_extraction_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("rejected OCR must not block content extraction");
+        assert_eq!(content.operation, ExtractionOperation::Content);
+    }
+
+    #[test]
+    fn native_ocr_capacity_refusal_requeues_without_automatic_retry() {
+        let fixture = fixture("Screenshot.png", &png_bytes(640, 480));
+        let job =
+            create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("OCR job should create");
+
+        let capacity = run_extraction_job_with_ocr_provider_at(
+            &fixture.database_path,
+            job.job_id,
+            ExtractionLimits::default(),
+            &CapacityBusyOcrProvider,
+        )
+        .expect_err("capacity refusal should be explicit");
+        assert_eq!(capacity.code(), "extraction_ocr_capacity_busy");
+        let still_queued = extraction_job_at(&fixture.database_path, job.job_id)
+            .expect("capacity refusal should preserve durable progress");
+        assert_eq!(still_queued.status, ExtractionStatus::Queued);
+        assert_eq!(still_queued.provider_id, None);
+        assert_eq!(still_queued.error_code, None);
+
+        let completed = run_extraction_job_with_ocr_provider_at(
+            &fixture.database_path,
+            job.job_id,
+            ExtractionLimits::default(),
+            &NoTextOcrProvider,
+        )
+        .expect("one explicit retry should run after capacity becomes available");
+        assert_eq!(completed.status, ExtractionStatus::Completed);
+    }
+
     #[test]
     fn screenshot_ocr_source_change_invalidates_prior_searchable_chunks() {
         let fixture = fixture("Screenshot.png", &png_bytes(640, 480));
+        let original_modified = fs::metadata(&fixture.file_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("source modified time should load");
         let initial_job =
             create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
                 .expect("initial OCR job should create");
@@ -1479,6 +1737,7 @@ mod tests {
             ExtractionLimits::default(),
             &MutatingOcrProvider {
                 file_path: fixture.file_path.clone(),
+                original_modified,
             },
         )
         .expect("source change should become a terminal job failure");
@@ -1486,7 +1745,7 @@ mod tests {
         assert_eq!(stale.status, ExtractionStatus::Failed);
         assert_eq!(
             stale.error_code.as_deref(),
-            Some("extraction_source_metadata_changed")
+            Some("extraction_source_changed")
         );
         assert_eq!(
             extraction_stats_at(&fixture.database_path)
@@ -1571,6 +1830,55 @@ mod tests {
         assert_eq!(
             extraction_stats_at(&fixture.database_path)
                 .expect("stats should load")
+                .active_chunk_count,
+            0
+        );
+    }
+
+    #[test]
+    fn durable_cancel_wins_a_provider_failure_race() {
+        let fixture = fixture("Screenshot.png", &png_bytes(640, 480));
+        let job =
+            create_screenshot_ocr_job_at(&fixture.database_path, fixture.scope_id, fixture.node_id)
+                .expect("OCR job should create");
+        let started = Arc::new(AtomicBool::new(false));
+        let release_failure = Arc::new(AtomicBool::new(false));
+        let provider = FailureAfterCancelOcrProvider {
+            started: Arc::clone(&started),
+            release_failure: Arc::clone(&release_failure),
+        };
+        let database_path = fixture.database_path.clone();
+        let job_id = job.job_id;
+        let runner = thread::spawn(move || {
+            run_extraction_job_with_ocr_provider_at(
+                &database_path,
+                job_id,
+                ExtractionLimits::default(),
+                &provider,
+            )
+        });
+        let wait_started = Instant::now();
+        while !started.load(Ordering::Acquire) {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(2),
+                "fake OCR provider should start"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        cancel_extraction_job_at(&fixture.database_path, job_id)
+            .expect("durable cancel should persist before provider failure");
+        release_failure.store(true, Ordering::Release);
+
+        let terminal = runner
+            .join()
+            .expect("OCR runner should not panic")
+            .expect("cancelled race should return terminal progress");
+        assert_eq!(terminal.status, ExtractionStatus::Cancelled);
+        assert!(terminal.cancel_requested);
+        assert_eq!(terminal.error_code, None);
+        assert_eq!(
+            extraction_stats_at(&fixture.database_path)
+                .expect("cancelled race should publish nothing")
                 .active_chunk_count,
             0
         );
