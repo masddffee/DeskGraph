@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
     DatabaseError, ManifestDatabase, NodeKind, Observation, QueueEntry, QueuedPath, ScanIssue,
+    ScopeAccessGrantState, ScopeAccessGrantWrite,
 };
 use deskgraph_domain::{AuthorizedScope, ScanJobProgress, ScanReport, ScanStatus};
 pub use deskgraph_identity::comparison_key;
@@ -65,6 +66,45 @@ pub fn authorize_scope(
     database: &ManifestDatabase,
     requested_path: &Path,
 ) -> Result<AuthorizedScope, ScannerError> {
+    let canonical = validated_requested_scope(requested_path)?;
+    let path_key = comparison_key(&canonical);
+    database
+        .add_scope(
+            &path_to_raw(&canonical),
+            &path_key,
+            &canonical.to_string_lossy(),
+            std::env::consts::OS,
+        )
+        .map_err(Into::into)
+}
+
+/// Persists a native user selection and its platform capability atomically.
+/// The opaque bytes remain backend-only and are never part of
+/// [`AuthorizedScope`].
+pub fn authorize_scope_with_access_grant(
+    database: &mut ManifestDatabase,
+    requested_path: &Path,
+    grant_platform: &str,
+    opaque_grant: &[u8],
+) -> Result<AuthorizedScope, ScannerError> {
+    let canonical = validated_requested_scope(requested_path)?;
+    let path_key = comparison_key(&canonical);
+    database
+        .add_scope_with_access_grant(
+            &path_to_raw(&canonical),
+            &path_key,
+            &canonical.to_string_lossy(),
+            ScopeAccessGrantWrite {
+                scope_platform: std::env::consts::OS,
+                grant_platform,
+                opaque_grant,
+                state: ScopeAccessGrantState::Active,
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn validated_requested_scope(requested_path: &Path) -> Result<std::path::PathBuf, ScannerError> {
     let canonical =
         fs::canonicalize(requested_path).map_err(|_| ScannerError::CanonicalizationFailed)?;
     let metadata =
@@ -75,16 +115,7 @@ pub fn authorize_scope(
     if is_protected_system_scope(&canonical) {
         return Err(ScannerError::ProtectedSystemScope);
     }
-
-    let path_key = comparison_key(&canonical);
-    database
-        .add_scope(
-            &path_to_raw(&canonical),
-            &path_key,
-            &canonical.to_string_lossy(),
-            std::env::consts::OS,
-        )
-        .map_err(Into::into)
+    Ok(canonical)
 }
 
 pub fn scan_scope(

@@ -242,11 +242,11 @@ export const zhCN = {
   scope: {
     kicker: '明确授权',
     heading: 'DeskGraph 可以检查的文件夹',
-    description: '请输入现有文件夹路径。授权和扫描是分开的操作；不会跟踪符号链接或隐藏项目。',
+    description:
+      '请在系统文件夹选择器中选择一个文件夹，明确授权本机访问。授权和扫描是分开的操作；不会跟踪符号链接或隐藏项目。现有范围在更新或系统变更后可能需要再次授权。',
     count: (scopeCount) => `${count(scopeCount)} 个已授权`,
-    inputLabel: '文件夹路径',
-    placeholder: '/Users/you/Documents 或 C:\\Users\\you\\Documents',
-    authorize: '授权文件夹',
+    inputLabel: '使用系统选择器选择文件夹',
+    authorize: '选择要授权的文件夹',
     emptyHeading: '没有文件夹访问权限',
     emptyDescription: '在这里添加前，DeskGraph 无法检查桌面、下载项或文档。',
     label: (scopeId) => `已授权范围 ${count(scopeId)}`,
@@ -257,10 +257,10 @@ export const zhCN = {
     resume: '继续扫描',
     scan: '扫描元数据',
     validation: {
-      required: '请先输入现有文件夹路径。',
-      validating: '正在验证文件夹边界…',
+      cancelled: '已取消文件夹选择，没有新增任何访问权限。',
+      validating: '等待你选择文件夹，然后验证文件夹边界…',
       authorized: '文件夹已授权。在你选择“扫描元数据”前不会扫描任何内容。',
-      denied: '无法授权此文件夹。请确认它存在且未受保护。',
+      denied: '无法授权所选文件夹。它可能不可用、受保护，或需要再次授权。',
       reading: '正在读取已授权文件夹中的元数据…',
       complete: (files, folders) =>
         `扫描完成：${count(files)} 个文件和 ${count(folders)} 个文件夹。`,

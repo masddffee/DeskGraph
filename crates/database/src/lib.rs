@@ -124,6 +124,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "action_transaction_journal",
         sql: include_str!("../../../migrations/0019_action_transaction_journal.sql"),
     },
+    Migration {
+        version: 20,
+        name: "scope_access_grants",
+        sql: include_str!("../../../migrations/0020_scope_access_grants.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -142,6 +147,7 @@ const MAX_WATCH_PATH_BYTES: usize = 64 * 1024;
 const MAX_ACTION_PATH_BYTES: usize = 64 * 1024;
 const MAX_FOLDER_PROFILE_ENTRIES: u64 = 100_000;
 const MAX_FILE_RELATION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SCOPE_ACCESS_GRANT_BYTES: usize = 1024 * 1024;
 
 struct Migration {
     version: i64,
@@ -199,6 +205,73 @@ pub struct ScopeRecord {
     pub path_raw: Vec<u8>,
     pub path_key: String,
     pub display_path: String,
+}
+
+/// The durable lifecycle state of a platform-owned scope access grant.
+///
+/// A scope with no row in `scope_access_grants` is intentionally interpreted
+/// as [`Self::NeedsReauthorization`], never as active.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScopeAccessGrantState {
+    Active,
+    NeedsReauthorization,
+    Revoked,
+}
+
+impl ScopeAccessGrantState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::NeedsReauthorization => "needs_reauthorization",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "needs_reauthorization" => Ok(Self::NeedsReauthorization),
+            "revoked" => Ok(Self::Revoked),
+            _ => Err(DatabaseError::InvalidStoredValue),
+        }
+    }
+}
+
+/// Backend-only record for restoring an OS-granted scope capability.
+///
+/// `opaque_grant` must not be mapped into `AuthorizedScope`, domain objects,
+/// IPC responses, diagnostics, or logs. Only platform adapters may interpret
+/// the bytes.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ScopeAccessGrant {
+    pub scope_id: i64,
+    pub platform: String,
+    pub opaque_grant: Vec<u8>,
+    pub state: ScopeAccessGrantState,
+    pub updated_at_unix_ms: i64,
+}
+
+/// Input for atomically storing a scope and its platform-owned access grant.
+/// The state is explicit so a caller cannot accidentally relabel a restored or
+/// revoked capability as active.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ScopeAccessGrantWrite<'a> {
+    pub scope_platform: &'a str,
+    pub grant_platform: &'a str,
+    pub opaque_grant: &'a [u8],
+    pub state: ScopeAccessGrantState,
+}
+
+impl fmt::Debug for ScopeAccessGrantWrite<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopeAccessGrantWrite")
+            .field("scope_platform", &self.scope_platform)
+            .field("grant_platform", &self.grant_platform)
+            .field("opaque_grant_len", &self.opaque_grant.len())
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -580,6 +653,9 @@ pub enum DatabaseError {
     ReadOnlyModeUnavailable,
     ReadOnlyQueryTimeout,
     ScopeNotFound,
+    ScopeAccessGrantNotFound,
+    ScopeAccessGrantNotActive,
+    ScopeAccessGrantInputInvalid,
     ScanJobNotFound,
     ScanJobAlreadyActive,
     ScanJobBusy,
@@ -638,6 +714,9 @@ impl DatabaseError {
             Self::ReadOnlyModeUnavailable => "database_read_only_mode_unavailable",
             Self::ReadOnlyQueryTimeout => "database_read_only_query_timeout",
             Self::ScopeNotFound => "authorized_scope_not_found",
+            Self::ScopeAccessGrantNotFound => "scope_access_grant_not_found",
+            Self::ScopeAccessGrantNotActive => "scope_access_grant_not_active",
+            Self::ScopeAccessGrantInputInvalid => "scope_access_grant_input_invalid",
             Self::ScanJobNotFound => "scan_job_not_found",
             Self::ScanJobAlreadyActive => "scan_job_already_active",
             Self::ScanJobBusy => "scan_job_busy",
@@ -942,6 +1021,73 @@ impl ManifestDatabase {
         ).map_err(Into::into)
     }
 
+    /// Atomically authorizes a scope and stores its platform-owned access
+    /// grant. This is the selection path for native platform adapters; callers
+    /// cannot observe a committed scope without its requested grant state.
+    pub fn add_scope_with_access_grant(
+        &mut self,
+        path_raw: &[u8],
+        path_key: &str,
+        display_path: &str,
+        grant: ScopeAccessGrantWrite<'_>,
+    ) -> Result<AuthorizedScope, DatabaseError> {
+        validate_scope_access_grant_platform(grant.scope_platform)?;
+        validate_scope_access_grant_platform(grant.grant_platform)?;
+        validate_scope_access_grant_bytes(grant.opaque_grant)?;
+        if grant.scope_platform != grant.grant_platform {
+            return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+        }
+
+        let created_at = unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO authorized_scopes(path_raw, path_key, display_path, platform, created_at_unix_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(path_key) DO UPDATE SET \
+                 path_raw = excluded.path_raw, display_path = excluded.display_path",
+            params![path_raw, path_key, display_path, grant.scope_platform, created_at],
+        )?;
+        let (scope, persisted_platform): (AuthorizedScope, String) = transaction.query_row(
+            "SELECT id, display_path, created_at_unix_ms, platform \
+             FROM authorized_scopes WHERE path_key = ?1",
+            [path_key],
+            |row| {
+                Ok((
+                    AuthorizedScope {
+                        id: row.get(0)?,
+                        display_path: row.get(1)?,
+                        created_at_unix_ms: row.get(2)?,
+                    },
+                    row.get(3)?,
+                ))
+            },
+        )?;
+        if persisted_platform != grant.grant_platform {
+            return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+        }
+        transaction.execute(
+            "INSERT INTO scope_access_grants( \
+                 scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(scope_id) DO UPDATE SET \
+                 platform = excluded.platform, \
+                 opaque_grant = excluded.opaque_grant, \
+                 state = excluded.state, \
+                 updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![
+                scope.id,
+                grant.grant_platform,
+                grant.opaque_grant,
+                grant.state.as_str(),
+                created_at
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(scope)
+    }
+
     pub fn list_scopes(&self) -> Result<Vec<AuthorizedScope>, DatabaseError> {
         let mut statement = self.connection.prepare(
             "SELECT id, display_path, created_at_unix_ms FROM authorized_scopes ORDER BY id",
@@ -972,6 +1118,177 @@ impl ManifestDatabase {
             )
             .optional()?
             .ok_or(DatabaseError::ScopeNotFound)
+    }
+
+    /// Stores or replaces a platform-owned grant for an existing scope.
+    ///
+    /// This is one SQLite upsert, so a failed write cannot leave a partially
+    /// updated grant. A successful upsert is the only database operation that
+    /// can transition a stored grant to `active`.
+    pub fn upsert_scope_access_grant(
+        &self,
+        scope_id: i64,
+        platform: &str,
+        opaque_grant: &[u8],
+    ) -> Result<ScopeAccessGrant, DatabaseError> {
+        self.scope_record(scope_id)?;
+        validate_scope_access_grant_platform(platform)?;
+        validate_scope_access_grant_bytes(opaque_grant)?;
+        let scope_platform = self.connection.query_row(
+            "SELECT platform FROM authorized_scopes WHERE id = ?1",
+            [scope_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        if scope_platform != platform {
+            return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+        }
+        let updated_at_unix_ms = unix_ms()?;
+
+        self.connection.execute(
+            "INSERT INTO scope_access_grants( \
+                 scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, 'active', ?4) \
+             ON CONFLICT(scope_id) DO UPDATE SET \
+                 platform = excluded.platform, \
+                 opaque_grant = excluded.opaque_grant, \
+                 state = 'active', \
+                 updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![scope_id, platform, opaque_grant, updated_at_unix_ms],
+        )?;
+
+        self.scope_access_grant(scope_id)?
+            .ok_or(DatabaseError::ScopeAccessGrantNotFound)
+    }
+
+    /// Returns the opaque record only to Rust backend code. General scope list
+    /// APIs deliberately do not expose this capability material.
+    pub fn scope_access_grant(
+        &self,
+        scope_id: i64,
+    ) -> Result<Option<ScopeAccessGrant>, DatabaseError> {
+        self.scope_record(scope_id)?;
+        self.connection
+            .query_row(
+                "SELECT grant.scope_id, grant.platform, grant.opaque_grant, grant.state, \
+                        grant.updated_at_unix_ms \
+                 FROM scope_access_grants grant \
+                 JOIN authorized_scopes scope \
+                   ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE grant.scope_id = ?1",
+                [scope_id],
+                scope_access_grant_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// A missing grant deliberately reports `needs_reauthorization`; migration
+    /// never upgrades legacy scopes to active access.
+    pub fn scope_access_grant_state(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeAccessGrantState, DatabaseError> {
+        self.scope_record(scope_id)?;
+        let state = self
+            .connection
+            .query_row(
+                "SELECT grant.state FROM scope_access_grants grant \
+                 JOIN authorized_scopes scope \
+                   ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE grant.scope_id = ?1",
+                [scope_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match state {
+            Some(state) => ScopeAccessGrantState::from_db(&state),
+            None => Ok(ScopeAccessGrantState::NeedsReauthorization),
+        }
+    }
+
+    /// Returns only active scope identifiers for backend restoration. No path,
+    /// grant bytes, platform string, or state leaks through this helper.
+    pub fn active_scope_access_grant_ids(&self) -> Result<Vec<i64>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT grant.scope_id FROM scope_access_grants grant \
+             JOIN authorized_scopes scope \
+               ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+             WHERE grant.state = 'active' ORDER BY grant.scope_id ASC",
+        )?;
+        let scope_ids = statement.query_map([], |row| row.get(0))?;
+        scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Restores the active grant for one already-authorized scope. A missing,
+    /// revoked, or reauthorization-required record is never returned as a
+    /// usable capability.
+    pub fn active_scope_grant(&self, scope_id: i64) -> Result<ScopeAccessGrant, DatabaseError> {
+        let grant = self
+            .scope_access_grant(scope_id)?
+            .ok_or(DatabaseError::ScopeAccessGrantNotFound)?;
+        if grant.state != ScopeAccessGrantState::Active {
+            return Err(DatabaseError::ScopeAccessGrantNotActive);
+        }
+        Ok(grant)
+    }
+
+    /// Backend-only restoration inventory. General scope listings deliberately
+    /// remain opaque-grant-free.
+    pub fn list_active_scope_grants(&self) -> Result<Vec<ScopeAccessGrant>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT grant.scope_id, grant.platform, grant.opaque_grant, grant.state, \
+                    grant.updated_at_unix_ms \
+             FROM scope_access_grants grant \
+             JOIN authorized_scopes scope \
+               ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+             WHERE grant.state = 'active' ORDER BY grant.scope_id ASC",
+        )?;
+        let grants = statement.query_map([], scope_access_grant_from_row)?;
+        grants.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn scope_has_active_access_grant(&self, scope_id: i64) -> Result<bool, DatabaseError> {
+        self.scope_record(scope_id)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM scope_access_grants grant \
+                     JOIN authorized_scopes scope \
+                       ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                     WHERE grant.scope_id = ?1 AND grant.state = 'active' \
+                 )",
+                [scope_id],
+                |row| row.get::<_, i64>(0).map(|value| value == 1),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn mark_scope_access_grant_needs_reauthorization(
+        &self,
+        scope_id: i64,
+    ) -> Result<(), DatabaseError> {
+        self.mark_scope_access_grant_state(scope_id, ScopeAccessGrantState::NeedsReauthorization)
+    }
+
+    pub fn mark_scope_access_grant_revoked(&self, scope_id: i64) -> Result<(), DatabaseError> {
+        self.mark_scope_access_grant_state(scope_id, ScopeAccessGrantState::Revoked)
+    }
+
+    fn mark_scope_access_grant_state(
+        &self,
+        scope_id: i64,
+        state: ScopeAccessGrantState,
+    ) -> Result<(), DatabaseError> {
+        self.scope_record(scope_id)?;
+        let updated = self.connection.execute(
+            "UPDATE scope_access_grants SET state = ?2, updated_at_unix_ms = ?3 \
+             WHERE scope_id = ?1",
+            params![scope_id, state.as_str(), unix_ms()?],
+        )?;
+        if updated == 0 {
+            return Err(DatabaseError::ScopeAccessGrantNotFound);
+        }
+        Ok(())
     }
 
     pub fn create_scan_job(&self, scope_id: i64) -> Result<i64, DatabaseError> {
@@ -1323,6 +1640,29 @@ impl ManifestDatabase {
         scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Desktop-only eligibility boundary: a completed initial scan is not
+    /// sufficient when the current process has not restored a platform-owned
+    /// access grant. CLI and deterministic core fixtures continue to use
+    /// `watchable_scope_ids`; the packaged Desktop uses this stricter query.
+    pub fn watchable_scope_ids_with_active_access_grants(&self) -> Result<Vec<i64>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT authorized_scopes.id \
+             FROM authorized_scopes \
+             JOIN scope_access_grants grant \
+               ON grant.scope_id = authorized_scopes.id \
+              AND grant.platform = authorized_scopes.platform \
+              AND grant.state = 'active' \
+             WHERE EXISTS ( \
+                SELECT 1 FROM scan_jobs \
+                WHERE scan_jobs.scope_id = authorized_scopes.id \
+                    AND scan_jobs.status = 'completed' \
+             ) \
+             ORDER BY authorized_scopes.id ASC",
+        )?;
+        let scope_ids = statement.query_map([], |row| row.get(0))?;
+        scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn scope_has_completed_scan(&self, scope_id: i64) -> Result<bool, DatabaseError> {
         self.scope_record(scope_id)?;
         self.connection
@@ -1380,6 +1720,75 @@ impl ManifestDatabase {
                 scope_id,
                 now_unix_ms,
             )?);
+        }
+        transaction.commit()?;
+        event_ids
+            .into_iter()
+            .map(|event_id| self.watch_event(event_id).map(|event| event.progress))
+            .collect()
+    }
+
+    /// Atomically requests reconciliation for every completed scope carrying
+    /// a durable active platform grant. This core/storage helper does not prove
+    /// that an OS capability is live in the current process; packaged Desktop
+    /// callers must use
+    /// `request_live_active_granted_scope_full_reconciliation_at` instead.
+    pub fn request_all_active_granted_scope_full_reconciliation_at(
+        &mut self,
+        now_unix_ms: i64,
+    ) -> Result<Vec<WatchEventProgress>, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let scope_ids = active_granted_watchable_scope_ids_in_transaction(&transaction)?;
+        let mut event_ids = Vec::with_capacity(scope_ids.len());
+        for scope_id in scope_ids {
+            event_ids.push(request_scope_full_reconciliation_in_transaction(
+                &transaction,
+                scope_id,
+                now_unix_ms,
+            )?);
+        }
+        transaction.commit()?;
+        event_ids
+            .into_iter()
+            .map(|event_id| self.watch_event(event_id).map(|event| event.progress))
+            .collect()
+    }
+
+    /// Atomically requests reconciliation for the caller's exact live-runtime
+    /// scope set, while revalidating completed-scan and active-grant state in
+    /// the same transaction. The packaged Desktop passes only scopes whose OS
+    /// capability guard is currently held; durable `active` state alone is
+    /// never enough to create an event through this entry point.
+    pub fn request_live_active_granted_scope_full_reconciliation_at(
+        &mut self,
+        live_scope_ids: &[i64],
+        now_unix_ms: i64,
+    ) -> Result<Vec<WatchEventProgress>, DatabaseError> {
+        if now_unix_ms < 0 || live_scope_ids.iter().any(|scope_id| *scope_id <= 0) {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let live_scope_ids = live_scope_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let eligible_scope_ids = active_granted_watchable_scope_ids_in_transaction(&transaction)?;
+        let mut event_ids = Vec::with_capacity(eligible_scope_ids.len().min(live_scope_ids.len()));
+        for scope_id in eligible_scope_ids {
+            if live_scope_ids.contains(&scope_id) {
+                event_ids.push(request_scope_full_reconciliation_in_transaction(
+                    &transaction,
+                    scope_id,
+                    now_unix_ms,
+                )?);
+            }
         }
         transaction.commit()?;
         event_ids
@@ -3301,6 +3710,52 @@ impl ManifestDatabase {
         })
     }
 
+    /// Returns only aggregate extraction state belonging to scopes whose
+    /// platform access grant is currently active. No grant bytes or paths are
+    /// selected by these queries.
+    pub fn extraction_stats_with_active_access_grants(
+        &self,
+    ) -> Result<ExtractionStats, DatabaseError> {
+        Ok(ExtractionStats {
+            api_version: ExtractionStats::API_VERSION,
+            active_chunk_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM content_chunks chunk \
+                 JOIN scope_access_grants grant ON grant.scope_id = chunk.scope_id \
+                 WHERE chunk.active = 1 AND grant.state = 'active'",
+            )?,
+            extracted_file_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM ( \
+                    SELECT chunk.node_id FROM content_chunks chunk \
+                    JOIN scope_access_grants grant ON grant.scope_id = chunk.scope_id \
+                    WHERE chunk.active = 1 AND grant.state = 'active' \
+                    UNION SELECT metadata.node_id FROM image_metadata metadata \
+                    JOIN scope_access_grants grant ON grant.scope_id = metadata.scope_id \
+                    WHERE metadata.active = 1 AND grant.state = 'active' \
+                 )",
+            )?,
+            completed_job_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM extraction_jobs job \
+                 JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
+                 WHERE job.status = 'completed' AND grant.state = 'active'",
+            )?,
+            failed_job_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM extraction_jobs job \
+                 JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
+                 WHERE job.status = 'failed' AND grant.state = 'active'",
+            )?,
+            cancelled_job_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM extraction_jobs job \
+                 JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
+                 WHERE job.status = 'cancelled' AND grant.state = 'active'",
+            )?,
+        })
+    }
+
     pub fn lexical_search_candidates(
         &self,
         match_query: &str,
@@ -3371,6 +3826,59 @@ impl ManifestDatabase {
             completed_scan_count: count(
                 &self.connection,
                 "SELECT COUNT(*) FROM scan_jobs WHERE status = 'completed'",
+            )?,
+        })
+    }
+
+    /// Returns the packaged Desktop dashboard view. Legacy, revoked, or
+    /// restore-failed scopes remain durable for reauthorization but do not
+    /// contribute paths, graph counts, issues, or scan totals to this view.
+    pub fn stats_with_active_access_grants(&self) -> Result<ManifestStats, DatabaseError> {
+        Ok(ManifestStats {
+            api_version: ManifestStats::API_VERSION,
+            database_ready: true,
+            authorized_scope_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM scope_access_grants WHERE state = 'active'",
+            )?,
+            node_count: count(
+                &self.connection,
+                "SELECT COUNT(DISTINCT location.node_id) FROM locations location \
+                 JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
+                 WHERE location.present = 1 AND grant.state = 'active'",
+            )?,
+            file_count: count(
+                &self.connection,
+                "SELECT COUNT(DISTINCT file.node_id) FROM files file \
+                 JOIN locations location ON location.node_id = file.node_id \
+                 JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
+                 WHERE location.present = 1 AND grant.state = 'active'",
+            )?,
+            folder_count: count(
+                &self.connection,
+                "SELECT COUNT(DISTINCT folder.node_id) FROM folders folder \
+                 JOIN locations location ON location.node_id = folder.node_id \
+                 JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
+                 WHERE location.present = 1 AND grant.state = 'active'",
+            )?,
+            active_location_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM locations location \
+                 JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
+                 WHERE location.present = 1 AND grant.state = 'active'",
+            )?,
+            issue_count: count(
+                &self.connection,
+                "SELECT COALESCE(job.issue_count, 0) FROM scan_jobs job \
+                 JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
+                 WHERE job.status = 'completed' AND grant.state = 'active' \
+                 ORDER BY job.id DESC LIMIT 1",
+            )?,
+            completed_scan_count: count(
+                &self.connection,
+                "SELECT COUNT(*) FROM scan_jobs job \
+                 JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
+                 WHERE job.status = 'completed' AND grant.state = 'active'",
             )?,
         })
     }
@@ -6643,6 +7151,27 @@ fn watchable_scope_ids_in_transaction(
     scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+fn active_granted_watchable_scope_ids_in_transaction(
+    transaction: &Transaction<'_>,
+) -> Result<Vec<i64>, DatabaseError> {
+    let mut statement = transaction.prepare(
+        "SELECT authorized_scopes.id \
+         FROM authorized_scopes \
+         JOIN scope_access_grants grant \
+           ON grant.scope_id = authorized_scopes.id \
+          AND grant.platform = authorized_scopes.platform \
+          AND grant.state = 'active' \
+         WHERE EXISTS ( \
+            SELECT 1 FROM scan_jobs \
+            WHERE scan_jobs.scope_id = authorized_scopes.id \
+                AND scan_jobs.status = 'completed' \
+         ) \
+         ORDER BY authorized_scopes.id ASC",
+    )?;
+    let scope_ids = statement.query_map([], |row| row.get(0))?;
+    scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn request_scope_full_reconciliation_in_transaction(
     transaction: &Transaction<'_>,
     scope_id: i64,
@@ -7271,6 +7800,41 @@ fn to_i64(value: u64) -> Result<i64, DatabaseError> {
     i64::try_from(value).map_err(|_| DatabaseError::InvalidCount)
 }
 
+fn validate_scope_access_grant_platform(platform: &str) -> Result<(), DatabaseError> {
+    match platform {
+        "macos" | "windows" | "linux" => Ok(()),
+        _ => Err(DatabaseError::ScopeAccessGrantInputInvalid),
+    }
+}
+
+fn validate_scope_access_grant_bytes(opaque_grant: &[u8]) -> Result<(), DatabaseError> {
+    if opaque_grant.is_empty() || opaque_grant.len() > MAX_SCOPE_ACCESS_GRANT_BYTES {
+        return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+    }
+    Ok(())
+}
+
+fn scope_access_grant_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScopeAccessGrant> {
+    let state = row.get::<_, String>(3)?;
+    let state = ScopeAccessGrantState::from_db(&state).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid scope access grant state",
+            )),
+        )
+    })?;
+    Ok(ScopeAccessGrant {
+        scope_id: row.get(0)?,
+        platform: row.get(1)?,
+        opaque_grant: row.get(2)?,
+        state,
+        updated_at_unix_ms: row.get(4)?,
+    })
+}
+
 fn unix_ms() -> Result<i64, DatabaseError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7815,6 +8379,72 @@ mod tests {
             vec![scanned_scope_id]
         );
         assert_ne!(scanned_scope_id, unscanned_scope.id);
+    }
+
+    #[test]
+    fn desktop_watchability_requires_a_completed_scan_and_active_access_grant() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .expect("scope should persist");
+        let root = QueuedPath {
+            path_raw: b"/scope".to_vec(),
+            path_key: "/scope".to_string(),
+            parent_identity_key: None,
+            is_root: true,
+        };
+
+        assert!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("strict watchable scopes should load")
+                .is_empty()
+        );
+        publish_manifest_file(&mut database, scope.id, &root, 4);
+        assert_eq!(
+            database
+                .watchable_scope_ids()
+                .expect("general watchable scopes should load"),
+            vec![scope.id]
+        );
+        assert!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("strict watchable scopes should load")
+                .is_empty(),
+            "a completed legacy scope must not become Desktop-watchable"
+        );
+        assert!(
+            database
+                .request_all_active_granted_scope_full_reconciliation_at(2_000)
+                .expect("strict all-scope request should be a no-op")
+                .is_empty()
+        );
+
+        database
+            .upsert_scope_access_grant(scope.id, "macos", b"opaque-grant")
+            .expect("active grant should persist");
+        assert_eq!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("strict watchable scopes should load"),
+            vec![scope.id]
+        );
+        let requested = database
+            .request_all_active_granted_scope_full_reconciliation_at(2_100)
+            .expect("strict all-scope request should be atomic");
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].scope_id, scope.id);
+
+        database
+            .mark_scope_access_grant_needs_reauthorization(scope.id)
+            .expect("grant should become inactive");
+        assert!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("strict watchable scopes should load")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8615,7 +9245,7 @@ mod tests {
     fn exact_duplicate_setup() -> (ManifestDatabase, ActionSourceRecord, ActionSourceRecord) {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "test")
+            .add_scope(b"/scope", "/scope", "/scope", "macos")
             .expect("scope should persist");
         database
             .connection
@@ -8673,7 +9303,7 @@ mod tests {
     fn file_version_setup() -> (ManifestDatabase, ActionSourceRecord, ActionSourceRecord) {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "test")
+            .add_scope(b"/scope", "/scope", "/scope", "macos")
             .expect("scope should persist");
         database
             .connection
@@ -8761,6 +9391,336 @@ mod tests {
                 .expect("version feedback schema should load"),
             3
         );
+    }
+
+    #[test]
+    fn scope_access_grant_migration_preserves_legacy_scopes_as_reauthorization_required() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("pre-scope-access-grants.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations ( \
+                     version INTEGER PRIMARY KEY, \
+                     name TEXT NOT NULL, \
+                     checksum TEXT NOT NULL, \
+                     applied_at_unix_ms INTEGER NOT NULL \
+                 );",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..19] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("historical migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("historical migration should register");
+        }
+        connection
+            .execute(
+                "INSERT INTO authorized_scopes( \
+                     id, path_raw, path_key, display_path, platform, created_at_unix_ms \
+                 ) VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0)",
+                [],
+            )
+            .expect("legacy scope should persist");
+        drop(connection);
+
+        let database = ManifestDatabase::open(&path).expect("new migration should apply");
+        assert_eq!(
+            database
+                .scope_access_grant_state(1)
+                .expect("legacy scope state should load"),
+            ScopeAccessGrantState::NeedsReauthorization
+        );
+        assert!(
+            database
+                .scope_access_grant(1)
+                .expect("legacy scope grant should load")
+                .is_none(),
+            "migration must not fabricate an active grant"
+        );
+        assert!(
+            database
+                .active_scope_access_grant_ids()
+                .expect("active grant ids should load")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scope_access_grants_are_opaque_upserted_and_never_exposed_by_scope_listing() {
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .expect("scope should persist");
+
+        assert_eq!(
+            database
+                .scope_access_grant_state(scope.id)
+                .expect("missing grant state should load"),
+            ScopeAccessGrantState::NeedsReauthorization
+        );
+        let first = database
+            .upsert_scope_access_grant(scope.id, "macos", b"first-grant")
+            .expect("grant should persist");
+        assert_eq!(first.scope_id, scope.id);
+        assert_eq!(first.platform, "macos");
+        assert_eq!(first.opaque_grant, b"first-grant");
+        assert_eq!(first.state, ScopeAccessGrantState::Active);
+        assert!(first.updated_at_unix_ms >= 0);
+        assert_eq!(
+            database.list_scopes().expect("ordinary scopes should load"),
+            vec![scope.clone()],
+            "ordinary scope listings must retain their path-only domain shape"
+        );
+        assert!(
+            database
+                .scope_has_active_access_grant(scope.id)
+                .expect("active state should load")
+        );
+        assert_eq!(
+            database
+                .active_scope_access_grant_ids()
+                .expect("active grant ids should load"),
+            vec![scope.id]
+        );
+
+        let replacement = database
+            .upsert_scope_access_grant(scope.id, "macos", b"replacement-grant")
+            .expect("replacement grant should upsert");
+        assert_eq!(replacement.platform, "macos");
+        assert_eq!(replacement.opaque_grant, b"replacement-grant");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scope_access_grants WHERE scope_id = ?1",
+                    [scope.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("one-to-one grant count should load"),
+            1
+        );
+
+        database
+            .mark_scope_access_grant_needs_reauthorization(scope.id)
+            .expect("grant should become reauthorization-required");
+        assert_eq!(
+            database
+                .scope_access_grant_state(scope.id)
+                .expect("grant state should load"),
+            ScopeAccessGrantState::NeedsReauthorization
+        );
+        database
+            .mark_scope_access_grant_revoked(scope.id)
+            .expect("grant should become revoked");
+        let revoked = database
+            .scope_access_grant(scope.id)
+            .expect("revoked grant should remain backend-readable")
+            .expect("grant should remain durable for platform diagnostics");
+        assert_eq!(revoked.state, ScopeAccessGrantState::Revoked);
+        assert_eq!(revoked.opaque_grant, b"replacement-grant");
+        assert!(
+            !database
+                .scope_has_active_access_grant(scope.id)
+                .expect("inactive state should load")
+        );
+        assert!(
+            database
+                .active_scope_access_grant_ids()
+                .expect("active grant ids should load")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scope_access_grant_write_debug_output_redacts_capability_bytes() {
+        let write = ScopeAccessGrantWrite {
+            scope_platform: "macos",
+            grant_platform: "macos",
+            opaque_grant: b"private-capability-marker",
+            state: ScopeAccessGrantState::Active,
+        };
+        let output = format!("{write:?}");
+
+        assert!(output.contains("opaque_grant_len: 25"));
+        assert!(!output.contains("private-capability-marker"));
+        assert!(!output.contains("opaque_grant: ["));
+    }
+
+    #[test]
+    fn scope_access_grants_reject_invalid_values_enforce_uniqueness_and_cascade_with_scope() {
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .expect("scope should persist");
+
+        for (platform, bytes) in [("unknown", b"grant".as_slice()), ("macos", b"".as_slice())] {
+            assert!(matches!(
+                database.upsert_scope_access_grant(scope.id, platform, bytes),
+                Err(DatabaseError::ScopeAccessGrantInputInvalid)
+            ));
+        }
+        assert!(matches!(
+            database.upsert_scope_access_grant(
+                scope.id,
+                "macos",
+                &vec![0_u8; MAX_SCOPE_ACCESS_GRANT_BYTES + 1],
+            ),
+            Err(DatabaseError::ScopeAccessGrantInputInvalid)
+        ));
+        assert!(matches!(
+            database.mark_scope_access_grant_revoked(scope.id),
+            Err(DatabaseError::ScopeAccessGrantNotFound)
+        ));
+        assert!(matches!(
+            database.upsert_scope_access_grant(999, "macos", b"grant"),
+            Err(DatabaseError::ScopeNotFound)
+        ));
+
+        database
+            .upsert_scope_access_grant(scope.id, "macos", b"grant")
+            .expect("valid grant should persist");
+        for (index, (platform, bytes, state)) in [
+            ("unknown", b"second".as_slice(), "active"),
+            ("macos", b"".as_slice(), "active"),
+            ("macos", b"second".as_slice(), "unknown"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let invalid_scope = database
+                .add_scope(
+                    format!("/invalid-{index}").as_bytes(),
+                    &format!("/invalid-{index}"),
+                    &format!("/invalid-{index}"),
+                    "macos",
+                )
+                .expect("invalid SQL fixture scope should persist");
+            assert!(
+                database
+                    .connection
+                    .execute(
+                        "INSERT INTO scope_access_grants( \
+                         scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                     ) VALUES (?1, ?2, ?3, ?4, 0)",
+                        params![invalid_scope.id, platform, bytes, state],
+                    )
+                    .is_err()
+            );
+        }
+        assert!(
+            database
+                .connection
+                .execute(
+                    "INSERT INTO scope_access_grants( \
+                     scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                 ) VALUES (?1, 'macos', X'01', 'active', 0)",
+                    [scope.id],
+                )
+                .is_err()
+        );
+
+        database
+            .connection
+            .execute("DELETE FROM authorized_scopes WHERE id = ?1", [scope.id])
+            .expect("scope deletion should cascade its grant");
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM scope_access_grants", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("grant count should load"),
+            0
+        );
+    }
+
+    #[test]
+    fn scope_and_access_grant_are_committed_or_rolled_back_together() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/selected",
+                "/selected",
+                "/selected",
+                ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"picker-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and active grant should persist atomically");
+        assert_eq!(
+            database
+                .active_scope_grant(scope.id)
+                .expect("active grant should be backend-readable")
+                .opaque_grant,
+            b"picker-grant"
+        );
+        assert_eq!(
+            database
+                .list_active_scope_grants()
+                .expect("active grants should load")
+                .len(),
+            1
+        );
+
+        let failed = database.add_scope_with_access_grant(
+            b"/selected-replaced",
+            "/selected",
+            "/selected-replaced",
+            ScopeAccessGrantWrite {
+                scope_platform: "windows",
+                grant_platform: "windows",
+                opaque_grant: b"wrong-platform",
+                state: ScopeAccessGrantState::Active,
+            },
+        );
+        assert!(matches!(
+            failed,
+            Err(DatabaseError::ScopeAccessGrantInputInvalid)
+        ));
+        let record = database
+            .scope_record(scope.id)
+            .expect("scope should remain readable");
+        assert_eq!(record.path_raw, b"/selected");
+        assert_eq!(record.display_path, "/selected");
+        assert_eq!(
+            database
+                .active_scope_grant(scope.id)
+                .expect("failed transaction must not replace existing grant")
+                .opaque_grant,
+            b"picker-grant"
+        );
+
+        let inactive_scope = database
+            .add_scope_with_access_grant(
+                b"/revoked",
+                "/revoked",
+                "/revoked",
+                ScopeAccessGrantWrite {
+                    scope_platform: "windows",
+                    grant_platform: "windows",
+                    opaque_grant: b"revoked-grant",
+                    state: ScopeAccessGrantState::Revoked,
+                },
+            )
+            .expect("explicitly revoked grant should persist atomically");
+        assert!(matches!(
+            database.active_scope_grant(inactive_scope.id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

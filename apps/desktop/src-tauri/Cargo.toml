@@ -23,8 +23,14 @@ deskgraph-transactions = { path = "../../../crates/transactions" }
 deskgraph-watcher = { path = "../../../crates/watcher" }
 serde.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tauri = { workspace = true, features = ["test"] }
 tempfile.workspace = true

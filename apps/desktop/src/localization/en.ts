@@ -243,11 +243,10 @@ export const en = {
     kicker: 'Explicit authorization',
     heading: 'Folders DeskGraph may inspect',
     description:
-      'Enter an existing folder path. Authorization and scanning are separate actions; symlinks and hidden entries are not followed.',
+      'Choose one folder in the system folder picker to grant explicit local access. Authorization and scanning are separate actions; symlinks and hidden entries are not followed. Existing scopes may need authorization again after an update or system change.',
     count: (count) => `${formatIntegerForLocale(count, 'en')} authorized`,
-    inputLabel: 'Folder path',
-    placeholder: '/Users/you/Documents or C:\\Users\\you\\Documents',
-    authorize: 'Authorize folder',
+    inputLabel: 'Choose a folder with the system picker',
+    authorize: 'Choose folder to authorize',
     emptyHeading: 'No folder access',
     emptyDescription: 'DeskGraph cannot inspect Desktop, Downloads, or Documents until added here.',
     label: (scopeId) => `Authorized scope ${scopeId}`,
@@ -258,10 +257,11 @@ export const en = {
     resume: 'Resume scan',
     scan: 'Scan metadata',
     validation: {
-      required: 'Enter an existing folder path first.',
-      validating: 'Validating the folder boundary…',
+      cancelled: 'Folder selection cancelled. No access was added.',
+      validating: 'Waiting for your folder choice, then validating the folder boundary…',
       authorized: 'Folder authorized. Nothing was scanned until you choose Scan metadata.',
-      denied: 'The folder could not be authorized. Check that it exists and is not protected.',
+      denied:
+        'The selected folder could not be authorized. It may be unavailable, protected, or require authorization again.',
       reading: 'Reading metadata inside the authorized folder…',
       complete: (files, folders) =>
         `Scan complete: ${englishCount(files, 'file')} and ${englishCount(folders, 'folder')}.`,

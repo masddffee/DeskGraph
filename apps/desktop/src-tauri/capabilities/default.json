@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "M1 main window uses narrow Rust manifest commands with no filesystem, shell, network, or opener plugins.",
+  "description": "The main window has no frontend filesystem, dialog, shell, network, or opener permission; folder selection is owned by the narrow Rust authorization command.",
   "windows": ["main"],
   "permissions": []
 }

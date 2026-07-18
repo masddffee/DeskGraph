@@ -229,11 +229,11 @@ export const zhTW = {
   scope: {
     kicker: '明確授權',
     heading: 'DeskGraph 可檢查的資料夾',
-    description: '請輸入既有資料夾路徑。授權與掃描是分開的操作；不會追蹤符號連結或隱藏項目。',
+    description:
+      '請在系統資料夾選擇器中選取一個資料夾，明確授權本機存取。授權與掃描是分開的操作；不會追蹤符號連結或隱藏項目。既有範圍在更新或系統變更後可能需要再次授權。',
     count: (count) => `${formatIntegerForLocale(count, 'zh-TW')} 個已授權`,
-    inputLabel: '資料夾路徑',
-    placeholder: '/Users/you/Documents 或 C:\\Users\\you\\Documents',
-    authorize: '授權資料夾',
+    inputLabel: '使用系統選擇器選取資料夾',
+    authorize: '選取要授權的資料夾',
     emptyHeading: '沒有資料夾存取權',
     emptyDescription: '在這裡新增前，DeskGraph 無法檢查桌面、下載項目或文件。',
     label: (scopeId) => `已授權範圍 ${scopeId}`,
@@ -244,10 +244,10 @@ export const zhTW = {
     resume: '繼續掃描',
     scan: '掃描中繼資料',
     validation: {
-      required: '請先輸入既有資料夾路徑。',
-      validating: '正在驗證資料夾邊界…',
+      cancelled: '已取消資料夾選取，沒有新增任何存取權。',
+      validating: '等待你選取資料夾，接著驗證資料夾邊界…',
       authorized: '資料夾已授權。在你選擇「掃描中繼資料」前不會掃描任何內容。',
-      denied: '無法授權此資料夾。請確認它存在且未受保護。',
+      denied: '無法授權選取的資料夾。它可能無法使用、受保護，或需要再次授權。',
       reading: '正在讀取已授權資料夾中的中繼資料…',
       complete: (files, folders) =>
         `掃描完成：${formatIntegerForLocale(files, 'zh-TW')} 個檔案與 ${formatIntegerForLocale(folders, 'zh-TW')} 個資料夾。`,

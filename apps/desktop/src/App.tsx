@@ -26,7 +26,6 @@ import {
   type ExtractionStats,
 } from './extraction';
 import {
-  addAuthorizedScope,
   createManifestScan,
   loadAuthorizedScopes,
   loadManifestStatus,
@@ -35,6 +34,7 @@ import {
   pauseManifestScan,
   resumeManifestScan,
   runManifestScan,
+  selectAndAuthorizeScope,
   type AuthorizedScope,
   type ManifestStats,
   type ScanJobProgress,
@@ -83,7 +83,7 @@ type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
 type ActionMessage =
   | {
       key:
-        | 'required'
+        | 'cancelled'
         | 'validating'
         | 'authorized'
         | 'denied'
@@ -103,6 +103,7 @@ type ActionState =
   | { kind: 'idle' }
   | { kind: 'working'; message: ActionMessage }
   | { kind: 'success'; message: ActionMessage }
+  | { kind: 'cancelled'; message: ActionMessage }
   | { kind: 'error'; message: ActionMessage };
 type SearchMessage = 'query' | 'extension' | 'dateRange' | 'request';
 type SearchState =
@@ -373,7 +374,6 @@ export default function App() {
   });
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
-  const [scopePath, setScopePath] = useState('');
   const [action, setAction] = useState<ActionState>({ kind: 'idle' });
   const [searchQuery, setSearchQuery] = useState('');
   const [searchScopeId, setSearchScopeId] = useState<number | null>(null);
@@ -580,16 +580,14 @@ export default function App() {
   }
 
   async function authorizeRequestedScope() {
-    const requestedPath = scopePath.trim();
-    if (!requestedPath) {
-      setAction({ kind: 'error', message: { key: 'required' } });
-      return;
-    }
     setAction({ kind: 'working', message: { key: 'validating' } });
     try {
-      await addAuthorizedScope(requestedPath);
+      const scope = await selectAndAuthorizeScope();
+      if (scope === null) {
+        setAction({ kind: 'cancelled', message: { key: 'cancelled' } });
+        return;
+      }
       await refreshManifest();
-      setScopePath('');
       setAction({
         kind: 'success',
         message: { key: 'authorized' },
@@ -1558,20 +1556,11 @@ export default function App() {
             </div>
 
             <div className="scope-form">
-              <label htmlFor="scope-path">{catalog.scope.inputLabel}</label>
               <div className="scope-form-row">
-                <input
-                  id="scope-path"
-                  type="text"
-                  value={scopePath}
-                  onChange={(event) => setScopePath(event.target.value)}
-                  placeholder={catalog.scope.placeholder}
-                  autoComplete="off"
-                  spellCheck="false"
-                />
                 <button
                   type="button"
                   disabled={action.kind === 'working'}
+                  aria-label={catalog.scope.inputLabel}
                   onClick={() => void authorizeRequestedScope()}
                 >
                   {catalog.scope.authorize}

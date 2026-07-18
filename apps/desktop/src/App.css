@@ -362,12 +362,9 @@ footer {
   margin-top: 1.5rem;
 }
 
-.scope-form label {
-  display: block;
-  margin-bottom: 0.55rem;
+.action-message--cancelled {
   color: #46544c;
-  font-size: 0.8rem;
-  font-weight: 800;
+  background: #edf3eb;
 }
 
 .scope-form-row {

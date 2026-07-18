@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 export const MANIFEST_STATUS_COMMAND = 'manifest_status';
 export const AUTHORIZED_SCOPES_COMMAND = 'authorized_scopes';
-export const AUTHORIZE_SCOPE_COMMAND = 'authorize_scope_path';
+export const SELECT_AND_AUTHORIZE_SCOPE_COMMAND = 'select_and_authorize_scope';
 export const CREATE_SCAN_COMMAND = 'create_manifest_scan';
 export const RUN_SCAN_COMMAND = 'run_manifest_scan';
 export const SCAN_JOB_STATUS_COMMAND = 'scan_job_status';
@@ -94,6 +94,16 @@ export function parseAuthorizedScopes(value: unknown): AuthorizedScope[] {
   return value.map(parseAuthorizedScope);
 }
 
+/**
+ * The native picker command is intentionally parameterless. A cancelled picker
+ * is a normal outcome, while every non-null response must still satisfy the
+ * same durable scope contract as data loaded from the backend.
+ */
+export function parseSelectedAuthorizedScope(value: unknown): AuthorizedScope | null {
+  if (value === null) return null;
+  return parseAuthorizedScope(value);
+}
+
 export function parseScanJobProgress(value: unknown): ScanJobProgress {
   if (!isRecord(value)) {
     throw new Error('Invalid scan response');
@@ -142,11 +152,10 @@ export async function loadAuthorizedScopes(
   return parseAuthorizedScopes(await invokeCommand(AUTHORIZED_SCOPES_COMMAND));
 }
 
-export async function addAuthorizedScope(
-  path: string,
+export async function selectAndAuthorizeScope(
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
-): Promise<AuthorizedScope> {
-  return parseAuthorizedScope(await invokeCommand(AUTHORIZE_SCOPE_COMMAND, { path }));
+): Promise<AuthorizedScope | null> {
+  return parseSelectedAuthorizedScope(await invokeCommand(SELECT_AND_AUTHORIZE_SCOPE_COMMAND));
 }
 
 export async function createManifestScan(

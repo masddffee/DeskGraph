@@ -1,3 +1,6 @@
+mod scope_access;
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard, TryLockError,
@@ -15,17 +18,19 @@ use deskgraph_domain::{
 };
 #[cfg(test)]
 use deskgraph_domain::{WatchEventReason, WatchEventStatus};
+#[cfg(test)]
+use deskgraph_extractors::extraction_stats_at as read_extraction_stats_at;
 use deskgraph_extractors::{
     ExtractionLimits, cancel_extraction_job_at, create_screenshot_ocr_job_at, extraction_job_at,
-    extraction_stats_at as read_extraction_stats_at,
     recent_extraction_jobs_at as read_recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 #[cfg(test)]
-use deskgraph_scanner::run_scan_job_to_terminal;
+use deskgraph_scanner::{authorize_scope, run_scan_job_to_terminal};
 use deskgraph_scanner::{
-    authorize_scope, create_scan_job, pause_scan_job, resume_scan_job, run_scan_job_batch,
+    authorize_scope_with_access_grant, comparison_key, create_scan_job, pause_scan_job,
+    resume_scan_job, run_scan_job_batch, validated_scope_root,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{create_rename_preview_at, recent_action_plans_at};
@@ -33,8 +38,10 @@ use deskgraph_watcher::{
     NativeWatchEventSource, PollingWatchPolicy, WatchCoordinator, WatchPolicy,
     recent_watch_events_at as read_recent_watch_events_at,
 };
+use scope_access::{ActiveScopeAccess, prepare_selected_scope, restore_scope_access};
 use serde::Serialize;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use tracing::{error, info};
 
 const WATCH_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -52,6 +59,7 @@ struct ManifestState {
     watch_stop: Arc<AtomicBool>,
     watch_wake: SyncSender<()>,
     watch_thread: Mutex<Option<JoinHandle<()>>>,
+    scope_accesses: Arc<Mutex<HashMap<i64, ActiveScopeAccess>>>,
 }
 
 impl Drop for ManifestState {
@@ -134,6 +142,27 @@ fn lock_database(state: &ManifestState) -> Result<MutexGuard<'_, ()>, String> {
         .map_err(|_| "manifest_writer_gate_poisoned".to_string())
 }
 
+fn lock_scope_accesses(
+    state: &ManifestState,
+) -> Result<MutexGuard<'_, HashMap<i64, ActiveScopeAccess>>, String> {
+    state
+        .scope_accesses
+        .lock()
+        .map_err(|_| "scope_access_registry_poisoned".to_string())
+}
+
+fn require_active_scope(state: &ManifestState, scope_id: i64) -> Result<(), String> {
+    if lock_scope_accesses(state)?.contains_key(&scope_id) {
+        Ok(())
+    } else {
+        Err("scope_reauthorization_required".to_string())
+    }
+}
+
+fn active_scope_ids(state: &ManifestState) -> Result<HashSet<i64>, String> {
+    Ok(lock_scope_accesses(state)?.keys().copied().collect())
+}
+
 fn lock_watch_status(
     status: &Mutex<WatchRuntimeStatus>,
 ) -> Result<MutexGuard<'_, WatchRuntimeStatus>, String> {
@@ -166,7 +195,26 @@ fn wake_watch_runtime(state: &ManifestState) {
     notify_watch_wake(&state.watch_wake);
 }
 
+#[cfg(test)]
 fn start_manifest_state(database_path: PathBuf) -> ManifestState {
+    start_manifest_state_with_accesses(database_path, HashMap::new())
+}
+
+struct WatchCoordinatorRuntime {
+    database_path: PathBuf,
+    database_gate: Arc<Mutex<()>>,
+    stop: Arc<AtomicBool>,
+    wake: SyncSender<()>,
+    wake_receiver: Receiver<()>,
+    status: Arc<Mutex<WatchRuntimeStatus>>,
+    scope_accesses: Arc<Mutex<HashMap<i64, ActiveScopeAccess>>>,
+    polling_policy: PollingWatchPolicy,
+}
+
+fn start_manifest_state_with_accesses(
+    database_path: PathBuf,
+    scope_accesses: HashMap<i64, ActiveScopeAccess>,
+) -> ManifestState {
     let database_gate = Arc::new(Mutex::new(()));
     let watch_stop = Arc::new(AtomicBool::new(false));
     let (watch_wake, watch_wake_receiver) = sync_channel(1);
@@ -177,19 +225,21 @@ fn start_manifest_state(database_path: PathBuf) -> ManifestState {
     let thread_watch_stop = Arc::clone(&watch_stop);
     let thread_watch_wake = watch_wake.clone();
     let thread_watch_status = Arc::clone(&watch_status);
+    let scope_accesses = Arc::new(Mutex::new(scope_accesses));
+    let thread_scope_accesses = Arc::clone(&scope_accesses);
+    let runtime = WatchCoordinatorRuntime {
+        database_path: thread_database_path,
+        database_gate: thread_database_gate,
+        stop: thread_watch_stop,
+        wake: thread_watch_wake,
+        wake_receiver: watch_wake_receiver,
+        status: thread_watch_status,
+        scope_accesses: thread_scope_accesses,
+        polling_policy,
+    };
     let watch_thread = thread::Builder::new()
         .name("deskgraph-watch-coordinator".to_string())
-        .spawn(move || {
-            run_watch_coordinator(
-                &thread_database_path,
-                &thread_database_gate,
-                &thread_watch_stop,
-                &thread_watch_wake,
-                watch_wake_receiver,
-                &thread_watch_status,
-                polling_policy,
-            );
-        });
+        .spawn(move || run_watch_coordinator(runtime));
     let watch_thread = match watch_thread {
         Ok(handle) => Some(handle),
         Err(_) => {
@@ -208,39 +258,56 @@ fn start_manifest_state(database_path: PathBuf) -> ManifestState {
         watch_stop,
         watch_wake,
         watch_thread: Mutex::new(watch_thread),
+        scope_accesses,
     }
 }
 
-fn run_watch_coordinator(
-    database_path: &Path,
-    database_gate: &Mutex<()>,
-    stop: &AtomicBool,
-    wake: &SyncSender<()>,
-    wake_receiver: Receiver<()>,
-    status: &Mutex<WatchRuntimeStatus>,
-    polling_policy: PollingWatchPolicy,
-) {
-    let mut coordinator =
-        match WatchCoordinator::open(database_path, WatchPolicy::default(), polling_policy) {
-            Ok(coordinator) => coordinator,
-            Err(error) => {
-                if let Ok(mut status) = status.lock() {
-                    status.state = WatchRuntimeState::Degraded;
-                    status.last_error_code = Some(error.code());
-                }
-                error!(
-                    event = "watch_runtime_start_failed",
-                    error_code = error.code()
-                );
-                return;
+fn run_watch_coordinator(runtime: WatchCoordinatorRuntime) {
+    let WatchCoordinatorRuntime {
+        database_path,
+        database_gate,
+        stop,
+        wake,
+        wake_receiver,
+        status,
+        scope_accesses,
+        polling_policy,
+    } = runtime;
+    let mut coordinator = match WatchCoordinator::open_requiring_active_platform_grants(
+        &database_path,
+        WatchPolicy::default(),
+        polling_policy,
+    ) {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            if let Ok(mut status) = status.lock() {
+                status.state = WatchRuntimeState::Degraded;
+                status.last_error_code = Some(error.code());
             }
-        };
+            error!(
+                event = "watch_runtime_start_failed",
+                error_code = error.code()
+            );
+            return;
+        }
+    };
     let mut native_source = None;
     let mut native_error = Some("watch_native_adapter_starting");
     let mut next_native_retry = Instant::now();
     let mut reconcile_after_native_change = false;
 
     while !stop.load(Ordering::Acquire) {
+        let runtime_active_scope_ids = match scope_accesses.lock() {
+            Ok(accesses) => accesses.keys().copied().collect::<Vec<_>>(),
+            Err(_) => {
+                if let Ok(mut status) = status.lock() {
+                    status.state = WatchRuntimeState::Degraded;
+                    status.last_error_code = Some("scope_access_registry_poisoned");
+                }
+                return;
+            }
+        };
+        coordinator.replace_runtime_active_scope_ids(runtime_active_scope_ids);
         if native_source.is_none() && Instant::now() >= next_native_retry {
             let callback_wake = wake.clone();
             match NativeWatchEventSource::new(Arc::new(move || {
@@ -295,7 +362,7 @@ fn run_watch_coordinator(
                 }
             }
             Err(TryLockError::WouldBlock) => {
-                if wait_for_watch_wake(&wake_receiver, stop, WATCH_GATE_RETRY_INTERVAL).is_err() {
+                if wait_for_watch_wake(&wake_receiver, &stop, WATCH_GATE_RETRY_INTERVAL).is_err() {
                     break;
                 }
                 continue;
@@ -402,7 +469,7 @@ fn run_watch_coordinator(
                 let Ok(wait_duration) = u64::try_from(wait_ms) else {
                     continue;
                 };
-                if wait_for_watch_wake(&wake_receiver, stop, Duration::from_millis(wait_duration))
+                if wait_for_watch_wake(&wake_receiver, &stop, Duration::from_millis(wait_duration))
                     .is_err()
                 {
                     if let Ok(mut status) = status.lock() {
@@ -421,7 +488,7 @@ fn run_watch_coordinator(
                     event = "watch_runtime_cycle_failed",
                     error_code = error.code()
                 );
-                if wait_for_watch_wake(&wake_receiver, stop, Duration::from_secs(5)).is_err() {
+                if wait_for_watch_wake(&wake_receiver, &stop, Duration::from_secs(5)).is_err() {
                     break;
                 }
             }
@@ -440,7 +507,9 @@ fn run_watch_coordinator(
 
 #[tauri::command]
 fn health(state: State<'_, ManifestState>) -> Result<HealthReport, String> {
-    let report = health_at(&state.database_path).map_err(str::to_string)?;
+    let scope_count = u32::try_from(active_scope_ids(&state)?.len())
+        .map_err(|_| "authorized_scope_count_out_of_range".to_string())?;
+    let report = collect_health_with_manifest(scope_count);
     info!(
         event = "health_check_completed",
         status = report.status,
@@ -451,26 +520,47 @@ fn health(state: State<'_, ManifestState>) -> Result<HealthReport, String> {
 
 #[tauri::command]
 fn manifest_status(state: State<'_, ManifestState>) -> Result<ManifestStats, String> {
-    manifest_status_at(&state.database_path).map_err(str::to_string)
+    manifest_status_with_active_access_grants_at(&state.database_path).map_err(str::to_string)
 }
 
 #[tauri::command]
 fn authorized_scopes(state: State<'_, ManifestState>) -> Result<Vec<AuthorizedScope>, String> {
-    authorized_scopes_at(&state.database_path).map_err(str::to_string)
+    let active = active_scope_ids(&state)?;
+    authorized_scopes_at(&state.database_path)
+        .map(|scopes| {
+            scopes
+                .into_iter()
+                .filter(|scope| active.contains(&scope.id))
+                .collect()
+        })
+        .map_err(str::to_string)
 }
 
 #[tauri::command]
-fn authorize_scope_path(
+async fn select_and_authorize_scope(
+    app: AppHandle,
     state: State<'_, ManifestState>,
-    path: String,
-) -> Result<AuthorizedScope, String> {
+) -> Result<Option<AuthorizedScope>, String> {
+    let Some(selected) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let selected_path = selected
+        .into_path()
+        .map_err(|_| "scope_selection_invalid".to_string())?;
+    let prepared = prepare_selected_scope(&selected_path).map_err(str::to_string)?;
     let _database_guard = lock_database(&state)?;
-    let scope =
-        authorize_scope_at(&state.database_path, Path::new(&path)).map_err(str::to_string)?;
+    let scope = authorize_scope_with_access_grant_at(
+        &state.database_path,
+        &prepared.resolved_path,
+        prepared.platform,
+        &prepared.opaque_grant,
+    )
+    .map_err(str::to_string)?;
+    lock_scope_accesses(&state)?.insert(scope.id, prepared.access);
     drop(_database_guard);
     wake_watch_runtime(&state);
     info!(event = "scope_authorized", scope_id = scope.id);
-    Ok(scope)
+    Ok(Some(scope))
 }
 
 #[tauri::command]
@@ -478,6 +568,7 @@ fn create_manifest_scan(
     state: State<'_, ManifestState>,
     scope_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    require_active_scope(&state, scope_id)?;
     let _database_guard = lock_database(&state)?;
     let progress =
         create_manifest_scan_at(&state.database_path, scope_id).map_err(str::to_string)?;
@@ -492,6 +583,8 @@ async fn run_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    let pending = scan_job_status_at(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
     let database_path = state.database_path.clone();
     let database_gate = Arc::clone(&state.database_gate);
     let watch_wake = state.watch_wake.clone();
@@ -510,24 +603,41 @@ fn scan_job_status(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
-    scan_job_status_at(&state.database_path, job_id).map_err(str::to_string)
+    let progress = scan_job_status_at(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, progress.scope_id)?;
+    Ok(progress)
 }
 
 #[tauri::command]
 fn recent_scan_jobs(state: State<'_, ManifestState>) -> Result<Vec<ScanJobProgress>, String> {
-    recent_scan_jobs_at(&state.database_path).map_err(str::to_string)
+    let active = active_scope_ids(&state)?;
+    recent_scan_jobs_at(&state.database_path)
+        .map(|jobs| {
+            jobs.into_iter()
+                .filter(|job| active.contains(&job.scope_id))
+                .collect()
+        })
+        .map_err(str::to_string)
 }
 
 #[tauri::command]
 fn content_extraction_stats(state: State<'_, ManifestState>) -> Result<ExtractionStats, String> {
-    content_extraction_stats_at(&state.database_path).map_err(str::to_string)
+    content_extraction_stats_with_active_access_grants_at(&state.database_path)
+        .map_err(str::to_string)
 }
 
 #[tauri::command]
 fn recent_content_extractions(
     state: State<'_, ManifestState>,
 ) -> Result<Vec<ExtractionJobProgress>, String> {
-    recent_content_extractions_at(&state.database_path).map_err(str::to_string)
+    let active = active_scope_ids(&state)?;
+    recent_content_extractions_at(&state.database_path)
+        .map(|jobs| {
+            jobs.into_iter()
+                .filter(|job| active.contains(&job.scope_id))
+                .collect()
+        })
+        .map_err(str::to_string)
 }
 
 /// Queues OCR for an already-scanned image. The core service revalidates the
@@ -538,6 +648,7 @@ fn create_screenshot_ocr_job(
     scope_id: i64,
     node_id: i64,
 ) -> Result<ExtractionJobProgress, String> {
+    require_active_scope(&state, scope_id)?;
     let progress = create_screenshot_ocr_job_for_database(&state.database_path, scope_id, node_id)
         .map_err(str::to_string)?;
     log_screenshot_ocr_progress("screenshot_ocr_created", &progress);
@@ -551,6 +662,9 @@ async fn run_screenshot_ocr_job(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ExtractionJobProgress, String> {
+    let pending =
+        require_screenshot_ocr_job(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
     let database_path = state.database_path.clone();
     let progress = tauri::async_runtime::spawn_blocking(move || {
         run_screenshot_ocr_job_at(&database_path, job_id).map_err(str::to_string)
@@ -566,7 +680,10 @@ fn screenshot_ocr_job_status(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ExtractionJobProgress, String> {
-    screenshot_ocr_job_status_at(&state.database_path, job_id).map_err(str::to_string)
+    let progress =
+        screenshot_ocr_job_status_at(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, progress.scope_id)?;
+    Ok(progress)
 }
 
 /// Looks up only the most actionable screenshot OCR job for one already-scanned
@@ -579,6 +696,7 @@ fn screenshot_ocr_job_for_node(
     scope_id: i64,
     node_id: i64,
 ) -> Result<Option<ExtractionJobProgress>, String> {
+    require_active_scope(&state, scope_id)?;
     screenshot_ocr_job_for_node_at(&state.database_path, scope_id, node_id).map_err(str::to_string)
 }
 
@@ -587,6 +705,9 @@ fn cancel_screenshot_ocr_job(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ExtractionJobProgress, String> {
+    let pending =
+        require_screenshot_ocr_job(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
     let progress =
         cancel_screenshot_ocr_job_at(&state.database_path, job_id).map_err(str::to_string)?;
     log_screenshot_ocr_progress("screenshot_ocr_cancel_requested", &progress);
@@ -601,6 +722,9 @@ fn resume_screenshot_ocr_job(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ExtractionJobProgress, String> {
+    let pending =
+        require_screenshot_ocr_job(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
     let progress =
         resume_screenshot_ocr_job_at(&state.database_path, job_id).map_err(str::to_string)?;
     log_screenshot_ocr_progress("screenshot_ocr_resume_requested", &progress);
@@ -609,7 +733,15 @@ fn resume_screenshot_ocr_job(
 
 #[tauri::command]
 fn recent_watch_events(state: State<'_, ManifestState>) -> Result<Vec<WatchEventProgress>, String> {
-    recent_watch_events_for_database(&state.database_path).map_err(str::to_string)
+    let active = active_scope_ids(&state)?;
+    recent_watch_events_for_database(&state.database_path)
+        .map(|events| {
+            events
+                .into_iter()
+                .filter(|event| active.contains(&event.scope_id))
+                .collect()
+        })
+        .map_err(str::to_string)
 }
 
 #[tauri::command]
@@ -624,6 +756,7 @@ fn create_rename_preview(
     source_path: String,
     new_name: String,
 ) -> Result<ActionPlanPreview, String> {
+    require_active_scope(&state, scope_id)?;
     let preview = create_rename_preview_for_database(
         &state.database_path,
         scope_id,
@@ -643,7 +776,15 @@ fn create_rename_preview(
 
 #[tauri::command]
 fn recent_action_plans(state: State<'_, ManifestState>) -> Result<Vec<ActionPlanSummary>, String> {
-    recent_action_plans_for_database(&state.database_path).map_err(str::to_string)
+    let active = active_scope_ids(&state)?;
+    recent_action_plans_for_database(&state.database_path)
+        .map(|plans| {
+            plans
+                .into_iter()
+                .filter(|plan| active.contains(&plan.scope_id))
+                .collect()
+        })
+        .map_err(str::to_string)
 }
 
 #[tauri::command]
@@ -653,8 +794,17 @@ fn search_local(
     filters: SearchFilters,
     limit: Option<u32>,
 ) -> Result<SearchResponse, String> {
-    let response =
+    if let Some(scope_id) = filters.scope_id {
+        require_active_scope(&state, scope_id)?;
+    }
+    let active = active_scope_ids(&state)?;
+    let mut response =
         search_local_at(&state.database_path, &query, &filters, limit).map_err(str::to_string)?;
+    response
+        .results
+        .retain(|result| active.contains(&result.scope_id));
+    response.result_count = u64::try_from(response.results.len())
+        .map_err(|_| "search_result_count_out_of_range".to_string())?;
     info!(
         event = "local_search_completed",
         scope_id = filters.scope_id,
@@ -674,6 +824,8 @@ fn pause_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    let pending = scan_job_status_at(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
     let _database_guard = lock_database(&state)?;
     let progress = pause_manifest_scan_at(&state.database_path, job_id).map_err(str::to_string)?;
     drop(_database_guard);
@@ -687,6 +839,8 @@ fn resume_manifest_scan(
     state: State<'_, ManifestState>,
     job_id: i64,
 ) -> Result<ScanJobProgress, String> {
+    let pending = scan_job_status_at(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
     let _database_guard = lock_database(&state)?;
     let progress = resume_manifest_scan_at(&state.database_path, job_id).map_err(str::to_string)?;
     drop(_database_guard);
@@ -701,6 +855,83 @@ fn initialize_manifest(path: &Path) -> Result<(), &'static str> {
         .map_err(|error| error.code())
 }
 
+fn restore_scope_access_registry(
+    path: &Path,
+) -> Result<HashMap<i64, ActiveScopeAccess>, &'static str> {
+    let database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    let grants = database
+        .list_active_scope_grants()
+        .map_err(|error| error.code())?;
+    let mut restored_accesses = HashMap::new();
+
+    for grant in grants {
+        let restored = match restore_scope_access(&grant.platform, &grant.opaque_grant) {
+            Ok(restored) => restored,
+            Err(error_code) => {
+                database
+                    .mark_scope_access_grant_needs_reauthorization(grant.scope_id)
+                    .map_err(|error| error.code())?;
+                info!(
+                    event = "scope_access_restore_failed",
+                    scope_id = grant.scope_id,
+                    error_code
+                );
+                continue;
+            }
+        };
+        let canonical_root = match validated_scope_root(&database, grant.scope_id) {
+            Ok(root) => root,
+            Err(error) => {
+                database
+                    .mark_scope_access_grant_needs_reauthorization(grant.scope_id)
+                    .map_err(|database_error| database_error.code())?;
+                info!(
+                    event = "scope_access_restore_failed",
+                    scope_id = grant.scope_id,
+                    error_code = error.code()
+                );
+                continue;
+            }
+        };
+        if let Some(resolved_path) = restored.resolved_path.as_deref() {
+            let resolved = match std::fs::canonicalize(resolved_path) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    database
+                        .mark_scope_access_grant_needs_reauthorization(grant.scope_id)
+                        .map_err(|error| error.code())?;
+                    info!(
+                        event = "scope_access_restore_failed",
+                        scope_id = grant.scope_id,
+                        error_code = "scope_canonicalization_failed"
+                    );
+                    continue;
+                }
+            };
+            if comparison_key(&resolved) != comparison_key(&canonical_root) {
+                database
+                    .mark_scope_access_grant_needs_reauthorization(grant.scope_id)
+                    .map_err(|error| error.code())?;
+                info!(
+                    event = "scope_access_restore_failed",
+                    scope_id = grant.scope_id,
+                    error_code = "authorized_scope_identity_changed"
+                );
+                continue;
+            }
+        }
+        if let Some(refreshed_grant) = restored.refreshed_grant.as_deref() {
+            database
+                .upsert_scope_access_grant(grant.scope_id, &grant.platform, refreshed_grant)
+                .map_err(|error| error.code())?;
+        }
+        restored_accesses.insert(grant.scope_id, restored.access);
+    }
+
+    Ok(restored_accesses)
+}
+
+#[cfg(test)]
 fn health_at(path: &Path) -> Result<HealthReport, &'static str> {
     let stats = manifest_status_at(path)?;
     let scope_count = u32::try_from(stats.authorized_scope_count)
@@ -708,9 +939,18 @@ fn health_at(path: &Path) -> Result<HealthReport, &'static str> {
     Ok(collect_health_with_manifest(scope_count))
 }
 
+#[cfg(test)]
 fn manifest_status_at(path: &Path) -> Result<ManifestStats, &'static str> {
     ManifestDatabase::open(path)
         .and_then(|database| database.stats())
+        .map_err(|error| error.code())
+}
+
+fn manifest_status_with_active_access_grants_at(
+    path: &Path,
+) -> Result<ManifestStats, &'static str> {
+    ManifestDatabase::open(path)
+        .and_then(|database| database.stats_with_active_access_grants())
         .map_err(|error| error.code())
 }
 
@@ -720,9 +960,21 @@ fn authorized_scopes_at(path: &Path) -> Result<Vec<AuthorizedScope>, &'static st
         .map_err(|error| error.code())
 }
 
+#[cfg(test)]
 fn authorize_scope_at(path: &Path, requested_path: &Path) -> Result<AuthorizedScope, &'static str> {
     let database = ManifestDatabase::open(path).map_err(|error| error.code())?;
     authorize_scope(&database, requested_path).map_err(|error| error.code())
+}
+
+fn authorize_scope_with_access_grant_at(
+    path: &Path,
+    requested_path: &Path,
+    grant_platform: &str,
+    opaque_grant: &[u8],
+) -> Result<AuthorizedScope, &'static str> {
+    let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    authorize_scope_with_access_grant(&mut database, requested_path, grant_platform, opaque_grant)
+        .map_err(|error| error.code())
 }
 
 fn create_manifest_scan_at(path: &Path, scope_id: i64) -> Result<ScanJobProgress, &'static str> {
@@ -781,8 +1033,17 @@ fn recent_scan_jobs_at(path: &Path) -> Result<Vec<ScanJobProgress>, &'static str
         .map_err(|error| error.code())
 }
 
+#[cfg(test)]
 fn content_extraction_stats_at(path: &Path) -> Result<ExtractionStats, &'static str> {
     read_extraction_stats_at(path).map_err(|error| error.code())
+}
+
+fn content_extraction_stats_with_active_access_grants_at(
+    path: &Path,
+) -> Result<ExtractionStats, &'static str> {
+    ManifestDatabase::open(path)
+        .and_then(|database| database.extraction_stats_with_active_access_grants())
+        .map_err(|error| error.code())
 }
 
 fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgress>, &'static str> {
@@ -935,6 +1196,7 @@ pub fn run() {
     info!(event = "desktop_starting");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data = app
                 .path()
@@ -942,14 +1204,18 @@ pub fn run() {
                 .map_err(|_| "app_data_path_unavailable")?;
             let database_path = app_data.join("manifest.sqlite3");
             initialize_manifest(&database_path)?;
-            app.manage(start_manifest_state(database_path));
+            let scope_accesses = restore_scope_access_registry(&database_path)?;
+            app.manage(start_manifest_state_with_accesses(
+                database_path,
+                scope_accesses,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             health,
             manifest_status,
             authorized_scopes,
-            authorize_scope_path,
+            select_and_authorize_scope,
             create_manifest_scan,
             run_manifest_scan,
             scan_job_status,
@@ -1022,6 +1288,39 @@ mod tests {
     }
 
     #[test]
+    fn macos_bundle_security_configuration_is_explicit_and_bounded() {
+        let entitlements = include_str!("../Entitlements.plist");
+        for required_key in [
+            "com.apple.security.app-sandbox",
+            "com.apple.security.files.user-selected.read-write",
+            "com.apple.security.files.bookmarks.app-scope",
+            "com.apple.security.network.client",
+        ] {
+            assert_eq!(
+                entitlements.matches(required_key).count(),
+                1,
+                "required macOS entitlement must appear exactly once: {required_key}"
+            );
+        }
+        assert!(!entitlements.contains("com.apple.security.network.server"));
+
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("Tauri configuration should remain valid JSON");
+        let security = &config["app"]["security"];
+        let production_csp = security["csp"]
+            .as_str()
+            .expect("production CSP should be configured");
+        let development_csp = security["devCsp"]
+            .as_str()
+            .expect("development CSP should be configured separately");
+
+        assert!(!production_csp.contains("localhost:1420"));
+        assert!(!production_csp.contains("ws://"));
+        assert!(development_csp.contains("http://localhost:1420"));
+        assert!(development_csp.contains("ws://localhost:1420"));
+    }
+
+    #[test]
     fn initialized_health_uses_the_shared_domain_contract() {
         let directory = tempfile::tempdir().expect("fixture root should exist");
         let database_path = directory.path().join("manifest.sqlite3");
@@ -1030,6 +1329,201 @@ mod tests {
         let report = health_at(&database_path).expect("health should load");
         assert_eq!(report.database.state, LifecycleState::Ready);
         assert_eq!(report.privacy.authorized_scope_count, 0);
+    }
+
+    #[test]
+    fn native_scope_grant_persists_restores_and_stays_out_of_ipc_scope_shape() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("selected-scope");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+
+        let prepared = prepare_selected_scope(&scope_path).expect("selection should prepare");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &prepared.resolved_path,
+            prepared.platform,
+            &prepared.opaque_grant,
+        )
+        .expect("scope and grant should persist atomically");
+        drop(prepared.access);
+
+        let restored = restore_scope_access_registry(&database_path)
+            .expect("stored selection should restore safely");
+        assert!(restored.contains_key(&scope.id));
+        let ordinary_scopes = authorized_scopes_at(&database_path).expect("scopes should load");
+        let payload = serde_json::to_string(&ordinary_scopes).expect("scopes should serialize");
+        assert!(!payload.contains("opaque_grant"));
+        assert!(!payload.contains("access_grant"));
+        assert_eq!(ordinary_scopes, vec![scope]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invalid_bookmark_is_durably_downgraded_to_reauthorization_required() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("selected-scope");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &scope_path,
+            std::env::consts::OS,
+            b"not-a-security-scoped-bookmark",
+        )
+        .expect("fixture grant should persist");
+
+        assert!(
+            restore_scope_access_registry(&database_path)
+                .expect("invalid grant should fail closed without blocking startup")
+                .is_empty()
+        );
+        let database = ManifestDatabase::open(&database_path).expect("database should open");
+        assert_eq!(
+            database
+                .scope_access_grant_state(scope.id)
+                .expect("grant state should load"),
+            deskgraph_database::ScopeAccessGrantState::NeedsReauthorization
+        );
+    }
+
+    #[test]
+    fn desktop_commands_fail_closed_for_a_completed_scope_without_a_live_grant() {
+        let private_marker = "scope-grant-command-private";
+        let image = png_bytes(64, 64, private_marker.as_bytes());
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("private-screenshot.png", image);
+        let scan_job = recent_scan_jobs_at(&database_path)
+            .expect("scan jobs should load")
+            .into_iter()
+            .find(|job| job.scope_id == scope.id)
+            .expect("completed scan job should exist");
+        let ocr_job = create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
+            .expect("OCR fixture job should queue before runtime gating");
+        let source_path = Path::new(&scope.display_path).join("private-screenshot.png");
+
+        let app = tauri::test::mock_builder()
+            .manage(start_manifest_state(database_path.clone()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Desktop app should build");
+
+        assert!(
+            authorized_scopes(app.state())
+                .expect("scope list should load")
+                .is_empty()
+        );
+        let manifest = manifest_status(app.state()).expect("manifest status should load");
+        assert_eq!(manifest.authorized_scope_count, 0);
+        assert_eq!(manifest.node_count, 0);
+        assert_eq!(manifest.completed_scan_count, 0);
+        let extraction =
+            content_extraction_stats(app.state()).expect("extraction stats should load");
+        assert_eq!(extraction.active_chunk_count, 0);
+        assert_eq!(extraction.completed_job_count, 0);
+        assert!(
+            recent_scan_jobs(app.state())
+                .expect("scan jobs should filter")
+                .is_empty()
+        );
+        assert!(
+            recent_content_extractions(app.state())
+                .expect("extraction jobs should filter")
+                .is_empty()
+        );
+        assert!(
+            recent_watch_events(app.state())
+                .expect("watch history should filter")
+                .is_empty()
+        );
+        assert!(
+            recent_action_plans(app.state())
+                .expect("action history should filter")
+                .is_empty()
+        );
+
+        for error in [
+            create_manifest_scan(app.state(), scope.id)
+                .expect_err("scan create must require a live grant"),
+            scan_job_status(app.state(), scan_job.job_id)
+                .expect_err("scan status must require a live grant"),
+            pause_manifest_scan(app.state(), scan_job.job_id)
+                .expect_err("scan pause must require a live grant"),
+            resume_manifest_scan(app.state(), scan_job.job_id)
+                .expect_err("scan resume must require a live grant"),
+            create_screenshot_ocr_job(app.state(), scope.id, node_id)
+                .expect_err("OCR create must require a live grant"),
+            screenshot_ocr_job_status(app.state(), ocr_job.job_id)
+                .expect_err("OCR status must require a live grant"),
+            screenshot_ocr_job_for_node(app.state(), scope.id, node_id)
+                .expect_err("OCR lookup must require a live grant"),
+            cancel_screenshot_ocr_job(app.state(), ocr_job.job_id)
+                .expect_err("OCR cancel must require a live grant"),
+            resume_screenshot_ocr_job(app.state(), ocr_job.job_id)
+                .expect_err("OCR resume must require a live grant"),
+            create_rename_preview(
+                app.state(),
+                scope.id,
+                source_path.to_string_lossy().into_owned(),
+                "renamed.png".to_string(),
+            )
+            .expect_err("rename preview must require a live grant"),
+            search_local(
+                app.state(),
+                "private".to_string(),
+                SearchFilters {
+                    scope_id: Some(scope.id),
+                    source: SearchSourceFilter::All,
+                    extension: None,
+                    modified_since_unix_seconds: None,
+                    modified_before_unix_seconds: None,
+                },
+                Some(10),
+            )
+            .expect_err("scoped search must require a live grant"),
+        ] {
+            assert_eq!(error, "scope_reauthorization_required");
+        }
+
+        assert_eq!(
+            tauri::async_runtime::block_on(run_manifest_scan(app.state(), scan_job.job_id))
+                .expect_err("scan run must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(run_screenshot_ocr_job(app.state(), ocr_job.job_id,))
+                .expect_err("OCR run must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        let all_scope_search = search_local(
+            app.state(),
+            "private".to_string(),
+            SearchFilters {
+                scope_id: None,
+                source: SearchSourceFilter::All,
+                extension: None,
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+            },
+            Some(10),
+        )
+        .expect("unscoped search should return only active scopes");
+        assert_eq!(all_scope_search.result_count, 0);
+        assert!(all_scope_search.results.is_empty());
+
+        assert!(source_path.exists());
+        assert_eq!(
+            recent_scan_jobs_at(&database_path)
+                .expect("underlying scan jobs should remain")
+                .len(),
+            1
+        );
+        assert!(
+            recent_action_plans_for_database(&database_path)
+                .expect("no action should be created")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1393,6 +1887,53 @@ mod tests {
             .expect("extraction should create");
         run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
             .expect("extraction should complete");
+
+        let inactive_manifest = manifest_status_with_active_access_grants_at(&database_path)
+            .expect("inactive manifest stats should load");
+        let inactive_extraction =
+            content_extraction_stats_with_active_access_grants_at(&database_path)
+                .expect("inactive extraction stats should load");
+        assert_eq!(inactive_manifest.authorized_scope_count, 0);
+        assert_eq!(inactive_manifest.node_count, 0);
+        assert_eq!(inactive_manifest.completed_scan_count, 0);
+        assert_eq!(inactive_extraction.active_chunk_count, 0);
+        assert_eq!(inactive_extraction.extracted_file_count, 0);
+        assert_eq!(inactive_extraction.completed_job_count, 0);
+
+        let database = ManifestDatabase::open(&database_path).expect("database should open");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"opaque-test-grant")
+            .expect("fixture grant should become active");
+        drop(database);
+        assert_eq!(
+            manifest_status_with_active_access_grants_at(&database_path)
+                .expect("active manifest stats should load"),
+            manifest_status_at(&database_path).expect("general manifest stats should load")
+        );
+        assert_eq!(
+            content_extraction_stats_with_active_access_grants_at(&database_path)
+                .expect("active extraction stats should load"),
+            content_extraction_stats_at(&database_path)
+                .expect("general extraction stats should load")
+        );
+
+        let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        database
+            .mark_scope_access_grant_revoked(scope.id)
+            .expect("fixture grant should revoke");
+        drop(database);
+        assert_eq!(
+            manifest_status_with_active_access_grants_at(&database_path)
+                .expect("revoked manifest stats should load")
+                .node_count,
+            0
+        );
+        assert_eq!(
+            content_extraction_stats_with_active_access_grants_at(&database_path)
+                .expect("revoked extraction stats should load")
+                .active_chunk_count,
+            0
+        );
 
         let payload = serde_json::to_string(&(
             content_extraction_stats_at(&database_path).expect("stats should load"),

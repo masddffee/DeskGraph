@@ -193,7 +193,6 @@ export type Catalog = {
     description: string;
     count: (count: number) => string;
     inputLabel: string;
-    placeholder: string;
     authorize: string;
     emptyHeading: string;
     emptyDescription: string;
@@ -204,7 +203,7 @@ export type Catalog = {
     resume: string;
     scan: string;
     validation: {
-      required: string;
+      cancelled: string;
       validating: string;
       authorized: string;
       denied: string;

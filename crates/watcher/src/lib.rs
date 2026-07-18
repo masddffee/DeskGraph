@@ -135,10 +135,18 @@ pub struct WatchCoordinator {
     database: ManifestDatabase,
     watch_policy: WatchPolicy,
     polling_policy: PollingWatchPolicy,
+    scope_access_policy: WatchScopeAccessPolicy,
+    runtime_active_scope_ids: Option<BTreeSet<i64>>,
     next_poll_by_scope: BTreeMap<i64, i64>,
     deferred_scope_due_at: BTreeMap<i64, i64>,
     event_retry_at: BTreeMap<i64, i64>,
     scope_errors: BTreeMap<i64, &'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchScopeAccessPolicy {
+    CompletedScan,
+    ActivePlatformGrant,
 }
 
 impl WatchCoordinator {
@@ -151,19 +159,100 @@ impl WatchCoordinator {
         Ok(Self::from_database(database, watch_policy, polling_policy))
     }
 
+    /// Opens the packaged Desktop coordinator. Unlike the general core/CLI
+    /// constructor, this never watches a completed scope unless its current
+    /// platform access grant remains active.
+    pub fn open_requiring_active_platform_grants(
+        database_path: &Path,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+    ) -> Result<Self, WatcherError> {
+        let database = ManifestDatabase::open(database_path)?;
+        Ok(Self::from_database_with_scope_access_policy(
+            database,
+            watch_policy,
+            polling_policy,
+            WatchScopeAccessPolicy::ActivePlatformGrant,
+        ))
+    }
+
     pub fn from_database(
         database: ManifestDatabase,
         watch_policy: WatchPolicy,
         polling_policy: PollingWatchPolicy,
     ) -> Self {
+        Self::from_database_with_scope_access_policy(
+            database,
+            watch_policy,
+            polling_policy,
+            WatchScopeAccessPolicy::CompletedScan,
+        )
+    }
+
+    fn from_database_with_scope_access_policy(
+        database: ManifestDatabase,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+        scope_access_policy: WatchScopeAccessPolicy,
+    ) -> Self {
         Self {
             database,
             watch_policy,
             polling_policy,
+            scope_access_policy,
+            runtime_active_scope_ids: match scope_access_policy {
+                WatchScopeAccessPolicy::CompletedScan => None,
+                WatchScopeAccessPolicy::ActivePlatformGrant => Some(BTreeSet::new()),
+            },
             next_poll_by_scope: BTreeMap::new(),
             deferred_scope_due_at: BTreeMap::new(),
             event_retry_at: BTreeMap::new(),
             scope_errors: BTreeMap::new(),
+        }
+    }
+
+    fn watchable_scope_ids(&self) -> Result<Vec<i64>, WatcherError> {
+        let scope_ids = match self.scope_access_policy {
+            WatchScopeAccessPolicy::CompletedScan => self.database.watchable_scope_ids(),
+            WatchScopeAccessPolicy::ActivePlatformGrant => self
+                .database
+                .watchable_scope_ids_with_active_access_grants(),
+        }?;
+        Ok(self.intersect_runtime_active_scope_ids(scope_ids))
+    }
+
+    fn authorized_scope_count(&self) -> Result<usize, WatcherError> {
+        let scope_ids = match self.scope_access_policy {
+            WatchScopeAccessPolicy::CompletedScan => self
+                .database
+                .list_scopes()?
+                .into_iter()
+                .map(|scope| scope.id)
+                .collect::<Vec<_>>(),
+            WatchScopeAccessPolicy::ActivePlatformGrant => {
+                self.database.active_scope_access_grant_ids()?
+            }
+        };
+        Ok(self.intersect_runtime_active_scope_ids(scope_ids).len())
+    }
+
+    fn intersect_runtime_active_scope_ids(&self, scope_ids: Vec<i64>) -> Vec<i64> {
+        match self.runtime_active_scope_ids.as_ref() {
+            Some(runtime_active) => scope_ids
+                .into_iter()
+                .filter(|scope_id| runtime_active.contains(scope_id))
+                .collect(),
+            None => scope_ids,
+        }
+    }
+
+    /// Supplies the exact scopes whose platform capability is live in the
+    /// packaged Desktop process. Durable `active` state alone is insufficient:
+    /// the RAII access guard must also exist for this runtime.
+    pub fn replace_runtime_active_scope_ids(&mut self, scope_ids: impl IntoIterator<Item = i64>) {
+        if let Some(runtime_active) = self.runtime_active_scope_ids.as_mut() {
+            runtime_active.clear();
+            runtime_active.extend(scope_ids.into_iter().filter(|scope_id| *scope_id > 0));
         }
     }
 
@@ -172,7 +261,7 @@ impl WatchCoordinator {
         source: &mut NativeWatchEventSource,
     ) -> Result<bool, WatcherError> {
         let now_unix_ms = unix_ms()?;
-        let watchable_scope_ids = self.database.watchable_scope_ids()?;
+        let watchable_scope_ids = self.watchable_scope_ids()?;
         let watchable_scope_set = watchable_scope_ids.iter().copied().collect::<BTreeSet<_>>();
         let mut scopes = Vec::with_capacity(watchable_scope_ids.len());
         for scope_id in watchable_scope_ids {
@@ -196,9 +285,20 @@ impl WatchCoordinator {
         if now_unix_ms < 0 {
             return Err(WatcherError::InvalidTimestamp);
         }
-        let scope_ids = self.database.watchable_scope_ids()?;
-        self.database
-            .request_all_scope_full_reconciliation_at(now_unix_ms)?;
+        let scope_ids = self.watchable_scope_ids()?;
+        match self.scope_access_policy {
+            WatchScopeAccessPolicy::CompletedScan => {
+                self.database
+                    .request_all_scope_full_reconciliation_at(now_unix_ms)?;
+            }
+            WatchScopeAccessPolicy::ActivePlatformGrant => {
+                self.database
+                    .request_live_active_granted_scope_full_reconciliation_at(
+                        &scope_ids,
+                        now_unix_ms,
+                    )?;
+            }
+        }
         for scope_id in scope_ids {
             self.next_poll_by_scope.insert(scope_id, now_unix_ms);
         }
@@ -238,19 +338,23 @@ impl WatchCoordinator {
         if batch.reconcile_all || batch.source_failed {
             self.request_all_scope_reconciliation_at(now_unix_ms)?;
         }
+        let watchable_scope_ids = self
+            .watchable_scope_ids()?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         for scope_id in &batch.reconcile_scope_ids {
-            if self.database.scope_has_completed_scan(*scope_id)? {
+            if watchable_scope_ids.contains(scope_id) {
                 self.database
                     .request_scope_full_reconciliation_at(*scope_id, now_unix_ms)?;
                 self.next_poll_by_scope.insert(*scope_id, now_unix_ms);
             }
         }
-        let hint_scope_count =
-            u64::try_from(batch.hints.len()).map_err(|_| WatcherError::InvalidRuntimeCount)?;
+        let mut hint_scope_count = 0_u64;
         for hint in batch.hints {
-            if !self.database.scope_has_completed_scan(hint.scope_id)? {
+            if !watchable_scope_ids.contains(&hint.scope_id) {
                 continue;
             }
+            hint_scope_count = hint_scope_count.saturating_add(1);
             if let Err(error) = observe_watch_path_at_time(
                 &mut self.database,
                 hint.scope_id,
@@ -290,12 +394,11 @@ impl WatchCoordinator {
             return Err(WatcherError::InvalidTimestamp);
         }
 
-        let scopes = self.database.list_scopes()?;
         let scope_ids = self
-            .database
             .watchable_scope_ids()?
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let authorized_scope_count = self.authorized_scope_count()?;
         self.next_poll_by_scope
             .retain(|scope_id, _| scope_ids.contains(scope_id));
         self.deferred_scope_due_at
@@ -308,11 +411,16 @@ impl WatchCoordinator {
                 .or_insert(now_unix_ms);
         }
 
-        let active_before = self.database.active_watch_events()?;
+        let active_before = self
+            .database
+            .active_watch_events()?
+            .into_iter()
+            .filter(|event| scope_ids.contains(&event.scope_id))
+            .collect::<Vec<_>>();
         let mut report = WatchCycleReport {
             api_version: WatchCycleReport::API_VERSION,
             cycle_unix_ms: now_unix_ms,
-            authorized_scope_count: u64::try_from(scopes.len())
+            authorized_scope_count: u64::try_from(authorized_scope_count)
                 .map_err(|_| WatcherError::InvalidRuntimeCount)?,
             active_event_count: u64::try_from(active_before.len())
                 .map_err(|_| WatcherError::InvalidRuntimeCount)?,
@@ -427,6 +535,7 @@ impl WatchCoordinator {
             .database
             .active_watch_events()?
             .into_iter()
+            .filter(|event| scope_ids.contains(&event.scope_id))
             .map(|event| event.scope_id)
             .collect::<BTreeSet<_>>();
         self.deferred_scope_due_at
@@ -2040,6 +2149,89 @@ mod tests {
         assert_eq!(before_scan.scheduled_scope_count, 0);
         assert_eq!(before_scan.active_event_count, 0);
         assert_eq!(before_scan.next_wake_unix_ms, 1_000 + MIN_POLL_INTERVAL_MS);
+    }
+
+    #[test]
+    fn desktop_coordinator_excludes_completed_scopes_without_an_active_platform_grant() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let legacy_path = directory.path().join("legacy");
+        let active_path = directory.path().join("active");
+        let durable_only_path = directory.path().join("durable-only");
+        fs::create_dir(&legacy_path).expect("legacy scope should create");
+        fs::create_dir(&active_path).expect("active scope should create");
+        fs::create_dir(&durable_only_path).expect("durable-only scope should create");
+        fs::write(legacy_path.join("legacy.md"), "legacy").expect("legacy file should create");
+        fs::write(active_path.join("active.md"), "active").expect("active file should create");
+        fs::write(durable_only_path.join("durable.md"), "durable")
+            .expect("durable-only file should create");
+
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let legacy = authorize_scope(&database, &legacy_path).expect("legacy scope should persist");
+        let active = authorize_scope(&database, &active_path).expect("active scope should persist");
+        let durable_only = authorize_scope(&database, &durable_only_path)
+            .expect("durable-only scope should persist");
+        scan_scope(&mut database, legacy.id).expect("legacy scan should complete");
+        scan_scope(&mut database, active.id).expect("active scan should complete");
+        scan_scope(&mut database, durable_only.id).expect("durable-only scan should complete");
+        database
+            .upsert_scope_access_grant(active.id, std::env::consts::OS, b"opaque-grant")
+            .expect("active grant should persist");
+        database
+            .upsert_scope_access_grant(durable_only.id, std::env::consts::OS, b"durable-only-grant")
+            .expect("durable-only grant should persist");
+
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator = WatchCoordinator::from_database_with_scope_access_policy(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+            WatchScopeAccessPolicy::ActivePlatformGrant,
+        );
+        let before_runtime_grant = coordinator
+            .run_cycle_at_time(900)
+            .expect("durable grant without a live guard should remain excluded");
+        assert_eq!(before_runtime_grant.authorized_scope_count, 0);
+        assert!(coordinator.next_poll_by_scope.is_empty());
+        coordinator
+            .request_all_scope_reconciliation_at(950)
+            .expect("no live runtime grants should make the request a no-op");
+        assert!(
+            coordinator
+                .database
+                .active_watch_events()
+                .expect("watch events should load")
+                .is_empty(),
+            "durable active grants without live runtime guards must not create events"
+        );
+
+        coordinator.replace_runtime_active_scope_ids([active.id]);
+        coordinator
+            .request_all_scope_reconciliation_at(975)
+            .expect("the live runtime scope should request reconciliation");
+        assert_eq!(
+            coordinator
+                .database
+                .active_watch_events()
+                .expect("watch events should load")
+                .into_iter()
+                .map(|event| event.scope_id)
+                .collect::<Vec<_>>(),
+            vec![active.id],
+            "a durable active scope without a live runtime guard must remain excluded"
+        );
+        let report = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("strict Desktop cycle should run");
+
+        assert_eq!(report.authorized_scope_count, 1);
+        assert!(coordinator.next_poll_by_scope.contains_key(&active.id));
+        assert!(!coordinator.next_poll_by_scope.contains_key(&legacy.id));
+        assert!(
+            !coordinator
+                .next_poll_by_scope
+                .contains_key(&durable_only.id)
+        );
     }
 
     #[test]

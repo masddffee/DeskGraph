@@ -252,11 +252,10 @@ export const ja = {
     kicker: '明示的な許可',
     heading: 'DeskGraph が検査できるフォルダー',
     description:
-      '存在するフォルダーパスを入力してください。許可とスキャンは別の操作です。シンボリックリンクと非表示エントリは追跡しません。',
+      'システムのフォルダー選択画面で 1 つのフォルダーを選び、ローカルアクセスを明示的に許可します。許可とスキャンは別の操作です。シンボリックリンクと非表示エントリは追跡しません。既存の範囲は更新またはシステム変更後に再許可が必要になる場合があります。',
     count: (count) => `${formatIntegerForLocale(count, 'ja')} 件を許可済み`,
-    inputLabel: 'フォルダーパス',
-    placeholder: '/Users/you/Documents or C:\\Users\\you\\Documents',
-    authorize: 'フォルダーを許可',
+    inputLabel: 'システム選択画面でフォルダーを選ぶ',
+    authorize: '許可するフォルダーを選ぶ',
     emptyHeading: 'フォルダーへのアクセス権がありません',
     emptyDescription:
       'ここに追加するまで、DeskGraph はデスクトップ、ダウンロード、またはドキュメントを検査できません。',
@@ -268,11 +267,12 @@ export const ja = {
     resume: 'スキャンを再開',
     scan: 'メタデータをスキャン',
     validation: {
-      required: 'まず存在するフォルダーパスを入力してください。',
-      validating: 'フォルダー境界を検証中…',
+      cancelled: 'フォルダー選択をキャンセルしました。アクセス権は追加されていません。',
+      validating: 'フォルダーの選択を待機してから、フォルダー境界を検証しています…',
       authorized:
         'フォルダーを許可しました。「メタデータをスキャン」を選ぶまで、何もスキャンされません。',
-      denied: 'フォルダーを許可できませんでした。存在し、保護されていないことを確認してください。',
+      denied:
+        '選択したフォルダーを許可できませんでした。利用できない、保護されている、または再許可が必要な可能性があります。',
       reading: '許可済みフォルダー内のメタデータを読み取り中…',
       complete: (files, folders) =>
         `スキャン完了：${formatIntegerForLocale(files, 'ja')} 個のファイルと ${formatIntegerForLocale(folders, 'ja')} 個のフォルダー。`,
