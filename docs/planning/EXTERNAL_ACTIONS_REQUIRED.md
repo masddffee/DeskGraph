@@ -36,11 +36,44 @@ Provide through a protected GitHub environment, never repository files:
 - notarization credentials using an App Store Connect API key or approved Apple ID flow;
 - updater signing private key stored as an environment secret.
 
+ADR-027 also requires the owner to approve the final macOS application identifier, minimum
+supported macOS version, and App Sandbox entitlement set. The local implementation must provide a
+native folder-selection flow and security-scoped bookmark persistence/revocation. A per-app-
+container `flock` remains a candidate until the selected OS version's SIP contract and a signed
+hostile probe prove that a non-entitled same-user process cannot silently open, unlink, rename, or
+recreate its entry without a user-authorized exception. If that proof fails, macOS production
+actions remain unavailable. Do not add an App Group unless a later accepted helper-topology ADR
+names the exact group, members, Team ID binding, IPC contract, and uninstall behavior.
+
+On clean signed arm64 and Intel-or-Universal installs, preserve evidence for: the exact OS version
+and SIP/container contract; container identity validation without recording the path in ordinary
+logs; first scope selection; bookmark restore after restart; user revocation; denied unselected
+folders; unsigned/unsandboxed action denial; and a non-entitled same-user probe that attempts to
+open/unlink/rename/recreate the fence entry without user consent. Only after that proof passes may
+the matrix cover two-process fence contention, paused-owner exclusion beyond the SQLite lease,
+forced-crash release, close-on-exec, app update, repair/reinstall and uninstall behavior. The run
+must prove the fence is acquired before the action database opens and must not enable the
+ADR-026-rejected general Unix Rename/Move adapter.
+
 Exact secret names and validation commands will be fixed when the Tauri packaging workflow is implemented and reviewed against current official documentation.
 
 ## Windows code signing (needed in M9)
 
 Provide a protected certificate or signing service, its non-repository secret references, timestamp authority, and access policy. Verify signatures on a clean Windows VM before calling artifacts production-ready.
+
+ADR-027 requires one stable Windows package identity shared by native OCR and the action fence.
+The owner must approve the package name, publisher subject/identity, installer channel and update
+identity; provide the matching signing certificate; and state whether distribution uses Store
+identity or a reviewed non-Store MSIX/external-location identity. Do not claim AppContainer: the
+accepted v0.1 design is packaged classic desktop medium-integrity code unless separately changed.
+
+On a clean Windows x64 VM, record package-family identity stability across install and update,
+unpackaged denial, repair, uninstall and reinstall. Then prove the protected private namespace,
+boundary descriptor/DACL, same-native-thread mutex ownership/release, non-inheritable handles,
+two-process contention, paused-owner exclusion beyond the SQLite lease, terminated-owner
+`WAIT_ABANDONED` recovery-only behavior, namespace squatting/replacement denial, fail-before-
+database ordering, and no SQLite WAL interference. Package names, SIDs, filesystem paths and
+security descriptors must not enter ordinary product logs.
 
 ## Clean-machine validation (needed in M9)
 
@@ -76,9 +109,9 @@ Filename-version Windows evidence must additionally cover separator/case normali
 
 ## M5 platform action fault matrix (required before any execution control)
 
-ADR-026 resolves D-018 by rejecting general macOS/Linux Rename/Move execution for user-authorized scopes. The leaf-name adapter remains test-only and all production targets currently return `action_platform_rename_unsupported`; clean-machine testing must not enable it by configuration or patch around that gate. Run the complete matrix for the separately reviewed Windows exact-handle adapter and for any future Unix design only after a new OS primitive or managed-namespace ADR supersedes ADR-026. D-019 must additionally accept a packaged-private process fence. Linux evidence remains experimental and cannot delay required macOS/Windows release evidence; this does not turn the rejected Unix adapter into an experimental production feature.
+ADR-026 resolves D-018 by rejecting general macOS/Linux Rename/Move execution for user-authorized scopes. The leaf-name adapter remains test-only and all production targets currently return `action_platform_rename_unsupported`; clean-machine testing must not enable it by configuration or patch around that gate. Run the complete matrix for the separately reviewed Windows exact-handle adapter and for any future Unix design only after a new OS primitive or managed-namespace ADR supersedes ADR-026. ADR-027 resolves D-019's architecture, but its packaged identity, platform fence implementations, and real runtime evidence remain mandatory before any action entry is exposed. Linux evidence remains experimental and cannot delay required macOS/Windows release evidence; this does not turn the rejected Unix adapter into an experimental production feature.
 
-For each accepted platform adapter, use disposable test scopes and prove normal Rename and Undo plus: two competing processes; repeated request/lost response; a child process paused after durable intent for longer than the database lease while recovery attempts to claim work; process kill at every durable boundary; database reopen; permission denial; parent durability failure; source/root/parent replacement; symlink/reparse and post-preview hard-link insertion; same-size/same-mtime content replacement; destination creation and overwrite denial; both names present or absent; post-action identity/hash mismatch; removable-volume disconnect; request/result/log privacy; and bounded 8 GiB/90-second hash behavior. A future accepted process fence must be released by crash, prevent recovery while a stopped live executor holds it, live in a trusted private or otherwise replacement-resistant namespace, resist unlink/rename/recreate attempts by another process, and not interfere with SQLite WAL locking. No such fence is currently implemented or accepted. No automatic syscall retry, rollback-by-guess, delete, permanent-delete, empty-trash, shell command, LLM, MCP, Watch or Inbox action is permitted.
+For each accepted platform adapter, use disposable test scopes and prove normal Rename and Undo plus: two competing processes; repeated request/lost response; a child process paused after durable intent for longer than the database lease while recovery attempts to claim work; process kill at every durable boundary; database reopen; permission denial; parent durability failure; source/root/parent replacement; symlink/reparse and post-preview hard-link insertion; same-size/same-mtime content replacement; destination creation and overwrite denial; both names present or absent; post-action identity/hash mismatch; removable-volume disconnect; request/result/log privacy; and bounded 8 GiB/90-second hash behavior. ADR-027's accepted process-fence contract must be released by crash, prevent recovery while a stopped live executor holds it, live in its specified trusted namespace, resist replacement/inheritance attempts, and not interfere with SQLite WAL locking. No platform fence is currently implemented or runtime-accepted. No automatic syscall retry, rollback-by-guess, delete, permanent-delete, empty-trash, shell command, LLM, MCP, Watch or Inbox action is permitted.
 
 macOS/Linux testing must include a deterministic adversarial interleaving that replaces the ordinary source leaf after final identity revalidation and before the namespace mutation. If the accepted design cannot make that interleaving fail before moving the replacement file, the adapter remains unavailable. Windows must use a separately reviewed handle-bound `FILE_RENAME_INFO`/`SetFileInformationByHandle` design with `ReplaceIfExists = false`, reparse-safe root/parent/source handles and real NTFS runtime evidence; a path-based fallback is forbidden.
 

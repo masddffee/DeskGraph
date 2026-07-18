@@ -1,6 +1,6 @@
 # DeskGraph v0.1 Task Graph
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 ## Dependency graph
 
@@ -17,9 +17,12 @@ M0 Foundation
 │       ├── M6 Smart Cleanup system-trash actions
 │       ├── M7 preview_organization_plan
 │       └── M8 Preview + History/Undo UI
+├── M9a Packaged runtime identity foundation
+│   ├── M2 Windows OCR runtime evidence
+│   └── M5 production action fence
 ├── Security, fixtures, benchmarks (continuous)
 ├── Docs/demo (continuous, claims gated by implementation)
-└── M9 Release Engineering foundation
+└── M9 Remaining release engineering
     └── M10 Launch (only after verified public release)
 ```
 
@@ -30,11 +33,12 @@ M0 Foundation
 3. **M2** — safely extract required formats and OCR into provenance-bearing chunks.
 4. **M3** — deliver model-optional multilingual hybrid retrieval with diagnostics.
 5. **M4** — create explainable/correctable project, folder, related, duplicate, and version relations.
-6. **M5** — prove preview → validate → durable execute → recover → undo for Move, Rename and system-trash moves, with no permanent-delete or empty-trash path.
-7. **M6 + M8** — make ingestion continuous and Smart Inbox／Smart Cleanup suggestions, explicit confirmation, history and Undo usable.
-8. **M7** — expose only read-only, minimum-necessary, scope-enforced MCP context.
-9. **M9** — measure security/performance, package, sign, verify, generate SBOM/checksums/updater, publish.
-10. **M10** — launch only a publicly downloadable, verified build and operate issues/hotfixes.
+6. **M9a** — establish verifiable Windows package family identity and macOS App Sandbox scope/container identity before any production action fence or Windows OCR runtime claim; macOS also needs a supported-version protected-container replacement proof or remains unavailable.
+7. **M5** — prove preview → validate → durable execute → recover → undo for accepted platform Rename/Move/system-trash operations, with no permanent-delete or empty-trash path. General Unix Rename/Move remains Preview-only under ADR-026.
+8. **M6 + M8** — make ingestion continuous and Smart Inbox／Smart Cleanup suggestions, explicit confirmation, history and Undo usable.
+9. **M7** — expose only read-only, minimum-necessary, scope-enforced MCP context.
+10. **M9** — finish security/performance evidence, installers, signing, updater, SBOM/checksums, and publishing.
+11. **M10** — launch only a publicly downloadable, verified build and operate issues/hotfixes.
 
 ## Parallel workstreams
 
@@ -95,10 +99,18 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 - Next: add deterministic related candidates and explainable screenshot groups with provenance/current-data invalidation and evaluation. Screenshot grouping depends on current M2 image metadata and any used OCR/provider provenance; time proximity, filename similarity or model confidence alone cannot prove disposability. Background duplicate discovery and larger-file hashing need a separate bounded design. Resolve D-013 before cross-root learned scoring and D-016 before merge/split; add file-membership correction, retrieval filters, and a backend-owned Project page only after those source-of-truth contracts pass. Exact duplicates, evidence-backed versions and screenshot groups may feed Smart Cleanup suggestions only; none authorizes a file action.
 - Exit with explainable low-confidence behavior and correction feedback evidence.
 
+### Step 5.5 — M9a packaged runtime identity foundation
+
+- Context: ADR-027 makes a verifiable OS package/container identity a prerequisite for the action process fence; Windows native OCR already depends on package identity. This is a narrow dependency inversion, not early completion of M9.
+- Build: macOS signed App Sandbox entitlements plus native folder selection/security-scoped bookmark lifecycle and a version-gated SIP-protected container candidate; Windows packaged identity shared by OCR and the future protected private-namespace fence. Preserve the current local-first, no-network and explicit-scope contracts.
+- Tests: unsigned/unpackaged denial, bookmark restore/revocation and scope escape, a non-entitled same-user macOS fence-entry replacement probe without user-authorized exception, package-family stability, path-free failures, installer update/repair/uninstall behavior, and clean-machine macOS arm64/Intel-or-Universal plus Windows x64 evidence.
+- Exit: the packaged app can prove its platform identity and explicitly authorized scope without enabling Execute, recovery, Undo, or adding a helper/daemon. Only then may Step 6 implement the process fence.
+
 ### Step 6 — M5 transaction safety
 
 - Current: ADR-017 plus ADR-025's protocol foundation bind a same-folder scanned-file preview to canonical scope, manifest/metadata/platform/open-handle identity, portable name, conflict policy and bounded SHA-256/root/parent/source evidence. Migration 0019 supplies immutable request receipts, a closed append-only command/recovery state machine and lease coordination. ADR-026 resolves D-018 by rejecting general Unix Rename/Move execution: a deterministic last-check counterexample proves the macOS/Linux no-replace pathname syscall can move a replacement inode. Every production adapter fails closed before database/journal/mutation side effects; CLI exposes explicit before/after Preview, Status and path-free History, while Desktop exposes Preview and path-free History only.
-- Next: resolve D-019 and prove packaged-private process fencing plus child-process pause/kill/descriptor/replacement behavior. Independently implement and run the Windows exact-handle Rename adapter/fault matrix; general Unix remains Preview-only unless a future OS primitive or managed-namespace ADR supersedes ADR-026. Then add Move/cross-volume planning and action-bound platform-trash adapters with immediate revalidation, destination hash or exact trash receipt/identity proof, startup recovery and idempotent Undo. Resolve D-017 before exposing any executable trash action.
+- ADR-027 resolves D-019's identity-first architecture without claiming a runtime: v0.1 keeps one Tauri Rust action host; Windows requires package family identity plus a protected private namespace/named mutex. macOS `flock` is only a candidate after signed App Sandbox scope handoff, a selected OS floor, and proof that the protected container rejects a non-entitled same-user fence-entry replacement; otherwise it remains unavailable. No generic AppData lock or single-instance plugin is accepted.
+- Next: complete Step 5.5, then implement the two platform fences and prove fail-before-database ordering plus pause/kill/fork/exec/handle/namespace/installer behavior. Independently implement and run the Windows exact-handle Rename adapter/fault matrix; general Unix remains Preview-only unless a future OS primitive or managed-namespace ADR supersedes ADR-026. Then add Move/cross-volume planning and action-bound platform-trash adapters with immediate revalidation, destination hash or exact trash receipt/identity proof, startup recovery and idempotent Undo. Resolve D-017 before exposing any executable trash action.
 - Exit only after fault injection, cross-volume, conflict, source-change, process-kill, platform-trash recovery and idempotent undo pass, with no permanent-delete or empty-trash capability.
 
 ### Step 7 — M6/M8 continuous product workflow

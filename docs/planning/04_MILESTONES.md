@@ -89,6 +89,7 @@ Done：
 - Undo。
 - Crash recovery。
 - Audit log。
+- Packaged-private action process fence；Windows 必須先完成 ADR-027 的 package identity foundation；macOS `flock` candidate 另需通過 supported-version SIP container replacement proof，否則維持 unavailable。
 
 Done：
 - Fault injection 測試。
@@ -96,6 +97,7 @@ Done：
 - 檔名衝突。
 - 跨 volume move。
 - Undo 後 hash 一致。
+- Fence 在 action database 開啟前取得；paused live owner 不因 lease expiry 被 recovery 越過，crash／abandoned state 只進安全 recovery。
 - macOS Trash 與 Windows Recycle Bin adapter 的 identity、collision、crash-recovery、external-empty 與 Undo runtime matrix 通過。
 - Linux freedesktop Trash 僅需獨立 experimental artifact／evidence；未完成或失敗不得拖延 macOS／Windows，也不得宣稱 Linux cleanup 已驗證。
 - 永久刪除不存在於程式碼路徑。
@@ -154,6 +156,7 @@ Done：
 
 ## M9 — Release Engineering
 
+- 提前供 M2／M5 使用的 macOS App Sandbox scope/container identity 與 Windows package family identity foundation；這不代表 M9 完成。
 - macOS package。
 - Windows package。
 - Signing config。
@@ -164,6 +167,7 @@ Done：
 - Clean VM smoke tests。
 
 Done：
+- macOS native folder selection／security-scoped bookmark／non-entitled replacement probe 與 Windows packaged identity 通過 clean-machine install／update／repair／uninstall matrix；macOS probe 失敗時不得啟用 action fence。
 - Tag 可重現建置。
 - Release assets 完整。
 - Updater 簽章驗證。

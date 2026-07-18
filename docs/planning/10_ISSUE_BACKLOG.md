@@ -71,7 +71,9 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - ACT-010 Cross-platform system-trash ActionPlan and adapter
 - ACT-011 System-trash crash recovery, conflict handling, and idempotent Undo
 - ACT-012 Closed by ADR-026: retain general Unix Rename/Move Preview-only and keep the source-leaf counterexample as a production-gate regression
-- ACT-013 Resolve D-019 packaged-private process fence; pass pause/kill/fork/exec/descriptor, lock-replacement, lease-expiry, durability, permission, and platform runtime matrix
+- ACT-013 Closed at architecture level by ADR-027: packaged identity precedes the action fence and the Tauri Rust core remains the sole v0.1 action host
+- ACT-014 Gate the macOS App Sandbox/SIP container `flock` candidate on D-002 and a signed non-entitled same-user replacement probe; if accepted, prove fail-before-database, pause/crash, close-on-exec, ownership/bookmark/update/repair/uninstall matrix
+- ACT-015 Windows protected private-namespace mutex fence; prove package-family/DACL, native-thread ownership, busy/abandoned recovery, handle inheritance, update, repair, and uninstall matrix
 
 ## Epic: Watch and Inbox
 
@@ -120,6 +122,8 @@ Create these as GitHub Issues with labels, dependencies and acceptance criteria.
 - REL-008 GitHub release workflow
 - REL-009 Required macOS Trash and Windows Recycle Bin acceptance matrix
 - REL-010 Linux experimental freedesktop Trash artifact and evidence
+- REL-011 macOS signed App Sandbox entitlement, native folder selection, security-scoped bookmark migration, supported-version SIP guarantee, hostile replacement probe, and packaged-container evidence
+- REL-012 Windows package identity shared by native OCR and the action-fence private namespace
 
 ## Epic: Launch
 

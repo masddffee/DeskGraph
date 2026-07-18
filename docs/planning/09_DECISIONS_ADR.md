@@ -231,3 +231,10 @@ Status：Accepted。官方 Apple／Linux／POSIX API 與 deterministic counterex
 
 Canonical detail：
 `docs/architecture/adr/0026-general-unix-file-actions-remain-preview-only.md`。
+
+## ADR-027 — Packaged runtime identity precedes the action process fence
+
+Status：Accepted。D-019 以平台封裝身分先行的架構解決：v0.1 不新增 writer daemon/helper；Windows 以 package family identity 建立 protected private namespace 與 named mutex。macOS `flock` 只保留為 gated candidate，必須先選定支援的 OS floor，並由 signed App Sandbox／SIP-protected per-app container 的官方合約與真機 hostile probe 證明非 entitled 同 UID process 不能靜默替換 fence entry；證明不了就維持 unavailable。Fence 必須在 action database 開啟前取得，paused live owner 不因 SQLite lease expiry 失去排他性，crash/abandoned state 只能進 recovery。現有 repository 尚無這些封裝條件，所以不加入通用 AppData lock 或假完成的 runtime abstraction，所有 production Execute／Recovery／Undo 仍 fail closed。
+
+Canonical detail：
+`docs/architecture/adr/0027-packaged-runtime-identity-precedes-action-fence.md`。
