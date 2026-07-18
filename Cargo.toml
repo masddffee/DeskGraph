@@ -29,6 +29,7 @@ clap = { version = "4.6.2", features = ["derive"] }
 imagesize = { version = "=0.15.0", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 libc = { version = "=0.2.186", default-features = false }
 lopdf = { version = "=0.44.0", default-features = false }
+notify = { version = "=8.2.0", default-features = false }
 objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSObject", "NSString", "std"] }
 objc2-vision = { version = "=0.3.2", default-features = false, features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes", "block2", "objc2-core-foundation", "std"] }

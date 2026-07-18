@@ -24,15 +24,18 @@ const event: WatchEventProgress = {
 };
 
 const runtime: WatchRuntimeStatus = {
-  api_version: 'deskgraph.watch-runtime.v1',
+  api_version: 'deskgraph.watch-runtime.v2',
   state: 'running',
-  adapter: 'bounded_metadata_polling',
+  adapter: 'native_with_periodic_reconciliation',
   poll_interval_ms: 300_000,
+  periodic_reconciliation_enabled: true,
   last_cycle_unix_ms: 1_000,
   authorized_scope_count: 2,
   active_event_count: 1,
   degraded_scope_count: 0,
   deferred_scope_count: 0,
+  native_watched_scope_count: 2,
+  native_overflow_count: 0,
   next_wake_unix_ms: 301_000,
   last_error_code: null,
 };
@@ -69,7 +72,7 @@ describe('watch event contract', () => {
     expect(invokeCommand).toHaveBeenCalledWith(RECENT_WATCH_EVENTS_COMMAND);
   });
 
-  it('accepts only path-free bounded runtime states', async () => {
+  it('accepts only path-free v2 runtime states with periodic safety reconciliation', async () => {
     expect(parseWatchRuntimeStatus(runtime)).toEqual(runtime);
     expect(
       parseWatchRuntimeStatus({
@@ -79,9 +82,24 @@ describe('watch event contract', () => {
         last_error_code: 'scope_canonicalization_failed',
       }).state,
     ).toBe('degraded');
+    expect(
+      parseWatchRuntimeStatus({
+        ...runtime,
+        state: 'degraded',
+        adapter: 'periodic_reconciliation_only',
+        native_watched_scope_count: 0,
+        last_error_code: 'native_watch_adapter_unavailable',
+      }).adapter,
+    ).toBe('periodic_reconciliation_only');
+    expect(() => parseWatchRuntimeStatus({ ...runtime, adapter: 'future_adapter' })).toThrow(
+      'Invalid watch runtime response',
+    );
     expect(() => parseWatchRuntimeStatus({ ...runtime, adapter: '/Users/private' })).toThrow(
       'Invalid watch runtime response',
     );
+    expect(() =>
+      parseWatchRuntimeStatus({ ...runtime, periodic_reconciliation_enabled: false }),
+    ).toThrow('Invalid watch runtime response');
     expect(() =>
       parseWatchRuntimeStatus({
         ...runtime,
@@ -107,6 +125,8 @@ describe('watch event contract', () => {
       active_event_count: 0,
       degraded_scope_count: 0,
       deferred_scope_count: 0,
+      native_watched_scope_count: 0,
+      native_overflow_count: 0,
       next_wake_unix_ms: null,
       last_error_code: null,
     };
@@ -119,11 +139,17 @@ describe('watch event contract', () => {
       { ...startingRuntime, active_event_count: 1 },
       { ...startingRuntime, degraded_scope_count: 1 },
       { ...startingRuntime, deferred_scope_count: 1 },
+      { ...startingRuntime, native_watched_scope_count: 1 },
+      { ...startingRuntime, native_overflow_count: 1 },
+      { ...runtime, native_watched_scope_count: -1 },
+      { ...runtime, native_overflow_count: -1 },
       { ...startingRuntime, last_cycle_unix_ms: 1 },
       { ...startingRuntime, next_wake_unix_ms: 1 },
       { ...startingRuntime, last_error_code: 'watch_failed' },
       { ...runtime, degraded_scope_count: 1 },
+      { ...runtime, adapter: 'periodic_reconciliation_only' },
       { ...runtime, state: 'stopped', next_wake_unix_ms: null, deferred_scope_count: 1 },
+      { ...runtime, state: 'stopped', next_wake_unix_ms: null, native_watched_scope_count: 1 },
       { ...runtime, next_wake_unix_ms: 999 },
       {
         ...runtime,

@@ -65,7 +65,8 @@ D-008 is resolved at the architecture level by ADR-024: native-first with a sepa
 
 - Filesystem events are untrusted hints. Durable per-scope debounce and a bounded stability gate must complete before the existing atomic manifest scanner reconciles live state (ADR-016).
 - The first core uses a one-second default stability window, closed temporary-download suffixes, size/modified-time/platform-identity snapshots, and read-only open-handle identity verification.
-- Watch status is path-free outside explicit adapter/user input. Native OS adapters, incremental extraction/indexing, cloud-placeholder policy, background resource controls, and Smart Inbox remain unselected or unimplemented.
+- Exact `notify 8.2.0` is selected for target-native hints only. One bounded non-blocking callback queue feeds the existing durable core; watch-set changes, overflow, rescan, source failure and unmatched routing request whole-scope reconciliation, while a second distinct path in one scope requests that scope's durable recovery instead of dropping an ordered rename destination. The five-minute periodic fallback remains enabled. Continuous coalescing is capped at that interval through a root-only forced metadata transaction that rechecks exact authorization/completed-scan eligibility; recovery received during a multi-batch scan forces a fresh follow-up scan. Direct ignored observations cannot cancel unrelated stabilizing work. No content extraction or filesystem action is authorized.
+- Watch status is path-free outside explicit adapter/user input. Incremental extraction/indexing, cloud-placeholder policy, background resource controls, and Smart Inbox remain unselected or unimplemented.
 
 ## Decisions made while entering M5
 

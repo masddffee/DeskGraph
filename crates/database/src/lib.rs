@@ -18,7 +18,7 @@ use deskgraph_domain::{
     ScanReport, ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus,
     is_valid_image_dimensions, is_valid_xlsx_cell_reference, parse_explicit_file_version_name,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -413,6 +413,7 @@ pub enum DatabaseError {
     SearchInputInvalid,
     WatchEventNotFound,
     InvalidWatchEventState,
+    WatchScopeInitialScanRequired,
     WatchInputInvalid,
     ActionSourceNotFound,
     ActionPlanNotFound,
@@ -456,6 +457,7 @@ impl DatabaseError {
             Self::SearchInputInvalid => "search_input_invalid",
             Self::WatchEventNotFound => "watch_event_not_found",
             Self::InvalidWatchEventState => "invalid_watch_event_state",
+            Self::WatchScopeInitialScanRequired => "watch_scope_initial_scan_required",
             Self::WatchInputInvalid => "watch_input_invalid",
             Self::ActionSourceNotFound => "action_source_not_found",
             Self::ActionPlanNotFound => "action_plan_not_found",
@@ -773,7 +775,9 @@ impl ManifestDatabase {
         observation: WatchObservationWrite<'_>,
     ) -> Result<WatchEventRecord, DatabaseError> {
         validate_watch_observation(&observation)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let scope_exists: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM authorized_scopes WHERE id = ?1",
             [observation.scope_id],
@@ -782,13 +786,63 @@ impl ManifestDatabase {
         if scope_exists != 1 {
             return Err(DatabaseError::ScopeNotFound);
         }
+        let completed_scan_exists: i64 = transaction.query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM scan_jobs \
+                WHERE scope_id = ?1 AND status = 'completed' \
+             )",
+            [observation.scope_id],
+            |row| row.get(0),
+        )?;
+        if completed_scan_exists != 1 {
+            return Err(DatabaseError::WatchScopeInitialScanRequired);
+        }
         let (status, reason) = if let Some(reason) = observation.ignored_reason {
             ("ignored", Some(watch_reason_as_str(reason)))
         } else {
             ("stabilizing", None)
         };
         let size_bytes = observation.snapshot.size_bytes.map(to_i64).transpose()?;
-        let event_id = if observation.ignored_reason.is_none() {
+        let event_id = if let Some(reason) = observation.ignored_reason {
+            let reason = watch_reason_as_str(reason);
+            let existing_ignored = transaction
+                .query_row(
+                    "SELECT id FROM watch_events \
+                     WHERE scope_id = ?1 AND status = 'ignored' AND reason = ?2 \
+                     ORDER BY id DESC LIMIT 1",
+                    params![observation.scope_id, reason],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            match existing_ignored {
+                Some(ignored_id) => {
+                    transaction.execute(
+                        "UPDATE watch_events SET path_raw = ?2, path_key = ?3, \
+                            observed_kind = ?4, observed_size_bytes = ?5, \
+                            observed_modified_unix_ns = ?6, observed_identity_key = ?7, \
+                            observation_count = observation_count + 1, \
+                            stable_after_unix_ms = ?8, updated_at_unix_ms = ?9 \
+                         WHERE id = ?1 AND status = 'ignored' AND reason = ?10",
+                        params![
+                            ignored_id,
+                            observation.path_raw,
+                            observation.path_key,
+                            observation.snapshot.kind.as_str(),
+                            size_bytes,
+                            observation.snapshot.modified_unix_ns,
+                            observation.snapshot.identity_key,
+                            observation.stable_after_unix_ms,
+                            observation.observed_at_unix_ms,
+                            reason,
+                        ],
+                    )?;
+                    ignored_id
+                }
+                None => {
+                    insert_watch_event(&transaction, observation, status, Some(reason), size_bytes)?
+                }
+            }
+        } else {
             let existing = transaction
                 .query_row(
                     "SELECT id FROM watch_events WHERE scope_id = ?1 AND status = 'stabilizing'",
@@ -819,8 +873,6 @@ impl ManifestDatabase {
             } else {
                 insert_watch_event(&transaction, observation, status, reason, size_bytes)?
             }
-        } else {
-            insert_watch_event(&transaction, observation, status, reason, size_bytes)?
         };
         transaction.commit()?;
         self.watch_event(event_id)
@@ -840,12 +892,28 @@ impl ManifestDatabase {
             .ok_or(DatabaseError::WatchEventNotFound)
     }
 
+    pub fn watch_event_created_at(&self, event_id: i64) -> Result<i64, DatabaseError> {
+        let created_at = self
+            .connection
+            .query_row(
+                "SELECT created_at_unix_ms FROM watch_events WHERE id = ?1",
+                [event_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::WatchEventNotFound)?;
+        if created_at < 0 {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        Ok(created_at)
+    }
+
     pub fn recent_watch_events(&self) -> Result<Vec<WatchEventProgress>, DatabaseError> {
         let mut statement = self.connection.prepare(
             "SELECT id, scope_id, status, observation_count, stable_after_unix_ms, \
                 scan_job_id, reason, path_raw, path_key, observed_kind, observed_size_bytes, \
                 observed_modified_unix_ns, observed_identity_key \
-             FROM watch_events ORDER BY id DESC LIMIT 20",
+             FROM watch_events ORDER BY updated_at_unix_ms DESC, id DESC LIMIT 20",
         )?;
         let events = statement.query_map([], watch_event_from_row)?;
         events
@@ -882,8 +950,22 @@ impl ManifestDatabase {
         scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn scope_has_completed_scan(&self, scope_id: i64) -> Result<bool, DatabaseError> {
+        self.scope_record(scope_id)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM scan_jobs \
+                    WHERE scope_id = ?1 AND status = 'completed' \
+                 )",
+                [scope_id],
+                |row| row.get::<_, i64>(0).map(|value| value == 1),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn mark_watch_event_ignored_at(
-        &self,
+        &mut self,
         event_id: i64,
         reason: WatchEventReason,
         now_unix_ms: i64,
@@ -891,15 +973,87 @@ impl ManifestDatabase {
         if now_unix_ms < 0 {
             return Err(DatabaseError::WatchInputInvalid);
         }
-        let changed = self.connection.execute(
-            "UPDATE watch_events SET status = 'ignored', reason = ?2, updated_at_unix_ms = ?3 \
-             WHERE id = ?1 AND status = 'stabilizing'",
-            params![event_id, watch_reason_as_str(reason), now_unix_ms],
-        )?;
-        if changed != 1 {
+        let reason = watch_reason_as_str(reason);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = transaction
+            .query_row(
+                "SELECT scope_id, status, path_raw, path_key, observed_kind, \
+                    observed_size_bytes, observed_modified_unix_ns, observed_identity_key, \
+                    observation_count \
+                 FROM watch_events WHERE id = ?1",
+                [event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::WatchEventNotFound)?;
+        if current.1 != "stabilizing" {
             return Err(DatabaseError::InvalidWatchEventState);
         }
-        Ok(self.watch_event(event_id)?.progress)
+        let existing_ignored = transaction
+            .query_row(
+                "SELECT id FROM watch_events \
+                 WHERE scope_id = ?1 AND status = 'ignored' AND reason = ?2 AND id != ?3 \
+                 ORDER BY id DESC LIMIT 1",
+                params![current.0, reason, event_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let result_event_id = if let Some(ignored_id) = existing_ignored {
+            transaction.execute(
+                "UPDATE watch_events SET path_raw = ?2, path_key = ?3, observed_kind = ?4, \
+                    observed_size_bytes = ?5, observed_modified_unix_ns = ?6, \
+                    observed_identity_key = ?7, observation_count = observation_count + ?8, \
+                    stable_after_unix_ms = ?9, updated_at_unix_ms = ?9 \
+                 WHERE id = ?1 AND status = 'ignored' AND reason = ?10",
+                params![
+                    ignored_id,
+                    current.2,
+                    current.3,
+                    current.4,
+                    current.5,
+                    current.6,
+                    current.7,
+                    current.8,
+                    now_unix_ms,
+                    reason,
+                ],
+            )?;
+            let deleted = transaction.execute(
+                "DELETE FROM watch_events WHERE id = ?1 AND status = 'stabilizing'",
+                [event_id],
+            )?;
+            if deleted != 1 {
+                return Err(DatabaseError::InvalidWatchEventState);
+            }
+            ignored_id
+        } else {
+            let changed = transaction.execute(
+                "UPDATE watch_events SET status = 'ignored', reason = ?2, \
+                    stable_after_unix_ms = ?3, updated_at_unix_ms = ?3 \
+                 WHERE id = ?1 AND status = 'stabilizing'",
+                params![event_id, reason, now_unix_ms],
+            )?;
+            if changed != 1 {
+                return Err(DatabaseError::InvalidWatchEventState);
+            }
+            event_id
+        };
+        transaction.commit()?;
+        Ok(self.watch_event(result_event_id)?.progress)
     }
 
     pub fn begin_watch_reconciliation_at(
@@ -908,10 +1062,43 @@ impl ManifestDatabase {
         root: &QueuedPath,
         now_unix_ms: i64,
     ) -> Result<WatchEventProgress, DatabaseError> {
-        if now_unix_ms < 0 {
+        self.begin_watch_reconciliation_with_policy_at(event_id, root, now_unix_ms, false)
+    }
+
+    /// Starts the same durable root-scan transaction as normal watch
+    /// reconciliation without waiting for the path hint's debounce deadline.
+    ///
+    /// This is intentionally limited to the exact stored root of an authorized
+    /// scope that already has a completed initial scan. Those bindings are
+    /// checked again inside the same write transaction. It exists only for
+    /// bounded metadata recovery after a native overflow/source change or a
+    /// maximum coalescing age; it does not authorize content extraction or any
+    /// filesystem mutation.
+    pub fn begin_forced_watch_metadata_reconciliation_at(
+        &mut self,
+        event_id: i64,
+        root: &QueuedPath,
+        now_unix_ms: i64,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if !root.is_root || root.parent_identity_key.is_some() {
             return Err(DatabaseError::WatchInputInvalid);
         }
-        let transaction = self.connection.transaction()?;
+        self.begin_watch_reconciliation_with_policy_at(event_id, root, now_unix_ms, true)
+    }
+
+    fn begin_watch_reconciliation_with_policy_at(
+        &mut self,
+        event_id: i64,
+        root: &QueuedPath,
+        now_unix_ms: i64,
+        allow_before_stable_deadline: bool,
+    ) -> Result<WatchEventProgress, DatabaseError> {
+        if now_unix_ms < 0 || !root.is_root || root.parent_identity_key.is_some() {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (scope_id, status, stable_after): (i64, String, i64) = transaction
             .query_row(
                 "SELECT scope_id, status, stable_after_unix_ms FROM watch_events WHERE id = ?1",
@@ -920,7 +1107,30 @@ impl ManifestDatabase {
             )
             .optional()?
             .ok_or(DatabaseError::WatchEventNotFound)?;
-        if status != "stabilizing" || stable_after > now_unix_ms {
+        let authorized_root = transaction
+            .query_row(
+                "SELECT path_raw, path_key FROM authorized_scopes WHERE id = ?1",
+                [scope_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or(DatabaseError::ScopeNotFound)?;
+        if root.path_raw != authorized_root.0 || root.path_key != authorized_root.1 {
+            return Err(DatabaseError::WatchInputInvalid);
+        }
+        let completed_scan_exists: i64 = transaction.query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM scan_jobs \
+                WHERE scope_id = ?1 AND status = 'completed' \
+             )",
+            [scope_id],
+            |row| row.get(0),
+        )?;
+        if completed_scan_exists != 1 {
+            return Err(DatabaseError::WatchScopeInitialScanRequired);
+        }
+        if status != "stabilizing" || (!allow_before_stable_deadline && stable_after > now_unix_ms)
+        {
             return Err(DatabaseError::InvalidWatchEventState);
         }
         let scan_job_id = insert_resumable_scan_job(&transaction, scope_id, root, now_unix_ms)?;
@@ -5135,6 +5345,17 @@ mod tests {
         stable_after_unix_ms: i64,
         ignored_reason: Option<WatchEventReason>,
     ) -> WatchEventRecord {
+        if !database
+            .scope_has_completed_scan(scope_id)
+            .expect("scope readiness should load")
+        {
+            let job_id = database
+                .create_scan_job(scope_id)
+                .expect("initial scan should start");
+            database
+                .complete_scan(job_id, scope_id, &[], &[], 0, 0)
+                .expect("initial scan should complete");
+        }
         let snapshot = WatchSnapshot {
             kind: WatchSnapshotKind::File,
             size_bytes: Some(7),
@@ -5152,6 +5373,263 @@ mod tests {
                 observed_at_unix_ms: 1,
             })
             .expect("watch event should persist")
+    }
+
+    #[test]
+    fn forced_watch_metadata_reconciliation_is_root_only_and_keeps_normal_debounce() {
+        let (mut database, scope_id, root) = resumable_setup();
+        let event = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/private-active.md",
+            5_000,
+            None,
+        );
+
+        assert!(matches!(
+            database.begin_watch_reconciliation_at(event.progress.event_id, &root, 1_000),
+            Err(DatabaseError::InvalidWatchEventState)
+        ));
+        let mut non_root = root.clone();
+        non_root.is_root = false;
+        assert!(matches!(
+            database.begin_forced_watch_metadata_reconciliation_at(
+                event.progress.event_id,
+                &non_root,
+                1_000
+            ),
+            Err(DatabaseError::WatchInputInvalid)
+        ));
+        let mut mismatched_raw = root.clone();
+        mismatched_raw.path_raw = b"/scope-other-raw".to_vec();
+        assert!(matches!(
+            database.begin_forced_watch_metadata_reconciliation_at(
+                event.progress.event_id,
+                &mismatched_raw,
+                1_000
+            ),
+            Err(DatabaseError::WatchInputInvalid)
+        ));
+        let mut mismatched_key = root.clone();
+        mismatched_key.path_key = "/scope-other-key".to_string();
+        assert!(matches!(
+            database.begin_forced_watch_metadata_reconciliation_at(
+                event.progress.event_id,
+                &mismatched_key,
+                1_000
+            ),
+            Err(DatabaseError::WatchInputInvalid)
+        ));
+        let relative_root = QueuedPath {
+            path_raw: b"scope".to_vec(),
+            path_key: "scope".to_string(),
+            parent_identity_key: None,
+            is_root: true,
+        };
+        assert!(matches!(
+            database.begin_forced_watch_metadata_reconciliation_at(
+                event.progress.event_id,
+                &relative_root,
+                1_000
+            ),
+            Err(DatabaseError::WatchInputInvalid)
+        ));
+        database
+            .add_scope(b"/other", "/other", "/other", "test")
+            .expect("second scope should persist");
+        let another_scope_root = QueuedPath {
+            path_raw: b"/other".to_vec(),
+            path_key: "/other".to_string(),
+            parent_identity_key: None,
+            is_root: true,
+        };
+        assert!(matches!(
+            database.begin_forced_watch_metadata_reconciliation_at(
+                event.progress.event_id,
+                &another_scope_root,
+                1_000
+            ),
+            Err(DatabaseError::WatchInputInvalid)
+        ));
+        let forced = database
+            .begin_forced_watch_metadata_reconciliation_at(event.progress.event_id, &root, 1_000)
+            .expect("authorized root metadata recovery should start durably");
+        assert_eq!(forced.status, WatchEventStatus::Reconciling);
+    }
+
+    #[test]
+    fn forced_watch_metadata_reconciliation_rechecks_completed_initial_scan_in_transaction() {
+        let (mut database, scope_id, root) = resumable_setup();
+        let event = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/private-active.md",
+            5_000,
+            None,
+        );
+        database
+            .connection
+            .execute(
+                "UPDATE scan_jobs SET status = 'failed' WHERE scope_id = ?1",
+                [scope_id],
+            )
+            .expect("fixture should remove completed-scan eligibility");
+
+        assert!(matches!(
+            database.begin_forced_watch_metadata_reconciliation_at(
+                event.progress.event_id,
+                &root,
+                1_000
+            ),
+            Err(DatabaseError::WatchScopeInitialScanRequired)
+        ));
+    }
+
+    #[test]
+    fn ignored_state_transition_merges_and_removes_only_the_transient_row() {
+        let (mut database, scope_id, _) = resumable_setup();
+        let ignored = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/archive.crdownload",
+            1,
+            Some(WatchEventReason::TemporaryDownload),
+        );
+        let stabilizing =
+            record_file_watch_event(&mut database, scope_id, "/scope/archive.md", 2_000, None);
+        assert_ne!(stabilizing.progress.event_id, ignored.progress.event_id);
+
+        let merged = database
+            .mark_watch_event_ignored_at(
+                stabilizing.progress.event_id,
+                WatchEventReason::TemporaryDownload,
+                1_500,
+            )
+            .expect("ignored transition should merge transactionally");
+
+        assert_eq!(merged.event_id, ignored.progress.event_id);
+        assert_eq!(merged.status, WatchEventStatus::Ignored);
+        assert_eq!(merged.observation_count, 2);
+        assert!(matches!(
+            database.watch_event(stabilizing.progress.event_id),
+            Err(DatabaseError::WatchEventNotFound)
+        ));
+        assert_eq!(
+            database
+                .recent_watch_events()
+                .expect("watch history should load"),
+            vec![merged.clone()]
+        );
+
+        let second_stabilizing = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/archive-final.md",
+            3_000,
+            None,
+        );
+        let direct_ignored = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/archive-final.download",
+            2_500,
+            Some(WatchEventReason::TemporaryDownload),
+        );
+        assert_eq!(direct_ignored.progress.event_id, merged.event_id);
+        assert_eq!(direct_ignored.progress.observation_count, 3);
+        assert_eq!(
+            database
+                .watch_event(second_stabilizing.progress.event_id)
+                .expect("unrelated stabilizing work must remain pending")
+                .progress,
+            second_stabilizing.progress
+        );
+        let transitioned = database
+            .mark_watch_event_ignored_at(
+                second_stabilizing.progress.event_id,
+                WatchEventReason::TemporaryDownload,
+                2_550,
+            )
+            .expect("only an explicit transition may supersede stabilizing work");
+        assert_eq!(transitioned.event_id, merged.event_id);
+        assert_eq!(transitioned.observation_count, 4);
+        assert!(matches!(
+            database.watch_event(second_stabilizing.progress.event_id),
+            Err(DatabaseError::WatchEventNotFound)
+        ));
+        assert_eq!(
+            database
+                .recent_watch_events()
+                .expect("watch history should remain bounded"),
+            vec![transitioned]
+        );
+
+        let newer_id = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/reconcile-failed.md",
+            4_000,
+            None,
+        );
+        database
+            .fail_watch_event_at(
+                newer_id.progress.event_id,
+                WatchEventReason::ReconcileFailed,
+                2_600,
+            )
+            .expect("separate terminal history should persist");
+        let latest_snapshot = WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(7),
+            modified_unix_ns: Some(11),
+            identity_key: Some(b"identity:/scope/archive-latest.part".to_vec()),
+        };
+        let latest_ignored = database
+            .record_watch_observation_at(WatchObservationWrite {
+                scope_id,
+                path_raw: b"/scope/archive-latest.part",
+                path_key: "/scope/archive-latest.part",
+                snapshot: &latest_snapshot,
+                stable_after_unix_ms: 2_700,
+                ignored_reason: Some(WatchEventReason::TemporaryDownload),
+                observed_at_unix_ms: 2_700,
+            })
+            .expect("latest ignored observation should update its terminal aggregate");
+        let recent = database
+            .recent_watch_events()
+            .expect("recent history should order by the latest update");
+        assert_eq!(recent[0], latest_ignored.progress);
+        assert_eq!(recent[1].event_id, newer_id.progress.event_id);
+    }
+
+    #[test]
+    fn direct_ignored_observation_never_supersedes_unrelated_stabilizing_work() {
+        let (mut database, scope_id, _) = resumable_setup();
+        let stabilizing =
+            record_file_watch_event(&mut database, scope_id, "/scope/report.md", 2_000, None);
+        let ignored = record_file_watch_event(
+            &mut database,
+            scope_id,
+            "/scope/download.crdownload",
+            1_100,
+            Some(WatchEventReason::TemporaryDownload),
+        );
+
+        assert_ne!(ignored.progress.event_id, stabilizing.progress.event_id);
+        assert_eq!(ignored.progress.status, WatchEventStatus::Ignored);
+        assert_eq!(
+            database
+                .watch_event(stabilizing.progress.event_id)
+                .expect("normal pending work must survive an unrelated ignored path")
+                .progress,
+            stabilizing.progress
+        );
+        assert_eq!(
+            database
+                .active_watch_events()
+                .expect("active work should remain queryable"),
+            vec![stabilizing.progress]
+        );
     }
 
     #[test]
@@ -5337,6 +5815,36 @@ mod tests {
             vec![scanned_scope_id]
         );
         assert_ne!(scanned_scope_id, unscanned_scope.id);
+    }
+
+    #[test]
+    fn watch_observation_transaction_rejects_an_unscanned_scope() {
+        let (mut database, scope_id, _) = resumable_setup();
+        let snapshot = WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(7),
+            modified_unix_ns: Some(11),
+            identity_key: Some(b"identity:/scope/private.md".to_vec()),
+        };
+
+        let result = database.record_watch_observation_at(WatchObservationWrite {
+            scope_id,
+            path_raw: b"/scope/private.md",
+            path_key: "/scope/private.md",
+            snapshot: &snapshot,
+            stable_after_unix_ms: 1_001,
+            ignored_reason: None,
+            observed_at_unix_ms: 1,
+        });
+
+        assert!(matches!(
+            result,
+            Err(DatabaseError::WatchScopeInitialScanRequired)
+        ));
+        assert_eq!(
+            DatabaseError::WatchScopeInitialScanRequired.code(),
+            "watch_scope_initial_scan_required"
+        );
     }
 
     fn observation(path: &str, kind: NodeKind, parent: Option<Vec<u8>>) -> Observation {

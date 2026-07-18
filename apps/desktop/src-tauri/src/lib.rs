@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Condvar, Mutex, MutexGuard,
+    Arc, Mutex, MutexGuard, TryLockError,
     atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -12,6 +13,8 @@ use deskgraph_domain::{
     ExtractionOperation, ExtractionStats, HealthReport, ManifestStats, ScanJobProgress, ScanStatus,
     SearchFilters, SearchResponse, WatchEventProgress, collect_health_with_manifest,
 };
+#[cfg(test)]
+use deskgraph_domain::{WatchEventReason, WatchEventStatus};
 use deskgraph_extractors::{
     ExtractionLimits, cancel_extraction_job_at, create_screenshot_ocr_job_at, extraction_job_at,
     extraction_stats_at as read_extraction_stats_at,
@@ -27,7 +30,7 @@ use deskgraph_scanner::{
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{create_rename_preview_at, recent_action_plans_at};
 use deskgraph_watcher::{
-    PollingWatchPolicy, WatchCoordinator, WatchPolicy,
+    NativeWatchEventSource, PollingWatchPolicy, WatchCoordinator, WatchPolicy,
     recent_watch_events_at as read_recent_watch_events_at,
 };
 use serde::Serialize;
@@ -36,14 +39,18 @@ use tracing::{error, info};
 
 const WATCH_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const WATCH_RUNTIME_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
+const WATCH_NATIVE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const WATCH_GATE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const FOREGROUND_SCAN_BATCH_SIZE: usize = 256;
+const WATCH_ADAPTER_NATIVE: &str = "native_with_periodic_reconciliation";
+const WATCH_ADAPTER_PERIODIC_ONLY: &str = "periodic_reconciliation_only";
 
 struct ManifestState {
     database_path: PathBuf,
     database_gate: Arc<Mutex<()>>,
     watch_status: Arc<Mutex<WatchRuntimeStatus>>,
     watch_stop: Arc<AtomicBool>,
-    watch_wake: Arc<(Mutex<u64>, Condvar)>,
+    watch_wake: SyncSender<()>,
     watch_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -85,29 +92,35 @@ struct WatchRuntimeStatus {
     state: WatchRuntimeState,
     adapter: &'static str,
     poll_interval_ms: i64,
+    periodic_reconciliation_enabled: bool,
     last_cycle_unix_ms: Option<i64>,
     authorized_scope_count: u64,
     active_event_count: u64,
     deferred_scope_count: u64,
     degraded_scope_count: u64,
+    native_watched_scope_count: u64,
+    native_overflow_count: u64,
     next_wake_unix_ms: Option<i64>,
     last_error_code: Option<&'static str>,
 }
 
 impl WatchRuntimeStatus {
-    const API_VERSION: &str = "deskgraph.watch-runtime.v1";
+    const API_VERSION: &str = "deskgraph.watch-runtime.v2";
 
     fn starting(polling_policy: PollingWatchPolicy) -> Self {
         Self {
             api_version: Self::API_VERSION,
             state: WatchRuntimeState::Starting,
-            adapter: "bounded_metadata_polling",
+            adapter: WATCH_ADAPTER_PERIODIC_ONLY,
             poll_interval_ms: polling_policy.poll_interval_ms(),
+            periodic_reconciliation_enabled: true,
             last_cycle_unix_ms: None,
             authorized_scope_count: 0,
             active_event_count: 0,
             deferred_scope_count: 0,
             degraded_scope_count: 0,
+            native_watched_scope_count: 0,
+            native_overflow_count: 0,
             next_wake_unix_ms: None,
             last_error_code: None,
         }
@@ -129,32 +142,24 @@ fn lock_watch_status(
         .map_err(|_| "watch_runtime_status_poisoned".to_string())
 }
 
-fn notify_watch_wake(wake: &(Mutex<u64>, Condvar)) {
-    if let Ok(mut generation) = wake.0.lock() {
-        *generation = generation.wrapping_add(1);
-        wake.1.notify_all();
+fn notify_watch_wake(wake: &SyncSender<()>) {
+    match wake.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) | Err(TrySendError::Disconnected(())) => {}
     }
 }
 
 fn wait_for_watch_wake(
-    wake: &(Mutex<u64>, Condvar),
+    wake: &Receiver<()>,
     stop: &AtomicBool,
-    observed_generation: &mut u64,
     timeout: Duration,
 ) -> Result<(), ()> {
-    let generation = wake.0.lock().map_err(|_| ())?;
-    if *generation != *observed_generation {
-        *observed_generation = *generation;
+    if stop.load(Ordering::Acquire) {
         return Ok(());
     }
-    let (generation, _) = wake
-        .1
-        .wait_timeout_while(generation, timeout, |generation| {
-            *generation == *observed_generation && !stop.load(Ordering::Acquire)
-        })
-        .map_err(|_| ())?;
-    *observed_generation = *generation;
-    Ok(())
+    match wake.recv_timeout(timeout) {
+        Ok(()) | Err(RecvTimeoutError::Timeout) => Ok(()),
+        Err(RecvTimeoutError::Disconnected) => Err(()),
+    }
 }
 
 fn wake_watch_runtime(state: &ManifestState) {
@@ -164,13 +169,13 @@ fn wake_watch_runtime(state: &ManifestState) {
 fn start_manifest_state(database_path: PathBuf) -> ManifestState {
     let database_gate = Arc::new(Mutex::new(()));
     let watch_stop = Arc::new(AtomicBool::new(false));
-    let watch_wake = Arc::new((Mutex::new(0), Condvar::new()));
+    let (watch_wake, watch_wake_receiver) = sync_channel(1);
     let polling_policy = PollingWatchPolicy::default();
     let watch_status = Arc::new(Mutex::new(WatchRuntimeStatus::starting(polling_policy)));
     let thread_database_path = database_path.clone();
     let thread_database_gate = Arc::clone(&database_gate);
     let thread_watch_stop = Arc::clone(&watch_stop);
-    let thread_watch_wake = Arc::clone(&watch_wake);
+    let thread_watch_wake = watch_wake.clone();
     let thread_watch_status = Arc::clone(&watch_status);
     let watch_thread = thread::Builder::new()
         .name("deskgraph-watch-coordinator".to_string())
@@ -180,6 +185,7 @@ fn start_manifest_state(database_path: PathBuf) -> ManifestState {
                 &thread_database_gate,
                 &thread_watch_stop,
                 &thread_watch_wake,
+                watch_wake_receiver,
                 &thread_watch_status,
                 polling_policy,
             );
@@ -209,7 +215,8 @@ fn run_watch_coordinator(
     database_path: &Path,
     database_gate: &Mutex<()>,
     stop: &AtomicBool,
-    wake: &(Mutex<u64>, Condvar),
+    wake: &SyncSender<()>,
+    wake_receiver: Receiver<()>,
     status: &Mutex<WatchRuntimeStatus>,
     polling_policy: PollingWatchPolicy,
 ) {
@@ -228,29 +235,72 @@ fn run_watch_coordinator(
                 return;
             }
         };
-    if let Ok(mut status) = status.lock() {
-        status.state = WatchRuntimeState::Running;
-    }
-    let mut observed_generation = match wake.0.lock() {
-        Ok(generation) => *generation,
-        Err(_) => {
-            if let Ok(mut status) = status.lock() {
-                status.state = WatchRuntimeState::Degraded;
-                status.last_error_code = Some("watch_runtime_wake_poisoned");
-            }
-            return;
-        }
-    };
+    let mut native_source = None;
+    let mut native_error = Some("watch_native_adapter_starting");
+    let mut next_native_retry = Instant::now();
+    let mut reconcile_after_native_change = false;
 
     while !stop.load(Ordering::Acquire) {
-        let cycle = match database_gate.lock() {
+        if native_source.is_none() && Instant::now() >= next_native_retry {
+            let callback_wake = wake.clone();
+            match NativeWatchEventSource::new(Arc::new(move || {
+                notify_watch_wake(&callback_wake);
+            })) {
+                Ok(source) => {
+                    native_source = Some(source);
+                    native_error = None;
+                    reconcile_after_native_change = true;
+                }
+                Err(_) => {
+                    native_error = Some("watch_native_adapter_unavailable");
+                    next_native_retry = Instant::now() + WATCH_NATIVE_RETRY_INTERVAL;
+                }
+            }
+        }
+
+        if let Some(source) = native_source.as_mut() {
+            match coordinator.synchronize_native_event_source(source) {
+                Ok(changed) => {
+                    reconcile_after_native_change |= changed;
+                }
+                Err(_) => {
+                    native_source = None;
+                    native_error = Some("watch_native_adapter_unavailable");
+                    next_native_retry = Instant::now() + WATCH_NATIVE_RETRY_INTERVAL;
+                    reconcile_after_native_change = true;
+                }
+            }
+        }
+
+        let cycle = match database_gate.try_lock() {
             Ok(_database_guard) => {
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                coordinator.run_cycle()
+                if reconcile_after_native_change {
+                    if let Err(error) = coordinator.request_all_scope_reconciliation() {
+                        Err(error)
+                    } else {
+                        reconcile_after_native_change = false;
+                        match native_source.as_ref() {
+                            Some(source) => coordinator.run_cycle_with_native_event_source(source),
+                            None => coordinator.run_cycle(),
+                        }
+                    }
+                } else {
+                    match native_source.as_ref() {
+                        Some(source) => coordinator.run_cycle_with_native_event_source(source),
+                        None => coordinator.run_cycle(),
+                    }
+                }
             }
-            Err(_) => {
+            Err(TryLockError::WouldBlock) => {
+                if wait_for_watch_wake(&wake_receiver, stop, WATCH_GATE_RETRY_INTERVAL).is_err() {
+                    break;
+                }
+                continue;
+            }
+            Err(TryLockError::Poisoned(_)) => {
                 if let Ok(mut status) = status.lock() {
                     status.state = WatchRuntimeState::Degraded;
                     status.last_error_code = Some("manifest_writer_gate_poisoned");
@@ -260,23 +310,69 @@ fn run_watch_coordinator(
         };
         match cycle {
             Ok(report) => {
+                let native_failed = report.native_source_failed
+                    || native_source
+                        .as_ref()
+                        .is_some_and(NativeWatchEventSource::source_failed);
+                if native_failed {
+                    native_source = None;
+                    native_error = Some("watch_native_source_failed");
+                    next_native_retry = Instant::now() + WATCH_NATIVE_RETRY_INTERVAL;
+                    reconcile_after_native_change = true;
+                } else if native_source.is_some() {
+                    native_error = None;
+                }
+                let watched_scope_count = native_source
+                    .as_ref()
+                    .map_or(0, NativeWatchEventSource::watched_scope_count);
+                let watched_scope_count = u64::try_from(watched_scope_count).unwrap_or(u64::MAX);
+                let adapter = if native_source.is_some() {
+                    WATCH_ADAPTER_NATIVE
+                } else {
+                    WATCH_ADAPTER_PERIODIC_ONLY
+                };
+                let error_code = native_error.or(report.last_error_code);
+                let mut next_wake_unix_ms = report.next_wake_unix_ms;
+                let mut wait_ms = report
+                    .next_wake_unix_ms
+                    .saturating_sub(report.cycle_unix_ms)
+                    .max(1);
+                if native_source.is_none() {
+                    let retry_ms = i64::try_from(
+                        next_native_retry
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(i64::MAX)
+                    .max(1);
+                    wait_ms = wait_ms.min(retry_ms);
+                    next_wake_unix_ms = report.cycle_unix_ms.saturating_add(wait_ms);
+                }
                 if let Ok(mut status) = status.lock() {
-                    status.state = if report.last_error_code.is_some() {
+                    status.state = if error_code.is_some() {
                         WatchRuntimeState::Degraded
                     } else {
                         WatchRuntimeState::Running
                     };
+                    status.adapter = adapter;
                     status.last_cycle_unix_ms = Some(report.cycle_unix_ms);
                     status.authorized_scope_count = report.authorized_scope_count;
                     status.active_event_count = report.active_event_count;
                     status.deferred_scope_count = report.deferred_scope_count;
                     status.degraded_scope_count = report.degraded_scope_count;
-                    status.next_wake_unix_ms = Some(report.next_wake_unix_ms);
-                    status.last_error_code = report.last_error_code;
+                    status.native_watched_scope_count = watched_scope_count;
+                    status.native_overflow_count = status
+                        .native_overflow_count
+                        .saturating_add(report.native_overflow_count);
+                    status.next_wake_unix_ms = Some(next_wake_unix_ms);
+                    status.last_error_code = error_code;
                 }
                 if report.scheduled_scope_count > 0
                     || report.advanced_event_count > 0
-                    || report.last_error_code.is_some()
+                    || report.native_signal_count > 0
+                    || report.native_reconcile_all
+                    || report.forced_scope_reconciliation_count > 0
+                    || error_code.is_some()
                 {
                     info!(
                         event = "watch_runtime_cycle",
@@ -288,31 +384,30 @@ fn run_watch_coordinator(
                         deferred_event_count = report.deferred_event_count,
                         deferred_scope_count = report.deferred_scope_count,
                         degraded_scope_count = report.degraded_scope_count,
-                        error_code = report.last_error_code
+                        native_signal_count = report.native_signal_count,
+                        native_hint_scope_count = report.native_hint_scope_count,
+                        native_overflow_count = report.native_overflow_count,
+                        native_reconcile_all = report.native_reconcile_all,
+                        native_more_pending = report.native_more_pending,
+                        forced_scope_reconciliation_count =
+                            report.forced_scope_reconciliation_count,
+                        native_watched_scope_count = watched_scope_count,
+                        error_code
                     );
                 }
 
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                let wait_ms = report
-                    .next_wake_unix_ms
-                    .saturating_sub(report.cycle_unix_ms)
-                    .max(1);
                 let Ok(wait_duration) = u64::try_from(wait_ms) else {
                     continue;
                 };
-                if wait_for_watch_wake(
-                    wake,
-                    stop,
-                    &mut observed_generation,
-                    Duration::from_millis(wait_duration),
-                )
-                .is_err()
+                if wait_for_watch_wake(&wake_receiver, stop, Duration::from_millis(wait_duration))
+                    .is_err()
                 {
                     if let Ok(mut status) = status.lock() {
                         status.state = WatchRuntimeState::Degraded;
-                        status.last_error_code = Some("watch_runtime_wake_poisoned");
+                        status.last_error_code = Some("watch_runtime_wake_channel_closed");
                     }
                     break;
                 }
@@ -326,9 +421,7 @@ fn run_watch_coordinator(
                     event = "watch_runtime_cycle_failed",
                     error_code = error.code()
                 );
-                if wait_for_watch_wake(wake, stop, &mut observed_generation, Duration::from_secs(5))
-                    .is_err()
-                {
+                if wait_for_watch_wake(&wake_receiver, stop, Duration::from_secs(5)).is_err() {
                     break;
                 }
             }
@@ -336,9 +429,11 @@ fn run_watch_coordinator(
     }
     if let Ok(mut status) = status.lock() {
         status.state = WatchRuntimeState::Stopped;
+        status.adapter = WATCH_ADAPTER_PERIODIC_ONLY;
         status.last_error_code = None;
         status.deferred_scope_count = 0;
         status.degraded_scope_count = 0;
+        status.native_watched_scope_count = 0;
         status.next_wake_unix_ms = None;
     }
 }
@@ -399,7 +494,7 @@ async fn run_manifest_scan(
 ) -> Result<ScanJobProgress, String> {
     let database_path = state.database_path.clone();
     let database_gate = Arc::clone(&state.database_gate);
-    let watch_wake = Arc::clone(&state.watch_wake);
+    let watch_wake = state.watch_wake.clone();
     let progress = tauri::async_runtime::spawn_blocking(move || {
         run_manifest_scan_with_gate(&database_path, job_id, &database_gate, &watch_wake)
             .map_err(str::to_string)
@@ -645,7 +740,7 @@ fn run_manifest_scan_with_gate(
     path: &Path,
     job_id: i64,
     database_gate: &Mutex<()>,
-    watch_wake: &(Mutex<u64>, Condvar),
+    watch_wake: &SyncSender<()>,
 ) -> Result<ScanJobProgress, &'static str> {
     let mut database = {
         let _database_guard = database_gate
@@ -959,7 +1054,10 @@ mod tests {
         }
         let observed = observed.expect("watch runtime should complete a startup cycle");
         let payload = serde_json::to_string(&observed).expect("status should serialize");
-        assert_eq!(observed.adapter, "bounded_metadata_polling");
+        assert_eq!(observed.api_version, "deskgraph.watch-runtime.v2");
+        assert_eq!(observed.adapter, WATCH_ADAPTER_NATIVE);
+        assert!(observed.periodic_reconciliation_enabled);
+        assert_eq!(observed.native_watched_scope_count, 0);
         assert_eq!(observed.last_error_code, None);
         assert!(!payload.contains("/Users/"));
         assert!(!payload.contains("manifest.sqlite3"));
@@ -974,23 +1072,194 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_runtime_reconciles_create_modify_rename_and_delete() {
+        fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+            for _ in 0..240 {
+                if predicate() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("{message}");
+        }
+
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let scope_path = directory.path().join("authorized");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let scope =
+            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let canonical_scope =
+            std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
+        let original_key =
+            deskgraph_scanner::comparison_key(&canonical_scope.join("native-original.md"));
+        let renamed_key =
+            deskgraph_scanner::comparison_key(&canonical_scope.join("native-renamed.md"));
+
+        let state = start_manifest_state(database_path.clone());
+        wait_until(
+            || {
+                let status = state
+                    .watch_status
+                    .lock()
+                    .expect("watch status should be readable")
+                    .clone();
+                status.state == WatchRuntimeState::Running
+                    && status.adapter == WATCH_ADAPTER_NATIVE
+                    && status.native_watched_scope_count == 1
+                    && status.active_event_count == 0
+            },
+            "native watcher should register after the initial reconciliation",
+        );
+
+        let original = scope_path.join("native-original.md");
+        std::fs::write(&original, "one").expect("native create should succeed");
+        let created = (0..240).any(|_| {
+            let found = {
+                let database =
+                    ManifestDatabase::open(&database_path).expect("database should open");
+                database
+                    .node_id_for_path_key(scope.id, &original_key)
+                    .expect("node lookup should pass")
+                    .is_some()
+            };
+            if !found {
+                thread::sleep(Duration::from_millis(50));
+            }
+            found
+        });
+        if !created {
+            let status = state
+                .watch_status
+                .lock()
+                .expect("watch status should be readable")
+                .clone();
+            let events = recent_watch_events_for_database(&database_path)
+                .expect("watch history should load");
+            panic!(
+                "native create should reconcile into the manifest; status={status:?}; events={events:?}"
+            );
+        }
+        let original_node_id = ManifestDatabase::open(&database_path)
+            .expect("database should open")
+            .node_id_for_path_key(scope.id, &original_key)
+            .expect("node lookup should pass")
+            .expect("created node should exist");
+
+        std::fs::write(&original, "a longer second value").expect("native modify should succeed");
+        wait_until(
+            || {
+                ManifestDatabase::open(&database_path)
+                    .expect("database should open")
+                    .extractable_file(scope.id, original_node_id)
+                    .expect("manifest file should remain available")
+                    .size_bytes
+                    == u64::try_from("a longer second value".len())
+                        .expect("fixture length should fit")
+            },
+            "native modify should publish the updated manifest metadata",
+        );
+
+        let renamed = scope_path.join("native-renamed.md");
+        std::fs::rename(&original, &renamed).expect("native rename should succeed");
+        wait_until(
+            || {
+                let database =
+                    ManifestDatabase::open(&database_path).expect("database should open");
+                database
+                    .node_id_for_path_key(scope.id, &renamed_key)
+                    .expect("renamed node lookup should pass")
+                    == Some(original_node_id)
+                    && database
+                        .node_id_for_path_key(scope.id, &original_key)
+                        .expect("old node lookup should pass")
+                        .is_none()
+            },
+            "native rename should preserve the stable node identity",
+        );
+
+        std::fs::remove_file(&renamed).expect("native delete should succeed");
+        wait_until(
+            || {
+                ManifestDatabase::open(&database_path)
+                    .expect("database should open")
+                    .node_id_for_path_key(scope.id, &renamed_key)
+                    .expect("deleted node lookup should pass")
+                    .is_none()
+            },
+            "native delete should reconcile out of the live manifest",
+        );
+
+        let temporary_download = scope_path.join("native-download.crdownload");
+        let final_download = scope_path.join("native-download.pdf");
+        let temporary_download_key =
+            deskgraph_scanner::comparison_key(&canonical_scope.join("native-download.crdownload"));
+        let final_download_key =
+            deskgraph_scanner::comparison_key(&canonical_scope.join("native-download.pdf"));
+        std::fs::write(&temporary_download, "complete").expect("temporary download should succeed");
+        wait_until(
+            || {
+                recent_watch_events_for_database(&database_path)
+                    .expect("watch history should load")
+                    .iter()
+                    .any(|event| {
+                        event.reason == Some(WatchEventReason::TemporaryDownload)
+                            && event.status == WatchEventStatus::Ignored
+                    })
+            },
+            "native temporary download should reach the ignored aggregate",
+        );
+        assert!(
+            ManifestDatabase::open(&database_path)
+                .expect("database should open")
+                .node_id_for_path_key(scope.id, &temporary_download_key)
+                .expect("temporary node lookup should pass")
+                .is_none(),
+            "temporary download must remain outside the live manifest"
+        );
+
+        std::fs::rename(&temporary_download, &final_download)
+            .expect("final download rename should succeed");
+        wait_until(
+            || {
+                ManifestDatabase::open(&database_path)
+                    .expect("database should open")
+                    .node_id_for_path_key(scope.id, &final_download_key)
+                    .expect("final download lookup should pass")
+                    .is_some()
+            },
+            "native final rename should enter the manifest without waiting for fallback",
+        );
+
+        let payload = serde_json::to_string(
+            &state
+                .watch_status
+                .lock()
+                .expect("watch status should be readable")
+                .clone(),
+        )
+        .expect("watch status should serialize");
+        assert!(!payload.contains("native-original.md"));
+        assert!(!payload.contains("native-renamed.md"));
+        assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
+        drop(state);
+    }
+
     #[test]
     fn watch_wait_does_not_lose_a_notification_before_the_wait_lock() {
-        let wake = (Mutex::new(0_u64), Condvar::new());
+        let (wake, wake_receiver) = sync_channel(1);
         let stop = AtomicBool::new(false);
-        let mut observed_generation = 0;
         notify_watch_wake(&wake);
 
         let started = Instant::now();
-        wait_for_watch_wake(
-            &wake,
-            &stop,
-            &mut observed_generation,
-            Duration::from_secs(5),
-        )
-        .expect("notification should remain observable");
+        wait_for_watch_wake(&wake_receiver, &stop, Duration::from_secs(5))
+            .expect("notification should remain observable");
 
-        assert_eq!(observed_generation, 1);
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "a notification between cycle completion and wait locking must not be lost"

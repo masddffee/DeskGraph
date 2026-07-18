@@ -241,6 +241,14 @@ fn process_queue_entry(
     if comparison_key(&path) != entry.path_key {
         return Err(ScannerError::ScopeChanged);
     }
+    if !entry.is_root && is_temporary_download_path(&path) {
+        return Ok(ProcessedQueueEntry {
+            observation: None,
+            children: Vec::new(),
+            issues: vec![issue("temporary_download_excluded", &path, None)],
+            skipped_entries: 1,
+        });
+    }
     let mut issues = Vec::new();
     let mut skipped_entries = 0_u64;
     let metadata = match fs::symlink_metadata(&path) {
@@ -417,6 +425,17 @@ fn is_hidden(name: Option<&OsStr>) -> bool {
     name.is_some_and(|name| name.to_string_lossy().starts_with('.'))
 }
 
+pub fn is_temporary_download_path(path: &Path) -> bool {
+    let filename = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(""))
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    [".part", ".crdownload", ".download"]
+        .iter()
+        .any(|suffix| filename.ends_with(suffix))
+}
+
 #[cfg(unix)]
 fn is_protected_system_scope(path: &Path) -> bool {
     const PROTECTED_TREES: &[&str] = &[
@@ -589,6 +608,40 @@ mod tests {
             first_stats.active_location_count
         );
         assert_eq!(second_stats.completed_scan_count, 2);
+    }
+
+    #[test]
+    fn temporary_downloads_are_excluded_until_renamed_to_a_final_name() {
+        let (directory, mut database, scope_id) = setup();
+        let partial = directory.path().join("report.pdf.part");
+        let completed = directory.path().join("report.pdf");
+        fs::write(&partial, "partial").expect("partial fixture should write");
+        fs::write(directory.path().join("archive.crdownload"), "partial")
+            .expect("browser fixture should write");
+        fs::write(directory.path().join("capture.download"), "partial")
+            .expect("download fixture should write");
+        fs::write(directory.path().join("ready.md"), "ready").expect("ready fixture should write");
+
+        let initial = scan_scope(&mut database, scope_id).expect("initial scan should pass");
+        assert_eq!(initial.discovered_files, 1);
+        assert_eq!(initial.skipped_entries, 3);
+        assert_eq!(initial.issue_count, 3);
+
+        fs::rename(&partial, &completed).expect("partial fixture should finalize");
+        let rescanned = scan_scope(&mut database, scope_id).expect("rescan should pass");
+        let completed_key = comparison_key(
+            &fs::canonicalize(&completed).expect("completed fixture should canonicalize"),
+        );
+
+        assert_eq!(rescanned.discovered_files, 2);
+        assert_eq!(rescanned.skipped_entries, 2);
+        assert_eq!(rescanned.issue_count, 2);
+        assert!(
+            database
+                .node_id_for_path_key(scope_id, &completed_key)
+                .expect("completed fixture lookup should pass")
+                .is_some()
+        );
     }
 
     #[cfg(target_os = "macos")]

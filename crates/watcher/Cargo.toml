@@ -11,5 +11,11 @@ deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
 deskgraph-scanner = { path = "../scanner" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { workspace = true, features = ["macos_fsevent"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

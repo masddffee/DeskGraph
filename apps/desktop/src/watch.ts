@@ -23,17 +23,22 @@ export interface WatchEventProgress {
 }
 
 export type WatchRuntimeState = 'starting' | 'running' | 'degraded' | 'stopped';
+export type WatchRuntimeAdapter =
+  'native_with_periodic_reconciliation' | 'periodic_reconciliation_only';
 
 export interface WatchRuntimeStatus {
-  api_version: 'deskgraph.watch-runtime.v1';
+  api_version: 'deskgraph.watch-runtime.v2';
   state: WatchRuntimeState;
-  adapter: 'bounded_metadata_polling';
+  adapter: WatchRuntimeAdapter;
   poll_interval_ms: number;
+  periodic_reconciliation_enabled: true;
   last_cycle_unix_ms: number | null;
   authorized_scope_count: number;
   active_event_count: number;
   degraded_scope_count: number;
   deferred_scope_count: number;
+  native_watched_scope_count: number;
+  native_overflow_count: number;
   next_wake_unix_ms: number | null;
   last_error_code: string | null;
 }
@@ -64,6 +69,12 @@ function isStatus(value: unknown): value is WatchEventStatus {
 
 function isRuntimeState(value: unknown): value is WatchRuntimeState {
   return value === 'starting' || value === 'running' || value === 'degraded' || value === 'stopped';
+}
+
+function isRuntimeAdapter(value: unknown): value is WatchRuntimeAdapter {
+  return (
+    value === 'native_with_periodic_reconciliation' || value === 'periodic_reconciliation_only'
+  );
 }
 
 function isFixedErrorCode(value: unknown): value is string | null {
@@ -120,31 +131,39 @@ export function parseWatchRuntimeStatus(value: unknown): WatchRuntimeStatus {
         value.active_event_count === 0 &&
         value.degraded_scope_count === 0 &&
         value.deferred_scope_count === 0 &&
+        value.native_watched_scope_count === 0 &&
+        value.native_overflow_count === 0 &&
         lastCycle === null &&
         nextWake === null &&
         value.last_error_code === null
       : state === 'running'
-        ? value.degraded_scope_count === 0 && value.last_error_code === null
+        ? value.adapter === 'native_with_periodic_reconciliation' &&
+          value.degraded_scope_count === 0 &&
+          value.last_error_code === null
         : state === 'degraded'
           ? value.last_error_code !== null
           : state === 'stopped'
             ? value.degraded_scope_count === 0 &&
               value.deferred_scope_count === 0 &&
+              value.native_watched_scope_count === 0 &&
               nextWake === null &&
               value.last_error_code === null
             : false) && (state === 'running' || state === 'degraded' ? hasNonDecreasingWake : true);
   const valid =
-    value.api_version === 'deskgraph.watch-runtime.v1' &&
+    value.api_version === 'deskgraph.watch-runtime.v2' &&
     isRuntimeState(state) &&
-    value.adapter === 'bounded_metadata_polling' &&
+    isRuntimeAdapter(value.adapter) &&
     isCount(value.poll_interval_ms) &&
     value.poll_interval_ms >= 5_000 &&
     value.poll_interval_ms <= 3_600_000 &&
+    value.periodic_reconciliation_enabled === true &&
     (lastCycle === null || isCount(lastCycle)) &&
     isCount(value.authorized_scope_count) &&
     isCount(value.active_event_count) &&
     isCount(value.degraded_scope_count) &&
     isCount(value.deferred_scope_count) &&
+    isCount(value.native_watched_scope_count) &&
+    isCount(value.native_overflow_count) &&
     (nextWake === null || isCount(nextWake)) &&
     isFixedErrorCode(value.last_error_code) &&
     hasCoherentState;

@@ -36,13 +36,21 @@ describe('i18n catalog contract', () => {
     expect(catalogs.en.actions.policyAria).toBe('Passed policy checks');
   });
 
-  it('labels the polling fallback and deferred backlog honestly in both locales', () => {
-    expect(catalogs.en.watch.heading).toBe('Bounded metadata polling fallback');
+  it('labels native hints and periodic safety reconciliation honestly in both locales', () => {
+    expect(catalogs.en.watch.heading).toBe('Native event hints + 5-minute safety reconciliation');
     expect(catalogs.en.watch.metrics.deferred).toBe('Deferred folders');
-    expect(catalogs.en.watch.description).toContain('It is not native event watching');
-    expect(catalogs['zh-TW'].watch.heading).toBe('受限的 metadata 輪詢備援');
+    expect(catalogs.en.watch.description).toContain('Native filesystem events are hints only');
+    expect(catalogs.en.watch.description).toContain('does not promise incremental content refresh');
+    expect(catalogs.en.watch.adapterActive).toContain('active');
+    expect(catalogs.en.watch.adapterDegraded).toContain('periodic-only fallback');
+    expect(catalogs.en.watch.adapterStopped).toContain('stopped');
+    expect(catalogs['zh-TW'].watch.heading).toBe('原生事件提示＋每五分鐘安全協調');
     expect(catalogs['zh-TW'].watch.metrics.deferred).toBe('延後資料夾');
-    expect(catalogs['zh-TW'].watch.description).toContain('這不是原生事件監看');
+    expect(catalogs['zh-TW'].watch.description).toContain('原生檔案系統事件僅是提示');
+    expect(catalogs['zh-TW'].watch.description).toContain('不保證增量內容更新或完成時限');
+    expect(catalogs['zh-TW'].watch.adapterActive).toContain('運作中');
+    expect(catalogs['zh-TW'].watch.adapterDegraded).toContain('僅週期性備援');
+    expect(catalogs['zh-TW'].watch.adapterStopped).toContain('已停止');
   });
 });
 

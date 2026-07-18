@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, Metadata};
 use std::path::{Component, Path, PathBuf};
@@ -15,9 +14,14 @@ use deskgraph_identity::{
     path_from_raw, path_to_raw, platform_identity, platform_identity_for_open_file,
 };
 use deskgraph_scanner::{
-    ScannerError, resume_scan_job, run_scan_job_batch, run_scan_job_to_terminal,
-    validated_scope_root,
+    ScannerError, is_temporary_download_path, resume_scan_job, run_scan_job_batch,
+    run_scan_job_to_terminal, validated_scope_root,
 };
+
+mod native;
+
+pub use native::NativeWatchEventSource;
+use native::{MAX_NATIVE_SIGNALS_PER_CYCLE, NativeWatchScope};
 
 const DEFAULT_STABILITY_WINDOW_MS: i64 = 1_000;
 const MIN_STABILITY_WINDOW_MS: i64 = 250;
@@ -106,6 +110,13 @@ pub struct WatchCycleReport {
     pub scheduled_scope_count: u64,
     pub deferred_scope_count: u64,
     pub degraded_scope_count: u64,
+    pub native_signal_count: u64,
+    pub native_hint_scope_count: u64,
+    pub native_overflow_count: u64,
+    pub native_reconcile_all: bool,
+    pub native_source_failed: bool,
+    pub native_more_pending: bool,
+    pub forced_scope_reconciliation_count: u64,
     pub next_wake_unix_ms: i64,
     pub last_error_code: Option<&'static str>,
 }
@@ -122,6 +133,7 @@ pub struct WatchCoordinator {
     deferred_scope_due_at: BTreeMap<i64, i64>,
     event_retry_at: BTreeMap<i64, i64>,
     scope_errors: BTreeMap<i64, &'static str>,
+    force_reconciliation_scopes: BTreeSet<i64>,
 }
 
 impl WatchCoordinator {
@@ -147,7 +159,114 @@ impl WatchCoordinator {
             deferred_scope_due_at: BTreeMap::new(),
             event_retry_at: BTreeMap::new(),
             scope_errors: BTreeMap::new(),
+            force_reconciliation_scopes: BTreeSet::new(),
         }
+    }
+
+    pub fn synchronize_native_event_source(
+        &mut self,
+        source: &mut NativeWatchEventSource,
+    ) -> Result<bool, WatcherError> {
+        let now_unix_ms = unix_ms()?;
+        let watchable_scope_ids = self.database.watchable_scope_ids()?;
+        let watchable_scope_set = watchable_scope_ids.iter().copied().collect::<BTreeSet<_>>();
+        let mut scopes = Vec::with_capacity(watchable_scope_ids.len());
+        for scope_id in watchable_scope_ids {
+            match validated_scope_root(&self.database, scope_id) {
+                Ok(root) => scopes.push(NativeWatchScope { scope_id, root }),
+                Err(error) => {
+                    self.scope_errors.insert(scope_id, error.code());
+                    self.next_poll_by_scope.insert(scope_id, now_unix_ms);
+                }
+            }
+        }
+        self.force_reconciliation_scopes
+            .retain(|scope_id| watchable_scope_set.contains(scope_id));
+        source.synchronize(scopes)
+    }
+
+    pub fn request_all_scope_reconciliation_at(
+        &mut self,
+        now_unix_ms: i64,
+    ) -> Result<(), WatcherError> {
+        if now_unix_ms < 0 {
+            return Err(WatcherError::InvalidTimestamp);
+        }
+        for scope_id in self.database.watchable_scope_ids()? {
+            self.next_poll_by_scope.insert(scope_id, now_unix_ms);
+            self.force_reconciliation_scopes.insert(scope_id);
+        }
+        Ok(())
+    }
+
+    pub fn request_all_scope_reconciliation(&mut self) -> Result<(), WatcherError> {
+        self.request_all_scope_reconciliation_at(unix_ms()?)
+    }
+
+    pub fn run_cycle_with_native_event_source(
+        &mut self,
+        source: &NativeWatchEventSource,
+    ) -> Result<WatchCycleReport, WatcherError> {
+        self.run_cycle_with_native_event_source_at_time(source, unix_ms()?)
+    }
+
+    pub fn run_cycle_with_native_event_source_at_time(
+        &mut self,
+        source: &NativeWatchEventSource,
+        now_unix_ms: i64,
+    ) -> Result<WatchCycleReport, WatcherError> {
+        self.run_cycle_with_native_batch_at_time(
+            source.drain(MAX_NATIVE_SIGNALS_PER_CYCLE),
+            now_unix_ms,
+        )
+    }
+
+    fn run_cycle_with_native_batch_at_time(
+        &mut self,
+        batch: native::NativeWatchBatch,
+        now_unix_ms: i64,
+    ) -> Result<WatchCycleReport, WatcherError> {
+        if now_unix_ms < 0 {
+            return Err(WatcherError::InvalidTimestamp);
+        }
+        if batch.reconcile_all || batch.source_failed {
+            self.request_all_scope_reconciliation_at(now_unix_ms)?;
+        }
+        for scope_id in &batch.reconcile_scope_ids {
+            if self.database.scope_has_completed_scan(*scope_id)? {
+                self.next_poll_by_scope.insert(*scope_id, now_unix_ms);
+                self.force_reconciliation_scopes.insert(*scope_id);
+            }
+        }
+        let hint_scope_count =
+            u64::try_from(batch.hints.len()).map_err(|_| WatcherError::InvalidRuntimeCount)?;
+        for hint in batch.hints {
+            if !self.database.scope_has_completed_scan(hint.scope_id)? {
+                continue;
+            }
+            if let Err(error) = observe_watch_path_at_time(
+                &mut self.database,
+                hint.scope_id,
+                &hint.path,
+                self.watch_policy,
+                now_unix_ms,
+            ) {
+                self.scope_errors.insert(hint.scope_id, error.code());
+                self.next_poll_by_scope.insert(hint.scope_id, now_unix_ms);
+            }
+        }
+
+        let mut report = self.run_cycle_at_time(now_unix_ms)?;
+        report.native_signal_count = batch.signal_count;
+        report.native_hint_scope_count = hint_scope_count;
+        report.native_overflow_count = batch.overflow_count;
+        report.native_reconcile_all = batch.reconcile_all;
+        report.native_source_failed = batch.source_failed;
+        report.native_more_pending = batch.more_pending;
+        if batch.source_failed {
+            report.last_error_code = Some("watch_native_source_failed");
+        }
+        Ok(report)
     }
 
     pub fn run_cycle(&mut self) -> Result<WatchCycleReport, WatcherError> {
@@ -174,6 +293,8 @@ impl WatchCoordinator {
             .retain(|scope_id, _| scope_ids.contains(scope_id));
         self.scope_errors
             .retain(|scope_id, _| scope_ids.contains(scope_id));
+        self.force_reconciliation_scopes
+            .retain(|scope_id| scope_ids.contains(scope_id));
         for scope_id in &scope_ids {
             self.next_poll_by_scope
                 .entry(*scope_id)
@@ -194,6 +315,13 @@ impl WatchCoordinator {
             scheduled_scope_count: 0,
             deferred_scope_count: 0,
             degraded_scope_count: 0,
+            native_signal_count: 0,
+            native_hint_scope_count: 0,
+            native_overflow_count: 0,
+            native_reconcile_all: false,
+            native_source_failed: false,
+            native_more_pending: false,
+            forced_scope_reconciliation_count: 0,
             next_wake_unix_ms: now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
             last_error_code: self.scope_errors.values().next().copied(),
         };
@@ -213,7 +341,16 @@ impl WatchCoordinator {
                 report.deferred_event_count = report.deferred_event_count.saturating_add(1);
                 continue;
             }
-            let is_due = event.status == WatchEventStatus::Reconciling
+            let created_at_unix_ms = self.database.watch_event_created_at(event.event_id)?;
+            let maximum_stabilizing_age_reached = event.status == WatchEventStatus::Stabilizing
+                && now_unix_ms.saturating_sub(created_at_unix_ms)
+                    >= self.polling_policy.poll_interval_ms;
+            let explicit_force_requested =
+                self.force_reconciliation_scopes.contains(&event.scope_id);
+            let force_reconciliation = event.status == WatchEventStatus::Stabilizing
+                && (explicit_force_requested || maximum_stabilizing_age_reached);
+            let is_due = force_reconciliation
+                || event.status == WatchEventStatus::Reconciling
                 || now_unix_ms >= event.stable_after_unix_ms;
             if !is_due {
                 continue;
@@ -223,14 +360,29 @@ impl WatchCoordinator {
                 continue;
             }
 
-            match advance_watch_event_batch_at_time(
-                &mut self.database,
-                event.event_id,
-                self.watch_policy,
-                COORDINATOR_RECONCILIATION_BATCH_SIZE,
-                now_unix_ms,
-            ) {
+            let advanced = if force_reconciliation {
+                force_scope_metadata_reconciliation_batch_at_time(
+                    &mut self.database,
+                    event.event_id,
+                    COORDINATOR_RECONCILIATION_BATCH_SIZE,
+                    now_unix_ms,
+                )
+            } else {
+                advance_watch_event_batch_at_time(
+                    &mut self.database,
+                    event.event_id,
+                    self.watch_policy,
+                    COORDINATOR_RECONCILIATION_BATCH_SIZE,
+                    now_unix_ms,
+                )
+            };
+            match advanced {
                 Ok(progress) => {
+                    if force_reconciliation {
+                        self.force_reconciliation_scopes.remove(&event.scope_id);
+                        report.forced_scope_reconciliation_count =
+                            report.forced_scope_reconciliation_count.saturating_add(1);
+                    }
                     self.event_retry_at.remove(&event.event_id);
                     reconciliation_count += 1;
                     report.advanced_event_count = report.advanced_event_count.saturating_add(1);
@@ -243,10 +395,15 @@ impl WatchCoordinator {
                             self.scope_errors
                                 .insert(progress.scope_id, watch_progress_error_code(&progress));
                         }
-                        self.next_poll_by_scope.insert(
-                            progress.scope_id,
-                            now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
-                        );
+                        let next_poll = if self
+                            .force_reconciliation_scopes
+                            .contains(&progress.scope_id)
+                        {
+                            now_unix_ms
+                        } else {
+                            now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms)
+                        };
+                        self.next_poll_by_scope.insert(progress.scope_id, next_poll);
                     }
                 }
                 Err(error) if is_retryable_scan_contention(&error) => {
@@ -351,22 +508,32 @@ impl WatchCoordinator {
         report.deferred_scope_count = u64::try_from(self.deferred_scope_due_at.len())
             .map_err(|_| WatcherError::InvalidRuntimeCount)?;
         report.last_error_code = self.scope_errors.values().next().copied();
-        let next_active_wake = active_after.iter().map(|event| {
+        let mut next_active_wake = Vec::with_capacity(active_after.len());
+        for event in &active_after {
             let normal_wake = match event.status {
-                WatchEventStatus::Stabilizing => event.stable_after_unix_ms,
+                WatchEventStatus::Stabilizing => {
+                    let maximum_age_wake = self
+                        .database
+                        .watch_event_created_at(event.event_id)?
+                        .saturating_add(self.polling_policy.poll_interval_ms);
+                    event.stable_after_unix_ms.min(maximum_age_wake)
+                }
                 WatchEventStatus::Reconciling => {
                     now_unix_ms.saturating_add(COORDINATOR_ACTIVE_RETRY_MS)
                 }
                 _ => now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms),
             };
-            self.event_retry_at
-                .get(&event.event_id)
-                .copied()
-                .unwrap_or(normal_wake)
-                .max(normal_wake)
-        });
+            next_active_wake.push(
+                self.event_retry_at
+                    .get(&event.event_id)
+                    .copied()
+                    .unwrap_or(normal_wake)
+                    .max(normal_wake),
+            );
+        }
         let next_poll_wake = self.next_poll_by_scope.values().copied();
         report.next_wake_unix_ms = next_active_wake
+            .into_iter()
             .chain(next_poll_wake)
             .min()
             .unwrap_or_else(|| now_unix_ms.saturating_add(self.polling_policy.poll_interval_ms))
@@ -501,6 +668,9 @@ pub fn observe_watch_path_at_time(
     policy: WatchPolicy,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
+    if !database.scope_has_completed_scan(scope_id)? {
+        return Err(DatabaseError::WatchScopeInitialScanRequired.into());
+    }
     let stable_after = stable_after(now_unix_ms, policy)?;
     match evaluate_hint(database, scope_id, observed_path)? {
         EvaluatedHint::Track(hint) => database
@@ -573,6 +743,44 @@ fn advance_watch_event_batch_at_time(
         database,
         event_id,
         policy,
+        now_unix_ms,
+        ReconciliationRunMode::Batch(batch_size),
+    )
+}
+
+fn force_scope_metadata_reconciliation_batch_at_time(
+    database: &mut ManifestDatabase,
+    event_id: i64,
+    batch_size: usize,
+    now_unix_ms: i64,
+) -> Result<WatchEventProgress, WatcherError> {
+    if now_unix_ms < 0 {
+        return Err(WatcherError::InvalidTimestamp);
+    }
+    let event = database.watch_event(event_id)?;
+    if event.progress.is_terminal() {
+        return Ok(event.progress);
+    }
+    if event.progress.status != WatchEventStatus::Stabilizing {
+        return Err(WatcherError::Database(
+            DatabaseError::InvalidWatchEventState,
+        ));
+    }
+
+    // Native overflow/source recovery and maximum coalescing age reconcile
+    // metadata only through the same atomic scanner. They never authorize
+    // content extraction or a filesystem action.
+    let canonical_root = validated_scope_root(database, event.progress.scope_id)?;
+    let root = QueuedPath {
+        path_raw: path_to_raw(&canonical_root),
+        path_key: comparison_key(&canonical_root),
+        parent_identity_key: None,
+        is_root: true,
+    };
+    database.begin_forced_watch_metadata_reconciliation_at(event_id, &root, now_unix_ms)?;
+    finish_reconciliation(
+        database,
+        event_id,
         now_unix_ms,
         ReconciliationRunMode::Batch(batch_size),
     )
@@ -825,7 +1033,7 @@ fn evaluate_hint(
         path,
         snapshot,
     };
-    if is_temporary_download(&hint.path) {
+    if is_temporary_download_path(&hint.path) {
         return Ok(EvaluatedHint::Ignore(
             hint,
             WatchEventReason::TemporaryDownload,
@@ -920,17 +1128,6 @@ fn stable_after(now_unix_ms: i64, policy: WatchPolicy) -> Result<i64, WatcherErr
         .ok_or(WatcherError::InvalidTimestamp)
 }
 
-fn is_temporary_download(path: &Path) -> bool {
-    let filename = path
-        .file_name()
-        .unwrap_or_else(|| OsStr::new(""))
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    [".part", ".crdownload", ".download"]
-        .iter()
-        .any(|suffix| filename.ends_with(suffix))
-}
-
 fn has_hidden_component(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root).is_ok_and(|relative| {
         relative.components().any(|component| {
@@ -958,6 +1155,7 @@ mod tests {
         authorize_scope, create_scan_job, run_scan_job_to_terminal, scan_scope,
     };
     use std::collections::VecDeque;
+    use std::sync::Arc;
 
     fn setup() -> (tempfile::TempDir, ManifestDatabase, i64) {
         let directory = tempfile::tempdir().expect("fixture root should exist");
@@ -1047,6 +1245,409 @@ mod tests {
             ),
             Err(WatcherError::EventSourceFailed)
         ));
+    }
+
+    #[test]
+    fn source_hint_cannot_turn_authorization_into_an_initial_scan() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
+        let file = directory.path().join("not-scanned.md");
+        fs::write(&file, "private").expect("fixture should write");
+        let mut source = ScriptedWatchEventSource {
+            steps: VecDeque::from([ScriptedSourceStep::Hint(WatchHint {
+                scope_id: scope.id,
+                path: file,
+            })]),
+        };
+
+        assert!(matches!(
+            ingest_next_source_hint_at_time(
+                &mut database,
+                &mut source,
+                WatchPolicy::default(),
+                1_000,
+            ),
+            Err(WatcherError::Database(
+                DatabaseError::WatchScopeInitialScanRequired
+            ))
+        ));
+        assert_eq!(
+            database
+                .stats()
+                .expect("manifest stats should load")
+                .completed_scan_count,
+            0
+        );
+    }
+
+    #[test]
+    fn native_rescan_signal_advances_periodic_reconciliation_without_bypassing_bounds() {
+        let (_directory, database, _scope_id) = setup();
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let scheduled = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("startup reconciliation should schedule");
+        assert_eq!(scheduled.scheduled_scope_count, 1);
+        let completed = coordinator
+            .run_cycle_at_time(2_000)
+            .expect("startup reconciliation should complete");
+        assert_eq!(completed.completed_event_count, 1);
+
+        let native = coordinator
+            .run_cycle_with_native_batch_at_time(
+                native::NativeWatchBatch {
+                    hints: Vec::new(),
+                    reconcile_scope_ids: BTreeSet::new(),
+                    reconcile_all: true,
+                    source_failed: false,
+                    more_pending: false,
+                    signal_count: 0,
+                    overflow_count: 1,
+                },
+                3_000,
+            )
+            .expect("native overflow should use the durable root path");
+        assert_eq!(native.scheduled_scope_count, 1);
+        assert!(native.native_reconcile_all);
+        assert_eq!(native.native_overflow_count, 1);
+        assert_eq!(native.native_hint_scope_count, 0);
+    }
+
+    #[test]
+    fn native_ordered_temporary_to_final_rename_cannot_lose_the_final_file() {
+        let (directory, database, scope_id) = setup();
+        let temporary = directory.path().join("report.crdownload");
+        let final_path = directory.path().join("report.pdf");
+        fs::write(&temporary, "complete").expect("temporary fixture should write");
+        fs::rename(&temporary, &final_path).expect("fixture should reach its final name");
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let scheduled = coordinator
+            .run_cycle_with_native_batch_at_time(
+                native::NativeWatchBatch {
+                    hints: vec![WatchHint {
+                        scope_id,
+                        path: temporary,
+                    }],
+                    reconcile_scope_ids: BTreeSet::from([scope_id]),
+                    reconcile_all: false,
+                    source_failed: false,
+                    more_pending: false,
+                    signal_count: 1,
+                    overflow_count: 0,
+                },
+                1_000,
+            )
+            .expect("ordered rename ambiguity should request bounded scope recovery");
+        assert_eq!(scheduled.scheduled_scope_count, 1);
+        assert_eq!(scheduled.forced_scope_reconciliation_count, 0);
+
+        let reconciled = coordinator
+            .run_cycle_at_time(1_001)
+            .expect("scope recovery should force a fresh root scan");
+        assert_eq!(reconciled.forced_scope_reconciliation_count, 1);
+        assert_eq!(reconciled.completed_event_count, 1);
+        assert!(
+            coordinator
+                .database
+                .node_id_for_path_key(
+                    scope_id,
+                    &comparison_key(
+                        &fs::canonicalize(&final_path).expect("final fixture should canonicalize")
+                    )
+                )
+                .expect("final node lookup should pass")
+                .is_some(),
+            "the final path must not wait for the periodic fallback"
+        );
+    }
+
+    #[test]
+    fn native_overflow_forces_an_active_scope_through_durable_root_reconciliation() {
+        let (directory, mut database, scope_id) = setup();
+        let file = directory.path().join("overflow.md");
+        fs::write(&file, "local").expect("fixture should write");
+        observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &file,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("active event should persist");
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let report = coordinator
+            .run_cycle_with_native_batch_at_time(
+                native::NativeWatchBatch {
+                    hints: Vec::new(),
+                    reconcile_scope_ids: BTreeSet::new(),
+                    reconcile_all: true,
+                    source_failed: false,
+                    more_pending: false,
+                    signal_count: 0,
+                    overflow_count: 1,
+                },
+                1_100,
+            )
+            .expect("overflow must not be blocked by a stabilizing event");
+
+        assert_eq!(report.forced_scope_reconciliation_count, 1);
+        assert_eq!(report.completed_event_count, 1);
+        assert_eq!(report.active_event_count, 0);
+        assert_eq!(
+            coordinator
+                .database
+                .stats()
+                .expect("manifest stats should load")
+                .file_count,
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_during_a_multibatch_scan_runs_a_fresh_root_scan_afterward() {
+        let (directory, database, scope_id) = setup();
+        for index in 0..300 {
+            fs::write(
+                directory.path().join(format!("before-{index:03}.md")),
+                "before",
+            )
+            .expect("large fixture should write");
+        }
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let scheduled = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("root reconciliation should schedule");
+        assert_eq!(scheduled.scheduled_scope_count, 1);
+        let first_batch = coordinator
+            .run_cycle_at_time(2_000)
+            .expect("large reconciliation should advance one bounded batch");
+        assert_eq!(first_batch.advanced_event_count, 1);
+        assert_eq!(first_batch.completed_event_count, 0);
+        assert_eq!(first_batch.active_event_count, 1);
+
+        let after_signal = directory.path().join("after-rescan-signal.md");
+        fs::write(&after_signal, "after").expect("post-signal fixture should write");
+        let old_scan_completed = coordinator
+            .run_cycle_with_native_batch_at_time(
+                native::NativeWatchBatch {
+                    hints: Vec::new(),
+                    reconcile_scope_ids: BTreeSet::new(),
+                    reconcile_all: true,
+                    source_failed: false,
+                    more_pending: false,
+                    signal_count: 0,
+                    overflow_count: 1,
+                },
+                2_100,
+            )
+            .expect("recovery intent should survive the existing scan");
+        assert_eq!(old_scan_completed.completed_event_count, 1);
+        assert_eq!(old_scan_completed.forced_scope_reconciliation_count, 0);
+        assert_eq!(old_scan_completed.scheduled_scope_count, 1);
+        assert_eq!(old_scan_completed.active_event_count, 1);
+
+        let followup_started = coordinator
+            .run_cycle_at_time(2_101)
+            .expect("a fresh forced root scan should start");
+        assert_eq!(followup_started.forced_scope_reconciliation_count, 1);
+        assert_eq!(followup_started.completed_event_count, 0);
+        assert_eq!(followup_started.active_event_count, 1);
+        let followup_completed = coordinator
+            .run_cycle_at_time(2_102)
+            .expect("the fresh root scan should complete");
+        assert_eq!(followup_completed.completed_event_count, 1);
+        assert_eq!(followup_completed.active_event_count, 0);
+        assert_eq!(
+            coordinator
+                .database
+                .stats()
+                .expect("manifest stats should load")
+                .completed_scan_count,
+            3
+        );
+        assert!(
+            coordinator
+                .database
+                .node_id_for_path_key(
+                    scope_id,
+                    &comparison_key(
+                        &fs::canonicalize(&after_signal)
+                            .expect("post-signal fixture should canonicalize")
+                    )
+                )
+                .expect("node lookup should pass")
+                .is_some(),
+            "the follow-up scan must capture changes after the old root was enumerated"
+        );
+    }
+
+    #[test]
+    fn native_watch_set_changes_close_the_registration_gap_with_a_root_reconciliation() {
+        let (directory, database, scope_id) = setup();
+        let missed_before_registration = directory.path().join("before-registration.md");
+        fs::write(&missed_before_registration, "local").expect("fixture should write");
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut source =
+            NativeWatchEventSource::new(Arc::new(|| {})).expect("native source should initialize");
+
+        assert!(
+            coordinator
+                .synchronize_native_event_source(&mut source)
+                .expect("watch set should synchronize"),
+            "the first registration must be reported to the runtime"
+        );
+        coordinator
+            .request_all_scope_reconciliation_at(1_000)
+            .expect("watch-set change should request reconciliation");
+        let scheduled = coordinator
+            .run_cycle_at_time(1_000)
+            .expect("root reconciliation should schedule durably");
+        assert_eq!(scheduled.scheduled_scope_count, 1);
+        let completed = coordinator
+            .run_cycle_at_time(1_001)
+            .expect("forced reconciliation should not wait for debounce");
+
+        assert_eq!(completed.forced_scope_reconciliation_count, 1);
+        assert_eq!(completed.completed_event_count, 1);
+        assert_eq!(
+            coordinator
+                .database
+                .stats()
+                .expect("manifest stats should load")
+                .file_count,
+            1
+        );
+        assert!(
+            coordinator
+                .database
+                .node_id_for_path_key(
+                    scope_id,
+                    &comparison_key(
+                        &fs::canonicalize(&missed_before_registration)
+                            .expect("fixture should canonicalize")
+                    )
+                )
+                .expect("node lookup should pass")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sustained_churn_cannot_postpone_metadata_reconciliation_past_the_poll_interval() {
+        let (directory, mut database, scope_id) = setup();
+        let file = directory.path().join("continuous.log");
+        fs::write(&file, "one").expect("fixture should write");
+        let event = observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &file,
+            WatchPolicy::default(),
+            1_000,
+        )
+        .expect("first observation should persist");
+        fs::write(&file, "two-two").expect("fixture should change");
+        observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &file,
+            WatchPolicy::default(),
+            3_000,
+        )
+        .expect("second observation should coalesce");
+        fs::write(&file, "three-three-three").expect("fixture should change again");
+        let latest = observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &file,
+            WatchPolicy::default(),
+            5_500,
+        )
+        .expect("latest observation should coalesce");
+        assert_eq!(latest.event_id, event.event_id);
+        assert_eq!(latest.stable_after_unix_ms, 6_500);
+
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let waiting = coordinator
+            .run_cycle_at_time(5_501)
+            .expect("pre-bound cycle should remain stable");
+        assert_eq!(
+            waiting.next_wake_unix_ms, 6_000,
+            "the first observation age, not the latest debounce, bounds the wake"
+        );
+
+        let forced = coordinator
+            .run_cycle_at_time(6_000)
+            .expect("maximum coalescing age should force metadata reconciliation");
+        assert_eq!(forced.forced_scope_reconciliation_count, 1);
+        assert_eq!(forced.completed_event_count, 1);
+        assert_eq!(forced.active_event_count, 0);
+        let node_id = coordinator
+            .database
+            .node_id_for_path_key(
+                scope_id,
+                &comparison_key(&fs::canonicalize(&file).expect("fixture should canonicalize")),
+            )
+            .expect("node lookup should pass")
+            .expect("reconciled node should exist");
+        assert_eq!(
+            coordinator
+                .database
+                .extractable_file(scope_id, node_id)
+                .expect("manifest metadata should load")
+                .size_bytes,
+            17
+        );
+    }
+
+    #[test]
+    fn native_source_failure_is_path_free_and_keeps_periodic_work_running() {
+        let (_directory, database, _scope_id) = setup();
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+
+        let report = coordinator
+            .run_cycle_with_native_batch_at_time(
+                native::NativeWatchBatch {
+                    hints: Vec::new(),
+                    reconcile_scope_ids: BTreeSet::new(),
+                    reconcile_all: true,
+                    source_failed: true,
+                    more_pending: false,
+                    signal_count: 0,
+                    overflow_count: 0,
+                },
+                1_000,
+            )
+            .expect("source failure should degrade to polling");
+
+        assert!(report.native_source_failed);
+        assert_eq!(report.scheduled_scope_count, 1);
+        assert_eq!(report.last_error_code, Some("watch_native_source_failed"));
     }
 
     #[test]
@@ -1341,6 +1942,32 @@ mod tests {
 
         assert_eq!(event.status, WatchEventStatus::Ignored);
         assert_eq!(event.reason, Some(WatchEventReason::TemporaryDownload));
+        let second_download = directory.path().join("other.part");
+        fs::write(&second_download, "partial-two").expect("temporary file should write");
+        let coalesced = observe_watch_path_at_time(
+            &mut database,
+            scope_id,
+            &second_download,
+            WatchPolicy::default(),
+            1_100,
+        )
+        .expect("temporary observation should coalesce safely");
+        assert_eq!(coalesced.event_id, event.event_id);
+        assert_eq!(coalesced.observation_count, 2);
+        assert_eq!(
+            database
+                .watch_event(event.event_id)
+                .expect("coalesced event should load")
+                .path_key,
+            comparison_key(&fs::canonicalize(&second_download).expect("path should canonicalize"))
+        );
+        assert_eq!(
+            database
+                .recent_watch_events()
+                .expect("watch history should load")
+                .len(),
+            1
+        );
         assert_eq!(
             database
                 .stats()

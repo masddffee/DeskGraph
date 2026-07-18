@@ -421,14 +421,14 @@ const en = {
     directPreviewed: 'Direct · previewed',
   },
   watch: {
-    kicker: 'Durable watch reconciliation',
-    heading: 'Bounded metadata polling fallback',
+    kicker: 'Native event hints with safety reconciliation',
+    heading: 'Native event hints + 5-minute safety reconciliation',
     description:
-      'Uses a five-minute polling interval. Each cycle schedules at most four due, previously scanned folders and advances one reconciliation batch; backlog is shown below. It is not native event watching or incremental content indexing.',
-    adapterActive: '5-minute polling fallback · active',
-    adapterStarting: '5-minute polling fallback · starting',
-    adapterDegraded: '5-minute polling fallback · needs attention',
-    adapterStopped: '5-minute polling fallback · stopped',
+      'Native filesystem events are hints only. A five-minute periodic safety reconciliation also checks eligible, previously scanned folders in bounded batches. It does not promise incremental content refresh or a completion deadline.',
+    adapterActive: 'Native hints + 5-minute safety reconciliation · active',
+    adapterStarting: 'Native hints + 5-minute safety reconciliation · starting',
+    adapterDegraded: 'Native hints or periodic-only fallback · needs attention',
+    adapterStopped: 'Native hints + 5-minute safety reconciliation · stopped',
     metrics: {
       recent: 'Recent events',
       observed: 'Observed hints',
@@ -697,14 +697,14 @@ const zhTW = {
     directPreviewed: '直接 · 已預覽',
   },
   watch: {
-    kicker: '可持久化監看協調',
-    heading: '受限的 metadata 輪詢備援',
+    kicker: '原生事件提示與安全協調',
+    heading: '原生事件提示＋每五分鐘安全協調',
     description:
-      '採用五分鐘輪詢間隔；每輪最多排程四個已到期且完成初始掃描的資料夾，並推進一個協調批次，延後數量會顯示於下方。這不是原生事件監看，也不是增量內容索引。',
-    adapterActive: '五分鐘輪詢備援 · 運作中',
-    adapterStarting: '五分鐘輪詢備援 · 啟動中',
-    adapterDegraded: '五分鐘輪詢備援 · 需要注意',
-    adapterStopped: '五分鐘輪詢備援 · 已停止',
+      '原生檔案系統事件僅是提示。每五分鐘的週期性安全協調也會以受限批次檢查符合資格、已完成初始掃描的資料夾；不保證增量內容更新或完成時限。',
+    adapterActive: '原生提示＋每五分鐘安全協調 · 運作中',
+    adapterStarting: '原生提示＋每五分鐘安全協調 · 啟動中',
+    adapterDegraded: '原生提示或僅週期性備援 · 需要注意',
+    adapterStopped: '原生提示＋每五分鐘安全協調 · 已停止',
     metrics: {
       recent: '最近事件',
       observed: '觀察到的提示',
