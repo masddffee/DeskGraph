@@ -87,14 +87,3 @@ export async function loadHealthReport(
   const response = await invokeCommand(HEALTH_COMMAND);
   return parseHealthReport(response);
 }
-
-export function lifecycleLabel(state: LifecycleState): string {
-  switch (state) {
-    case 'ready':
-      return 'Ready';
-    case 'not_initialized':
-      return 'Not initialized';
-    case 'disabled':
-      return 'Disabled';
-  }
-}

@@ -104,8 +104,32 @@ h2 {
   line-height: 1.65;
 }
 
-.hero-copy--zh {
-  color: #657269;
+.hero-controls {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.7rem;
+}
+
+.language-selector {
+  display: grid;
+  gap: 0.35rem;
+  color: #52705d;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-align: right;
+  text-transform: uppercase;
+}
+
+.language-selector select {
+  min-width: 9.5rem;
+  padding: 0.48rem 2rem 0.48rem 0.68rem;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: normal;
+  text-transform: none;
 }
 
 .release-badge,
@@ -791,8 +815,14 @@ footer {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .release-badge {
+  .hero-controls,
+  .release-badge,
+  .language-selector {
     align-self: flex-start;
+  }
+
+  .language-selector {
+    text-align: left;
   }
 
   .scope-form-row,

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { lifecycleLabel, loadHealthReport, type HealthReport } from './health';
+import { loadHealthReport, type HealthReport } from './health';
 import {
   createRenamePreview,
   loadRecentActionPlans,
@@ -45,6 +45,19 @@ import {
   type SearchSourceFilter,
 } from './search';
 import { loadRecentWatchEvents, type WatchEventProgress, type WatchEventReason } from './watch';
+import {
+  collectLanguagePreferences,
+  formatInteger,
+  formatUtcDate,
+  getCatalog,
+  getLocalizedMetadata,
+  isLocale,
+  loadLocale,
+  resolveLocale,
+  storeLocale,
+  type Catalog,
+  type Locale,
+} from './i18n';
 
 type ReadyState = {
   kind: 'ready';
@@ -58,26 +71,57 @@ type ReadyState = {
   actionPlans: ActionPlanSummary[];
 };
 type ViewState = { kind: 'loading' } | ReadyState | { kind: 'error' };
+type ActionMessage =
+  | {
+      key:
+        | 'required'
+        | 'validating'
+        | 'authorized'
+        | 'denied'
+        | 'reading'
+        | 'interrupted'
+        | 'stopped'
+        | 'creating'
+        | 'startDenied'
+        | 'waiting'
+        | 'pauseDenied'
+        | 'revalidating'
+        | 'resumeDenied';
+    }
+  | { key: 'complete'; files: number; folders: number }
+  | { key: 'paused'; processed: number; queued: number };
 type ActionState =
   | { kind: 'idle' }
-  | { kind: 'working'; label: string }
-  | { kind: 'success'; message: string }
-  | { kind: 'error'; message: string };
+  | { kind: 'working'; message: ActionMessage }
+  | { kind: 'success'; message: ActionMessage }
+  | { kind: 'error'; message: ActionMessage };
+type SearchMessage = 'query' | 'extension' | 'dateRange' | 'request';
 type SearchState =
   | { kind: 'idle' }
   | { kind: 'working' }
   | { kind: 'ready'; response: SearchResponse }
-  | { kind: 'error'; message: string };
+  | { kind: 'error'; message: SearchMessage };
+type RenameMessage = 'chooseFolder' | 'required' | 'denied';
 type RenamePreviewState =
   | { kind: 'idle' }
   | { kind: 'working' }
   | { kind: 'ready'; preview: ActionPlanPreview }
-  | { kind: 'error'; message: string };
+  | { kind: 'error'; message: RenameMessage };
+type OcrMessage =
+  | 'capacity'
+  | 'providerUnavailable'
+  | 'indexed'
+  | 'cancelledFeedback'
+  | 'interruptedFeedback'
+  | 'failedFeedback'
+  | 'denied'
+  | 'resumeDenied'
+  | 'cancelDenied';
 type OcrActionState =
   | { kind: 'idle' }
   | { kind: 'working'; scopeId: number; nodeId: number }
-  | { kind: 'success'; scopeId: number; nodeId: number; message: string }
-  | { kind: 'error'; scopeId: number; nodeId: number; message: string };
+  | { kind: 'success'; scopeId: number; nodeId: number; message: OcrMessage }
+  | { kind: 'error'; scopeId: number; nodeId: number; message: OcrMessage };
 
 interface StatusRowProps {
   label: string;
@@ -94,10 +138,10 @@ function StatusRow({ label, value, tone = 'quiet' }: StatusRowProps) {
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({ label, value, locale }: { label: string; value: number; locale: Locale }) {
   return (
     <div className="metric">
-      <strong>{value.toLocaleString()}</strong>
+      <strong>{formatInteger(value, locale)}</strong>
       <span>{label}</span>
     </div>
   );
@@ -151,42 +195,52 @@ function screenshotOcrJobForResult(
   );
 }
 
-function scanStatusLabel(job: ScanJobProgress): string {
-  if (job.status === 'running' && job.pause_requested) return 'Pausing safely…';
-  if (job.status === 'running') return 'Scanning metadata…';
-  if (job.status === 'paused') return 'Paused';
-  if (job.status === 'interrupted') return 'Interrupted safely';
-  if (job.status === 'completed') return 'Completed';
-  return 'Stopped with an error';
+function actionMessageLabel(catalog: Catalog, message: ActionMessage): string {
+  if (message.key === 'complete') {
+    return catalog.scope.validation.complete(message.files, message.folders);
+  }
+  if (message.key === 'paused') {
+    return catalog.scope.validation.paused(message.processed, message.queued);
+  }
+  return catalog.scope.validation[message.key];
 }
 
-function extractionStatusLabel(job: ExtractionJobProgress): string {
-  if (job.status === 'queued') return 'Waiting to start';
-  if (job.status === 'running' && job.cancel_requested) return 'Stopping safely…';
+function scanStatusLabel(job: ScanJobProgress, catalog: Catalog): string {
+  if (job.status === 'running' && job.pause_requested) return catalog.scope.status.pausing;
+  if (job.status === 'running') return catalog.scope.status.scanning;
+  if (job.status === 'paused') return catalog.scope.status.paused;
+  if (job.status === 'interrupted') return catalog.scope.status.interrupted;
+  if (job.status === 'completed') return catalog.scope.status.completed;
+  return catalog.scope.status.stopped;
+}
+
+function extractionStatusLabel(job: ExtractionJobProgress, catalog: Catalog): string {
+  if (job.status === 'queued') return catalog.search.ocr.queued;
+  if (job.status === 'running' && job.cancel_requested) return catalog.search.ocr.stopping;
   if (job.status === 'running' && job.operation === 'screenshot_ocr') {
-    return 'Reading screenshot text locally…';
+    return catalog.search.ocr.reading;
   }
-  if (job.status === 'running') return 'Extracting bounded text…';
+  if (job.status === 'running') return catalog.search.ocr.running;
   if (job.status === 'completed' && job.operation === 'screenshot_ocr') {
-    return 'Screenshot text indexed locally';
+    return catalog.search.ocr.completed;
   }
-  if (job.status === 'completed') return 'Completed';
-  if (job.status === 'cancelled') return 'Cancelled safely';
-  if (job.status === 'interrupted') return 'Interrupted safely';
-  if (job.operation === 'screenshot_ocr') return 'Screenshot OCR unavailable or skipped safely';
-  return 'File skipped safely';
+  if (job.status === 'completed') return catalog.scope.status.completed;
+  if (job.status === 'cancelled') return catalog.search.ocr.cancelled;
+  if (job.status === 'interrupted') return catalog.search.ocr.interrupted;
+  if (job.operation === 'screenshot_ocr') return catalog.search.ocr.unavailable;
+  return catalog.search.ocr.skipped;
 }
 
-function searchExplanation(result: SearchResult): string {
+function searchExplanation(result: SearchResult, catalog: Catalog): string {
   if (result.explanation === 'exact_filename_and_extracted_text') {
-    return 'Exact filename + extracted text';
+    return catalog.search.explanation.filenameAndText;
   }
-  if (result.explanation === 'exact_filename') return 'Exact filename';
+  if (result.explanation === 'exact_filename') return catalog.search.explanation.filename;
   if (result.explanation === 'path_and_extracted_text_substring') {
-    return 'Path + extracted text';
+    return catalog.search.explanation.pathAndText;
   }
-  if (result.explanation === 'path_substring') return 'Filename or path';
-  return 'Extracted text';
+  if (result.explanation === 'path_substring') return catalog.search.explanation.path;
+  return catalog.search.explanation.text;
 }
 
 function utcDateToUnixSeconds(value: string): number | null {
@@ -198,60 +252,83 @@ function utcDateToUnixSeconds(value: string): number | null {
   return Math.floor(milliseconds / 1000);
 }
 
-function activeSearchFilters(response: SearchResponse): string {
+function activeSearchFilters(response: SearchResponse, catalog: Catalog, locale: Locale): string {
   const labels: string[] = [];
   if (response.filters.scope_id !== null) {
-    labels.push(`scope ${response.filters.scope_id}`);
+    labels.push(catalog.search.filters.scope(response.filters.scope_id));
   }
-  if (response.filters.source === 'metadata_path') labels.push('paths only');
-  if (response.filters.source === 'extracted_text') labels.push('extracted text only');
+  if (response.filters.source === 'metadata_path') labels.push(catalog.search.filters.pathsOnly);
+  if (response.filters.source === 'extracted_text') labels.push(catalog.search.filters.textOnly);
   if (response.filters.extension) labels.push(`.${response.filters.extension}`);
   if (response.filters.modified_since_unix_seconds !== null) {
     labels.push(
-      `since ${new Date(response.filters.modified_since_unix_seconds * 1000)
-        .toISOString()
-        .slice(0, 10)} UTC`,
+      catalog.search.filters.since(
+        formatUtcDate(response.filters.modified_since_unix_seconds * 1000, locale),
+      ),
     );
   }
   if (response.filters.modified_before_unix_seconds !== null) {
     labels.push(
-      `before ${new Date(response.filters.modified_before_unix_seconds * 1000)
-        .toISOString()
-        .slice(0, 10)} UTC`,
+      catalog.search.filters.before(
+        formatUtcDate(response.filters.modified_before_unix_seconds * 1000, locale),
+      ),
     );
   }
-  return labels.length > 0 ? labels.join(' · ') : 'all authorized local sources';
+  return labels.length > 0 ? labels.join(' · ') : catalog.search.filters.allSources;
 }
 
-function watchReasonLabel(reason: WatchEventReason | null): string {
-  if (reason === 'temporary_download') return 'Temporary download ignored';
-  if (reason === 'hidden_entry') return 'Hidden entry ignored';
-  if (reason === 'unsupported_entry') return 'Unsupported entry ignored';
-  if (reason === 'source_unavailable') return 'Source unavailable';
-  if (reason === 'reconcile_failed') return 'Reconciliation failed safely';
-  return 'No failure';
+function watchReasonLabel(reason: WatchEventReason | null, catalog: Catalog): string {
+  if (reason === 'temporary_download') return catalog.watch.reason.temporary;
+  if (reason === 'hidden_entry') return catalog.watch.reason.hidden;
+  if (reason === 'unsupported_entry') return catalog.watch.reason.unsupported;
+  if (reason === 'source_unavailable') return catalog.watch.reason.unavailable;
+  if (reason === 'reconcile_failed') return catalog.watch.reason.failed;
+  return catalog.watch.status.noFailure;
 }
 
-function watchStatusLabel(event: WatchEventProgress): string {
-  if (event.status === 'stabilizing') return 'Waiting for a stable snapshot';
-  if (event.status === 'reconciling') return 'Atomic manifest reconciliation';
-  if (event.status === 'completed') return 'Reconciled';
-  return watchReasonLabel(event.reason);
+function watchStatusLabel(event: WatchEventProgress, catalog: Catalog): string {
+  if (event.status === 'stabilizing') return catalog.watch.status.stabilizing;
+  if (event.status === 'reconciling') return catalog.watch.status.reconciling;
+  if (event.status === 'completed') return catalog.watch.status.completed;
+  return watchReasonLabel(event.reason, catalog);
 }
 
-function actionPolicyCheckLabel(check: ActionPolicyCheck): string {
-  if (check === 'explicit_authorized_scope') return 'Inside the selected authorized folder';
-  if (check === 'present_manifest_file') return 'Current scanned file';
-  if (check === 'canonical_source_contained') return 'Canonical source stays in scope';
-  if (check === 'source_identity_matches') return 'Platform identity matches the manifest';
-  if (check === 'read_only_handle_identity_matches') return 'Read-only open handle matches';
-  if (check === 'portable_single_component_name') return 'Portable one-part filename';
-  if (check === 'same_canonical_parent') return 'Same canonical parent folder';
-  if (check === 'destination_contained') return 'Destination stays in scope';
-  return 'Destination is available';
+function actionPolicyCheckLabel(check: ActionPolicyCheck, catalog: Catalog): string {
+  if (check === 'explicit_authorized_scope') return catalog.actions.policy.authorizedScope;
+  if (check === 'present_manifest_file') return catalog.actions.policy.manifestFile;
+  if (check === 'canonical_source_contained') return catalog.actions.policy.canonicalSource;
+  if (check === 'source_identity_matches') return catalog.actions.policy.sourceIdentity;
+  if (check === 'read_only_handle_identity_matches') return catalog.actions.policy.readOnlyHandle;
+  if (check === 'portable_single_component_name') return catalog.actions.policy.portableName;
+  if (check === 'same_canonical_parent') return catalog.actions.policy.sameParent;
+  if (check === 'destination_contained') return catalog.actions.policy.destinationScope;
+  return catalog.actions.policy.destinationAvailable;
+}
+
+function browserLocaleStorage(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function browserLanguagePreferences(): readonly string[] {
+  try {
+    if (typeof navigator === 'undefined') return [];
+    return collectLanguagePreferences(navigator.languages, navigator.language);
+  } catch {
+    return [];
+  }
 }
 
 export default function App() {
+  const [locale, setLocale] = useState<Locale>(() => {
+    if (typeof window === 'undefined') return 'en';
+    const storage = browserLocaleStorage();
+    const preferences = browserLanguagePreferences();
+    return storage ? loadLocale(storage, preferences) : resolveLocale(null, preferences);
+  });
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<ViewState>({ kind: 'loading' });
   const [scopePath, setScopePath] = useState('');
@@ -277,6 +354,25 @@ export default function App() {
   const activeExtractionJobIds =
     state.kind === 'ready' ? activeScreenshotOcrJobIds(state.extractionJobs) : [];
   const activeExtractionJobKey = activeExtractionJobIds.join(',');
+  const catalog = getCatalog(locale);
+
+  useEffect(() => {
+    const metadata = getLocalizedMetadata(locale);
+    document.documentElement.lang = metadata.htmlLang;
+    document.title = metadata.title;
+    document
+      .querySelector('meta[name="description"]')
+      ?.setAttribute('content', metadata.description);
+  }, [locale]);
+
+  function changeLocale(nextLocale: string) {
+    if (!isLocale(nextLocale)) return;
+    setLocale(nextLocale);
+    if (typeof window !== 'undefined') {
+      const storage = browserLocaleStorage();
+      if (storage) storeLocale(storage, nextLocale);
+    }
+  }
 
   useEffect(() => {
     let active = true;
@@ -398,61 +494,67 @@ export default function App() {
   async function authorizeRequestedScope() {
     const requestedPath = scopePath.trim();
     if (!requestedPath) {
-      setAction({ kind: 'error', message: 'Enter an existing folder path first.' });
+      setAction({ kind: 'error', message: { key: 'required' } });
       return;
     }
-    setAction({ kind: 'working', label: 'Validating the folder boundary…' });
+    setAction({ kind: 'working', message: { key: 'validating' } });
     try {
       await addAuthorizedScope(requestedPath);
       await refreshManifest();
       setScopePath('');
       setAction({
         kind: 'success',
-        message: 'Folder authorized. Nothing was scanned until you choose Scan metadata.',
+        message: { key: 'authorized' },
       });
     } catch {
       setAction({
         kind: 'error',
-        message: 'The folder could not be authorized. Check that it exists and is not protected.',
+        message: { key: 'denied' },
       });
     }
   }
 
   async function runJob(job: ScanJobProgress) {
     try {
-      setAction({ kind: 'working', label: 'Reading metadata inside the authorized folder…' });
+      setAction({ kind: 'working', message: { key: 'reading' } });
       const progress = await runManifestScan(job.job_id);
       updateJob(progress);
       await refreshManifest();
       if (progress.status === 'completed') {
         setAction({
           kind: 'success',
-          message: `Scan complete: ${progress.discovered_files} files and ${progress.discovered_folders} folders.`,
+          message: {
+            key: 'complete',
+            files: progress.discovered_files,
+            folders: progress.discovered_folders,
+          },
         });
       } else if (progress.status === 'paused') {
         setAction({
           kind: 'success',
-          message: `Scan paused after ${progress.processed_entries} of ${progress.queued_entries} discovered entries.`,
+          message: {
+            key: 'paused',
+            processed: progress.processed_entries,
+            queued: progress.queued_entries,
+          },
         });
       } else {
         setAction({
           kind: 'error',
-          message:
-            'The scan was interrupted safely. Resume it after checking the authorized folder.',
+          message: { key: 'interrupted' },
         });
       }
     } catch {
       await refreshManifest().catch(() => undefined);
       setAction({
         kind: 'error',
-        message:
-          'The metadata scan stopped safely. Existing manifest data was not partially replaced.',
+        message: { key: 'stopped' },
       });
     }
   }
 
   async function scan(scope: AuthorizedScope) {
-    setAction({ kind: 'working', label: 'Creating a durable local scan job…' });
+    setAction({ kind: 'working', message: { key: 'creating' } });
     try {
       const job = await createManifestScan(scope.id);
       updateJob(job);
@@ -461,26 +563,33 @@ export default function App() {
       await refreshManifest().catch(() => undefined);
       setAction({
         kind: 'error',
-        message: 'A new scan could not start. Resume the existing job if this folder has one.',
+        message: { key: 'startDenied' },
       });
     }
   }
 
   async function pause(job: ScanJobProgress) {
-    setAction({ kind: 'working', label: 'Waiting for the current metadata entry to finish…' });
+    setAction({ kind: 'working', message: { key: 'waiting' } });
     try {
       const progress = await pauseManifestScan(job.job_id);
       updateJob(progress);
       if (progress.status === 'paused') {
-        setAction({ kind: 'success', message: 'Scan paused. Durable progress is safe to resume.' });
+        setAction({
+          kind: 'success',
+          message: {
+            key: 'paused',
+            processed: progress.processed_entries,
+            queued: progress.queued_entries,
+          },
+        });
       }
     } catch {
-      setAction({ kind: 'error', message: 'The pause request could not be recorded safely.' });
+      setAction({ kind: 'error', message: { key: 'pauseDenied' } });
     }
   }
 
   async function resume(job: ScanJobProgress) {
-    setAction({ kind: 'working', label: 'Revalidating the authorized folder boundary…' });
+    setAction({ kind: 'working', message: { key: 'revalidating' } });
     try {
       const progress = await resumeManifestScan(job.job_id);
       updateJob(progress);
@@ -489,7 +598,7 @@ export default function App() {
       await refreshManifest().catch(() => undefined);
       setAction({
         kind: 'error',
-        message: 'Resume was denied because the job or authorized folder is no longer valid.',
+        message: { key: 'resumeDenied' },
       });
     }
   }
@@ -499,7 +608,7 @@ export default function App() {
     if ([...query].length < 3) {
       setSearchState({
         kind: 'error',
-        message: 'Enter at least 3 characters to keep local search bounded.',
+        message: 'query',
       });
       return;
     }
@@ -507,7 +616,7 @@ export default function App() {
     if (extension && !/^\.?[a-z0-9]{1,16}$/i.test(extension)) {
       setSearchState({
         kind: 'error',
-        message: 'File type must be a 1–16 character extension such as md, pdf, or docx.',
+        message: 'extension',
       });
       return;
     }
@@ -522,7 +631,7 @@ export default function App() {
     ) {
       setSearchState({
         kind: 'error',
-        message: 'Choose a valid UTC date range where “Modified since” is before “Before”.',
+        message: 'dateRange',
       });
       return;
     }
@@ -559,7 +668,7 @@ export default function App() {
     } catch {
       setSearchState({
         kind: 'error',
-        message: 'Search stopped safely. Try a shorter query or refresh the local manifest.',
+        message: 'request',
       });
     }
   }
@@ -578,8 +687,7 @@ export default function App() {
           kind: 'error',
           scopeId: job.scope_id,
           nodeId: job.node_id,
-          message:
-            'Another local OCR is still finishing. This job remains queued; retry it safely.',
+          message: 'capacity',
         });
         return;
       }
@@ -587,8 +695,7 @@ export default function App() {
         kind: 'error',
         scopeId: job.scope_id,
         nodeId: job.node_id,
-        message:
-          'Screenshot OCR stopped safely. The local provider may be unavailable on this computer.',
+        message: 'providerUnavailable',
       });
     }
   }
@@ -599,7 +706,7 @@ export default function App() {
         kind: 'success',
         scopeId: progress.scope_id,
         nodeId: progress.node_id,
-        message: 'Screenshot text was indexed locally. Search again to find its contents.',
+        message: 'indexed',
       });
       return;
     }
@@ -608,7 +715,7 @@ export default function App() {
         kind: 'success',
         scopeId: progress.scope_id,
         nodeId: progress.node_id,
-        message: 'Screenshot OCR was cancelled safely. No partial text was published.',
+        message: 'cancelledFeedback',
       });
       return;
     }
@@ -617,7 +724,7 @@ export default function App() {
         kind: 'error',
         scopeId: progress.scope_id,
         nodeId: progress.node_id,
-        message: 'Screenshot OCR was interrupted safely. Resume it to continue locally.',
+        message: 'interruptedFeedback',
       });
       return;
     }
@@ -626,7 +733,7 @@ export default function App() {
         kind: 'error',
         scopeId: progress.scope_id,
         nodeId: progress.node_id,
-        message: 'Screenshot OCR stopped safely. The previous complete local index was preserved.',
+        message: 'failedFeedback',
       });
     }
   }
@@ -646,8 +753,7 @@ export default function App() {
         kind: 'error',
         scopeId: result.scope_id,
         nodeId: result.node_id,
-        message:
-          'OCR was denied safely. Rescan the file if it changed and confirm it is a supported screenshot.',
+        message: 'denied',
       });
     } finally {
       ocrRequestInFlight.current.delete(requestKey);
@@ -669,7 +775,7 @@ export default function App() {
         kind: 'error',
         scopeId: job.scope_id,
         nodeId: job.node_id,
-        message: 'Resume was denied safely. Refresh the local manifest before trying again.',
+        message: 'resumeDenied',
       });
     } finally {
       ocrRequestInFlight.current.delete(requestKey);
@@ -711,7 +817,7 @@ export default function App() {
         kind: 'error',
         scopeId: job.scope_id,
         nodeId: job.node_id,
-        message: 'The cancellation request could not be recorded safely.',
+        message: 'cancelDenied',
       });
     }
   }
@@ -719,13 +825,13 @@ export default function App() {
   async function submitRenamePreview() {
     const sourcePath = renameSourcePath.trim();
     if (renameScopeId === null) {
-      setRenameState({ kind: 'error', message: 'Choose the authorized folder first.' });
+      setRenameState({ kind: 'error', message: 'chooseFolder' });
       return;
     }
     if (!sourcePath || !renameNewName) {
       setRenameState({
         kind: 'error',
-        message: 'Enter the current absolute file path and one proposed filename.',
+        message: 'required',
       });
       return;
     }
@@ -738,8 +844,7 @@ export default function App() {
     } catch {
       setRenameState({
         kind: 'error',
-        message:
-          'Preview denied safely. Rescan a changed file, verify the authorized folder, and choose an unused portable filename.',
+        message: 'denied',
       });
     }
   }
@@ -748,25 +853,32 @@ export default function App() {
     <main className="app-shell">
       <header className="hero">
         <div>
-          <p className="eyebrow">DeskGraph · M2 Local Context</p>
-          <h1>Graphify your computer.</h1>
-          <p className="hero-copy">
-            Authorize one local folder at a time, build its metadata manifest, and keep bounded text
-            extraction on this computer.
-          </p>
-          <p className="hero-copy hero-copy--zh">
-            一次明確授權一個本機資料夾；metadata 與受限文字抽取都留在本機，不上傳路徑或內容。
-          </p>
+          <p className="eyebrow">{catalog.hero.eyebrow}</p>
+          <h1>{catalog.hero.heading}</h1>
+          <p className="hero-copy">{catalog.hero.description}</p>
         </div>
-        <span className="release-badge">PRE-RELEASE</span>
+        <div className="hero-controls">
+          <label className="language-selector" htmlFor="display-language">
+            <span>{catalog.language.selectorLabel}</span>
+            <select
+              id="display-language"
+              value={locale}
+              onChange={(event) => changeLocale(event.target.value)}
+            >
+              <option value="en">{catalog.language.english}</option>
+              <option value="zh-TW">{catalog.language.traditionalChinese}</option>
+            </select>
+          </label>
+          <span className="release-badge">{catalog.hero.release}</span>
+        </div>
       </header>
 
       {state.kind === 'loading' ? (
         <section className="state-card" aria-live="polite" aria-busy="true">
           <span className="loader" aria-hidden="true" />
           <div>
-            <h2>Opening the local manifest</h2>
-            <p>No authorized folder is scanned automatically.</p>
+            <h2>{catalog.loading.heading}</h2>
+            <p>{catalog.loading.description}</p>
           </div>
         </section>
       ) : null}
@@ -774,11 +886,11 @@ export default function App() {
       {state.kind === 'error' ? (
         <section className="state-card state-card--error" role="alert">
           <div>
-            <h2>Local manifest unavailable</h2>
-            <p>The backend returned no validated status. Raw local errors and paths are hidden.</p>
+            <h2>{catalog.backendError.heading}</h2>
+            <p>{catalog.backendError.description}</p>
           </div>
           <button type="button" onClick={() => setAttempt((value) => value + 1)}>
-            Retry
+            {catalog.backendError.retry}
           </button>
         </section>
       ) : null}
@@ -788,52 +900,79 @@ export default function App() {
           <section className="panel" aria-labelledby="runtime-title">
             <div className="panel-heading">
               <div>
-                <p className="panel-kicker">Local runtime</p>
-                <h2 id="runtime-title">Manifest is ready</h2>
+                <p className="panel-kicker">{catalog.runtime.kicker}</p>
+                <h2 id="runtime-title">{catalog.runtime.heading}</h2>
               </div>
-              <span className="connected-indicator">Local only</span>
+              <span className="connected-indicator">{catalog.runtime.localOnly}</span>
             </div>
             <div className="status-list">
               <StatusRow
-                label="Platform"
+                label={catalog.runtime.platform}
                 value={`${state.report.platform.os} · ${state.report.platform.architecture}`}
                 tone="ok"
               />
-              <StatusRow label="SQLite manifest" value="Ready" tone="ok" />
               <StatusRow
-                label="Optional local LLM"
-                value={lifecycleLabel(state.report.providers.local_llm.state)}
+                label={catalog.runtime.sqliteManifest}
+                value={catalog.runtime.ready}
+                tone="ok"
               />
-              <StatusRow label="Network required" value="No" tone="ok" />
+              <StatusRow
+                label={catalog.runtime.optionalLocalLlm}
+                value={
+                  state.report.providers.local_llm.state === 'ready'
+                    ? catalog.runtime.ready
+                    : state.report.providers.local_llm.state === 'not_initialized'
+                      ? catalog.runtime.lifecycle.notInitialized
+                      : catalog.runtime.lifecycle.disabled
+                }
+              />
+              <StatusRow
+                label={catalog.runtime.networkRequired}
+                value={catalog.runtime.no}
+                tone="ok"
+              />
             </div>
           </section>
 
           <section className="panel panel--privacy" aria-labelledby="manifest-title">
-            <p className="panel-kicker">Current graph</p>
+            <p className="panel-kicker">{catalog.manifest.kicker}</p>
             <h2 id="manifest-title">
               {state.manifest.completed_scan_count === 0
-                ? 'Nothing indexed yet'
-                : 'Metadata indexed'}
+                ? catalog.manifest.emptyHeading
+                : catalog.manifest.readyHeading}
             </h2>
             <div className="metrics">
-              <Metric label="Files" value={state.manifest.file_count} />
-              <Metric label="Folders" value={state.manifest.folder_count} />
-              <Metric label="Locations" value={state.manifest.active_location_count} />
-              <Metric label="Scan issues" value={state.manifest.issue_count} />
+              <Metric
+                label={catalog.manifest.files}
+                value={state.manifest.file_count}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.manifest.folders}
+                value={state.manifest.folder_count}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.manifest.locations}
+                value={state.manifest.active_location_count}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.manifest.scanIssues}
+                value={state.manifest.issue_count}
+                locale={locale}
+              />
             </div>
           </section>
 
           <section className="panel panel--search" aria-labelledby="search-title">
             <div className="panel-heading panel-heading--wrap">
               <div>
-                <p className="panel-kicker">Deterministic local search</p>
-                <h2 id="search-title">Find filenames and extracted text</h2>
-                <p>
-                  Traditional Chinese and English queries stay inside SQLite. Embeddings are off;
-                  every result says which local field matched.
-                </p>
+                <p className="panel-kicker">{catalog.search.kicker}</p>
+                <h2 id="search-title">{catalog.search.heading}</h2>
+                <p>{catalog.search.description}</p>
               </div>
-              <span className="connected-indicator">Lexical · offline</span>
+              <span className="connected-indicator">{catalog.search.mode}</span>
             </div>
             <form
               className="search-form"
@@ -842,61 +981,63 @@ export default function App() {
                 void submitSearch();
               }}
             >
-              <label htmlFor="search-query">Search local context</label>
+              <label htmlFor="search-query">{catalog.search.queryLabel}</label>
               <div className="search-form-row">
                 <input
                   id="search-query"
                   type="search"
                   value={searchQuery}
                   onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="專案脈絡 or project context"
+                  placeholder={catalog.search.queryPlaceholder}
                   autoComplete="off"
                   spellCheck="false"
                   maxLength={256}
                 />
                 <select
-                  aria-label="Search folder scope"
+                  aria-label={catalog.search.scopeAria}
                   value={searchScopeId ?? ''}
                   onChange={(event) =>
                     setSearchScopeId(event.target.value ? Number(event.target.value) : null)
                   }
                 >
-                  <option value="">All authorized folders</option>
+                  <option value="">{catalog.search.allFolders}</option>
                   {state.scopes.map((scope) => (
                     <option key={scope.id} value={scope.id}>
-                      Authorized scope {scope.id}
+                      {catalog.search.authorizedScope(scope.id)}
                     </option>
                   ))}
                 </select>
                 <button type="submit" disabled={searchState.kind === 'working'}>
-                  {searchState.kind === 'working' ? 'Searching…' : 'Search'}
+                  {searchState.kind === 'working'
+                    ? catalog.search.searching
+                    : catalog.search.search}
                 </button>
               </div>
-              <div className="search-filter-grid" aria-label="Bounded local search filters">
+              <div className="search-filter-grid" aria-label={catalog.search.filtersAria}>
                 <label>
-                  Match source
+                  {catalog.search.sourceLabel}
                   <select
                     value={searchSource}
                     onChange={(event) => setSearchSource(event.target.value as SearchSourceFilter)}
                   >
-                    <option value="all">Paths + extracted text</option>
-                    <option value="metadata_path">Filenames and paths only</option>
-                    <option value="extracted_text">Extracted text only</option>
+                    <option value="all">{catalog.search.sources.all}</option>
+                    <option value="metadata_path">{catalog.search.sources.paths}</option>
+                    <option value="extracted_text">{catalog.search.sources.extractedText}</option>
                   </select>
                 </label>
                 <label>
-                  File type
+                  {catalog.search.fileType}
                   <input
                     value={searchExtension}
                     onChange={(event) => setSearchExtension(event.target.value)}
-                    placeholder="md or pdf"
+                    placeholder={catalog.search.fileTypePlaceholder}
                     maxLength={17}
                     autoComplete="off"
                     spellCheck="false"
                   />
                 </label>
                 <label>
-                  Modified since (UTC)
+                  {catalog.search.modifiedSince}
                   <input
                     type="date"
                     value={searchModifiedSince}
@@ -904,7 +1045,7 @@ export default function App() {
                   />
                 </label>
                 <label>
-                  Before (UTC, exclusive)
+                  {catalog.search.modifiedBefore}
                   <input
                     type="date"
                     value={searchModifiedBefore}
@@ -916,21 +1057,23 @@ export default function App() {
 
             {searchState.kind === 'error' ? (
               <p className="search-message search-message--error" role="alert">
-                {searchState.message}
+                {catalog.search.validation[searchState.message]}
               </p>
             ) : null}
             {searchState.kind === 'ready' && searchState.response.results.length === 0 ? (
               <p className="search-message" role="status">
-                No current path or active extracted text matched “{searchState.response.query}”.
+                {catalog.search.empty(searchState.response.query)}
               </p>
             ) : null}
             {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
               <div className="search-summary" role="status">
                 <span>
-                  {searchState.response.result_count.toLocaleString()} results ·{' '}
-                  {searchState.response.elapsed_ms.toLocaleString()} ms
+                  {catalog.search.summary(
+                    searchState.response.result_count,
+                    searchState.response.elapsed_ms,
+                  )}
                 </span>
-                <span>{activeSearchFilters(searchState.response)}</span>
+                <span>{activeSearchFilters(searchState.response, catalog, locale)}</span>
               </div>
             ) : null}
             {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
@@ -952,26 +1095,25 @@ export default function App() {
                   return (
                     <li key={`${result.node_id}:${result.location_id}`}>
                       <div className="search-result-heading">
-                        <span className="search-rank">#{result.lexical_rank}</span>
-                        <strong>{searchExplanation(result)}</strong>
+                        <span className="search-rank">
+                          #{formatInteger(result.lexical_rank, locale)}
+                        </span>
+                        <strong>{searchExplanation(result, catalog)}</strong>
                       </div>
                       <code>{result.display_path}</code>
                       {isScreenshotCandidateDisplayPath(result.display_path) ? (
                         <div
                           className="search-result-action"
-                          aria-label="Local screenshot OCR controls"
+                          aria-label={catalog.search.ocr.controlsAria}
                         >
                           <div className="search-result-action-row">
                             <div>
                               <strong>
                                 {ocrJob
-                                  ? extractionStatusLabel(ocrJob)
-                                  : 'Screenshot text has not been read'}
+                                  ? extractionStatusLabel(ocrJob, catalog)
+                                  : catalog.search.ocr.notRead}
                               </strong>
-                              <span>
-                                Only this already-scanned screenshot is revalidated and read on this
-                                computer.
-                              </span>
+                              <span>{catalog.search.ocr.description}</span>
                             </div>
                             {ocrIsRunning && ocrJob ? (
                               <button
@@ -979,7 +1121,9 @@ export default function App() {
                                 disabled={ocrJob.cancel_requested}
                                 onClick={() => void cancelScreenshotOcr(ocrJob)}
                               >
-                                {ocrJob.cancel_requested ? 'Stopping safely…' : 'Cancel OCR'}
+                                {ocrJob.cancel_requested
+                                  ? catalog.search.ocr.stopping
+                                  : catalog.search.ocr.cancel}
                               </button>
                             ) : ocrIsQueued && ocrJob ? (
                               <div className="search-result-action-buttons">
@@ -991,14 +1135,14 @@ export default function App() {
                                   }
                                   onClick={() => void retryQueuedScreenshotOcr(ocrJob)}
                                 >
-                                  Retry queued OCR
+                                  {catalog.search.ocr.retryQueued}
                                 </button>
                                 <button
                                   type="button"
                                   disabled={ocrJob.cancel_requested}
                                   onClick={() => void cancelScreenshotOcr(ocrJob)}
                                 >
-                                  Cancel OCR
+                                  {catalog.search.ocr.cancel}
                                 </button>
                               </div>
                             ) : ocrJob?.status === 'interrupted' ? (
@@ -1010,7 +1154,7 @@ export default function App() {
                                 }
                                 onClick={() => void resumeScreenshotOcr(ocrJob)}
                               >
-                                Resume screenshot OCR
+                                {catalog.search.ocr.resume}
                               </button>
                             ) : (
                               <button
@@ -1021,25 +1165,25 @@ export default function App() {
                                 }
                                 onClick={() => void startScreenshotOcr(result)}
                               >
-                                {ocrJob ? 'Read screenshot again' : 'Read screenshot text locally'}
+                                {ocrJob ? catalog.search.ocr.readAgain : catalog.search.ocr.read}
                               </button>
                             )}
                           </div>
                           {feedbackMatches && ocrAction.kind === 'error' ? (
                             <p className="ocr-feedback ocr-feedback--error" role="alert">
-                              {ocrAction.message}
+                              {catalog.search.ocr[ocrAction.message]}
                             </p>
                           ) : null}
                           {feedbackMatches && ocrAction.kind === 'success' ? (
                             <p className="ocr-feedback" role="status">
-                              {ocrAction.message}
+                              {catalog.search.ocr[ocrAction.message]}
                             </p>
                           ) : null}
                         </div>
                       ) : null}
                       {result.snippet ? (
                         <p className="search-snippet">
-                          <span>Untrusted local text</span>
+                          <span>{catalog.search.ocr.untrustedText}</span>
                           {result.snippet}
                         </p>
                       ) : null}
@@ -1053,16 +1197,12 @@ export default function App() {
           <section className="panel panel--actions" aria-labelledby="actions-title">
             <div className="panel-heading panel-heading--wrap">
               <div>
-                <p className="panel-kicker">Safe organization preview</p>
-                <h2 id="actions-title">Review a rename without changing the file</h2>
-                <p>
-                  DeskGraph revalidates the selected scope, current manifest snapshot, file
-                  identity, read-only open handle, proposed name, and destination before it journals
-                  a preview.
-                </p>
+                <p className="panel-kicker">{catalog.actions.kicker}</p>
+                <h2 id="actions-title">{catalog.actions.heading}</h2>
+                <p>{catalog.actions.description}</p>
               </div>
               <span className="connected-indicator connected-indicator--pending">
-                Preview only · no execute
+                {catalog.actions.previewOnly}
               </span>
             </div>
 
@@ -1074,110 +1214,109 @@ export default function App() {
               }}
             >
               <label>
-                Authorized folder
+                {catalog.actions.folderLabel}
                 <select
                   value={renameScopeId ?? ''}
                   onChange={(event) =>
                     setRenameScopeId(event.target.value ? Number(event.target.value) : null)
                   }
                 >
-                  <option value="">Choose a scanned folder</option>
+                  <option value="">{catalog.actions.chooseFolder}</option>
                   {state.scopes.map((scope) => (
                     <option key={scope.id} value={scope.id}>
-                      Scope {scope.id} · {scope.display_path}
+                      {catalog.actions.scopeOption(scope.id, scope.display_path)}
                     </option>
                   ))}
                 </select>
               </label>
               <label>
-                Current absolute file path
+                {catalog.actions.sourceLabel}
                 <input
                   value={renameSourcePath}
                   onChange={(event) => setRenameSourcePath(event.target.value)}
-                  placeholder="/authorized/folder/draft.md"
+                  placeholder={catalog.actions.sourcePlaceholder}
                   autoComplete="off"
                   spellCheck="false"
                 />
               </label>
               <label>
-                Proposed filename only
+                {catalog.actions.newNameLabel}
                 <input
                   value={renameNewName}
                   onChange={(event) => setRenameNewName(event.target.value)}
-                  placeholder="final.md"
+                  placeholder={catalog.actions.newNamePlaceholder}
                   autoComplete="off"
                   spellCheck="false"
                   maxLength={255}
                 />
               </label>
               <button type="submit" disabled={renameState.kind === 'working'}>
-                {renameState.kind === 'working' ? 'Validating safely…' : 'Create durable preview'}
+                {renameState.kind === 'working'
+                  ? catalog.actions.validating
+                  : catalog.actions.createPreview}
               </button>
             </form>
 
             {renameState.kind === 'error' ? (
               <p className="action-message action-message--error" role="alert">
-                {renameState.message}
+                {catalog.actions.validation[renameState.message]}
               </p>
             ) : null}
 
             {renameState.kind === 'ready' ? (
-              <div className="rename-preview" role="status" aria-label="Validated rename preview">
+              <div
+                className="rename-preview"
+                role="status"
+                aria-label={catalog.actions.previewAria}
+              >
                 <div className="rename-preview-heading">
                   <div>
-                    <strong>Plan {renameState.preview.plan_id} · validated preview</strong>
+                    <strong>{catalog.actions.plan(renameState.preview.plan_id)}</strong>
                     <span>
                       {renameState.preview.execution_strategy === 'case_only_staged'
-                        ? 'Case-only rename requires a staged future executor.'
-                        : 'Direct rename strategy recorded for a future executor.'}
+                        ? catalog.actions.caseOnly
+                        : catalog.actions.direct}
                     </span>
                   </div>
-                  <span className="status-pill status-pill--ok">No file changed</span>
+                  <span className="status-pill status-pill--ok">{catalog.actions.unchanged}</span>
                 </div>
                 <div className="rename-paths">
                   <div>
-                    <span>Before</span>
+                    <span>{catalog.actions.before}</span>
                     <code>{renameState.preview.source_path}</code>
                   </div>
                   <div>
-                    <span>After</span>
+                    <span>{catalog.actions.after}</span>
                     <code>{renameState.preview.destination_path}</code>
                   </div>
                 </div>
-                <ul className="policy-checks" aria-label="Passed policy checks">
+                <ul className="policy-checks" aria-label={catalog.actions.policyAria}>
                   {renameState.preview.policy.checks.map((check) => (
-                    <li key={check}>{actionPolicyCheckLabel(check)}</li>
+                    <li key={check}>{actionPolicyCheckLabel(check, catalog)}</li>
                   ))}
                 </ul>
-                <p className="content-empty">
-                  This plan is journaled but cannot execute. Recovery and Undo do not exist yet, so
-                  DeskGraph exposes no action button.
-                </p>
+                <p className="content-empty">{catalog.actions.noExecute}</p>
               </div>
             ) : null}
 
             <div className="action-history-heading">
-              <strong>Recent path-free preview history</strong>
-              <span>{state.actionPlans.length} plans</span>
+              <strong>{catalog.actions.historyHeading}</strong>
+              <span>{catalog.actions.plans(state.actionPlans.length)}</span>
             </div>
             {state.actionPlans.length === 0 ? (
-              <p className="content-empty">
-                No organization preview has been journaled. Files cannot be changed from this app.
-              </p>
+              <p className="content-empty">{catalog.actions.historyEmpty}</p>
             ) : (
               <ol className="action-plan-list">
                 {state.actionPlans.slice(0, 5).map((plan) => (
                   <li key={plan.plan_id}>
                     <div>
-                      <strong>Rename preview {plan.plan_id}</strong>
-                      <span>
-                        Scope {plan.scope_id} · node {plan.node_id}
-                      </span>
+                      <strong>{catalog.actions.historyPlan(plan.plan_id)}</strong>
+                      <span>{catalog.actions.historyScopeNode(plan.scope_id, plan.node_id)}</span>
                     </div>
                     <span>
                       {plan.execution_strategy === 'case_only_staged'
-                        ? 'Case-only staged'
-                        : 'Direct · previewed'}
+                        ? catalog.actions.caseOnlyStaged
+                        : catalog.actions.directPreviewed}
                     </span>
                   </li>
                 ))}
@@ -1188,57 +1327,64 @@ export default function App() {
           <section className="panel panel--watch" aria-labelledby="watch-title">
             <div className="panel-heading panel-heading--wrap">
               <div>
-                <p className="panel-kicker">Durable watch reconciliation</p>
-                <h2 id="watch-title">Stable hints, atomic manifest updates</h2>
-                <p>
-                  The local core can debounce path-free event states, reject temporary downloads,
-                  and resume reconciliation after restart. The native OS event adapter and automatic
-                  content re-indexing are not connected yet.
-                </p>
+                <p className="panel-kicker">{catalog.watch.kicker}</p>
+                <h2 id="watch-title">{catalog.watch.heading}</h2>
+                <p>{catalog.watch.description}</p>
               </div>
               <span className="connected-indicator connected-indicator--pending">
-                Core ready · adapter pending
+                {catalog.watch.adapterPending}
               </span>
             </div>
             <div className="metrics metrics--content">
-              <Metric label="Recent events" value={state.watchEvents.length} />
               <Metric
-                label="Observed hints"
+                label={catalog.watch.metrics.recent}
+                value={state.watchEvents.length}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.watch.metrics.observed}
                 value={state.watchEvents.reduce(
                   (total, event) => total + event.observation_count,
                   0,
                 )}
+                locale={locale}
               />
               <Metric
-                label="Reconciled"
+                label={catalog.watch.metrics.reconciled}
                 value={state.watchEvents.filter((event) => event.status === 'completed').length}
+                locale={locale}
               />
               <Metric
-                label="Needs attention"
+                label={catalog.watch.metrics.attention}
                 value={
                   state.watchEvents.filter(
                     (event) => event.status === 'failed' || event.status === 'reconciling',
                   ).length
                 }
+                locale={locale}
               />
             </div>
             {state.watchEvents.length === 0 ? (
-              <p className="content-empty">
-                No event source is enabled. Files are still updated only by an explicit scan.
-              </p>
+              <p className="content-empty">{catalog.watch.empty}</p>
             ) : (
               <ol className="watch-event-list">
                 {state.watchEvents.slice(0, 3).map((event) => (
                   <li key={event.event_id}>
                     <div>
-                      <strong>{watchStatusLabel(event)}</strong>
+                      <strong>{watchStatusLabel(event, catalog)}</strong>
                       <span>
-                        Event {event.event_id} · scope {event.scope_id} ·{' '}
-                        {event.observation_count.toLocaleString()} coalesced hint
-                        {event.observation_count === 1 ? '' : 's'}
+                        {catalog.watch.event(
+                          event.event_id,
+                          event.scope_id,
+                          event.observation_count,
+                        )}
                       </span>
                     </div>
-                    <span>{event.scan_job_id ? `Scan ${event.scan_job_id}` : 'No scan yet'}</span>
+                    <span>
+                      {event.scan_job_id
+                        ? catalog.watch.scan(event.scan_job_id)
+                        : catalog.watch.noScan}
+                    </span>
                   </li>
                 ))}
               </ol>
@@ -1248,73 +1394,80 @@ export default function App() {
           <section className="panel panel--content" aria-labelledby="content-title">
             <div className="panel-heading panel-heading--wrap">
               <div>
-                <p className="panel-kicker">Bounded local content</p>
+                <p className="panel-kicker">{catalog.extraction.kicker}</p>
                 <h2 id="content-title">
                   {state.extraction.extracted_file_count === 0
-                    ? 'No file content extracted yet'
-                    : 'Local text is ready'}
+                    ? catalog.extraction.emptyHeading
+                    : catalog.extraction.readyHeading}
                 </h2>
-                <p>
-                  Only already-scanned supported documents and explicitly selected screenshots are
-                  eligible. Every source is revalidated, output is size-limited, and a failed job
-                  cannot replace the last complete text.
-                </p>
+                <p>{catalog.extraction.description}</p>
               </div>
-              <span className="connected-indicator">Never uploaded</span>
+              <span className="connected-indicator">{catalog.extraction.neverUploaded}</span>
             </div>
             <div className="metrics metrics--content">
-              <Metric label="Files with text" value={state.extraction.extracted_file_count} />
-              <Metric label="Active chunks" value={state.extraction.active_chunk_count} />
-              <Metric label="Completed jobs" value={state.extraction.completed_job_count} />
               <Metric
-                label="Skipped or cancelled"
+                label={catalog.extraction.metrics.files}
+                value={state.extraction.extracted_file_count}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.extraction.metrics.chunks}
+                value={state.extraction.active_chunk_count}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.extraction.metrics.completed}
+                value={state.extraction.completed_job_count}
+                locale={locale}
+              />
+              <Metric
+                label={catalog.extraction.metrics.skipped}
                 value={state.extraction.failed_job_count + state.extraction.cancelled_job_count}
+                locale={locale}
               />
             </div>
             {state.extractionJobs[0] ? (
               <div className="extraction-progress" role="status">
                 <span>
-                  Latest{' '}
-                  {state.extractionJobs[0].operation === 'screenshot_ocr'
-                    ? 'Screenshot OCR'
-                    : 'content'}{' '}
-                  job {state.extractionJobs[0].job_id}
+                  {catalog.extraction.latest(
+                    state.extractionJobs[0].operation === 'screenshot_ocr'
+                      ? catalog.extraction.operation.screenshotOcr
+                      : catalog.extraction.operation.content,
+                    state.extractionJobs[0].job_id,
+                  )}
                 </span>
-                <strong>{extractionStatusLabel(state.extractionJobs[0])}</strong>
+                <strong>{extractionStatusLabel(state.extractionJobs[0], catalog)}</strong>
                 <span>
-                  {state.extractionJobs[0].chunk_count.toLocaleString()} chunks ·{' '}
-                  {state.extractionJobs[0].output_bytes.toLocaleString()} bytes
+                  {catalog.extraction.progress(
+                    state.extractionJobs[0].chunk_count,
+                    state.extractionJobs[0].output_bytes,
+                  )}
                 </span>
               </div>
             ) : (
-              <p className="content-empty">
-                Extraction is opt-in. Authorizing or scanning a folder never reads file contents.
-              </p>
+              <p className="content-empty">{catalog.extraction.optInEmpty}</p>
             )}
           </section>
 
           <section className="panel panel--scopes" aria-labelledby="scopes-title">
             <div className="panel-heading panel-heading--wrap">
               <div>
-                <p className="panel-kicker">Explicit authorization</p>
-                <h2 id="scopes-title">Folders DeskGraph may inspect</h2>
-                <p>
-                  Enter an existing folder path. Authorization and scanning are separate actions;
-                  symlinks and hidden entries are not followed.
-                </p>
+                <p className="panel-kicker">{catalog.scope.kicker}</p>
+                <h2 id="scopes-title">{catalog.scope.heading}</h2>
+                <p>{catalog.scope.description}</p>
               </div>
-              <span className="scope-count">{state.scopes.length} authorized</span>
+              <span className="scope-count">{catalog.scope.count(state.scopes.length)}</span>
             </div>
 
             <div className="scope-form">
-              <label htmlFor="scope-path">Folder path</label>
+              <label htmlFor="scope-path">{catalog.scope.inputLabel}</label>
               <div className="scope-form-row">
                 <input
                   id="scope-path"
                   type="text"
                   value={scopePath}
                   onChange={(event) => setScopePath(event.target.value)}
-                  placeholder="/Users/you/Documents or C:\Users\you\Documents"
+                  placeholder={catalog.scope.placeholder}
                   autoComplete="off"
                   spellCheck="false"
                 />
@@ -1323,23 +1476,24 @@ export default function App() {
                   disabled={action.kind === 'working'}
                   onClick={() => void authorizeRequestedScope()}
                 >
-                  Authorize folder
+                  {catalog.scope.authorize}
                 </button>
               </div>
             </div>
 
             {action.kind !== 'idle' ? (
-              <p className={`action-message action-message--${action.kind}`} role="status">
-                {action.kind === 'working' ? action.label : action.message}
+              <p
+                className={`action-message action-message--${action.kind}`}
+                role={action.kind === 'error' ? 'alert' : 'status'}
+              >
+                {actionMessageLabel(catalog, action.message)}
               </p>
             ) : null}
 
             {state.scopes.length === 0 ? (
               <div className="empty-scope">
-                <strong>No folder access</strong>
-                <span>
-                  DeskGraph cannot inspect Desktop, Downloads, or Documents until added here.
-                </span>
+                <strong>{catalog.scope.emptyHeading}</strong>
+                <span>{catalog.scope.emptyDescription}</span>
               </div>
             ) : (
               <ul className="scope-list">
@@ -1355,15 +1509,17 @@ export default function App() {
                   return (
                     <li key={scope.id}>
                       <div className="scope-details">
-                        <span className="scope-label">Authorized scope {scope.id}</span>
+                        <span className="scope-label">{catalog.scope.label(scope.id)}</span>
                         <code>{scope.display_path}</code>
                         {latestJob ? (
                           <div className="scan-progress" role="status">
-                            <span>{scanStatusLabel(latestJob)}</span>
+                            <span>{scanStatusLabel(latestJob, catalog)}</span>
                             <span>
-                              {latestJob.processed_entries.toLocaleString()} /{' '}
-                              {latestJob.queued_entries.toLocaleString()} entries ·{' '}
-                              {latestJob.issue_count.toLocaleString()} issues
+                              {catalog.scope.progress(
+                                latestJob.processed_entries,
+                                latestJob.queued_entries,
+                                latestJob.issue_count,
+                              )}
                             </span>
                           </div>
                         ) : null}
@@ -1374,13 +1530,15 @@ export default function App() {
                           disabled={resumableJob.pause_requested}
                           onClick={() => void pause(resumableJob)}
                         >
-                          {resumableJob.pause_requested ? 'Pausing…' : 'Pause scan'}
+                          {resumableJob.pause_requested
+                            ? catalog.scope.pausing
+                            : catalog.scope.pause}
                         </button>
                       ) : null}
                       {resumableJob?.status === 'paused' ||
                       resumableJob?.status === 'interrupted' ? (
                         <button type="button" onClick={() => void resume(resumableJob)}>
-                          Resume scan
+                          {catalog.scope.resume}
                         </button>
                       ) : null}
                       {!resumableJob ? (
@@ -1389,7 +1547,7 @@ export default function App() {
                           disabled={action.kind === 'working'}
                           onClick={() => void scan(scope)}
                         >
-                          Scan metadata
+                          {catalog.scope.scan}
                         </button>
                       ) : null}
                     </li>
@@ -1402,8 +1560,10 @@ export default function App() {
       ) : null}
 
       <footer>
-        <span>DeskGraph {state.kind === 'ready' ? state.report.app_version : '0.1.0'}</span>
-        <span>Metadata + bounded local text · No uploads · No file operations</span>
+        <span>
+          {catalog.footer.version(state.kind === 'ready' ? state.report.app_version : '0.1.0')}
+        </span>
+        <span>{catalog.footer.description}</span>
       </footer>
     </main>
   );

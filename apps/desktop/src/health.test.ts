@@ -1,12 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import {
-  HEALTH_COMMAND,
-  lifecycleLabel,
-  loadHealthReport,
-  parseHealthReport,
-  type HealthReport,
-} from './health';
+import { HEALTH_COMMAND, loadHealthReport, parseHealthReport, type HealthReport } from './health';
 
 const report: HealthReport = {
   api_version: 'deskgraph.health.v1',
@@ -45,10 +39,5 @@ describe('health contract', () => {
     await expect(loadHealthReport(invokeCommand)).resolves.toEqual(report);
     expect(invokeCommand).toHaveBeenCalledWith(HEALTH_COMMAND);
     expect(HEALTH_COMMAND).toBe('health');
-  });
-
-  it('uses human-readable lifecycle labels', () => {
-    expect(lifecycleLabel('not_initialized')).toBe('Not initialized');
-    expect(lifecycleLabel('disabled')).toBe('Disabled');
   });
 });
