@@ -109,8 +109,9 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 8 — M7 MCP
 
-- Build an independently launched stdio server over identity-based read services and read-only SQLite connections only; it does not require daemon IPC or acquire a writer lease.
-- Exit with no arbitrary paths, no write tools, scope/injection tests, minimal response fields, and setup docs.
+- Current: an independently launched stdio server exposes exactly one read-only `search_files` tool over an existing-schema SQLite read-only/query-only capability. Launch-time scope grants must be positive, present, and backed by a completed scan; every call revalidates scope eligibility. Closed input schemas accept no paths, content snippets are explicit and labeled untrusted, protocol and response sizes are bounded, structured stderr omits query/path/content, and real child-process lifecycle/scope/injection/main-database-and-source-immutability tests pass. SQLite's narrow WAL/SHM coordination-sidecar exception is documented. The exact bundled macOS/Linux VFS plus DeskGraph link checks satisfy the current no-follow proof; Windows and other unproven targets fail closed. It does not require daemon IPC or acquire a writer lease.
+- Next: add only the remaining minimum-necessary read tools after their source milestones are truthful, then package and smoke supported clients/platforms. Keep remote transport, write tools, scan/extraction triggers, filesystem actions, and model execution out of M7.
+- Exit remains open until the accepted M7 tool set has complete scope/injection/minimum-field tests, cross-platform stdio/client setup evidence, packaged documentation, and no arbitrary paths or write tools.
 
 ### Step 9 — M9 release gate
 

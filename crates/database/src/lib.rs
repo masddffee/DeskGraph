@@ -1,7 +1,9 @@
 use std::fmt;
 use std::fs;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::path::Component;
 use std::path::{MAIN_SEPARATOR, Path};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_domain::{
     ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
@@ -18,6 +20,10 @@ use deskgraph_domain::{
     ScanReport, ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus,
     is_valid_image_dimensions, is_valid_xlsx_cell_reference, parse_explicit_file_version_name,
 };
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use deskgraph_identity::{IdentityNodeKind, is_symlink_or_reparse_point, platform_identity};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use rusqlite::OpenFlags;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 const MIGRATIONS: &[Migration] = &[
@@ -112,6 +118,11 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/0018_watch_reconciliation_kind.sql"),
     },
 ];
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const READ_ONLY_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+const READ_ONLY_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_ONLY_PROGRESS_OPS: i32 = 100;
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_CHUNKS: usize = 65_536;
@@ -465,6 +476,10 @@ pub enum DatabaseError {
     Io(std::io::Error),
     Sqlite(rusqlite::Error),
     MigrationChanged { version: i64 },
+    ReadOnlyPathInvalid,
+    ReadOnlySchemaInvalid,
+    ReadOnlyModeUnavailable,
+    ReadOnlyQueryTimeout,
     ScopeNotFound,
     ScanJobNotFound,
     ScanJobAlreadyActive,
@@ -511,6 +526,10 @@ impl DatabaseError {
             Self::Io(_) => "database_io_failed",
             Self::Sqlite(_) => "database_operation_failed",
             Self::MigrationChanged { .. } => "database_migration_changed",
+            Self::ReadOnlyPathInvalid => "database_read_only_path_invalid",
+            Self::ReadOnlySchemaInvalid => "database_read_only_schema_invalid",
+            Self::ReadOnlyModeUnavailable => "database_read_only_mode_unavailable",
+            Self::ReadOnlyQueryTimeout => "database_read_only_query_timeout",
             Self::ScopeNotFound => "authorized_scope_not_found",
             Self::ScanJobNotFound => "scan_job_not_found",
             Self::ScanJobAlreadyActive => "scan_job_already_active",
@@ -575,6 +594,125 @@ impl From<rusqlite::Error> for DatabaseError {
 
 pub struct ManifestDatabase {
     connection: Connection,
+}
+
+/// A capability-limited connection to an existing, fully migrated manifest.
+///
+/// This type deliberately exposes no migration, recovery, scan, extraction,
+/// transaction-journal, or filesystem-action methods. Opening it never creates
+/// a parent directory or database and never falls back to read-write access.
+pub struct ManifestReadDatabase {
+    connection: Connection,
+}
+
+impl ManifestReadDatabase {
+    pub fn open_existing_read_only(path: &Path) -> Result<Self, DatabaseError> {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = path;
+            Err(DatabaseError::ReadOnlyModeUnavailable)
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let identity_before = validate_existing_database_path(path)?;
+            validate_existing_sqlite_sidecars(path)?;
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            let identity_after = validate_existing_database_path(path)?;
+            validate_existing_sqlite_sidecars(path)?;
+            if identity_before != identity_after {
+                return Err(DatabaseError::ReadOnlyPathInvalid);
+            }
+            connection.execute_batch(
+                "PRAGMA query_only = ON;\
+                 PRAGMA foreign_keys = ON;\
+                 PRAGMA temp_store = MEMORY;",
+            )?;
+            connection.busy_timeout(READ_ONLY_BUSY_TIMEOUT)?;
+            if !connection.is_readonly("main")?
+                || !connection.pragma_query_value(None, "query_only", |row| {
+                    row.get::<_, i64>(0).map(|value| value == 1)
+                })?
+            {
+                return Err(DatabaseError::ReadOnlyModeUnavailable);
+            }
+            validate_schema_migrations_exact(&connection)?;
+            Ok(Self { connection })
+        }
+    }
+
+    pub fn ensure_scope_queryable(&self, scope_id: i64) -> Result<(), DatabaseError> {
+        ensure_scope_queryable(&self.connection, scope_id)
+    }
+
+    pub fn lexical_search_candidates(
+        &self,
+        match_query: &str,
+        filters: LexicalSearchFilters<'_>,
+        per_source_candidate_limit: u32,
+    ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
+        self.lexical_search_candidates_until(
+            match_query,
+            filters,
+            per_source_candidate_limit,
+            Instant::now() + READ_ONLY_QUERY_TIMEOUT,
+        )
+    }
+
+    fn lexical_search_candidates_until(
+        &self,
+        match_query: &str,
+        filters: LexicalSearchFilters<'_>,
+        per_source_candidate_limit: u32,
+        deadline: Instant,
+    ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
+        let scope_id = filters.scope_id.ok_or(DatabaseError::SearchInputInvalid)?;
+        self.connection.progress_handler(
+            READ_ONLY_PROGRESS_OPS,
+            Some(move || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let transaction = self.connection.unchecked_transaction()?;
+            ensure_scope_queryable(&transaction, scope_id)?;
+            let candidates = lexical_search_candidates_from_connection(
+                &transaction,
+                match_query,
+                filters,
+                per_source_candidate_limit,
+            )?;
+            transaction.commit()?;
+            Ok(candidates)
+        })();
+        let clear_result = self
+            .connection
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(DatabaseError::from);
+        let result = result.map_err(normalize_read_only_query_error);
+        clear_result?;
+        result
+    }
+}
+
+fn normalize_read_only_query_error(error: DatabaseError) -> DatabaseError {
+    match &error {
+        DatabaseError::Sqlite(sqlite)
+            if matches!(
+                sqlite.sqlite_error_code(),
+                Some(
+                    rusqlite::ffi::ErrorCode::OperationInterrupted
+                        | rusqlite::ffi::ErrorCode::DatabaseBusy
+                        | rusqlite::ffi::ErrorCode::DatabaseLocked
+                )
+            ) =>
+        {
+            DatabaseError::ReadOnlyQueryTimeout
+        }
+        _ => error,
+    }
 }
 
 impl ManifestDatabase {
@@ -3054,127 +3192,12 @@ impl ManifestDatabase {
         filters: LexicalSearchFilters<'_>,
         per_source_candidate_limit: u32,
     ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
-        if match_query.is_empty()
-            || match_query.len() > MAX_SEARCH_MATCH_BYTES
-            || per_source_candidate_limit == 0
-            || per_source_candidate_limit > MAX_SEARCH_CANDIDATES_PER_SOURCE
-            || filters.scope_id.is_some_and(|scope_id| scope_id <= 0)
-            || filters.extension.is_some_and(|extension| {
-                extension.is_empty()
-                    || extension.len() > 16
-                    || !extension
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-            })
-            || filters
-                .modified_since_unix_ns
-                .is_some_and(|timestamp| timestamp < 0)
-            || filters
-                .modified_before_unix_ns
-                .is_some_and(|timestamp| timestamp < 0)
-            || matches!(
-                (
-                    filters.modified_since_unix_ns,
-                    filters.modified_before_unix_ns
-                ),
-                (Some(since), Some(before)) if since >= before
-            )
-        {
-            return Err(DatabaseError::SearchInputInvalid);
-        }
-        let limit = i64::from(per_source_candidate_limit);
-        let maximum_sources = if filters.source == LexicalSearchSource::All {
-            2
-        } else {
-            1
-        };
-        let mut candidates = Vec::with_capacity(
-            usize::try_from(per_source_candidate_limit)
-                .map_err(|_| DatabaseError::SearchInputInvalid)?
-                .saturating_mul(maximum_sources),
-        );
-
-        if filters.source != LexicalSearchSource::ExtractedText {
-            let mut metadata_statement = self.connection.prepare(
-                "SELECT l.scope_id, l.node_id, l.id, l.display_path \
-                 FROM location_search_fts \
-                 JOIN locations l ON l.id = location_search_fts.rowid \
-                 LEFT JOIN files f ON f.node_id = l.node_id \
-                 WHERE location_search_fts MATCH ?1 AND l.present = 1 \
-                   AND (?2 IS NULL OR l.scope_id = ?2) \
-                   AND (?3 IS NULL OR (f.node_id IS NOT NULL AND substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3)) \
-                   AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
-                   AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
-                 ORDER BY location_search_fts.rank, l.id \
-                 LIMIT ?6",
-            )?;
-            let metadata_rows = metadata_statement.query_map(
-                params![
-                    match_query,
-                    filters.scope_id,
-                    filters.extension,
-                    filters.modified_since_unix_ns,
-                    filters.modified_before_unix_ns,
-                    limit
-                ],
-                |row| {
-                    Ok(LexicalSearchCandidate {
-                        source: LexicalCandidateSource::MetadataPath,
-                        scope_id: row.get(0)?,
-                        node_id: row.get(1)?,
-                        location_id: row.get(2)?,
-                        display_path: row.get(3)?,
-                        snippet: None,
-                    })
-                },
-            )?;
-            for row in metadata_rows {
-                candidates.push(row?);
-            }
-        }
-
-        if filters.source != LexicalSearchSource::MetadataPath {
-            let mut content_statement = self.connection.prepare(
-                "SELECT c.scope_id, c.node_id, c.location_id, l.display_path, \
-                        snippet(content_search_fts, 0, '[', ']', '…', 24) \
-                 FROM content_search_fts \
-                 JOIN content_chunks c ON c.id = content_search_fts.rowid \
-                 JOIN locations l ON l.id = c.location_id AND l.node_id = c.node_id \
-                 JOIN files f ON f.node_id = c.node_id \
-                 WHERE content_search_fts MATCH ?1 AND c.active = 1 AND l.present = 1 \
-                   AND (?2 IS NULL OR c.scope_id = ?2) \
-                   AND (?3 IS NULL OR substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3) \
-                   AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
-                   AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
-                 ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
-                 LIMIT ?6",
-            )?;
-            let content_rows = content_statement.query_map(
-                params![
-                    match_query,
-                    filters.scope_id,
-                    filters.extension,
-                    filters.modified_since_unix_ns,
-                    filters.modified_before_unix_ns,
-                    limit
-                ],
-                |row| {
-                    Ok(LexicalSearchCandidate {
-                        source: LexicalCandidateSource::ExtractedText,
-                        scope_id: row.get(0)?,
-                        node_id: row.get(1)?,
-                        location_id: row.get(2)?,
-                        display_path: row.get(3)?,
-                        snippet: Some(row.get(4)?),
-                    })
-                },
-            )?;
-            for row in content_rows {
-                candidates.push(row?);
-            }
-        }
-
-        Ok(candidates)
+        lexical_search_candidates_from_connection(
+            &self.connection,
+            match_query,
+            filters,
+            per_source_candidate_limit,
+        )
     }
 
     pub fn invalidate_content_for_node(
@@ -5815,6 +5838,256 @@ fn invalidate_stale_extraction_outputs(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_existing_database_path(path: &Path) -> Result<Vec<u8>, DatabaseError> {
+    if !path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(DatabaseError::ReadOnlyPathInvalid);
+    }
+
+    let mut database_metadata = None;
+    for (index, candidate) in path.ancestors().enumerate() {
+        let metadata =
+            fs::symlink_metadata(candidate).map_err(|_| DatabaseError::ReadOnlyPathInvalid)?;
+        if is_symlink_or_reparse_point(&metadata)
+            || (index == 0 && !metadata.is_file())
+            || (index != 0 && !metadata.is_dir())
+        {
+            return Err(DatabaseError::ReadOnlyPathInvalid);
+        }
+        if index == 0 {
+            database_metadata = Some(metadata);
+        }
+    }
+
+    let metadata = database_metadata.ok_or(DatabaseError::ReadOnlyPathInvalid)?;
+    platform_identity(path, &metadata, IdentityNodeKind::File)
+        .map(|identity| identity.key)
+        .map_err(|_| DatabaseError::ReadOnlyPathInvalid)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_existing_sqlite_sidecars(path: &Path) -> Result<(), DatabaseError> {
+    let file_name = path.file_name().ok_or(DatabaseError::ReadOnlyPathInvalid)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_name = file_name.to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar = path.with_file_name(sidecar_name);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if is_symlink_or_reparse_point(&metadata) || !metadata.is_file() => {
+                return Err(DatabaseError::ReadOnlyPathInvalid);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(DatabaseError::ReadOnlyPathInvalid),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_schema_migrations_exact(connection: &Connection) -> Result<(), DatabaseError> {
+    let migration_table_count = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migrations'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let expected_count =
+        i64::try_from(MIGRATIONS.len()).map_err(|_| DatabaseError::ReadOnlySchemaInvalid)?;
+    let actual_count = if migration_table_count == 1 {
+        connection.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+    } else {
+        return Err(DatabaseError::ReadOnlySchemaInvalid);
+    };
+    if actual_count != expected_count {
+        return Err(DatabaseError::ReadOnlySchemaInvalid);
+    }
+
+    for migration in MIGRATIONS {
+        let applied = connection
+            .query_row(
+                "SELECT name, checksum FROM schema_migrations WHERE version = ?1",
+                [migration.version],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((name, checksum)) = applied else {
+            return Err(DatabaseError::ReadOnlySchemaInvalid);
+        };
+        if name != migration.name {
+            return Err(DatabaseError::ReadOnlySchemaInvalid);
+        }
+        if checksum != migration_checksum(migration.sql) {
+            return Err(DatabaseError::MigrationChanged {
+                version: migration.version,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_scope_queryable(connection: &Connection, scope_id: i64) -> Result<(), DatabaseError> {
+    if scope_id <= 0 {
+        return Err(DatabaseError::ScopeNotFound);
+    }
+    let exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM authorized_scopes WHERE id = ?1)",
+        [scope_id],
+        |row| row.get::<_, i64>(0).map(|value| value == 1),
+    )?;
+    if !exists {
+        return Err(DatabaseError::ScopeNotFound);
+    }
+    let completed = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed')",
+        [scope_id],
+        |row| row.get::<_, i64>(0).map(|value| value == 1),
+    )?;
+    if !completed {
+        return Err(DatabaseError::ScanJobIncomplete);
+    }
+    Ok(())
+}
+
+fn lexical_search_candidates_from_connection(
+    connection: &Connection,
+    match_query: &str,
+    filters: LexicalSearchFilters<'_>,
+    per_source_candidate_limit: u32,
+) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
+    if match_query.is_empty()
+        || match_query.len() > MAX_SEARCH_MATCH_BYTES
+        || per_source_candidate_limit == 0
+        || per_source_candidate_limit > MAX_SEARCH_CANDIDATES_PER_SOURCE
+        || filters.scope_id.is_some_and(|scope_id| scope_id <= 0)
+        || filters.extension.is_some_and(|extension| {
+            extension.is_empty()
+                || extension.len() > 16
+                || !extension
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+        || filters
+            .modified_since_unix_ns
+            .is_some_and(|timestamp| timestamp < 0)
+        || filters
+            .modified_before_unix_ns
+            .is_some_and(|timestamp| timestamp < 0)
+        || matches!(
+            (
+                filters.modified_since_unix_ns,
+                filters.modified_before_unix_ns
+            ),
+            (Some(since), Some(before)) if since >= before
+        )
+    {
+        return Err(DatabaseError::SearchInputInvalid);
+    }
+    let limit = i64::from(per_source_candidate_limit);
+    let maximum_sources = if filters.source == LexicalSearchSource::All {
+        2
+    } else {
+        1
+    };
+    let mut candidates = Vec::with_capacity(
+        usize::try_from(per_source_candidate_limit)
+            .map_err(|_| DatabaseError::SearchInputInvalid)?
+            .saturating_mul(maximum_sources),
+    );
+
+    if filters.source != LexicalSearchSource::ExtractedText {
+        let mut metadata_statement = connection.prepare(
+            "SELECT l.scope_id, l.node_id, l.id, l.display_path \
+             FROM location_search_fts \
+             JOIN locations l ON l.id = location_search_fts.rowid \
+             LEFT JOIN files f ON f.node_id = l.node_id \
+             WHERE location_search_fts MATCH ?1 AND l.present = 1 \
+               AND (?2 IS NULL OR l.scope_id = ?2) \
+               AND (?3 IS NULL OR (f.node_id IS NOT NULL AND substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3)) \
+               AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
+               AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+             ORDER BY location_search_fts.rank, l.id \
+             LIMIT ?6",
+        )?;
+        let metadata_rows = metadata_statement.query_map(
+            params![
+                match_query,
+                filters.scope_id,
+                filters.extension,
+                filters.modified_since_unix_ns,
+                filters.modified_before_unix_ns,
+                limit
+            ],
+            |row| {
+                Ok(LexicalSearchCandidate {
+                    source: LexicalCandidateSource::MetadataPath,
+                    scope_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    location_id: row.get(2)?,
+                    display_path: row.get(3)?,
+                    snippet: None,
+                })
+            },
+        )?;
+        for row in metadata_rows {
+            candidates.push(row?);
+        }
+    }
+
+    if filters.source != LexicalSearchSource::MetadataPath {
+        let mut content_statement = connection.prepare(
+            "SELECT c.scope_id, c.node_id, c.location_id, l.display_path, \
+                    snippet(content_search_fts, 0, '[', ']', '…', 24) \
+             FROM content_search_fts \
+             JOIN content_chunks c ON c.id = content_search_fts.rowid \
+             JOIN locations l ON l.id = c.location_id \
+                AND l.node_id = c.node_id AND l.scope_id = c.scope_id \
+             JOIN extraction_jobs e ON e.id = c.extraction_job_id \
+                AND e.scope_id = c.scope_id AND e.node_id = c.node_id \
+                AND e.location_id = c.location_id AND e.status = 'completed' \
+             JOIN files f ON f.node_id = c.node_id \
+             WHERE content_search_fts MATCH ?1 AND c.active = 1 AND l.present = 1 \
+               AND (?2 IS NULL OR c.scope_id = ?2) \
+               AND (?3 IS NULL OR substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3) \
+               AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
+               AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+             ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
+             LIMIT ?6",
+        )?;
+        let content_rows = content_statement.query_map(
+            params![
+                match_query,
+                filters.scope_id,
+                filters.extension,
+                filters.modified_since_unix_ns,
+                filters.modified_before_unix_ns,
+                limit
+            ],
+            |row| {
+                Ok(LexicalSearchCandidate {
+                    source: LexicalCandidateSource::ExtractedText,
+                    scope_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    location_id: row.get(2)?,
+                    display_path: row.get(3)?,
+                    snippet: Some(row.get(4)?),
+                })
+            },
+        )?;
+        for row in content_rows {
+            candidates.push(row?);
+        }
+    }
+
+    Ok(candidates)
+}
+
 fn upsert_observation(
     transaction: &Transaction<'_>,
     scope_id: i64,
@@ -7237,6 +7510,247 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn read_only_manifest_requires_an_existing_absolute_regular_file() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize");
+        let missing_parent = canonical_directory.join("missing-parent");
+        let missing_database = missing_parent.join("manifest.sqlite3");
+
+        let error = ManifestReadDatabase::open_existing_read_only(&missing_database)
+            .err()
+            .expect("missing database must fail closed");
+
+        assert_eq!(error.code(), "database_read_only_path_invalid");
+        assert!(!missing_parent.exists());
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(Path::new("relative.sqlite3")),
+            Err(DatabaseError::ReadOnlyPathInvalid)
+        ));
+
+        let empty_database = canonical_directory.join("empty.sqlite3");
+        fs::write(&empty_database, []).expect("empty fixture should exist");
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(&empty_database),
+            Err(DatabaseError::ReadOnlySchemaInvalid)
+        ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn read_only_manifest_rejects_symlinked_database_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize");
+        let real_parent = canonical_directory.join("real");
+        fs::create_dir(&real_parent).expect("real parent should exist");
+        let real_database = real_parent.join("manifest.sqlite3");
+        ManifestDatabase::open(&real_database).expect("fixture should initialize");
+
+        let database_link = canonical_directory.join("manifest-link.sqlite3");
+        symlink(&real_database, &database_link).expect("database symlink should exist");
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(&database_link),
+            Err(DatabaseError::ReadOnlyPathInvalid)
+        ));
+
+        let parent_link = canonical_directory.join("parent-link");
+        symlink(&real_parent, &parent_link).expect("parent symlink should exist");
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(&parent_link.join("manifest.sqlite3")),
+            Err(DatabaseError::ReadOnlyPathInvalid)
+        ));
+
+        let victim = canonical_directory.join("sidecar-victim");
+        fs::write(&victim, b"must remain unchanged").expect("victim should exist");
+        symlink(&victim, real_parent.join("manifest.sqlite3-shm"))
+            .expect("sidecar symlink should exist");
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(&real_database),
+            Err(DatabaseError::ReadOnlyPathInvalid)
+        ));
+        assert_eq!(
+            fs::read(&victim).expect("victim should remain readable"),
+            b"must remain unchanged"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn read_only_manifest_seals_schema_and_blocks_writes() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("manifest.sqlite3");
+        let writer = ManifestDatabase::open(&path).expect("fixture should initialize");
+        let scope = writer
+            .add_scope(b"/scope", "/scope", "/scope", "test")
+            .expect("scope should persist");
+        let unscanned_scope = writer
+            .add_scope(b"/unscanned", "/unscanned", "/unscanned", "test")
+            .expect("unscanned scope should persist");
+        writer
+            .connection
+            .execute(
+                "INSERT INTO scan_jobs(scope_id, status, started_at_unix_ms, finished_at_unix_ms) \
+                 VALUES (?1, 'completed', 1, 1)",
+                [scope.id],
+            )
+            .expect("completed scan should persist");
+        let scan_id = writer.connection.last_insert_rowid();
+        writer
+            .connection
+            .execute(
+                "INSERT INTO nodes(kind, identity_kind, identity_key, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES ('file', 'test', X'01', 1, 1)",
+                [],
+            )
+            .expect("node should persist");
+        let node_id = writer.connection.last_insert_rowid();
+        writer
+            .connection
+            .execute(
+                "INSERT INTO files(node_id, size_bytes, modified_unix_ns, link_count) \
+                 VALUES (?1, 10, 1, 1)",
+                [node_id],
+            )
+            .expect("file should persist");
+        writer
+            .connection
+            .execute(
+                "INSERT INTO locations(scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id) \
+                 VALUES (?1, ?2, X'2F73636F70652F6E6F7465732E6D64', '/scope/notes.md', '/scope/notes.md', 1, ?3)",
+                params![scope.id, node_id, scan_id],
+            )
+            .expect("location should persist");
+        let migration_count_before = writer
+            .connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("migration count should load");
+
+        let reader = ManifestReadDatabase::open_existing_read_only(&path)
+            .expect("active WAL database should open read-only");
+        reader
+            .ensure_scope_queryable(scope.id)
+            .expect("completed scope should be queryable");
+        assert!(matches!(
+            reader.ensure_scope_queryable(unscanned_scope.id),
+            Err(DatabaseError::ScanJobIncomplete)
+        ));
+        let candidates = reader
+            .lexical_search_candidates("\"notes\"", lexical_filters(Some(scope.id)), 10)
+            .expect("read-only metadata search should pass");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display_path, "/scope/notes.md");
+        let timeout = reader
+            .lexical_search_candidates_until(
+                "\"notes\"",
+                lexical_filters(Some(scope.id)),
+                10,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .expect_err("expired read-only search must stop");
+        assert!(matches!(timeout, DatabaseError::ReadOnlyQueryTimeout));
+        let recovered = reader
+            .lexical_search_candidates("\"notes\"", lexical_filters(Some(scope.id)), 10)
+            .expect("a request after timeout should recover");
+        assert_eq!(recovered.len(), 1);
+        assert!(reader.connection.is_readonly("main").unwrap_or(false));
+        assert_eq!(
+            reader
+                .connection
+                .pragma_query_value(None, "query_only", |row| row.get::<_, i64>(0))
+                .expect("query-only state should load"),
+            1
+        );
+        let write_error = reader
+            .connection
+            .execute(
+                "INSERT INTO authorized_scopes(path_raw, path_key, display_path, platform, created_at_unix_ms) \
+                 VALUES (X'00', 'denied', 'denied', 'test', 1)",
+                [],
+            )
+            .expect_err("read-only connection must reject writes");
+        assert!(matches!(write_error, rusqlite::Error::SqliteFailure(_, _)));
+        drop(reader);
+
+        assert_eq!(
+            writer
+                .connection
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("migration count should remain readable"),
+            migration_count_before
+        );
+        assert_eq!(
+            writer
+                .connection
+                .query_row("SELECT COUNT(*) FROM authorized_scopes", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("scope count should remain readable"),
+            2
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn read_only_manifest_rejects_incomplete_or_changed_schema() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let canonical_directory = directory
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize");
+        let path = canonical_directory.join("manifest.sqlite3");
+        let writer = ManifestDatabase::open(&path).expect("fixture should initialize");
+        writer
+            .connection
+            .execute("DELETE FROM schema_migrations WHERE version = 18", [])
+            .expect("fixture should remove latest migration row");
+        drop(writer);
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(&path),
+            Err(DatabaseError::ReadOnlySchemaInvalid)
+        ));
+
+        let changed_path = canonical_directory.join("changed.sqlite3");
+        let changed = ManifestDatabase::open(&changed_path).expect("fixture should initialize");
+        changed
+            .connection
+            .execute(
+                "UPDATE schema_migrations SET checksum = 'changed' WHERE version = 18",
+                [],
+            )
+            .expect("fixture checksum should change");
+        drop(changed);
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(&changed_path),
+            Err(DatabaseError::MigrationChanged { version: 18 })
+        ));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn read_only_manifest_fails_closed_without_nofollow_sidecar_evidence() {
+        assert!(matches!(
+            ManifestReadDatabase::open_existing_read_only(Path::new("C:\\manifest.sqlite3")),
+            Err(DatabaseError::ReadOnlyModeUnavailable)
+        ));
+    }
+
     #[test]
     fn changed_applied_migration_is_rejected() {
         let connection = Connection::open_in_memory().expect("connection should open");
@@ -8420,6 +8934,78 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.source != LexicalCandidateSource::ExtractedText)
         );
+    }
+
+    #[test]
+    fn content_search_rejects_cross_scope_location_inconsistency() {
+        let (mut database, granted_scope_id, node_id, _) = extraction_setup();
+        let denied = database
+            .add_scope(b"/denied", "/denied", "/denied", "test")
+            .expect("denied scope should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO scan_jobs(scope_id, status, started_at_unix_ms, finished_at_unix_ms) \
+                 VALUES (?1, 'completed', 1, 1)",
+                [denied.id],
+            )
+            .expect("denied scan should persist");
+        let denied_scan_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations(scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id) \
+                 VALUES (?1, ?2, X'2F64656E6965642F707269766174652E6D64', '/denied/private.md', '/denied/private.md', 1, ?3)",
+                params![denied.id, node_id, denied_scan_id],
+            )
+            .expect("cross-scope identity location should persist");
+        let denied_location_id = database.connection.last_insert_rowid();
+
+        let text = "forged cross scope private marker";
+        let job = database
+            .create_extraction_job(granted_scope_id, node_id)
+            .expect("granted job should create");
+        database
+            .claim_extraction_job(job.job_id, "scope-runner", 60_000)
+            .expect("job should claim");
+        database
+            .complete_extraction_job(
+                job.job_id,
+                "scope-runner",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                u64::try_from(text.len()).expect("fixture length should fit"),
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: text.to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("content should publish");
+        database
+            .connection
+            .execute(
+                "UPDATE content_chunks SET location_id = ?1 WHERE extraction_job_id = ?2",
+                params![denied_location_id, job.job_id],
+            )
+            .expect("fixture should forge an inconsistent cross-scope location");
+
+        let candidates = database
+            .lexical_search_candidates(
+                "\"cross scope private\"",
+                LexicalSearchFilters {
+                    scope_id: Some(granted_scope_id),
+                    source: LexicalSearchSource::ExtractedText,
+                    ..lexical_filters(Some(granted_scope_id))
+                },
+                10,
+            )
+            .expect("inconsistent row should fail closed without failing the query");
+        assert!(candidates.is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 deskgraph-domain = { path = "../domain" }
+deskgraph-identity = { path = "../identity" }
 rusqlite.workspace = true
 
 [dev-dependencies]

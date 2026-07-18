@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use deskgraph_database::{
     DatabaseError, LexicalCandidateSource, LexicalSearchCandidate, LexicalSearchFilters,
-    LexicalSearchSource, ManifestDatabase,
+    LexicalSearchSource, ManifestDatabase, ManifestReadDatabase,
 };
 pub use deskgraph_domain::SearchSourceFilter;
 use deskgraph_domain::{
@@ -126,8 +126,61 @@ pub fn search_at(path: &Path, request: SearchRequest<'_>) -> Result<SearchRespon
     search(&database, request)
 }
 
+pub fn search_read_only_at(
+    path: &Path,
+    request: SearchRequest<'_>,
+) -> Result<SearchResponse, SearchError> {
+    let database = ManifestReadDatabase::open_existing_read_only(path)?;
+    search_read_only(&database, request)
+}
+
 pub fn search(
     database: &ManifestDatabase,
+    request: SearchRequest<'_>,
+) -> Result<SearchResponse, SearchError> {
+    search_with(database, request)
+}
+
+pub fn search_read_only(
+    database: &ManifestReadDatabase,
+    request: SearchRequest<'_>,
+) -> Result<SearchResponse, SearchError> {
+    search_with(database, request)
+}
+
+trait LexicalSearchStore {
+    fn candidates(
+        &self,
+        match_query: &str,
+        filters: LexicalSearchFilters<'_>,
+        per_source_candidate_limit: u32,
+    ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError>;
+}
+
+impl LexicalSearchStore for ManifestDatabase {
+    fn candidates(
+        &self,
+        match_query: &str,
+        filters: LexicalSearchFilters<'_>,
+        per_source_candidate_limit: u32,
+    ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
+        self.lexical_search_candidates(match_query, filters, per_source_candidate_limit)
+    }
+}
+
+impl LexicalSearchStore for ManifestReadDatabase {
+    fn candidates(
+        &self,
+        match_query: &str,
+        filters: LexicalSearchFilters<'_>,
+        per_source_candidate_limit: u32,
+    ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
+        self.lexical_search_candidates(match_query, filters, per_source_candidate_limit)
+    }
+}
+
+fn search_with(
+    database: &impl LexicalSearchStore,
     request: SearchRequest<'_>,
 ) -> Result<SearchResponse, SearchError> {
     let started = Instant::now();
@@ -139,7 +192,7 @@ pub fn search(
     }
     let per_source_candidate_limit = limit.saturating_mul(2).min(MAX_CANDIDATES_PER_SOURCE);
     let match_query = quote_fts_phrase(&normalized_query);
-    let candidates = database.lexical_search_candidates(
+    let candidates = database.candidates(
         &match_query,
         filters.database_filters(),
         per_source_candidate_limit,

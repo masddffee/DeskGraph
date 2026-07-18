@@ -2,6 +2,7 @@
 members = [
   "apps/cli",
   "apps/desktop/src-tauri",
+  "apps/mcp",
   "crates/database",
   "crates/domain",
   "crates/extractors",
@@ -34,13 +35,15 @@ objc2 = { version = "=0.6.4", default-features = false, features = ["std"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSObject", "NSString", "std"] }
 objc2-vision = { version = "=0.3.2", default-features = false, features = ["VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes", "block2", "objc2-core-foundation", "std"] }
 quick-xml = { version = "=0.41.0", default-features = false }
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+rmcp = { version = "=2.2.0", default-features = false, features = ["server", "transport-io"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "=0.11.0", default-features = false }
 tauri = "2"
 tauri-build = "2"
 tempfile = "3.27.0"
+tokio = { version = "=1.52.3", default-features = false, features = ["io-std", "io-util", "macros", "rt", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "json"] }
 unicode-normalization = "0.1.25"
