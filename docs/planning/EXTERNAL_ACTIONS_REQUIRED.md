@@ -1,6 +1,6 @@
 # External Actions Required
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-19
 
 No external step should block safe local implementation. Do not add real credentials to the repository.
 
@@ -73,6 +73,14 @@ macOS Screenshot OCR clean-machine evidence must run on arm64 and Intel or the f
 Windows Screenshot OCR evidence must run the production module on Windows 10/11 x64 with both package identity present and absent. Cover MSIX/external-location packaging, an unpackaged CLI path, requested `zh-TW`/`en-US` resolving to acceptable actual recognizers, missing/incompatible language capabilities, mixed Traditional Chinese/English, no-text, corrupt/signature mismatch, source/dimension/pixel/output/observation/word limits, nullable confidence, exact de-duplication, zero/absent and non-zero `TextAngle`, source change, atomic SQLite/FTS replacement, and path-free status/logs. Exercise cancellation and deadline at every WinRT async stage; prove `Close()` occurs only after terminal status, a detached cleanup worker eventually releases the one-worker gate, a stuck cleanup makes later OCR fail closed without accumulating workers, and restart recovers availability. Record CPU plus start/peak/end RSS on documented 8 GB hardware. Do not install OCR Language Features on Demand silently. Missing identity/language currently returns a fixed error; separately verify the packaged fallback only after its dependency/runtime gate is accepted and implemented.
 
 Filename-version Windows evidence must additionally cover separator/case normalization, Traditional Chinese names, extension mismatch, unsupported/leading-zero/same-number suffixes, reparse/hard-link identity denial, stale manifest/open-handle invalidation, migration preservation of existing duplicate feedback, immutable observations and evidence-bound decisions, idempotent retry/opposite correction, changed-direction suggestion reset, unchanged files, and path-free history/log output.
+
+## M5 platform action fault matrix (required before any execution control)
+
+D-018 must first accept an exact-source safety boundary. The current macOS/Linux leaf-name prototype is test-only and all production targets return `action_platform_rename_unsupported`; clean-machine testing must not enable it by configuration or patch around that gate. After a superseding adapter ADR is accepted, run the complete matrix on macOS arm64, macOS Intel/Universal and Windows x64. Linux evidence is separately labeled experimental and cannot delay the required macOS/Windows targets.
+
+For each accepted platform adapter, use disposable test scopes and prove normal Rename and Undo plus: two competing processes; repeated request/lost response; a child process paused after durable intent for longer than the database lease while recovery attempts to claim work; process kill at every durable boundary; database reopen; permission denial; parent durability failure; source/root/parent replacement; symlink/reparse and post-preview hard-link insertion; same-size/same-mtime content replacement; destination creation and overwrite denial; both names present or absent; post-action identity/hash mismatch; removable-volume disconnect; request/result/log privacy; and bounded 8 GiB/90-second hash behavior. A future accepted process fence must be released by crash, prevent recovery while a stopped live executor holds it, live in a trusted private or otherwise replacement-resistant namespace, resist unlink/rename/recreate attempts by another process, and not interfere with SQLite WAL locking. No such fence is currently implemented or accepted. No automatic syscall retry, rollback-by-guess, delete, permanent-delete, empty-trash, shell command, LLM, MCP, Watch or Inbox action is permitted.
+
+macOS/Linux testing must include a deterministic adversarial interleaving that replaces the ordinary source leaf after final identity revalidation and before the namespace mutation. If the accepted design cannot make that interleaving fail before moving the replacement file, the adapter remains unavailable. Windows must use a separately reviewed handle-bound `FILE_RENAME_INFO`/`SetFileInformationByHandle` design with `ReplaceIfExists = false`, reparse-safe root/parent/source handles and real NTFS runtime evidence; a path-based fallback is forbidden.
 
 ## Public release and launch accounts (needed in M10)
 

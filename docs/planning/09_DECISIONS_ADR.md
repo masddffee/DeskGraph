@@ -210,3 +210,17 @@ Status：Accepted。Version accept/reject 必須先 live reverify 並綁定 immu
 
 Canonical detail：
 `docs/architecture/adr/0023-version-feedback-is-bound-to-directional-evidence.md`。
+
+## ADR-024 — Native-first OCR provider stack
+
+Status：Accepted。macOS 先使用 Apple Vision；Windows 只在 package identity 與實際 Traditional Chinese／English recognizer 驗證通過時使用 `Windows.Media.Ocr`。Packaged fallback 必須經 D-015 同 corpus bake-off、license、checksum、memory、cancellation、packaging 與跨平台證據後另行選擇，不能把候選 runtime 當作已採用能力。
+
+Canonical detail：
+`docs/architecture/adr/0024-native-first-ocr-provider-stack.md`。
+
+## ADR-025 — Journaled Rename protocol and fail-closed execution gate
+
+Status：Accepted。批准 immutable SHA-256/root/parent/source execution binding、closed append-only command/recovery state、immutable request receipt 與 lease 作為 M5 內部協定基礎；不批准 production executor 或任何 process-fence 實作。macOS/Linux pathname prototype 僅能在測試使用，因為無法原子綁定 exact source inode。未來 fence 必須位於可信任的私有或不可替換 namespace，並通過 adversarial lock replacement 與 child-process matrix；D-018 通過前，所有 production adapter、CLI/Desktop Execute、recovery 與 Undo 都必須 fail closed／保持不存在。
+
+Canonical detail：
+`docs/architecture/adr/0025-journaled-direct-rename-execution-and-undo.md`。

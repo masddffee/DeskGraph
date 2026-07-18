@@ -819,6 +819,8 @@ dependencies = [
 name = "deskgraph-identity"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "tempfile",
  "unicode-normalization",
  "windows-sys 0.61.2",
 ]
@@ -916,7 +918,10 @@ dependencies = [
  "deskgraph-domain",
  "deskgraph-identity",
  "deskgraph-scanner",
+ "libc",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
 ]
 

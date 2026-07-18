@@ -86,25 +86,25 @@ describe('i18n catalog and registry contract', () => {
       en: {
         hintOnly: 'hints only',
         noDeadline: 'does not promise',
-        noExecute: 'cannot execute',
+        noExecute: 'no Execute or Undo control',
         noUpload: 'No uploads',
       },
       'zh-TW': {
         hintOnly: '僅是提示',
         noDeadline: '不保證',
-        noExecute: '無法執行',
+        noExecute: '不提供執行或 Undo 控制項',
         noUpload: '不上傳',
       },
       'zh-CN': {
         hintOnly: '仅是提示',
         noDeadline: '不保证',
-        noExecute: '不能执行',
+        noExecute: '不提供执行或 Undo 控件',
         noUpload: '不上传',
       },
       ja: {
         hintOnly: 'ヒントにすぎません',
         noDeadline: '保証するものではありません',
-        noExecute: '実行できません',
+        noExecute: '実行または Undo のコントロールは表示しません',
         noUpload: 'アップロードなし',
       },
     };
@@ -240,6 +240,21 @@ describe('localized helpers and UI wiring', () => {
     );
     expect(catalogs['zh-CN'].scope.validation.complete(2, 1)).toContain('2 个文件');
     expect(catalogs.ja.scope.validation.complete(2, 1)).toContain('2 個のファイル');
+  });
+
+  it('labels durable action history states while keeping the Desktop surface preview-only', () => {
+    for (const locale of LOCALES) {
+      const history = catalogs[locale].actions.historyState;
+      expect(history.previewed.length).toBeGreaterThan(0);
+      expect(history.pending.length).toBeGreaterThan(0);
+      expect(history.executed.length).toBeGreaterThan(0);
+      expect(history.undone.length).toBeGreaterThan(0);
+      expect(history.needsAttention.length).toBeGreaterThan(0);
+      expect(catalogs[locale].actions.noExecute).toMatch(/Desktop/);
+    }
+    expect(appSource).toContain('actionPlanStateLabel(plan.state, catalog)');
+    expect(appSource).not.toContain('execute_action_plan');
+    expect(appSource).not.toContain('undo_action_plan');
   });
 
   it('generates the selector from the registry and updates document language and direction', () => {

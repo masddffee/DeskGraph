@@ -7,8 +7,11 @@ mod search;
 mod watch;
 
 pub use action::{
-    ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
+    ActionCommandKind, ActionCommandStart, ActionExecutionBinding, ActionExecutionRecord,
+    ActionExecutionStrategy, ActionJournalEvent, ActionJournalEventKind,
+    ActionJournalReductionError, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyCheck, ActionPolicyDecision, ActionPolicyReport,
+    reduce_action_journal,
 };
 pub use extraction::{
     ExtractionJobProgress, ExtractionOperation, ExtractionStats, ExtractionStatus, ImageFormat,

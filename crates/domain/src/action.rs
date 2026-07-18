@@ -10,6 +10,13 @@ pub enum ActionOperation {
 #[serde(rename_all = "snake_case")]
 pub enum ActionPlanState {
     Previewed,
+    ExecuteRequested,
+    DirectRenameIntent,
+    Executed,
+    UndoRequested,
+    UndoRenameIntent,
+    Undone,
+    NeedsAttention,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -17,6 +24,168 @@ pub enum ActionPlanState {
 pub enum ActionExecutionStrategy {
     Direct,
     CaseOnlyStaged,
+}
+
+/// A closed journal vocabulary. Unknown events are deliberately not reduced
+/// into a plausible state by callers; database decoding rejects them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionJournalEventKind {
+    PreviewCreated,
+    ExecuteRequested,
+    ExecuteRequestNotStarted,
+    DirectRenameIntent,
+    ExecutionCompleted,
+    ExecutionNotApplied,
+    ExecutionNeedsAttention,
+    UndoRequested,
+    UndoRequestNotStarted,
+    UndoRenameIntent,
+    UndoCompleted,
+    UndoNotApplied,
+    UndoNeedsAttention,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionCommandKind {
+    Execute,
+    Undo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActionJournalEvent {
+    pub api_version: &'static str,
+    pub event_id: i64,
+    pub plan_id: i64,
+    pub sequence: u64,
+    pub kind: ActionJournalEventKind,
+    pub command_request_id: Option<i64>,
+    pub created_at_unix_ms: i64,
+}
+
+impl ActionJournalEvent {
+    pub const API_VERSION: &str = "deskgraph.action-journal.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActionExecutionBinding {
+    pub api_version: &'static str,
+    pub source_hash_bytes: u64,
+    pub source_sha256: Vec<u8>,
+    pub scope_root_node_id: i64,
+    pub scope_root_identity_kind: String,
+    pub scope_root_identity_key: Vec<u8>,
+    pub parent_node_id: i64,
+    pub parent_identity_kind: String,
+    pub parent_identity_key: Vec<u8>,
+    pub created_at_unix_ms: i64,
+}
+
+impl ActionExecutionBinding {
+    pub const API_VERSION: &str = "deskgraph.action-execution-binding.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActionExecutionRecord {
+    pub api_version: &'static str,
+    pub plan_id: i64,
+    pub operation: ActionOperation,
+    pub execution_strategy: ActionExecutionStrategy,
+    pub state: ActionPlanState,
+    pub journal_sequence: u64,
+    pub binding: ActionExecutionBinding,
+}
+
+impl ActionExecutionRecord {
+    pub const API_VERSION: &str = "deskgraph.action-execution-record.v1";
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActionCommandStart {
+    pub api_version: &'static str,
+    pub command_request_id: i64,
+    pub plan_id: i64,
+    pub kind: ActionCommandKind,
+    pub state: ActionPlanState,
+    pub journal_sequence: u64,
+    pub idempotent: bool,
+}
+
+impl ActionCommandStart {
+    pub const API_VERSION: &str = "deskgraph.action-command-start.v1";
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionJournalReductionError {
+    Empty,
+    NonMonotonicSequence,
+    InvalidInitialEvent,
+    InvalidTransition,
+}
+
+/// Derives the only executable state from immutable events. `not_applied`
+/// events deliberately return to the prior stable state, while ambiguous
+/// events fail closed into `NeedsAttention`.
+pub fn reduce_action_journal(
+    events: &[ActionJournalEvent],
+) -> Result<ActionPlanState, ActionJournalReductionError> {
+    let Some(first) = events.first() else {
+        return Err(ActionJournalReductionError::Empty);
+    };
+    if first.sequence != 1 || first.kind != ActionJournalEventKind::PreviewCreated {
+        return Err(ActionJournalReductionError::InvalidInitialEvent);
+    }
+    let mut previous_sequence = first.sequence;
+    let mut state = ActionPlanState::Previewed;
+    for event in &events[1..] {
+        if event.sequence != previous_sequence.saturating_add(1) {
+            return Err(ActionJournalReductionError::NonMonotonicSequence);
+        }
+        state = match (state, event.kind) {
+            (ActionPlanState::Previewed, ActionJournalEventKind::ExecuteRequested) => {
+                ActionPlanState::ExecuteRequested
+            }
+            (
+                ActionPlanState::ExecuteRequested,
+                ActionJournalEventKind::ExecuteRequestNotStarted,
+            ) => ActionPlanState::Previewed,
+            (ActionPlanState::ExecuteRequested, ActionJournalEventKind::DirectRenameIntent) => {
+                ActionPlanState::DirectRenameIntent
+            }
+            (ActionPlanState::DirectRenameIntent, ActionJournalEventKind::ExecutionCompleted) => {
+                ActionPlanState::Executed
+            }
+            (ActionPlanState::DirectRenameIntent, ActionJournalEventKind::ExecutionNotApplied) => {
+                ActionPlanState::Previewed
+            }
+            (
+                ActionPlanState::DirectRenameIntent,
+                ActionJournalEventKind::ExecutionNeedsAttention,
+            ) => ActionPlanState::NeedsAttention,
+            (ActionPlanState::Executed, ActionJournalEventKind::UndoRequested) => {
+                ActionPlanState::UndoRequested
+            }
+            (ActionPlanState::UndoRequested, ActionJournalEventKind::UndoRequestNotStarted) => {
+                ActionPlanState::Executed
+            }
+            (ActionPlanState::UndoRequested, ActionJournalEventKind::UndoRenameIntent) => {
+                ActionPlanState::UndoRenameIntent
+            }
+            (ActionPlanState::UndoRenameIntent, ActionJournalEventKind::UndoCompleted) => {
+                ActionPlanState::Undone
+            }
+            (ActionPlanState::UndoRenameIntent, ActionJournalEventKind::UndoNotApplied) => {
+                ActionPlanState::Executed
+            }
+            (ActionPlanState::UndoRenameIntent, ActionJournalEventKind::UndoNeedsAttention) => {
+                ActionPlanState::NeedsAttention
+            }
+            _ => return Err(ActionJournalReductionError::InvalidTransition),
+        };
+        previous_sequence = event.sequence;
+    }
+    Ok(state)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -86,7 +255,7 @@ pub struct ActionPlanPreview {
 }
 
 impl ActionPlanPreview {
-    pub const API_VERSION: &str = "deskgraph.action-plan.v1";
+    pub const API_VERSION: &str = "deskgraph.action-plan.v2";
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,12 +272,24 @@ pub struct ActionPlanSummary {
 }
 
 impl ActionPlanSummary {
-    pub const API_VERSION: &str = "deskgraph.action-plan-summary.v1";
+    pub const API_VERSION: &str = "deskgraph.action-plan-summary.v2";
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event(sequence: u64, kind: ActionJournalEventKind) -> ActionJournalEvent {
+        ActionJournalEvent {
+            api_version: ActionJournalEvent::API_VERSION,
+            event_id: i64::try_from(sequence).expect("test sequence should fit"),
+            plan_id: 1,
+            sequence,
+            kind,
+            command_request_id: (sequence > 1).then_some(1),
+            created_at_unix_ms: 1,
+        }
+    }
 
     #[test]
     fn preview_contract_is_versioned_and_explainable() {
@@ -125,6 +306,47 @@ mod tests {
             report
                 .checks
                 .contains(&ActionPolicyCheck::DestinationAvailable)
+        );
+    }
+
+    #[test]
+    fn journal_reducer_returns_to_stable_state_when_a_command_never_starts() {
+        assert_eq!(
+            reduce_action_journal(&[
+                event(1, ActionJournalEventKind::PreviewCreated),
+                event(2, ActionJournalEventKind::ExecuteRequested),
+                event(3, ActionJournalEventKind::ExecuteRequestNotStarted),
+            ]),
+            Ok(ActionPlanState::Previewed)
+        );
+        assert_eq!(
+            reduce_action_journal(&[
+                event(1, ActionJournalEventKind::PreviewCreated),
+                event(2, ActionJournalEventKind::ExecuteRequested),
+                event(3, ActionJournalEventKind::DirectRenameIntent),
+                event(4, ActionJournalEventKind::ExecutionCompleted),
+                event(5, ActionJournalEventKind::UndoRequested),
+                event(6, ActionJournalEventKind::UndoRequestNotStarted),
+            ]),
+            Ok(ActionPlanState::Executed)
+        );
+    }
+
+    #[test]
+    fn journal_reducer_rejects_arbitrary_or_non_monotonic_events() {
+        assert_eq!(
+            reduce_action_journal(&[
+                event(1, ActionJournalEventKind::PreviewCreated),
+                event(2, ActionJournalEventKind::ExecutionCompleted),
+            ]),
+            Err(ActionJournalReductionError::InvalidTransition)
+        );
+        assert_eq!(
+            reduce_action_journal(&[
+                event(1, ActionJournalEventKind::PreviewCreated),
+                event(3, ActionJournalEventKind::ExecuteRequested),
+            ]),
+            Err(ActionJournalReductionError::NonMonotonicSequence)
         );
     }
 }

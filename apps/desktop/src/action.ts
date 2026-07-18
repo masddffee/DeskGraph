@@ -4,6 +4,15 @@ export const CREATE_RENAME_PREVIEW_COMMAND = 'create_rename_preview';
 export const RECENT_ACTION_PLANS_COMMAND = 'recent_action_plans';
 
 export type ActionExecutionStrategy = 'direct' | 'case_only_staged';
+export type ActionPlanState =
+  | 'previewed'
+  | 'execute_requested'
+  | 'direct_rename_intent'
+  | 'executed'
+  | 'undo_requested'
+  | 'undo_rename_intent'
+  | 'undone'
+  | 'needs_attention';
 export type ActionPolicyCheck =
   | 'explicit_authorized_scope'
   | 'present_manifest_file'
@@ -22,7 +31,7 @@ export interface ActionPolicyReport {
 }
 
 export interface ActionPlanPreview {
-  api_version: 'deskgraph.action-plan.v1';
+  api_version: 'deskgraph.action-plan.v2';
   plan_id: number;
   operation: 'rename';
   state: 'previewed';
@@ -32,19 +41,19 @@ export interface ActionPlanPreview {
   destination_path: string;
   execution_strategy: ActionExecutionStrategy;
   policy: ActionPolicyReport;
-  journal_sequence: 1;
+  journal_sequence: number;
   created_at_unix_ms: number;
 }
 
 export interface ActionPlanSummary {
-  api_version: 'deskgraph.action-plan-summary.v1';
+  api_version: 'deskgraph.action-plan-summary.v2';
   plan_id: number;
   operation: 'rename';
-  state: 'previewed';
+  state: ActionPlanState;
   scope_id: number;
   node_id: number;
   execution_strategy: ActionExecutionStrategy;
-  journal_sequence: 1;
+  journal_sequence: number;
   created_at_unix_ms: number;
 }
 
@@ -78,8 +87,43 @@ function isExecutionStrategy(value: unknown): value is ActionExecutionStrategy {
   return value === 'direct' || value === 'case_only_staged';
 }
 
+function isActionPlanState(value: unknown): value is ActionPlanState {
+  return (
+    value === 'previewed' ||
+    value === 'execute_requested' ||
+    value === 'direct_rename_intent' ||
+    value === 'executed' ||
+    value === 'undo_requested' ||
+    value === 'undo_rename_intent' ||
+    value === 'undone' ||
+    value === 'needs_attention'
+  );
+}
+
+const SUMMARY_FIELDS = [
+  'api_version',
+  'plan_id',
+  'operation',
+  'state',
+  'scope_id',
+  'node_id',
+  'execution_strategy',
+  'journal_sequence',
+  'created_at_unix_ms',
+] as const;
+
+const PREVIEW_FIELDS = [...SUMMARY_FIELDS, 'source_path', 'destination_path', 'policy'] as const;
+
+function hasExactFields(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  const allowedFields = new Set(fields);
+  return (
+    Object.keys(value).length === allowedFields.size &&
+    Object.keys(value).every((key) => allowedFields.has(key))
+  );
+}
+
 function parsePolicy(value: unknown): ActionPolicyReport {
-  if (!isRecord(value)) {
+  if (!isRecord(value) || !hasExactFields(value, ['api_version', 'decision', 'checks'])) {
     throw new Error('Invalid action policy response');
   }
   const checks = value.checks;
@@ -98,25 +142,26 @@ function parsePolicy(value: unknown): ActionPolicyReport {
   return value as unknown as ActionPolicyReport;
 }
 
-function hasValidSummaryFields(value: Record<string, unknown>): boolean {
+function hasValidCommonFields(value: Record<string, unknown>): boolean {
   return (
     isId(value.plan_id) &&
     value.operation === 'rename' &&
-    value.state === 'previewed' &&
+    isActionPlanState(value.state) &&
     isId(value.scope_id) &&
     isId(value.node_id) &&
     isExecutionStrategy(value.execution_strategy) &&
-    value.journal_sequence === 1 &&
+    isId(value.journal_sequence) &&
     isTimestamp(value.created_at_unix_ms)
   );
 }
 
 export function parseActionPlanPreview(value: unknown): ActionPlanPreview {
-  if (!isRecord(value) || !hasValidSummaryFields(value)) {
+  if (!isRecord(value) || !hasExactFields(value, PREVIEW_FIELDS) || !hasValidCommonFields(value)) {
     throw new Error('Invalid action preview response');
   }
   if (
-    value.api_version !== 'deskgraph.action-plan.v1' ||
+    value.api_version !== 'deskgraph.action-plan.v2' ||
+    value.state !== 'previewed' ||
     typeof value.source_path !== 'string' ||
     value.source_path.length === 0 ||
     typeof value.destination_path !== 'string' ||
@@ -132,10 +177,9 @@ export function parseActionPlanPreview(value: unknown): ActionPlanPreview {
 export function parseActionPlanSummary(value: unknown): ActionPlanSummary {
   if (
     !isRecord(value) ||
-    value.api_version !== 'deskgraph.action-plan-summary.v1' ||
-    !hasValidSummaryFields(value) ||
-    'source_path' in value ||
-    'destination_path' in value
+    value.api_version !== 'deskgraph.action-plan-summary.v2' ||
+    !hasExactFields(value, SUMMARY_FIELDS) ||
+    !hasValidCommonFields(value)
   ) {
     throw new Error('Invalid action plan summary response');
   }

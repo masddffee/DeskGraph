@@ -1721,7 +1721,7 @@ mod tests {
                 .expect("path-free plan history should load"),
         )
         .expect("plan summaries should serialize");
-        assert!(summary_payload.contains("deskgraph.action-plan-summary.v1"));
+        assert!(summary_payload.contains("deskgraph.action-plan-summary.v2"));
         assert!(!summary_payload.contains("private-draft.md"));
         assert!(!summary_payload.contains("private-final.md"));
         assert!(!summary_payload.contains(scope_path.to_string_lossy().as_ref()));

@@ -6,19 +6,21 @@ use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_domain::{
-    ActionExecutionStrategy, ActionOperation, ActionPlanPreview, ActionPlanState,
-    ActionPlanSummary, ActionPolicyReport, AuthorizedScope, ExplicitFileVersionName,
-    ExtractionJobProgress, ExtractionOperation, ExtractionStats, ExtractionStatus,
-    FileRelationCandidate, FileRelationCandidateState, FileRelationCandidateSummary,
-    FileRelationComparisonKind, FileRelationCreator, FileRelationDecision,
-    FileRelationDecisionCreator, FileRelationDecisionKind, FileRelationEndpoint,
-    FileRelationEvidence, FileRelationKind, FileVersionCandidate, FileVersionDecision,
-    FileVersionEvidence, FileVersionSignalKind, FolderCategoryCount, FolderFileCategory,
-    ImageFormat, ImageMetadata, ManifestStats, ProjectCandidate, ProjectCandidateState,
-    ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator, ProjectDecisionKind,
-    ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator, ScanJobProgress,
-    ScanReport, ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus,
-    is_valid_image_dimensions, is_valid_xlsx_cell_reference, parse_explicit_file_version_name,
+    ActionCommandKind, ActionCommandStart, ActionExecutionBinding, ActionExecutionRecord,
+    ActionExecutionStrategy, ActionJournalEvent, ActionJournalEventKind, ActionOperation,
+    ActionPlanPreview, ActionPlanState, ActionPlanSummary, ActionPolicyReport, AuthorizedScope,
+    ExplicitFileVersionName, ExtractionJobProgress, ExtractionOperation, ExtractionStats,
+    ExtractionStatus, FileRelationCandidate, FileRelationCandidateState,
+    FileRelationCandidateSummary, FileRelationComparisonKind, FileRelationCreator,
+    FileRelationDecision, FileRelationDecisionCreator, FileRelationDecisionKind,
+    FileRelationEndpoint, FileRelationEvidence, FileRelationKind, FileVersionCandidate,
+    FileVersionDecision, FileVersionEvidence, FileVersionSignalKind, FolderCategoryCount,
+    FolderFileCategory, ImageFormat, ImageMetadata, ManifestStats, ProjectCandidate,
+    ProjectCandidateState, ProjectCandidateSummary, ProjectDecision, ProjectDecisionCreator,
+    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, WatchEventProgress,
+    WatchEventReason, WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
+    parse_explicit_file_version_name, reduce_action_journal,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use deskgraph_identity::{IdentityNodeKind, is_symlink_or_reparse_point, platform_identity};
@@ -117,6 +119,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "watch_reconciliation_kind",
         sql: include_str!("../../../migrations/0018_watch_reconciliation_kind.sql"),
     },
+    Migration {
+        version: 19,
+        name: "action_transaction_journal",
+        sql: include_str!("../../../migrations/0019_action_transaction_journal.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -125,6 +132,8 @@ const READ_ONLY_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_ONLY_PROGRESS_OPS: i32 = 100;
 const MAX_EXTRACTION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXTRACTION_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_ACTION_EXECUTOR_LEASE_MS: i64 = 1_000;
+const MAX_ACTION_EXECUTOR_LEASE_MS: i64 = 120_000;
 const MAX_EXTRACTION_CHUNKS: usize = 65_536;
 const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_MATCH_BYTES: usize = 1024;
@@ -354,6 +363,42 @@ pub struct ActionSourceRecord {
     pub modified_unix_ns: Option<i64>,
 }
 
+/// The only database-derived topology snapshot that can be used to create an
+/// executable rename preview. It intentionally requires a completed scan, a
+/// single present source location, and a single active parent edge, so the
+/// transaction crate never infers a folder identity from a path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionExecutionSourceRecord {
+    pub source: ActionSourceRecord,
+    pub scope_root_node_id: i64,
+    pub scope_root_identity_kind: String,
+    pub scope_root_identity_key: Vec<u8>,
+    pub parent_node_id: i64,
+    pub parent_identity_kind: String,
+    pub parent_identity_key: Vec<u8>,
+}
+
+/// Trusted internal execution detail for the transaction engine. This is not
+/// a UI/read-model payload: it carries canonical raw paths only after an
+/// immutable binding has been found and the closed journal has decoded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionExecutionPlan {
+    pub plan_id: i64,
+    pub scope_id: i64,
+    pub node_id: i64,
+    pub source_location_id: i64,
+    pub source_path_raw: Vec<u8>,
+    pub source_path_key: String,
+    pub destination_path_raw: Vec<u8>,
+    pub destination_path_key: String,
+    pub source_identity_kind: String,
+    pub source_identity_key: Vec<u8>,
+    pub source_size_bytes: u64,
+    pub source_modified_unix_ns: Option<i64>,
+    pub execution_strategy: ActionExecutionStrategy,
+    pub binding: ActionExecutionBinding,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ActionPlanWrite<'a> {
     pub scope_id: i64,
@@ -369,7 +414,61 @@ pub struct ActionPlanWrite<'a> {
     pub source_identity_key: &'a [u8],
     pub source_size_bytes: u64,
     pub source_modified_unix_ns: Option<i64>,
+    /// Full SHA-256 of exactly the source bytes read through the open, verified
+    /// source handle by the transaction crate. The database never opens files.
+    pub source_sha256: &'a [u8],
+    pub source_hash_bytes: u64,
+    /// Strong root and parent identities observed by the transaction crate at
+    /// preview time. The database compares them to the current manifest in the
+    /// same transaction before sealing the immutable binding.
+    pub scope_root_identity_kind: &'a str,
+    pub scope_root_identity_key: &'a [u8],
+    pub parent_identity_kind: &'a str,
+    pub parent_identity_key: &'a [u8],
     pub execution_strategy: ActionExecutionStrategy,
+}
+
+/// A caller-supplied, bounded idempotency key for an explicit user command.
+/// It is never a path and is persisted separately from immutable plan data.
+#[derive(Clone, Copy, Debug)]
+pub struct ActionCommandWrite<'a> {
+    pub plan_id: i64,
+    pub request_id: &'a str,
+    pub kind: ActionCommandKind,
+    pub expected_sequence: u64,
+}
+
+/// An internal journal transition belongs to the immutable user command that
+/// first obtained the plan. It cannot create a filesystem action on its own.
+#[derive(Clone, Debug)]
+pub struct ActionJournalAppend<'a> {
+    pub plan_id: i64,
+    pub command_request_id: i64,
+    pub expected_sequence: u64,
+    pub expected_state: ActionPlanState,
+    pub kind: ActionJournalEventKind,
+    pub executor_lease_owner_token: &'a str,
+}
+
+/// A short-lived operational lease for exactly one executor/recovery process.
+/// It is not audit history and expires so a crashed executor cannot block
+/// recovery indefinitely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionExecutorLease {
+    pub plan_id: i64,
+    pub owner_token: String,
+    pub expires_at_unix_ms: i64,
+}
+
+/// Internal-only recovery work. It intentionally has no source or destination
+/// pathname; the transaction engine must reload the immutable plan and perform
+/// scope/open-handle validation before it can inspect the filesystem.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncompleteActionRecovery {
+    pub plan_id: i64,
+    pub command_request_id: i64,
+    pub state: ActionPlanState,
+    pub journal_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,6 +605,14 @@ pub enum DatabaseError {
     ActionPlanNotFound,
     ActionPlanInputInvalid,
     ActionSourceSnapshotChanged,
+    ActionExecutionBindingUnavailable,
+    ActionExecutionRecordNotFound,
+    ActionJournalInputInvalid,
+    ActionJournalInvalidTransition,
+    ActionJournalCompareAndSwapFailed,
+    ActionJournalIdempotencyConflict,
+    ActionJournalCommandNotFound,
+    ActionExecutorLeaseUnavailable,
     FolderNotFound,
     FolderProfileInputInvalid,
     FolderProfileTooLarge,
@@ -556,6 +663,14 @@ impl DatabaseError {
             Self::ActionPlanNotFound => "action_plan_not_found",
             Self::ActionPlanInputInvalid => "action_plan_input_invalid",
             Self::ActionSourceSnapshotChanged => "action_source_snapshot_changed",
+            Self::ActionExecutionBindingUnavailable => "action_execution_binding_unavailable",
+            Self::ActionExecutionRecordNotFound => "action_execution_record_not_found",
+            Self::ActionJournalInputInvalid => "action_journal_input_invalid",
+            Self::ActionJournalInvalidTransition => "action_journal_invalid_transition",
+            Self::ActionJournalCompareAndSwapFailed => "action_journal_compare_and_swap_failed",
+            Self::ActionJournalIdempotencyConflict => "action_journal_idempotency_conflict",
+            Self::ActionJournalCommandNotFound => "action_journal_command_not_found",
+            Self::ActionExecutorLeaseUnavailable => "action_executor_lease_unavailable",
             Self::FolderNotFound => "folder_not_found",
             Self::FolderProfileInputInvalid => "folder_profile_input_invalid",
             Self::FolderProfileTooLarge => "folder_profile_entry_limit_exceeded",
@@ -4761,6 +4876,90 @@ impl ManifestDatabase {
             .ok_or(DatabaseError::ActionSourceNotFound)
     }
 
+    /// Reads the source and the exact root/parent topology from one completed
+    /// manifest snapshot. Callers must use these returned identities when
+    /// creating an executable preview; deriving them from filesystem paths is
+    /// intentionally unsupported.
+    pub fn action_execution_source_for_path_key(
+        &self,
+        scope_id: i64,
+        path_key: &str,
+    ) -> Result<ActionExecutionSourceRecord, DatabaseError> {
+        if scope_id <= 0 || path_key.is_empty() || path_key.len() > MAX_ACTION_PATH_BYTES {
+            return Err(DatabaseError::ActionSourceNotFound);
+        }
+        self.connection
+            .query_row(
+                "SELECT source.scope_id, source.node_id, source.id, source.path_raw, \
+                        source.path_key, source.display_path, source_node.identity_kind, \
+                        source_node.identity_key, source_file.size_bytes, source_file.modified_unix_ns, \
+                        root_node.id, root_node.identity_kind, root_node.identity_key, \
+                        parent_node.id, parent_node.identity_kind, parent_node.identity_key \
+                 FROM authorized_scopes scope \
+                 JOIN locations source ON source.scope_id = scope.id AND source.path_key = ?2 \
+                    AND source.present = 1 \
+                 JOIN nodes source_node ON source_node.id = source.node_id AND source_node.kind = 'file' \
+                 JOIN files source_file ON source_file.node_id = source.node_id \
+                 JOIN scan_jobs source_scan ON source_scan.id = source.last_seen_scan_id \
+                    AND source_scan.scope_id = scope.id AND source_scan.status = 'completed' \
+                 JOIN locations root ON root.scope_id = scope.id AND root.path_key = scope.path_key \
+                    AND root.present = 1 \
+                 JOIN nodes root_node ON root_node.id = root.node_id AND root_node.kind = 'folder' \
+                 JOIN edges parent_edge ON parent_edge.scope_id = scope.id \
+                    AND parent_edge.source_node_id = source.node_id \
+                    AND parent_edge.kind = 'located_in' AND parent_edge.active = 1 \
+                 JOIN locations parent ON parent.scope_id = scope.id \
+                    AND parent.node_id = parent_edge.target_node_id AND parent.present = 1 \
+                 JOIN nodes parent_node ON parent_node.id = parent.node_id AND parent_node.kind = 'folder' \
+                 WHERE scope.id = ?1 \
+                   AND root_node.identity_kind <> 'path_fallback' \
+                   AND parent_node.identity_kind <> 'path_fallback' \
+                   AND (SELECT COUNT(*) FROM locations only_source \
+                        WHERE only_source.scope_id = scope.id \
+                          AND only_source.node_id = source.node_id AND only_source.present = 1) = 1 \
+                   AND (SELECT COUNT(*) FROM locations only_root \
+                        WHERE only_root.scope_id = scope.id AND only_root.path_key = scope.path_key \
+                          AND only_root.present = 1) = 1 \
+                   AND (SELECT COUNT(*) FROM edges only_parent \
+                        WHERE only_parent.scope_id = scope.id \
+                          AND only_parent.source_node_id = source.node_id \
+                          AND only_parent.kind = 'located_in' AND only_parent.active = 1) = 1 \
+                   AND (SELECT COUNT(*) FROM locations only_parent_location \
+                        WHERE only_parent_location.scope_id = scope.id \
+                          AND only_parent_location.node_id = parent_node.id \
+                          AND only_parent_location.present = 1) = 1",
+                params![scope_id, path_key],
+                |row| {
+                    Ok(ActionExecutionSourceRecord {
+                        source: ActionSourceRecord {
+                            scope_id: row.get(0)?,
+                            node_id: row.get(1)?,
+                            location_id: row.get(2)?,
+                            path_raw: row.get(3)?,
+                            path_key: row.get(4)?,
+                            display_path: row.get(5)?,
+                            identity_kind: row.get(6)?,
+                            identity_key: row.get(7)?,
+                            size_bytes: row_u64(row, 8)?,
+                            modified_unix_ns: row.get(9)?,
+                        },
+                        scope_root_node_id: row.get(10)?,
+                        scope_root_identity_kind: row.get(11)?,
+                        scope_root_identity_key: row.get(12)?,
+                        parent_node_id: row.get(13)?,
+                        parent_identity_kind: row.get(14)?,
+                        parent_identity_key: row.get(15)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::ActionExecutionBindingUnavailable)
+    }
+
+    fn action_plan_base(&self, plan_id: i64) -> Result<StoredActionPlan, DatabaseError> {
+        action_plan_base_from_connection(&self.connection, plan_id)
+    }
+
     pub fn create_rename_action_plan(
         &mut self,
         plan: ActionPlanWrite<'_>,
@@ -4769,7 +4968,9 @@ impl ManifestDatabase {
         let source_size = to_i64(plan.source_size_bytes)?;
         let created_at = unix_ms()?;
         let execution_strategy = action_execution_strategy_str(plan.execution_strategy);
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot_matches: i64 = transaction.query_row(
             "SELECT COUNT(*) \
              FROM locations l \
@@ -4796,6 +4997,7 @@ impl ManifestDatabase {
         if snapshot_matches != 1 {
             return Err(DatabaseError::ActionSourceSnapshotChanged);
         }
+        let binding = preview_execution_binding(&transaction, &plan)?;
         transaction.execute(
             "INSERT INTO action_plans( \
                 api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
@@ -4827,43 +5029,434 @@ impl ManifestDatabase {
         )?;
         let plan_id = transaction.last_insert_rowid();
         transaction.execute(
-            "INSERT INTO action_plan_events(plan_id, sequence, event_kind, created_at_unix_ms) \
-             VALUES (?1, 1, 'preview_created', ?2)",
+            "INSERT INTO action_journal_events( \
+                 api_version, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+             ) VALUES ('deskgraph.action-journal.v1', ?1, 1, 'preview_created', NULL, ?2)",
             params![plan_id, created_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO action_execution_bindings( \
+                 plan_id, api_version, source_hash_bytes, source_sha256, scope_root_node_id, \
+                 scope_root_identity_kind, scope_root_identity_key, parent_node_id, \
+                 parent_identity_kind, parent_identity_key, created_at_unix_ms \
+             ) VALUES ( \
+                 ?1, 'deskgraph.action-execution-binding.v1', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 \
+             )",
+            params![
+                plan_id,
+                to_i64(plan.source_hash_bytes)?,
+                plan.source_sha256,
+                binding.scope_root_node_id,
+                binding.scope_root_identity_kind,
+                binding.scope_root_identity_key,
+                binding.parent_node_id,
+                binding.parent_identity_kind,
+                binding.parent_identity_key,
+                created_at,
+            ],
         )?;
         transaction.commit()?;
         self.action_plan(plan_id)
     }
 
     pub fn action_plan(&self, plan_id: i64) -> Result<ActionPlanPreview, DatabaseError> {
-        self.connection
-            .query_row(
-                "SELECT p.id, p.operation, p.scope_id, p.node_id, p.source_display_path, \
-                        p.destination_display_path, p.execution_strategy, p.created_at_unix_ms, \
-                        MAX(e.sequence) \
-                 FROM action_plans p \
-                 JOIN action_plan_events e ON e.plan_id = p.id \
-                 WHERE p.id = ?1 \
-                 GROUP BY p.id",
-                [plan_id],
-                action_plan_from_row,
-            )
-            .optional()?
-            .ok_or(DatabaseError::ActionPlanNotFound)
+        let plan = self.action_plan_base(plan_id)?;
+        let events = action_journal_events(&self.connection, plan_id)?;
+        let state = reduce_journal_or_stored_value(&events)?;
+        Ok(ActionPlanPreview {
+            api_version: ActionPlanPreview::API_VERSION,
+            plan_id: plan.id,
+            operation: plan.operation,
+            state,
+            scope_id: plan.scope_id,
+            node_id: plan.node_id,
+            source_path: plan.source_display_path,
+            destination_path: plan.destination_display_path,
+            execution_strategy: plan.execution_strategy,
+            policy: ActionPolicyReport::rename_allowed(),
+            journal_sequence: last_journal_sequence(&events)?,
+            created_at_unix_ms: plan.created_at_unix_ms,
+        })
     }
 
     pub fn recent_action_plans(&self) -> Result<Vec<ActionPlanSummary>, DatabaseError> {
-        let mut statement = self.connection.prepare(
-            "SELECT p.id, p.operation, p.scope_id, p.node_id, p.execution_strategy, \
-                    p.created_at_unix_ms, MAX(e.sequence) \
-             FROM action_plans p \
-             JOIN action_plan_events e ON e.plan_id = p.id \
-             GROUP BY p.id \
-             ORDER BY p.id DESC \
-             LIMIT 20",
+        let ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT p.id FROM action_plans p \
+                 JOIN action_journal_events e ON e.plan_id = p.id \
+                 GROUP BY p.id ORDER BY p.id DESC LIMIT 20",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        ids.into_iter()
+            .map(|plan_id| {
+                let plan = self.action_plan_base(plan_id)?;
+                let events = action_journal_events(&self.connection, plan_id)?;
+                Ok(ActionPlanSummary {
+                    api_version: ActionPlanSummary::API_VERSION,
+                    plan_id: plan.id,
+                    operation: plan.operation,
+                    state: reduce_journal_or_stored_value(&events)?,
+                    scope_id: plan.scope_id,
+                    node_id: plan.node_id,
+                    execution_strategy: plan.execution_strategy,
+                    journal_sequence: last_journal_sequence(&events)?,
+                    created_at_unix_ms: plan.created_at_unix_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// Starts an explicit user command. The request row and first command
+    /// event are committed together under an SQLite writer lock, making a
+    /// duplicate click/restart idempotent without granting a second intent.
+    pub fn start_action_command(
+        &mut self,
+        command: ActionCommandWrite<'_>,
+    ) -> Result<ActionCommandStart, DatabaseError> {
+        validate_action_command_write(&command)?;
+        let now = unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT id, command_kind, requested_sequence FROM action_command_requests \
+                 WHERE plan_id = ?1 AND request_id = ?2",
+                params![command.plan_id, command.request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((command_request_id, stored_kind, requested_sequence)) = existing {
+            let stored_kind = action_command_kind_from_str(&stored_kind)?;
+            if stored_kind != command.kind {
+                return Err(DatabaseError::ActionJournalIdempotencyConflict);
+            }
+            let events = action_journal_events(&transaction, command.plan_id)?;
+            let (state, sequence) = action_command_outcome_from_journal(
+                &events,
+                command_request_id,
+                stored_kind,
+                u64::try_from(requested_sequence).map_err(|_| DatabaseError::InvalidStoredValue)?,
+            )?;
+            transaction.commit()?;
+            return Ok(ActionCommandStart {
+                api_version: ActionCommandStart::API_VERSION,
+                command_request_id,
+                plan_id: command.plan_id,
+                kind: command.kind,
+                state,
+                journal_sequence: sequence,
+                idempotent: true,
+            });
+        }
+        let record = action_execution_record_from_connection(&transaction, command.plan_id)?;
+        if record.journal_sequence != command.expected_sequence {
+            return Err(DatabaseError::ActionJournalCompareAndSwapFailed);
+        }
+        let requested_event = match (record.state, command.kind) {
+            (ActionPlanState::Previewed, ActionCommandKind::Execute) => {
+                ActionJournalEventKind::ExecuteRequested
+            }
+            (ActionPlanState::Executed, ActionCommandKind::Undo) => {
+                ActionJournalEventKind::UndoRequested
+            }
+            _ => return Err(DatabaseError::ActionJournalInvalidTransition),
+        };
+        let requested_sequence = record
+            .journal_sequence
+            .checked_add(1)
+            .ok_or(DatabaseError::InvalidCount)?;
+        transaction.execute(
+            "INSERT INTO action_command_requests( \
+                 plan_id, request_id, command_kind, requested_sequence, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                command.plan_id,
+                command.request_id,
+                action_command_kind_str(command.kind),
+                to_i64(requested_sequence)?,
+                now,
+            ],
         )?;
-        let rows = statement.query_map([], action_plan_summary_from_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let command_request_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO action_journal_events( \
+                 api_version, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+             ) VALUES ('deskgraph.action-journal.v1', ?1, ?2, ?3, ?4, ?5)",
+            params![
+                command.plan_id,
+                to_i64(requested_sequence)?,
+                action_journal_event_kind_str(requested_event),
+                command_request_id,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ActionCommandStart {
+            api_version: ActionCommandStart::API_VERSION,
+            command_request_id,
+            plan_id: command.plan_id,
+            kind: command.kind,
+            state: match command.kind {
+                ActionCommandKind::Execute => ActionPlanState::ExecuteRequested,
+                ActionCommandKind::Undo => ActionPlanState::UndoRequested,
+            },
+            journal_sequence: requested_sequence,
+            idempotent: false,
+        })
+    }
+
+    /// Claims an unfinished command for one executor. This writer transaction
+    /// ends before any filesystem operation; callers must renew the lease if
+    /// their bounded filesystem work can outlive the chosen duration.
+    pub fn acquire_action_executor_lease(
+        &mut self,
+        plan_id: i64,
+        owner_token: &str,
+        lease_duration_ms: i64,
+    ) -> Result<ActionExecutorLease, DatabaseError> {
+        validate_action_executor_lease_input(plan_id, owner_token, lease_duration_ms)?;
+        let now = unix_ms()?;
+        let expires_at = now
+            .checked_add(lease_duration_ms)
+            .ok_or(DatabaseError::InvalidTimestamp)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record = action_execution_record_from_connection(&transaction, plan_id)?;
+        if !matches!(
+            record.state,
+            ActionPlanState::ExecuteRequested
+                | ActionPlanState::DirectRenameIntent
+                | ActionPlanState::UndoRequested
+                | ActionPlanState::UndoRenameIntent
+        ) {
+            return Err(DatabaseError::ActionJournalInvalidTransition);
+        }
+        transaction.execute(
+            "INSERT INTO action_executor_leases( \
+                 plan_id, owner_token, expires_at_unix_ms, heartbeat_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(plan_id) DO UPDATE SET \
+                 owner_token = excluded.owner_token, \
+                 expires_at_unix_ms = excluded.expires_at_unix_ms, \
+                 heartbeat_at_unix_ms = excluded.heartbeat_at_unix_ms \
+             WHERE action_executor_leases.owner_token = excluded.owner_token \
+                OR action_executor_leases.expires_at_unix_ms <= ?4",
+            params![plan_id, owner_token, expires_at, now],
+        )?;
+        let lease = action_executor_lease_from_connection(&transaction, plan_id)?;
+        if lease.owner_token != owner_token || lease.expires_at_unix_ms != expires_at {
+            return Err(DatabaseError::ActionExecutorLeaseUnavailable);
+        }
+        transaction.commit()?;
+        Ok(lease)
+    }
+
+    /// Extends only the caller's still-valid lease. A process that lost its
+    /// lease must reacquire and revalidate before performing another syscall.
+    pub fn renew_action_executor_lease(
+        &mut self,
+        plan_id: i64,
+        owner_token: &str,
+        lease_duration_ms: i64,
+    ) -> Result<ActionExecutorLease, DatabaseError> {
+        validate_action_executor_lease_input(plan_id, owner_token, lease_duration_ms)?;
+        let now = unix_ms()?;
+        let expires_at = now
+            .checked_add(lease_duration_ms)
+            .ok_or(DatabaseError::InvalidTimestamp)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE action_executor_leases \
+             SET expires_at_unix_ms = ?3, heartbeat_at_unix_ms = ?4 \
+             WHERE plan_id = ?1 AND owner_token = ?2 AND expires_at_unix_ms > ?4",
+            params![plan_id, owner_token, expires_at, now],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ActionExecutorLeaseUnavailable);
+        }
+        let lease = action_executor_lease_from_connection(&transaction, plan_id)?;
+        transaction.commit()?;
+        Ok(lease)
+    }
+
+    /// Releases only the current owner's lease. Releasing stale ownership is
+    /// rejected rather than silently touching a new recovery process's lease.
+    pub fn release_action_executor_lease(
+        &mut self,
+        plan_id: i64,
+        owner_token: &str,
+    ) -> Result<(), DatabaseError> {
+        validate_action_executor_owner(plan_id, owner_token)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "DELETE FROM action_executor_leases WHERE plan_id = ?1 AND owner_token = ?2",
+            params![plan_id, owner_token],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ActionExecutorLeaseUnavailable);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Appends a non-user event after the transaction engine has performed a
+    /// bounded validation step. This method never touches the filesystem.
+    pub fn append_action_journal_event(
+        &mut self,
+        append: ActionJournalAppend<'_>,
+    ) -> Result<ActionExecutionRecord, DatabaseError> {
+        validate_action_journal_append(&append)?;
+        let now = unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease = action_executor_lease_from_connection(&transaction, append.plan_id)?;
+        if lease.owner_token != append.executor_lease_owner_token || lease.expires_at_unix_ms <= now
+        {
+            return Err(DatabaseError::ActionExecutorLeaseUnavailable);
+        }
+        let record = action_execution_record_from_connection(&transaction, append.plan_id)?;
+        if record.journal_sequence != append.expected_sequence
+            || record.state != append.expected_state
+        {
+            return Err(DatabaseError::ActionJournalCompareAndSwapFailed);
+        }
+        let previous_command_request_id: Option<i64> = transaction.query_row(
+            "SELECT command_request_id FROM action_journal_events \
+             WHERE plan_id = ?1 AND sequence = ?2",
+            params![append.plan_id, to_i64(append.expected_sequence)?],
+            |row| row.get(0),
+        )?;
+        if previous_command_request_id != Some(append.command_request_id) {
+            return Err(DatabaseError::ActionJournalInvalidTransition);
+        }
+        let command_kind: String = transaction
+            .query_row(
+                "SELECT command_kind FROM action_command_requests \
+                 WHERE id = ?1 AND plan_id = ?2",
+                params![append.command_request_id, append.plan_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::ActionJournalCommandNotFound)?;
+        let command_kind = action_command_kind_from_str(&command_kind)?;
+        if !internal_event_matches_command(append.kind, command_kind)
+            || !transition_is_valid(append.expected_state, append.kind)
+        {
+            return Err(DatabaseError::ActionJournalInvalidTransition);
+        }
+        let next_sequence = append
+            .expected_sequence
+            .checked_add(1)
+            .ok_or(DatabaseError::InvalidCount)?;
+        transaction.execute(
+            "INSERT INTO action_journal_events( \
+                 api_version, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+             ) VALUES ('deskgraph.action-journal.v1', ?1, ?2, ?3, ?4, ?5)",
+            params![
+                append.plan_id,
+                to_i64(next_sequence)?,
+                action_journal_event_kind_str(append.kind),
+                append.command_request_id,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        self.action_execution_record(append.plan_id)
+    }
+
+    pub fn action_execution_record(
+        &self,
+        plan_id: i64,
+    ) -> Result<ActionExecutionRecord, DatabaseError> {
+        action_execution_record_from_connection(&self.connection, plan_id)
+    }
+
+    /// Loads the raw, canonical values needed by the filesystem transaction
+    /// engine. UI callers must use `action_plan` instead. Missing bindings on
+    /// legacy previews intentionally make this fail closed.
+    pub fn action_execution_plan(
+        &self,
+        plan_id: i64,
+    ) -> Result<ActionExecutionPlan, DatabaseError> {
+        action_execution_plan_from_connection(&self.connection, plan_id)
+    }
+
+    /// Returns only bounded, path-free records for unfinished journal states.
+    /// Startup recovery must reload and revalidate the plan before any action.
+    pub fn incomplete_action_recovery(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<IncompleteActionRecovery>, DatabaseError> {
+        if limit == 0 || limit > 100 {
+            return Err(DatabaseError::ActionJournalInputInvalid);
+        }
+        let now = unix_ms()?;
+        let candidates = {
+            let mut statement = self.connection.prepare(
+                "SELECT latest.plan_id, latest.command_request_id, latest.sequence \
+                 FROM action_journal_events latest \
+                 JOIN ( \
+                    SELECT plan_id, MAX(sequence) AS sequence \
+                    FROM action_journal_events GROUP BY plan_id \
+                 ) tail ON tail.plan_id = latest.plan_id AND tail.sequence = latest.sequence \
+                 JOIN action_execution_bindings binding ON binding.plan_id = latest.plan_id \
+                 LEFT JOIN action_executor_leases lease ON lease.plan_id = latest.plan_id \
+                 WHERE latest.event_kind IN ( \
+                    'execute_requested', 'direct_rename_intent', \
+                    'undo_requested', 'undo_rename_intent' \
+                 ) \
+                   AND (lease.plan_id IS NULL OR lease.expires_at_unix_ms <= ?1) \
+                 ORDER BY latest.sequence ASC, latest.plan_id ASC LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![now, i64::from(limit)], |row| {
+                    let sequence: i64 = row.get(2)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        u64::try_from(sequence)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, sequence))?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut recovery = Vec::new();
+        for (plan_id, command_request_id, journal_sequence) in candidates {
+            let record = self.action_execution_record(plan_id)?;
+            if !matches!(
+                record.state,
+                ActionPlanState::ExecuteRequested
+                    | ActionPlanState::DirectRenameIntent
+                    | ActionPlanState::UndoRequested
+                    | ActionPlanState::UndoRenameIntent
+            ) || record.journal_sequence != journal_sequence
+            {
+                return Err(DatabaseError::InvalidStoredValue);
+            }
+            recovery.push(IncompleteActionRecovery {
+                plan_id,
+                command_request_id,
+                state: record.state,
+                journal_sequence,
+            });
+        }
+        Ok(recovery)
     }
 
     pub fn node_id_for_path_key(
@@ -5058,6 +5651,367 @@ fn relation_snapshot_matches(
     Ok(matches == 1)
 }
 
+#[derive(Clone, Debug)]
+struct StoredActionPlan {
+    id: i64,
+    operation: ActionOperation,
+    scope_id: i64,
+    node_id: i64,
+    source_display_path: String,
+    destination_display_path: String,
+    execution_strategy: ActionExecutionStrategy,
+    created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewExecutionBinding {
+    scope_root_node_id: i64,
+    scope_root_identity_kind: String,
+    scope_root_identity_key: Vec<u8>,
+    parent_node_id: i64,
+    parent_identity_kind: String,
+    parent_identity_key: Vec<u8>,
+}
+
+fn action_plan_base_from_connection(
+    connection: &Connection,
+    plan_id: i64,
+) -> Result<StoredActionPlan, DatabaseError> {
+    if plan_id <= 0 {
+        return Err(DatabaseError::ActionPlanNotFound);
+    }
+    connection
+        .query_row(
+            "SELECT id, api_version, policy_version, operation, scope_id, node_id, \
+                    source_display_path, destination_display_path, execution_strategy, \
+                    created_at_unix_ms \
+             FROM action_plans WHERE id = ?1",
+            [plan_id],
+            |row| {
+                let api_version: String = row.get(1)?;
+                let policy_version: String = row.get(2)?;
+                if api_version != "deskgraph.action-plan.v1"
+                    || policy_version != ActionPolicyReport::API_VERSION
+                {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok(StoredActionPlan {
+                    id: row.get(0)?,
+                    operation: action_operation_from_str(&row.get::<_, String>(3)?)?,
+                    scope_id: row.get(4)?,
+                    node_id: row.get(5)?,
+                    source_display_path: row.get(6)?,
+                    destination_display_path: row.get(7)?,
+                    execution_strategy: action_execution_strategy_from_str(
+                        &row.get::<_, String>(8)?,
+                    )?,
+                    created_at_unix_ms: row.get(9)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ActionPlanNotFound)
+}
+
+fn action_journal_events(
+    connection: &Connection,
+    plan_id: i64,
+) -> Result<Vec<ActionJournalEvent>, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT id, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+         FROM action_journal_events WHERE plan_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let rows = statement.query_map([plan_id], |row| {
+        Ok(ActionJournalEvent {
+            api_version: ActionJournalEvent::API_VERSION,
+            event_id: row.get(0)?,
+            plan_id: row.get(1)?,
+            sequence: row_u64(row, 2)?,
+            kind: action_journal_event_kind_from_str(&row.get::<_, String>(3)?)?,
+            command_request_id: row.get(4)?,
+            created_at_unix_ms: row.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Resolves an idempotency request against only its own immutable journal
+/// chain. Later commands may change the plan's global state, but must never
+/// rewrite the historical result returned for this request id.
+fn action_command_outcome_from_journal(
+    events: &[ActionJournalEvent],
+    command_request_id: i64,
+    command: ActionCommandKind,
+    requested_sequence: u64,
+) -> Result<(ActionPlanState, u64), DatabaseError> {
+    let command_events = events
+        .iter()
+        .filter(|event| event.command_request_id == Some(command_request_id));
+    let mut outcome = None;
+    for event in command_events {
+        let state = match (command, event.kind) {
+            (ActionCommandKind::Execute, ActionJournalEventKind::ExecuteRequested) => {
+                ActionPlanState::ExecuteRequested
+            }
+            (ActionCommandKind::Execute, ActionJournalEventKind::ExecuteRequestNotStarted)
+            | (ActionCommandKind::Execute, ActionJournalEventKind::ExecutionNotApplied) => {
+                ActionPlanState::Previewed
+            }
+            (ActionCommandKind::Execute, ActionJournalEventKind::DirectRenameIntent) => {
+                ActionPlanState::DirectRenameIntent
+            }
+            (ActionCommandKind::Execute, ActionJournalEventKind::ExecutionCompleted) => {
+                ActionPlanState::Executed
+            }
+            (ActionCommandKind::Execute, ActionJournalEventKind::ExecutionNeedsAttention) => {
+                ActionPlanState::NeedsAttention
+            }
+            (ActionCommandKind::Undo, ActionJournalEventKind::UndoRequested) => {
+                ActionPlanState::UndoRequested
+            }
+            (ActionCommandKind::Undo, ActionJournalEventKind::UndoRequestNotStarted)
+            | (ActionCommandKind::Undo, ActionJournalEventKind::UndoNotApplied) => {
+                ActionPlanState::Executed
+            }
+            (ActionCommandKind::Undo, ActionJournalEventKind::UndoRenameIntent) => {
+                ActionPlanState::UndoRenameIntent
+            }
+            (ActionCommandKind::Undo, ActionJournalEventKind::UndoCompleted) => {
+                ActionPlanState::Undone
+            }
+            (ActionCommandKind::Undo, ActionJournalEventKind::UndoNeedsAttention) => {
+                ActionPlanState::NeedsAttention
+            }
+            _ => return Err(DatabaseError::InvalidStoredValue),
+        };
+        if outcome.is_none() {
+            let expected = match command {
+                ActionCommandKind::Execute => ActionJournalEventKind::ExecuteRequested,
+                ActionCommandKind::Undo => ActionJournalEventKind::UndoRequested,
+            };
+            if event.sequence != requested_sequence || event.kind != expected {
+                return Err(DatabaseError::InvalidStoredValue);
+            }
+        }
+        outcome = Some((state, event.sequence));
+    }
+    outcome.ok_or(DatabaseError::InvalidStoredValue)
+}
+
+fn reduce_journal_or_stored_value(
+    events: &[ActionJournalEvent],
+) -> Result<ActionPlanState, DatabaseError> {
+    reduce_action_journal(events).map_err(|_| DatabaseError::InvalidStoredValue)
+}
+
+fn last_journal_sequence(events: &[ActionJournalEvent]) -> Result<u64, DatabaseError> {
+    events
+        .last()
+        .map(|event| event.sequence)
+        .ok_or(DatabaseError::InvalidStoredValue)
+}
+
+fn action_execution_record_from_connection(
+    connection: &Connection,
+    plan_id: i64,
+) -> Result<ActionExecutionRecord, DatabaseError> {
+    let plan = action_plan_base_from_connection(connection, plan_id)?;
+    let binding = connection
+        .query_row(
+            "SELECT source_hash_bytes, source_sha256, scope_root_node_id, scope_root_identity_kind, \
+                    scope_root_identity_key, parent_node_id, parent_identity_kind, \
+                    parent_identity_key, created_at_unix_ms \
+             FROM action_execution_bindings WHERE plan_id = ?1",
+            [plan_id],
+            |row| {
+                Ok(ActionExecutionBinding {
+                    api_version: ActionExecutionBinding::API_VERSION,
+                    source_hash_bytes: row_u64(row, 0)?,
+                    source_sha256: row.get(1)?,
+                    scope_root_node_id: row.get(2)?,
+                    scope_root_identity_kind: row.get(3)?,
+                    scope_root_identity_key: row.get(4)?,
+                    parent_node_id: row.get(5)?,
+                    parent_identity_kind: row.get(6)?,
+                    parent_identity_key: row.get(7)?,
+                    created_at_unix_ms: row.get(8)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ActionExecutionBindingUnavailable)?;
+    if binding.source_sha256.len() != 32
+        || binding.scope_root_identity_kind == "path_fallback"
+        || binding.parent_identity_kind == "path_fallback"
+    {
+        return Err(DatabaseError::InvalidStoredValue);
+    }
+    let events = action_journal_events(connection, plan_id)?;
+    Ok(ActionExecutionRecord {
+        api_version: ActionExecutionRecord::API_VERSION,
+        plan_id,
+        operation: plan.operation,
+        execution_strategy: plan.execution_strategy,
+        state: reduce_journal_or_stored_value(&events)?,
+        journal_sequence: last_journal_sequence(&events)?,
+        binding,
+    })
+}
+
+fn action_execution_plan_from_connection(
+    connection: &Connection,
+    plan_id: i64,
+) -> Result<ActionExecutionPlan, DatabaseError> {
+    let record = action_execution_record_from_connection(connection, plan_id)?;
+    connection
+        .query_row(
+            "SELECT scope_id, node_id, source_location_id, source_path_raw, source_path_key, \
+                    destination_path_raw, destination_path_key, source_identity_kind, \
+                    source_identity_key, source_size_bytes, source_modified_unix_ns, \
+                    execution_strategy \
+             FROM action_plans WHERE id = ?1",
+            [plan_id],
+            |row| {
+                let source_size_bytes: i64 = row.get(9)?;
+                let strategy: String = row.get(11)?;
+                Ok(ActionExecutionPlan {
+                    plan_id,
+                    scope_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    source_location_id: row.get(2)?,
+                    source_path_raw: row.get(3)?,
+                    source_path_key: row.get(4)?,
+                    destination_path_raw: row.get(5)?,
+                    destination_path_key: row.get(6)?,
+                    source_identity_kind: row.get(7)?,
+                    source_identity_key: row.get(8)?,
+                    source_size_bytes: u64::try_from(source_size_bytes).map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(9, source_size_bytes)
+                    })?,
+                    source_modified_unix_ns: row.get(10)?,
+                    execution_strategy: action_execution_strategy_from_str(&strategy)?,
+                    binding: record.binding,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ActionPlanNotFound)
+        .and_then(validate_action_execution_plan)
+}
+
+fn validate_action_execution_plan(
+    plan: ActionExecutionPlan,
+) -> Result<ActionExecutionPlan, DatabaseError> {
+    if plan.plan_id <= 0
+        || plan.scope_id <= 0
+        || plan.node_id <= 0
+        || plan.source_location_id <= 0
+        || plan.source_path_raw.is_empty()
+        || plan.source_path_raw.len() > MAX_ACTION_PATH_BYTES
+        || plan.source_path_key.is_empty()
+        || plan.source_path_key.len() > MAX_ACTION_PATH_BYTES
+        || plan.destination_path_raw.is_empty()
+        || plan.destination_path_raw.len() > MAX_ACTION_PATH_BYTES
+        || plan.destination_path_key.is_empty()
+        || plan.destination_path_key.len() > MAX_ACTION_PATH_BYTES
+        || plan.source_identity_kind.is_empty()
+        || plan.source_identity_kind.len() > 128
+        || plan.source_identity_key.is_empty()
+        || plan.source_identity_key.len() > 4096
+        || plan.binding.source_hash_bytes != plan.source_size_bytes
+    {
+        return Err(DatabaseError::InvalidStoredValue);
+    }
+    Ok(plan)
+}
+
+fn action_executor_lease_from_connection(
+    connection: &Connection,
+    plan_id: i64,
+) -> Result<ActionExecutorLease, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT plan_id, owner_token, expires_at_unix_ms \
+             FROM action_executor_leases WHERE plan_id = ?1",
+            [plan_id],
+            |row| {
+                Ok(ActionExecutorLease {
+                    plan_id: row.get(0)?,
+                    owner_token: row.get(1)?,
+                    expires_at_unix_ms: row.get(2)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ActionExecutorLeaseUnavailable)
+}
+
+fn preview_execution_binding(
+    transaction: &Transaction<'_>,
+    plan: &ActionPlanWrite<'_>,
+) -> Result<PreviewExecutionBinding, DatabaseError> {
+    let binding = transaction
+        .query_row(
+            "SELECT root_node.id, root_node.identity_kind, root_node.identity_key, \
+                    parent_node.id, parent_node.identity_kind, parent_node.identity_key \
+             FROM authorized_scopes scope \
+             JOIN locations source ON source.id = ?1 AND source.scope_id = scope.id \
+                AND source.node_id = ?2 AND source.present = 1 \
+             JOIN scan_jobs source_scan ON source_scan.id = source.last_seen_scan_id \
+                AND source_scan.scope_id = scope.id AND source_scan.status = 'completed' \
+             JOIN locations root ON root.scope_id = scope.id AND root.path_key = scope.path_key \
+                AND root.present = 1 \
+             JOIN nodes root_node ON root_node.id = root.node_id AND root_node.kind = 'folder' \
+             JOIN edges parent_edge ON parent_edge.scope_id = scope.id \
+                AND parent_edge.source_node_id = source.node_id \
+                AND parent_edge.kind = 'located_in' AND parent_edge.active = 1 \
+             JOIN locations parent ON parent.scope_id = scope.id \
+                AND parent.node_id = parent_edge.target_node_id AND parent.present = 1 \
+             JOIN nodes parent_node ON parent_node.id = parent.node_id AND parent_node.kind = 'folder' \
+             WHERE scope.id = ?3 \
+               AND root_node.identity_kind <> 'path_fallback' \
+               AND parent_node.identity_kind <> 'path_fallback' \
+               AND root_node.identity_kind = ?4 AND root_node.identity_key = ?5 \
+               AND parent_node.identity_kind = ?6 AND parent_node.identity_key = ?7 \
+               AND (SELECT COUNT(*) FROM locations only_source \
+                    WHERE only_source.scope_id = scope.id \
+                      AND only_source.node_id = source.node_id AND only_source.present = 1) = 1 \
+               AND (SELECT COUNT(*) FROM edges only_parent \
+                    WHERE only_parent.scope_id = scope.id \
+                      AND only_parent.source_node_id = source.node_id \
+                      AND only_parent.kind = 'located_in' AND only_parent.active = 1) = 1",
+            params![
+                plan.source_location_id,
+                plan.node_id,
+                plan.scope_id,
+                plan.scope_root_identity_kind,
+                plan.scope_root_identity_key,
+                plan.parent_identity_kind,
+                plan.parent_identity_key,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ActionExecutionBindingUnavailable)?;
+    Ok(PreviewExecutionBinding {
+        scope_root_node_id: binding.0,
+        scope_root_identity_kind: binding.1,
+        scope_root_identity_key: binding.2,
+        parent_node_id: binding.3,
+        parent_identity_kind: binding.4,
+        parent_identity_key: binding.5,
+    })
+}
+
 fn validate_action_plan_write(plan: &ActionPlanWrite<'_>) -> Result<(), DatabaseError> {
     let paths_valid = !plan.source_path_raw.is_empty()
         && plan.source_path_raw.len() <= MAX_ACTION_PATH_BYTES
@@ -5081,6 +6035,18 @@ fn validate_action_plan_write(plan: &ActionPlanWrite<'_>) -> Result<(), Database
         || plan.source_identity_kind.len() > 128
         || plan.source_identity_key.is_empty()
         || plan.source_identity_key.len() > 4096
+        || plan.source_sha256.len() != 32
+        || plan.source_hash_bytes != plan.source_size_bytes
+        || plan.scope_root_identity_kind.is_empty()
+        || plan.scope_root_identity_kind.len() > 128
+        || plan.scope_root_identity_kind == "path_fallback"
+        || plan.scope_root_identity_key.is_empty()
+        || plan.scope_root_identity_key.len() > 4096
+        || plan.parent_identity_kind.is_empty()
+        || plan.parent_identity_kind.len() > 128
+        || plan.parent_identity_kind == "path_fallback"
+        || plan.parent_identity_key.is_empty()
+        || plan.parent_identity_key.len() > 4096
     {
         return Err(DatabaseError::ActionPlanInputInvalid);
     }
@@ -5286,47 +6252,176 @@ fn action_operation_from_str(stored: &str) -> Result<ActionOperation, rusqlite::
     }
 }
 
-fn action_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPlanPreview> {
-    let operation = action_operation_from_str(&row.get::<_, String>(1)?)?;
-    let execution_strategy = action_execution_strategy_from_str(&row.get::<_, String>(6)?)?;
-    let journal_sequence = row_u64(row, 8)?;
-    if journal_sequence != 1 {
-        return Err(rusqlite::Error::InvalidQuery);
+fn action_command_kind_str(kind: ActionCommandKind) -> &'static str {
+    match kind {
+        ActionCommandKind::Execute => "execute",
+        ActionCommandKind::Undo => "undo",
     }
-    Ok(ActionPlanPreview {
-        api_version: ActionPlanPreview::API_VERSION,
-        plan_id: row.get(0)?,
-        operation,
-        state: ActionPlanState::Previewed,
-        scope_id: row.get(2)?,
-        node_id: row.get(3)?,
-        source_path: row.get(4)?,
-        destination_path: row.get(5)?,
-        execution_strategy,
-        policy: ActionPolicyReport::rename_allowed(),
-        journal_sequence,
-        created_at_unix_ms: row.get(7)?,
-    })
 }
 
-fn action_plan_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ActionPlanSummary> {
-    let operation = action_operation_from_str(&row.get::<_, String>(1)?)?;
-    let execution_strategy = action_execution_strategy_from_str(&row.get::<_, String>(4)?)?;
-    let journal_sequence = row_u64(row, 6)?;
-    if journal_sequence != 1 {
-        return Err(rusqlite::Error::InvalidQuery);
+fn action_command_kind_from_str(stored: &str) -> Result<ActionCommandKind, DatabaseError> {
+    match stored {
+        "execute" => Ok(ActionCommandKind::Execute),
+        "undo" => Ok(ActionCommandKind::Undo),
+        _ => Err(DatabaseError::InvalidStoredValue),
     }
-    Ok(ActionPlanSummary {
-        api_version: ActionPlanSummary::API_VERSION,
-        plan_id: row.get(0)?,
-        operation,
-        state: ActionPlanState::Previewed,
-        scope_id: row.get(2)?,
-        node_id: row.get(3)?,
-        execution_strategy,
-        journal_sequence,
-        created_at_unix_ms: row.get(5)?,
-    })
+}
+
+fn action_journal_event_kind_str(kind: ActionJournalEventKind) -> &'static str {
+    match kind {
+        ActionJournalEventKind::PreviewCreated => "preview_created",
+        ActionJournalEventKind::ExecuteRequested => "execute_requested",
+        ActionJournalEventKind::ExecuteRequestNotStarted => "execute_request_not_started",
+        ActionJournalEventKind::DirectRenameIntent => "direct_rename_intent",
+        ActionJournalEventKind::ExecutionCompleted => "execution_completed",
+        ActionJournalEventKind::ExecutionNotApplied => "execution_not_applied",
+        ActionJournalEventKind::ExecutionNeedsAttention => "execution_needs_attention",
+        ActionJournalEventKind::UndoRequested => "undo_requested",
+        ActionJournalEventKind::UndoRequestNotStarted => "undo_request_not_started",
+        ActionJournalEventKind::UndoRenameIntent => "undo_rename_intent",
+        ActionJournalEventKind::UndoCompleted => "undo_completed",
+        ActionJournalEventKind::UndoNotApplied => "undo_not_applied",
+        ActionJournalEventKind::UndoNeedsAttention => "undo_needs_attention",
+    }
+}
+
+fn action_journal_event_kind_from_str(
+    stored: &str,
+) -> Result<ActionJournalEventKind, rusqlite::Error> {
+    match stored {
+        "preview_created" => Ok(ActionJournalEventKind::PreviewCreated),
+        "execute_requested" => Ok(ActionJournalEventKind::ExecuteRequested),
+        "execute_request_not_started" => Ok(ActionJournalEventKind::ExecuteRequestNotStarted),
+        "direct_rename_intent" => Ok(ActionJournalEventKind::DirectRenameIntent),
+        "execution_completed" => Ok(ActionJournalEventKind::ExecutionCompleted),
+        "execution_not_applied" => Ok(ActionJournalEventKind::ExecutionNotApplied),
+        "execution_needs_attention" => Ok(ActionJournalEventKind::ExecutionNeedsAttention),
+        "undo_requested" => Ok(ActionJournalEventKind::UndoRequested),
+        "undo_request_not_started" => Ok(ActionJournalEventKind::UndoRequestNotStarted),
+        "undo_rename_intent" => Ok(ActionJournalEventKind::UndoRenameIntent),
+        "undo_completed" => Ok(ActionJournalEventKind::UndoCompleted),
+        "undo_not_applied" => Ok(ActionJournalEventKind::UndoNotApplied),
+        "undo_needs_attention" => Ok(ActionJournalEventKind::UndoNeedsAttention),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn internal_event_matches_command(
+    event: ActionJournalEventKind,
+    command: ActionCommandKind,
+) -> bool {
+    matches!(
+        (event, command),
+        (
+            ActionJournalEventKind::DirectRenameIntent
+                | ActionJournalEventKind::ExecuteRequestNotStarted
+                | ActionJournalEventKind::ExecutionCompleted
+                | ActionJournalEventKind::ExecutionNotApplied
+                | ActionJournalEventKind::ExecutionNeedsAttention,
+            ActionCommandKind::Execute
+        ) | (
+            ActionJournalEventKind::UndoRenameIntent
+                | ActionJournalEventKind::UndoRequestNotStarted
+                | ActionJournalEventKind::UndoCompleted
+                | ActionJournalEventKind::UndoNotApplied
+                | ActionJournalEventKind::UndoNeedsAttention,
+            ActionCommandKind::Undo
+        )
+    )
+}
+
+fn transition_is_valid(state: ActionPlanState, event: ActionJournalEventKind) -> bool {
+    matches!(
+        (state, event),
+        (
+            ActionPlanState::ExecuteRequested,
+            ActionJournalEventKind::DirectRenameIntent
+        ) | (
+            ActionPlanState::ExecuteRequested,
+            ActionJournalEventKind::ExecuteRequestNotStarted
+        ) | (
+            ActionPlanState::DirectRenameIntent,
+            ActionJournalEventKind::ExecutionCompleted
+        ) | (
+            ActionPlanState::DirectRenameIntent,
+            ActionJournalEventKind::ExecutionNotApplied
+        ) | (
+            ActionPlanState::DirectRenameIntent,
+            ActionJournalEventKind::ExecutionNeedsAttention
+        ) | (
+            ActionPlanState::UndoRequested,
+            ActionJournalEventKind::UndoRenameIntent
+        ) | (
+            ActionPlanState::UndoRequested,
+            ActionJournalEventKind::UndoRequestNotStarted
+        ) | (
+            ActionPlanState::UndoRenameIntent,
+            ActionJournalEventKind::UndoCompleted
+        ) | (
+            ActionPlanState::UndoRenameIntent,
+            ActionJournalEventKind::UndoNotApplied
+        ) | (
+            ActionPlanState::UndoRenameIntent,
+            ActionJournalEventKind::UndoNeedsAttention
+        )
+    )
+}
+
+fn validate_action_command_write(command: &ActionCommandWrite<'_>) -> Result<(), DatabaseError> {
+    if command.plan_id <= 0
+        || command.expected_sequence == 0
+        || command.request_id.len() < 8
+        || command.request_id.len() > 128
+        || !command
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(DatabaseError::ActionJournalInputInvalid);
+    }
+    Ok(())
+}
+
+fn validate_action_journal_append(append: &ActionJournalAppend<'_>) -> Result<(), DatabaseError> {
+    if append.plan_id <= 0
+        || append.command_request_id <= 0
+        || append.expected_sequence == 0
+        || matches!(
+            append.kind,
+            ActionJournalEventKind::PreviewCreated
+                | ActionJournalEventKind::ExecuteRequested
+                | ActionJournalEventKind::UndoRequested
+        )
+    {
+        return Err(DatabaseError::ActionJournalInputInvalid);
+    }
+    validate_action_executor_owner(append.plan_id, append.executor_lease_owner_token)
+        .map_err(|_| DatabaseError::ActionJournalInputInvalid)
+}
+
+fn validate_action_executor_lease_input(
+    plan_id: i64,
+    owner_token: &str,
+    lease_duration_ms: i64,
+) -> Result<(), DatabaseError> {
+    validate_action_executor_owner(plan_id, owner_token)?;
+    if !(MIN_ACTION_EXECUTOR_LEASE_MS..=MAX_ACTION_EXECUTOR_LEASE_MS).contains(&lease_duration_ms) {
+        return Err(DatabaseError::ActionJournalInputInvalid);
+    }
+    Ok(())
+}
+
+fn validate_action_executor_owner(plan_id: i64, owner_token: &str) -> Result<(), DatabaseError> {
+    if plan_id <= 0
+        || owner_token.len() < 16
+        || owner_token.len() > 128
+        || !owner_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(DatabaseError::ActionJournalInputInvalid);
+    }
+    Ok(())
 }
 
 fn watch_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatchEventRecord> {
@@ -6207,7 +7302,10 @@ mod tests {
     }
 
     fn resumable_setup() -> (ManifestDatabase, i64, QueuedPath) {
-        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        resumable_setup_in(ManifestDatabase::open_in_memory().expect("database should initialize"))
+    }
+
+    fn resumable_setup_in(database: ManifestDatabase) -> (ManifestDatabase, i64, QueuedPath) {
         let scope = database
             .add_scope(b"/scope", "/scope", "/scope", "test")
             .expect("scope should persist");
@@ -7290,9 +8388,164 @@ mod tests {
     }
 
     fn extraction_setup() -> (ManifestDatabase, i64, i64, QueuedPath) {
-        let (mut database, scope_id, root) = resumable_setup();
+        extraction_setup_in(ManifestDatabase::open_in_memory().expect("database should initialize"))
+    }
+
+    fn extraction_setup_in(database: ManifestDatabase) -> (ManifestDatabase, i64, i64, QueuedPath) {
+        let (mut database, scope_id, root) = resumable_setup_in(database);
         let node_id = publish_manifest_file(&mut database, scope_id, &root, 4);
         (database, scope_id, node_id, root)
+    }
+
+    fn create_bound_rename_preview(
+        database: &mut ManifestDatabase,
+        scope_id: i64,
+        node_id: i64,
+    ) -> ActionPlanPreview {
+        let execution_source = database
+            .action_execution_source_for_path_key(scope_id, "/scope/file.txt")
+            .expect("execution source should load from a completed manifest");
+        let source = &execution_source.source;
+        assert_eq!(source.node_id, node_id);
+        let source_sha256 = [0xa5; 32];
+        database
+            .create_rename_action_plan(ActionPlanWrite {
+                scope_id,
+                node_id,
+                source_location_id: source.location_id,
+                source_path_raw: &source.path_raw,
+                source_path_key: &source.path_key,
+                source_display_path: &source.display_path,
+                destination_path_raw: b"/scope/renamed.txt",
+                destination_path_key: "/scope/renamed.txt",
+                destination_display_path: "/scope/renamed.txt",
+                source_identity_kind: &source.identity_kind,
+                source_identity_key: &source.identity_key,
+                source_size_bytes: source.size_bytes,
+                source_modified_unix_ns: source.modified_unix_ns,
+                source_sha256: &source_sha256,
+                source_hash_bytes: source.size_bytes,
+                scope_root_identity_kind: &execution_source.scope_root_identity_kind,
+                scope_root_identity_key: &execution_source.scope_root_identity_key,
+                parent_identity_kind: &execution_source.parent_identity_kind,
+                parent_identity_key: &execution_source.parent_identity_key,
+                execution_strategy: ActionExecutionStrategy::Direct,
+            })
+            .expect("preview and binding should persist")
+    }
+
+    fn acquire_test_executor_lease(database: &mut ManifestDatabase, plan_id: i64) {
+        database
+            .acquire_action_executor_lease(plan_id, "test_executor_0001", 60_000)
+            .expect("executor lease should be claimable");
+    }
+
+    fn insert_terminal_action_fixture(
+        database: &mut ManifestDatabase,
+        source_plan_id: i64,
+        request_id: &str,
+    ) {
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_plans( \
+                     api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
+                     source_location_id, source_path_raw, source_path_key, source_display_path, \
+                     destination_path_raw, destination_path_key, destination_display_path, \
+                     source_identity_kind, source_identity_key, source_size_bytes, \
+                     source_modified_unix_ns, created_at_unix_ms \
+                 ) SELECT \
+                     api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
+                     source_location_id, source_path_raw, source_path_key, source_display_path, \
+                     destination_path_raw, destination_path_key, destination_display_path, \
+                     source_identity_kind, source_identity_key, source_size_bytes, \
+                     source_modified_unix_ns, created_at_unix_ms \
+                 FROM action_plans WHERE id = ?1",
+                [source_plan_id],
+            )
+            .expect("terminal plan fixture should clone immutable plan data");
+        let plan_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_execution_bindings( \
+                     plan_id, api_version, source_hash_bytes, source_sha256, scope_root_node_id, \
+                     scope_root_identity_kind, scope_root_identity_key, parent_node_id, \
+                     parent_identity_kind, parent_identity_key, created_at_unix_ms \
+                 ) SELECT \
+                     ?1, api_version, source_hash_bytes, source_sha256, scope_root_node_id, \
+                     scope_root_identity_kind, scope_root_identity_key, parent_node_id, \
+                     parent_identity_kind, parent_identity_key, created_at_unix_ms \
+                 FROM action_execution_bindings WHERE plan_id = ?2",
+                params![plan_id, source_plan_id],
+            )
+            .expect("terminal plan fixture should clone binding");
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_journal_events( \
+                     api_version, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+                 ) VALUES ('deskgraph.action-journal.v1', ?1, 1, 'preview_created', NULL, 1)",
+                [plan_id],
+            )
+            .expect("fixture preview should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_command_requests( \
+                     plan_id, request_id, command_kind, requested_sequence, created_at_unix_ms \
+                 ) VALUES (?1, ?2, 'execute', 2, 1)",
+                params![plan_id, request_id],
+            )
+            .expect("fixture command should persist");
+        let command_id = database.connection.last_insert_rowid();
+        for (sequence, event_kind) in [
+            (2_i64, "execute_requested"),
+            (3, "direct_rename_intent"),
+            (4, "execution_completed"),
+        ] {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO action_journal_events( \
+                         api_version, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+                     ) VALUES ('deskgraph.action-journal.v1', ?1, ?2, ?3, ?4, 1)",
+                    params![plan_id, sequence, event_kind, command_id],
+                )
+                .expect("terminal fixture journal should persist");
+        }
+    }
+
+    fn insert_legacy_preview_fixture(database: &mut ManifestDatabase, source_plan_id: i64) {
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_plans( \
+                     api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
+                     source_location_id, source_path_raw, source_path_key, source_display_path, \
+                     destination_path_raw, destination_path_key, destination_display_path, \
+                     source_identity_kind, source_identity_key, source_size_bytes, \
+                     source_modified_unix_ns, created_at_unix_ms \
+                 ) SELECT \
+                     api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
+                     source_location_id, source_path_raw, source_path_key, source_display_path, \
+                     destination_path_raw, destination_path_key, destination_display_path, \
+                     source_identity_kind, source_identity_key, source_size_bytes, \
+                     source_modified_unix_ns, created_at_unix_ms \
+                 FROM action_plans WHERE id = ?1",
+                [source_plan_id],
+            )
+            .expect("legacy fixture should clone plan without a binding");
+        let plan_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_journal_events( \
+                     api_version, plan_id, sequence, event_kind, command_request_id, created_at_unix_ms \
+                 ) VALUES ('deskgraph.action-journal.v1', ?1, 1, 'preview_created', NULL, 1)",
+                [plan_id],
+            )
+            .expect("legacy preview event should persist");
     }
 
     fn project_setup() -> (ManifestDatabase, i64, i64) {
@@ -8102,28 +9355,7 @@ mod tests {
     #[test]
     fn action_preview_and_first_journal_event_commit_atomically_and_are_immutable() {
         let (mut database, scope_id, node_id, _) = extraction_setup();
-        let source = database
-            .action_source_for_path_key(scope_id, "/scope/file.txt")
-            .expect("action source should load");
-        assert_eq!(source.node_id, node_id);
-        let preview = database
-            .create_rename_action_plan(ActionPlanWrite {
-                scope_id,
-                node_id,
-                source_location_id: source.location_id,
-                source_path_raw: &source.path_raw,
-                source_path_key: &source.path_key,
-                source_display_path: &source.display_path,
-                destination_path_raw: b"/scope/renamed.txt",
-                destination_path_key: "/scope/renamed.txt",
-                destination_display_path: "/scope/renamed.txt",
-                source_identity_kind: &source.identity_kind,
-                source_identity_key: &source.identity_key,
-                source_size_bytes: source.size_bytes,
-                source_modified_unix_ns: source.modified_unix_ns,
-                execution_strategy: ActionExecutionStrategy::Direct,
-            })
-            .expect("preview and journal should persist");
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
 
         assert_eq!(preview.state, ActionPlanState::Previewed);
         assert_eq!(preview.journal_sequence, 1);
@@ -8131,7 +9363,7 @@ mod tests {
             database
                 .connection
                 .query_row(
-                    "SELECT COUNT(*) FROM action_plan_events WHERE plan_id = ?1",
+                    "SELECT COUNT(*) FROM action_journal_events WHERE plan_id = ?1",
                     [preview.plan_id],
                     |row| row.get::<_, i64>(0),
                 )
@@ -8152,12 +9384,474 @@ mod tests {
             database
                 .connection
                 .execute(
-                    "DELETE FROM action_plan_events WHERE plan_id = ?1",
+                    "DELETE FROM action_journal_events WHERE plan_id = ?1",
                     [preview.plan_id],
                 )
                 .is_err(),
             "append-only journal delete must fail"
         );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM action_execution_bindings WHERE plan_id = ?1",
+                    [preview.plan_id],
+                )
+                .is_err(),
+            "execution binding delete must fail"
+        );
+    }
+
+    #[test]
+    fn action_journal_uses_closed_cas_state_transitions_and_idempotent_commands() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let binding = database
+            .action_execution_record(preview.plan_id)
+            .expect("new preview should have an immutable execution binding");
+        assert_eq!(binding.state, ActionPlanState::Previewed);
+        assert_eq!(binding.binding.source_hash_bytes, 4);
+        assert_eq!(binding.binding.source_sha256.len(), 32);
+        let execution_plan = database
+            .action_execution_plan(preview.plan_id)
+            .expect("bound plan should expose trusted raw execution detail");
+        assert_eq!(execution_plan.source_path_raw, b"/scope/file.txt");
+        assert_eq!(execution_plan.destination_path_raw, b"/scope/renamed.txt");
+        assert_eq!(execution_plan.binding, binding.binding);
+
+        let execute = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0001",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("execute request should journal");
+        assert_eq!(execute.state, ActionPlanState::ExecuteRequested);
+        assert_eq!(execute.journal_sequence, 2);
+        assert!(!execute.idempotent);
+        acquire_test_executor_lease(&mut database, preview.plan_id);
+        let replay = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0001",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("same request must be idempotent");
+        assert!(replay.idempotent);
+        assert_eq!(replay.command_request_id, execute.command_request_id);
+        assert_eq!(replay.journal_sequence, 2);
+        assert!(matches!(
+            database.start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0001",
+                kind: ActionCommandKind::Undo,
+                expected_sequence: 2,
+            }),
+            Err(DatabaseError::ActionJournalIdempotencyConflict)
+        ));
+        assert!(matches!(
+            database.append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: 2,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::ExecutionCompleted,
+                executor_lease_owner_token: "test_executor_0001",
+            }),
+            Err(DatabaseError::ActionJournalInvalidTransition)
+        ));
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_command_requests( \
+                     plan_id, request_id, command_kind, requested_sequence, created_at_unix_ms \
+                 ) VALUES (?1, 'request_execute_other', 'execute', 99, 1)",
+                [preview.plan_id],
+            )
+            .expect("fixture command should persist");
+        let other_command_id = database.connection.last_insert_rowid();
+        assert!(
+            database
+                .connection
+                .execute(
+                    "INSERT INTO action_journal_events( \
+                         api_version, plan_id, sequence, event_kind, command_request_id, \
+                         created_at_unix_ms \
+                     ) VALUES ('deskgraph.action-journal.v1', ?1, 3, 'direct_rename_intent', ?2, 1)",
+                    params![preview.plan_id, other_command_id],
+                )
+                .is_err(),
+            "a second command cannot attach itself to another command's intent"
+        );
+        let intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: 2,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::DirectRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("rename intent should be journaled first");
+        assert_eq!(intent.state, ActionPlanState::DirectRenameIntent);
+        let restored = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: 3,
+                expected_state: ActionPlanState::DirectRenameIntent,
+                kind: ActionJournalEventKind::ExecutionNotApplied,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("not-applied execution should return to previewed");
+        assert_eq!(restored.state, ActionPlanState::Previewed);
+        assert_eq!(restored.journal_sequence, 4);
+        assert!(matches!(
+            database.append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: 3,
+                expected_state: ActionPlanState::DirectRenameIntent,
+                kind: ActionJournalEventKind::ExecutionNotApplied,
+                executor_lease_owner_token: "test_executor_0001",
+            }),
+            Err(DatabaseError::ActionJournalCompareAndSwapFailed)
+        ));
+        let summary = database
+            .recent_action_plans()
+            .expect("path-free history should reduce later journal states");
+        assert_eq!(summary[0].api_version, "deskgraph.action-plan-summary.v2");
+        assert_eq!(summary[0].state, ActionPlanState::Previewed);
+        assert_eq!(summary[0].journal_sequence, 4);
+    }
+
+    #[test]
+    fn action_journal_request_not_started_events_release_only_the_original_stable_state() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let execute = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0003",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("execute request should persist");
+        acquire_test_executor_lease(&mut database, preview.plan_id);
+        let previewed = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: execute.journal_sequence,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::ExecuteRequestNotStarted,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("a command that never starts should release the preview");
+        assert_eq!(previewed.state, ActionPlanState::Previewed);
+
+        let execute_again = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0004",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: previewed.journal_sequence,
+            })
+            .expect("a released preview may request execution again");
+        let intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute_again.command_request_id,
+                expected_sequence: execute_again.journal_sequence,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::DirectRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("intent should persist");
+        let executed = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute_again.command_request_id,
+                expected_sequence: intent.journal_sequence,
+                expected_state: ActionPlanState::DirectRenameIntent,
+                kind: ActionJournalEventKind::ExecutionCompleted,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("completion should persist");
+        let undo = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_undo_0000002",
+                kind: ActionCommandKind::Undo,
+                expected_sequence: executed.journal_sequence,
+            })
+            .expect("undo request should persist");
+        let still_executed = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: undo.command_request_id,
+                expected_sequence: undo.journal_sequence,
+                expected_state: ActionPlanState::UndoRequested,
+                kind: ActionJournalEventKind::UndoRequestNotStarted,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("an undo that never starts should retain executed state");
+        assert_eq!(still_executed.state, ActionPlanState::Executed);
+    }
+
+    #[test]
+    fn action_executor_lease_blocks_a_second_process_then_allows_expired_recovery() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory
+            .path()
+            .canonicalize()
+            .expect("tempdir should canonicalize")
+            .join("manifest.sqlite3");
+        let (mut first, scope_id, node_id, _) = extraction_setup_in(
+            ManifestDatabase::open(&path).expect("first process should initialize"),
+        );
+        let preview = create_bound_rename_preview(&mut first, scope_id, node_id);
+        let execute = first
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_lease_01",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("command should persist");
+        first
+            .acquire_action_executor_lease(preview.plan_id, "executor_process_one", 60_000)
+            .expect("first process should claim lease");
+
+        let mut second = ManifestDatabase::open(&path).expect("second process should open");
+        assert!(matches!(
+            second.acquire_action_executor_lease(preview.plan_id, "executor_process_two", 60_000,),
+            Err(DatabaseError::ActionExecutorLeaseUnavailable)
+        ));
+        first
+            .connection
+            .execute(
+                "UPDATE action_executor_leases SET expires_at_unix_ms = 0 WHERE plan_id = ?1",
+                [preview.plan_id],
+            )
+            .expect("test crash simulation should expire the operational lease");
+        drop(first);
+
+        second
+            .acquire_action_executor_lease(preview.plan_id, "executor_process_two", 60_000)
+            .expect("expired lease should be recoverable after reopen");
+        let intent = second
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: execute.journal_sequence,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::DirectRenameIntent,
+                executor_lease_owner_token: "executor_process_two",
+            })
+            .expect("only recovered owner may advance the journal");
+        assert_eq!(intent.state, ActionPlanState::DirectRenameIntent);
+    }
+
+    #[test]
+    fn action_journal_supports_execute_then_idempotent_undo_and_recovery_query() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let execute = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0002",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("execute request should persist");
+        acquire_test_executor_lease(&mut database, preview.plan_id);
+        let intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: 2,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::DirectRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("intent should persist");
+        let recovery = database
+            .incomplete_action_recovery(10)
+            .expect("active executor work must not be offered to recovery");
+        assert!(recovery.is_empty());
+        database
+            .release_action_executor_lease(preview.plan_id, "test_executor_0001")
+            .expect("test executor should release before recovery");
+        let recovery = database
+            .incomplete_action_recovery(10)
+            .expect("released intent should be listed path-free");
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].state, ActionPlanState::DirectRenameIntent);
+        assert_eq!(recovery[0].command_request_id, execute.command_request_id);
+        acquire_test_executor_lease(&mut database, preview.plan_id);
+        let executed = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: intent.journal_sequence,
+                expected_state: ActionPlanState::DirectRenameIntent,
+                kind: ActionJournalEventKind::ExecutionCompleted,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("completion should persist");
+        assert_eq!(executed.state, ActionPlanState::Executed);
+        let undo = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_undo_0000001",
+                kind: ActionCommandKind::Undo,
+                expected_sequence: executed.journal_sequence,
+            })
+            .expect("undo request should persist");
+        let undo_intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: undo.command_request_id,
+                expected_sequence: undo.journal_sequence,
+                expected_state: ActionPlanState::UndoRequested,
+                kind: ActionJournalEventKind::UndoRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("undo intent should persist");
+        let undone = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: undo.command_request_id,
+                expected_sequence: undo_intent.journal_sequence,
+                expected_state: ActionPlanState::UndoRenameIntent,
+                kind: ActionJournalEventKind::UndoCompleted,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("undo completion should persist");
+        assert_eq!(undone.state, ActionPlanState::Undone);
+        let execute_replay = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_execute_0002",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("old execute replay should be historical and non-mutating");
+        assert!(execute_replay.idempotent);
+        assert_eq!(execute_replay.state, ActionPlanState::Executed);
+        assert_eq!(execute_replay.journal_sequence, executed.journal_sequence);
+        let undo_replay = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "request_undo_0000001",
+                kind: ActionCommandKind::Undo,
+                expected_sequence: 1,
+            })
+            .expect("old undo replay should be historical and non-mutating");
+        assert!(undo_replay.idempotent);
+        assert_eq!(undo_replay.state, ActionPlanState::Undone);
+        assert_eq!(undo_replay.journal_sequence, undone.journal_sequence);
+        assert_eq!(
+            database
+                .action_execution_record(preview.plan_id)
+                .expect("global plan should remain unchanged")
+                .state,
+            ActionPlanState::Undone
+        );
+        assert!(
+            database
+                .incomplete_action_recovery(10)
+                .expect("terminal undo is not recovery work")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_limits_qualifying_bound_work_not_terminal_or_legacy_plans() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let terminal_seed = create_bound_rename_preview(&mut database, scope_id, node_id);
+        for index in 0..101 {
+            insert_terminal_action_fixture(
+                &mut database,
+                terminal_seed.plan_id,
+                &format!("terminal_request_{index:04}"),
+            );
+        }
+        insert_legacy_preview_fixture(&mut database, terminal_seed.plan_id);
+
+        let recoverable = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let request = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: recoverable.plan_id,
+                request_id: "request_recovery_0001",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("recoverable request should persist");
+        let recovery = database
+            .incomplete_action_recovery(1)
+            .expect("terminal and legacy rows must not starve recovery");
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].plan_id, recoverable.plan_id);
+        assert_eq!(recovery[0].command_request_id, request.command_request_id);
+        assert_eq!(recovery[0].state, ActionPlanState::ExecuteRequested);
+        assert_eq!(recovery[0].journal_sequence, request.journal_sequence);
+    }
+
+    #[test]
+    fn legacy_previews_without_a_v19_binding_are_non_executable() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_plans( \
+                     api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
+                     source_location_id, source_path_raw, source_path_key, source_display_path, \
+                     destination_path_raw, destination_path_key, destination_display_path, \
+                     source_identity_kind, source_identity_key, source_size_bytes, \
+                     source_modified_unix_ns, created_at_unix_ms \
+                 ) SELECT \
+                     'deskgraph.action-plan.v1', 'deskgraph.action-policy.v1', 'rename', 'direct', \
+                     l.scope_id, l.node_id, l.id, l.path_raw, l.path_key, l.display_path, \
+                     X'2F73636F70652F6C65676163792E747874', '/scope/legacy.txt', '/scope/legacy.txt', \
+                     n.identity_kind, n.identity_key, f.size_bytes, f.modified_unix_ns, 1 \
+                 FROM locations l JOIN nodes n ON n.id = l.node_id \
+                    JOIN files f ON f.node_id = l.node_id \
+                 WHERE l.scope_id = ?1 AND l.node_id = ?2",
+                params![scope_id, node_id],
+            )
+            .expect("historical plan fixture should insert");
+        let plan_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO action_journal_events( \
+                     api_version, plan_id, sequence, event_kind, command_request_id, \
+                     created_at_unix_ms \
+                 ) VALUES ('deskgraph.action-journal.v1', ?1, 1, 'preview_created', NULL, 1)",
+                [plan_id],
+            )
+            .expect("historical event fixture should insert");
+        assert!(matches!(
+            database.action_execution_record(plan_id),
+            Err(DatabaseError::ActionExecutionBindingUnavailable)
+        ));
+        assert!(matches!(
+            database.action_execution_plan(plan_id),
+            Err(DatabaseError::ActionExecutionBindingUnavailable)
+        ));
+        assert!(matches!(
+            database.start_action_command(ActionCommandWrite {
+                plan_id,
+                request_id: "request_legacy_0001",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            }),
+            Err(DatabaseError::ActionExecutionBindingUnavailable)
+        ));
     }
 
     #[test]
@@ -8706,9 +10400,11 @@ mod tests {
     #[test]
     fn database_rejects_action_plan_when_manifest_snapshot_does_not_match() {
         let (mut database, scope_id, node_id, _) = extraction_setup();
-        let source = database
-            .action_source_for_path_key(scope_id, "/scope/file.txt")
-            .expect("action source should load");
+        let execution_source = database
+            .action_execution_source_for_path_key(scope_id, "/scope/file.txt")
+            .expect("execution source should load");
+        let source = &execution_source.source;
+        let source_sha256 = [0xa5; 32];
         let error = database
             .create_rename_action_plan(ActionPlanWrite {
                 scope_id,
@@ -8724,6 +10420,12 @@ mod tests {
                 source_identity_key: &source.identity_key,
                 source_size_bytes: source.size_bytes + 1,
                 source_modified_unix_ns: source.modified_unix_ns,
+                source_sha256: &source_sha256,
+                source_hash_bytes: source.size_bytes + 1,
+                scope_root_identity_kind: &execution_source.scope_root_identity_kind,
+                scope_root_identity_key: &execution_source.scope_root_identity_key,
+                parent_identity_kind: &execution_source.parent_identity_kind,
+                parent_identity_key: &execution_source.parent_identity_key,
                 execution_strategy: ActionExecutionStrategy::Direct,
             })
             .expect_err("database boundary must reject stale snapshot");

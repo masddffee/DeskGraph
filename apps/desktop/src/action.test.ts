@@ -7,6 +7,7 @@ import {
   loadRecentActionPlans,
   parseActionPlanPreview,
   parseActionPlanSummaries,
+  type ActionPlanState,
   type ActionPlanPreview,
   type ActionPlanSummary,
 } from './action';
@@ -24,7 +25,7 @@ const checks = [
 ] as const;
 
 const preview: ActionPlanPreview = {
-  api_version: 'deskgraph.action-plan.v1',
+  api_version: 'deskgraph.action-plan.v2',
   plan_id: 8,
   operation: 'rename',
   state: 'previewed',
@@ -43,7 +44,7 @@ const preview: ActionPlanPreview = {
 };
 
 const summary: ActionPlanSummary = {
-  api_version: 'deskgraph.action-plan-summary.v1',
+  api_version: 'deskgraph.action-plan-summary.v2',
   plan_id: 8,
   operation: 'rename',
   state: 'previewed',
@@ -62,11 +63,36 @@ describe('action preview contract', () => {
     expect(JSON.stringify(summary)).not.toContain('private-final.md');
   });
 
-  it('rejects unknown operations, mutable journal shapes, and injected summary paths', () => {
+  it('accepts every durable history state and a later positive journal sequence', () => {
+    const states: ActionPlanState[] = [
+      'previewed',
+      'execute_requested',
+      'direct_rename_intent',
+      'executed',
+      'undo_requested',
+      'undo_rename_intent',
+      'undone',
+      'needs_attention',
+    ];
+
+    expect(
+      parseActionPlanSummaries(
+        states.map((state, index) => ({ ...summary, state, journal_sequence: index + 1 })),
+      ),
+    ).toEqual(states.map((state, index) => ({ ...summary, state, journal_sequence: index + 1 })));
+  });
+
+  it('rejects unknown operations, invalid states, invalid journal shapes, and injected summary paths', () => {
     expect(() => parseActionPlanPreview({ ...preview, operation: 'delete' })).toThrow(
       'Invalid action preview response',
     );
-    expect(() => parseActionPlanPreview({ ...preview, journal_sequence: 2 })).toThrow(
+    expect(() => parseActionPlanPreview({ ...preview, state: 'executed' })).toThrow(
+      'Invalid action preview response',
+    );
+    expect(() => parseActionPlanPreview({ ...preview, filename: 'private.txt' })).toThrow(
+      'Invalid action preview response',
+    );
+    expect(() => parseActionPlanPreview({ ...preview, journal_sequence: 0 })).toThrow(
       'Invalid action preview response',
     );
     expect(() =>
@@ -75,7 +101,22 @@ describe('action preview contract', () => {
         policy: { ...preview.policy, checks: [...checks, 'llm_approved'] },
       }),
     ).toThrow('Invalid action policy response');
+    expect(() =>
+      parseActionPlanPreview({
+        ...preview,
+        policy: { ...preview.policy, source_path: '/private' },
+      }),
+    ).toThrow('Invalid action policy response');
     expect(() => parseActionPlanSummaries([{ ...summary, source_path: '/private' }])).toThrow(
+      'Invalid action plan summary response',
+    );
+    expect(() =>
+      parseActionPlanSummaries([{ ...summary, destination_display_path: '/private' }]),
+    ).toThrow('Invalid action plan summary response');
+    expect(() => parseActionPlanSummaries([{ ...summary, filename: 'private.txt' }])).toThrow(
+      'Invalid action plan summary response',
+    );
+    expect(() => parseActionPlanSummaries([{ ...summary, state: 'delete_requested' }])).toThrow(
       'Invalid action plan summary response',
     );
   });

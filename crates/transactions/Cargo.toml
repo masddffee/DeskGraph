@@ -10,6 +10,11 @@ deskgraph-database = { path = "../database" }
 deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
 deskgraph-scanner = { path = "../scanner" }
+serde.workspace = true
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

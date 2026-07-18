@@ -138,7 +138,14 @@ export type Catalog = {
     historyPlan: (planId: number) => string;
     historyScopeNode: (scopeId: number, nodeId: number) => string;
     caseOnlyStaged: string;
-    directPreviewed: string;
+    directStrategy: string;
+    historyState: {
+      previewed: string;
+      pending: string;
+      executed: string;
+      undone: string;
+      needsAttention: string;
+    };
   };
   watch: {
     kicker: string;

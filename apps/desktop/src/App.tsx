@@ -6,6 +6,7 @@ import {
   loadRecentActionPlans,
   type ActionPlanPreview,
   type ActionPlanSummary,
+  type ActionPlanState,
   type ActionPolicyCheck,
 } from './action';
 import {
@@ -329,6 +330,21 @@ function actionPolicyCheckLabel(check: ActionPolicyCheck, catalog: Catalog): str
   if (check === 'same_canonical_parent') return catalog.actions.policy.sameParent;
   if (check === 'destination_contained') return catalog.actions.policy.destinationScope;
   return catalog.actions.policy.destinationAvailable;
+}
+
+function actionPlanStateLabel(state: ActionPlanState, catalog: Catalog): string {
+  if (state === 'previewed') return catalog.actions.historyState.previewed;
+  if (
+    state === 'execute_requested' ||
+    state === 'direct_rename_intent' ||
+    state === 'undo_requested' ||
+    state === 'undo_rename_intent'
+  ) {
+    return catalog.actions.historyState.pending;
+  }
+  if (state === 'executed') return catalog.actions.historyState.executed;
+  if (state === 'undone') return catalog.actions.historyState.undone;
+  return catalog.actions.historyState.needsAttention;
 }
 
 function browserLocaleStorage(): Storage | null {
@@ -1391,7 +1407,9 @@ export default function App() {
                     <span>
                       {plan.execution_strategy === 'case_only_staged'
                         ? catalog.actions.caseOnlyStaged
-                        : catalog.actions.directPreviewed}
+                        : catalog.actions.directStrategy}
+                      {' · '}
+                      {actionPlanStateLabel(plan.state, catalog)}
                     </span>
                   </li>
                 ))}

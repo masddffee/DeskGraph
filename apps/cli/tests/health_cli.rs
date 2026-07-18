@@ -1080,7 +1080,7 @@ fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
     assert!(output.status.success());
     let preview: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("stdout should be JSON");
-    assert_eq!(preview["api_version"], "deskgraph.action-plan.v1");
+    assert_eq!(preview["api_version"], "deskgraph.action-plan.v2");
     assert_eq!(preview["operation"], "rename");
     assert_eq!(preview["state"], "previewed");
     let canonical_source = std::fs::canonicalize(&source_path).expect("source should canonicalize");
@@ -1143,4 +1143,21 @@ fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
         assert!(!list_stdout.contains(secret));
         assert!(!list_stderr.contains(secret));
     }
+}
+
+#[test]
+fn organizer_help_exposes_preview_and_history_but_no_execution_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args(["organize", "--help"])
+        .output()
+        .expect("deskgraph organizer help should start");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rename-preview"));
+    assert!(stdout.contains("status"));
+    assert!(stdout.contains("list"));
+    assert!(!stdout.contains("rename-execute"));
+    assert!(!stdout.contains("rename-undo"));
+    assert!(!stdout.contains("recover"));
 }
