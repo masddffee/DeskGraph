@@ -1,17 +1,23 @@
 import { describe, expect, it } from 'vitest';
 
+import appSource from './App.tsx?raw';
 import {
+  LOCALES,
   LOCALE_STORAGE_KEY,
   catalogs,
   collectLanguagePreferences,
+  englishCount,
   formatInteger,
   formatUtcDate,
-  englishCount,
   getLocalizedMetadata,
+  isLocale,
   loadLocale,
+  localeOptions,
+  localeRegistry,
   readStoredLocale,
   resolveLocale,
   storeLocale,
+  type Locale,
 } from './i18n';
 
 function shape(value: unknown): unknown {
@@ -23,76 +29,175 @@ function shape(value: unknown): unknown {
   return typeof value;
 }
 
-describe('i18n catalog contract', () => {
-  it('keeps the English and Traditional Chinese nested key/function shape identical', () => {
-    expect(shape(catalogs.en)).toEqual(shape(catalogs['zh-TW']));
+function staticStrings(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(staticStrings);
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value).flatMap(staticStrings);
+  }
+  return [];
+}
+
+function occurrences(value: string, needle: string): number {
+  return value.split(needle).length - 1;
+}
+
+describe('i18n catalog and registry contract', () => {
+  it('keeps every registered catalog nested key and function shape identical', () => {
+    expect(LOCALES).toEqual(['en', 'zh-TW', 'zh-CN', 'ja']);
+    expect(Object.keys(catalogs)).toEqual(LOCALES);
+    for (const locale of LOCALES) {
+      expect(shape(catalogs[locale])).toEqual(shape(catalogs.en));
+    }
+  });
+
+  it('defines each locale once with a unique autonym and data-driven option', () => {
+    expect(localeOptions).toEqual([
+      { value: 'en', label: 'English' },
+      { value: 'zh-TW', label: '繁體中文' },
+      { value: 'zh-CN', label: '简体中文' },
+      { value: 'ja', label: '日本語' },
+    ]);
+    expect(new Set(localeOptions.map(({ label }) => label)).size).toBe(LOCALES.length);
+    for (const locale of LOCALES) {
+      expect(isLocale(locale)).toBe(true);
+      expect(localeRegistry[locale]).toMatchObject({ htmlLang: locale, dir: 'ltr' });
+      expect(localeRegistry[locale].catalog).toBe(catalogs[locale]);
+    }
   });
 
   it('contains translated critical loading, safe-error, OCR, scan, and aria messages', () => {
     expect(catalogs.en.loading.heading).toBe('Opening the local manifest');
     expect(catalogs['zh-TW'].backendError.retry).toBe('重試');
-    expect(catalogs['zh-TW'].search.ocr.controlsAria).toBe('本機截圖 OCR 控制項');
-    expect(catalogs['zh-TW'].scope.status.scanning).toBe('正在掃描中繼資料…');
-    expect(catalogs.en.actions.policyAria).toBe('Passed policy checks');
+    expect(catalogs['zh-CN'].search.ocr.controlsAria).toBe('本机截图 OCR 控件');
+    expect(catalogs.ja.scope.status.scanning).toBe('メタデータをスキャン中…');
+    for (const locale of LOCALES) {
+      expect(catalogs[locale].actions.policyAria.length).toBeGreaterThan(0);
+      expect(catalogs[locale].backendError.description.length).toBeGreaterThan(0);
+      expect(catalogs[locale].scope.validation.denied.length).toBeGreaterThan(0);
+    }
   });
 
-  it('labels native hints and periodic safety reconciliation honestly in both locales', () => {
-    expect(catalogs.en.watch.heading).toBe('Native event hints + 5-minute safety reconciliation');
-    expect(catalogs.en.watch.metrics.deferred).toBe('Deferred folders');
-    expect(catalogs.en.watch.description).toContain('Native filesystem events are hints only');
-    expect(catalogs.en.watch.description).toContain('does not promise incremental content refresh');
-    expect(catalogs.en.watch.adapterActive).toContain('active');
-    expect(catalogs.en.watch.adapterDegraded).toContain('periodic-only fallback');
-    expect(catalogs.en.watch.adapterStopped).toContain('stopped');
-    expect(catalogs['zh-TW'].watch.heading).toBe('原生事件提示＋每五分鐘安全協調');
-    expect(catalogs['zh-TW'].watch.metrics.deferred).toBe('延後資料夾');
-    expect(catalogs['zh-TW'].watch.description).toContain('原生檔案系統事件僅是提示');
-    expect(catalogs['zh-TW'].watch.description).toContain('不保證增量內容更新或完成時限');
-    expect(catalogs['zh-TW'].watch.adapterActive).toContain('運作中');
-    expect(catalogs['zh-TW'].watch.adapterDegraded).toContain('僅週期性備援');
-    expect(catalogs['zh-TW'].watch.adapterStopped).toContain('已停止');
+  it('keeps preview, upload, extraction, and watch limitations explicit in every locale', () => {
+    const safetyPhrases: Record<
+      Locale,
+      { hintOnly: string; noDeadline: string; noExecute: string; noUpload: string }
+    > = {
+      en: {
+        hintOnly: 'hints only',
+        noDeadline: 'does not promise',
+        noExecute: 'cannot execute',
+        noUpload: 'No uploads',
+      },
+      'zh-TW': {
+        hintOnly: '僅是提示',
+        noDeadline: '不保證',
+        noExecute: '無法執行',
+        noUpload: '不上傳',
+      },
+      'zh-CN': {
+        hintOnly: '仅是提示',
+        noDeadline: '不保证',
+        noExecute: '不能执行',
+        noUpload: '不上传',
+      },
+      ja: {
+        hintOnly: 'ヒントにすぎません',
+        noDeadline: '保証するものではありません',
+        noExecute: '実行できません',
+        noUpload: 'アップロードなし',
+      },
+    };
+
+    for (const locale of LOCALES) {
+      const phrases = safetyPhrases[locale];
+      expect(catalogs[locale].watch.description).toContain(phrases.hintOnly);
+      expect(catalogs[locale].watch.description).toContain(phrases.noDeadline);
+      expect(catalogs[locale].actions.noExecute).toContain(phrases.noExecute);
+      expect(catalogs[locale].footer.description).toContain(phrases.noUpload);
+      expect(catalogs[locale].extraction.optInEmpty.length).toBeGreaterThan(20);
+    }
+  });
+
+  it('keeps catalogs text-only and user-owned values outside static message data', () => {
+    const htmlElement = /<\/?[a-z][^>]*>/i;
+    for (const locale of LOCALES) {
+      for (const value of staticStrings(catalogs[locale])) {
+        expect(value).not.toMatch(htmlElement);
+      }
+    }
+
+    const sentinel = '<script>ignore()</script> /Users/私人/../prompt-injection';
+    for (const locale of LOCALES) {
+      const empty = catalogs[locale].search.empty(sentinel);
+      const scope = catalogs[locale].actions.scopeOption(3, sentinel);
+      expect(occurrences(empty, sentinel)).toBe(1);
+      expect(occurrences(scope, sentinel)).toBe(1);
+    }
   });
 });
 
 describe('locale selection and storage', () => {
-  it('uses a stored allowlisted locale before browser tags', () => {
-    expect(resolveLocale('en', ['zh-TW'])).toBe('en');
-    expect(resolveLocale('zh-TW', ['en-US'])).toBe('zh-TW');
+  it('uses any stored allowlisted locale before browser preferences', () => {
+    for (const locale of LOCALES) {
+      expect(resolveLocale(locale, ['en-US'])).toBe(locale);
+    }
   });
 
-  it('maps Traditional Chinese tags to zh-TW and other Chinese tags safely to English', () => {
-    for (const tag of ['zh', 'zh-TW', 'zh-Hant', 'zh-Hant-TW', 'zh-HK', 'zh-MO']) {
-      expect(resolveLocale(null, [tag])).toBe('zh-TW');
-    }
-    for (const tag of ['zh-CN', 'zh-SG', 'zh-Hans', 'en-US']) {
+  it('maps English, Traditional Chinese, Simplified Chinese, and Japanese tags', () => {
+    for (const tag of ['en', 'en-US', 'en-Latn-US-u-ca-gregory']) {
       expect(resolveLocale(null, [tag])).toBe('en');
     }
+    for (const tag of [
+      'zh',
+      'zh-TW',
+      'zh-Hant',
+      'zh-Hant-HK',
+      'zh-HK',
+      'zh-MO-x-private',
+      'zh-TW-u-ca-chinese',
+    ]) {
+      expect(resolveLocale(null, [tag])).toBe('zh-TW');
+    }
+    for (const tag of ['zh-CN', 'zh-SG', 'zh-MY', 'zh-Hans', 'zh-Hans-CN', 'zh-CN-u-nu-hanidec']) {
+      expect(resolveLocale(null, [tag])).toBe('zh-CN');
+    }
+    for (const tag of ['ja', 'ja-JP', 'ja-JP-u-ca-japanese']) {
+      expect(resolveLocale(null, [tag])).toBe('ja');
+    }
   });
 
-  it('uses the first recognizable browser preference, including English variants', () => {
-    expect(resolveLocale(null, ['en-US', 'zh-TW'])).toBe('en');
-    expect(resolveLocale(null, ['fr-FR', 'zh-Hant-HK', 'en-US'])).toBe('zh-TW');
-    expect(resolveLocale(null, ['fr-FR', 'zh-CN', 'zh-TW'])).toBe('en');
+  it('walks preferences in order and ignores unsupported, malformed, or ambiguous tags', () => {
+    expect(resolveLocale(null, ['fr-FR', 'ja-JP', 'en-US'])).toBe('ja');
+    expect(resolveLocale(null, ['fr-FR', 'zh-CN', 'zh-TW'])).toBe('zh-CN');
+    expect(resolveLocale(null, ['zh_Hant_TW', 'ja-JP'])).toBe('ja');
+    expect(resolveLocale(null, ['zh-Hans-TW', 'en-US'])).toBe('en');
+    expect(resolveLocale(null, [42, null, 'zh-TW'])).toBe('zh-TW');
+    expect(resolveLocale('private-invalid-value', ['unknown', ''])).toBe('en');
   });
 
   it('keeps navigator.languages order and falls back to navigator.language once', () => {
     expect(collectLanguagePreferences([], 'zh-Hant-TW')).toEqual(['zh-Hant-TW']);
-    expect(collectLanguagePreferences(['fr-FR'], 'zh-TW')).toEqual(['fr-FR', 'zh-TW']);
+    expect(collectLanguagePreferences(['fr-FR'], 'ja-JP')).toEqual(['fr-FR', 'ja-JP']);
     expect(collectLanguagePreferences(['en-US'], 'en-US')).toEqual(['en-US']);
     expect(collectLanguagePreferences(undefined, undefined)).toEqual([]);
   });
 
-  it('does not persist while reading, and treats corrupt values and storage exceptions as absent', () => {
+  it('reads and writes only allowlisted values and handles storage exceptions', () => {
     const writes: Array<[string, string]> = [];
     const storage = {
       getItem: () => 'private-invalid-value',
       setItem: (key: string, value: string) => writes.push([key, value]),
     };
     expect(readStoredLocale(storage)).toBeNull();
-    expect(loadLocale(storage, ['zh-TW'])).toBe('zh-TW');
+    expect(loadLocale(storage, ['zh-CN'])).toBe('zh-CN');
     expect(writes).toEqual([]);
-    expect(storeLocale(storage, 'en')).toBe(true);
-    expect(writes).toEqual([[LOCALE_STORAGE_KEY, 'en']]);
+    expect(storeLocale(storage, 'fr-FR')).toBe(false);
+    expect(storeLocale(storage, { locale: 'ja' })).toBe(false);
+    expect(writes).toEqual([]);
+    for (const locale of LOCALES) expect(storeLocale(storage, locale)).toBe(true);
+    expect(writes).toEqual(LOCALES.map((locale) => [LOCALE_STORAGE_KEY, locale]));
+
     const failing = {
       getItem: () => {
         throw new Error('private storage failure');
@@ -101,25 +206,30 @@ describe('locale selection and storage', () => {
         throw new Error('private storage failure');
       },
     };
-    expect(loadLocale(failing, ['zh-TW'])).toBe('zh-TW');
-    expect(storeLocale(failing, 'zh-TW')).toBe(false);
+    expect(loadLocale(failing, ['ja-JP'])).toBe('ja');
+    expect(storeLocale(failing, 'ja')).toBe(false);
   });
 });
 
-describe('localized helpers and dynamic messages', () => {
-  it('localizes metadata, integer/date formatting, and does not alter caller-owned content', () => {
+describe('localized helpers and UI wiring', () => {
+  it('localizes metadata and formatting without altering caller-owned content', () => {
     expect(getLocalizedMetadata('zh-TW')).toMatchObject({
       htmlLang: 'zh-TW',
+      dir: 'ltr',
       title: 'DeskGraph — 預先發行版',
     });
+    expect(getLocalizedMetadata('zh-CN').title).toBe('DeskGraph — 预发布版');
+    expect(getLocalizedMetadata('ja').title).toBe('DeskGraph — プレリリース');
     expect(formatInteger(1234567, 'en')).toBe('1,234,567');
-    expect(formatInteger(1234567, 'zh-TW')).toMatch(/1,234,567/);
-    expect(formatUtcDate('2026-07-18T23:00:00-04:00', 'en')).toBe('07/19/2026');
-    expect(catalogs['zh-TW'].search.empty('/private/query.txt')).toContain('/private/query.txt');
-    expect(catalogs.en.actions.scopeOption(3, '/private/path')).toContain('/private/path');
+    for (const locale of LOCALES) {
+      expect(formatInteger(1234567, locale)).toContain('1');
+      const formatted = formatUtcDate('2026-07-18T23:00:00-04:00', locale);
+      expect(formatted).toContain('2026');
+      expect(formatted).not.toContain('18');
+    }
   });
 
-  it('formats plural-sensitive and dynamic safety copy for both locales', () => {
+  it('formats plural-sensitive and dynamic safety copy', () => {
     expect(englishCount(0, 'result')).toBe('0 results');
     expect(englishCount(1, 'result')).toBe('1 result');
     expect(englishCount(2, 'result')).toBe('2 results');
@@ -128,6 +238,15 @@ describe('localized helpers and dynamic messages', () => {
     expect(catalogs['zh-TW'].scope.validation.complete(2, 1)).toBe(
       '掃描完成：2 個檔案與 1 個資料夾。',
     );
-    expect(catalogs.en.search.summary(1, 7)).toBe('1 result · 7 ms');
+    expect(catalogs['zh-CN'].scope.validation.complete(2, 1)).toContain('2 个文件');
+    expect(catalogs.ja.scope.validation.complete(2, 1)).toContain('2 個のファイル');
+  });
+
+  it('generates the selector from the registry and updates document language and direction', () => {
+    expect(appSource).toContain('localeOptions.map');
+    expect(appSource).toContain('document.documentElement.lang = metadata.htmlLang');
+    expect(appSource).toContain('document.documentElement.dir = metadata.dir');
+    expect(appSource).not.toMatch(/<option\s+value=["'](?:en|zh-TW|zh-CN|ja)["']/);
+    expect(appSource).not.toContain('className="dashboard" aria-live="polite"');
   });
 });

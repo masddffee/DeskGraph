@@ -96,6 +96,49 @@ h2 {
   font-weight: 500;
 }
 
+:lang(zh) h1,
+:lang(zh) h2,
+:lang(ja) h1,
+:lang(ja) h2,
+:lang(zh) .metric strong,
+:lang(ja) .metric strong {
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'PingFang TC',
+    'PingFang SC',
+    'Hiragino Sans',
+    'Yu Gothic UI',
+    'Microsoft JhengHei',
+    'Microsoft YaHei',
+    sans-serif;
+  letter-spacing: normal;
+}
+
+:lang(zh) h1,
+:lang(ja) h1 {
+  line-height: 1.08;
+}
+
+:lang(zh) .eyebrow,
+:lang(zh) .panel-kicker,
+:lang(zh) .metric span,
+:lang(zh) .scope-label,
+:lang(zh) .search-snippet span,
+:lang(zh) .rename-paths span,
+:lang(ja) .eyebrow,
+:lang(ja) .panel-kicker,
+:lang(ja) .metric span,
+:lang(ja) .scope-label,
+:lang(ja) .search-snippet span,
+:lang(ja) .rename-paths span {
+  letter-spacing: normal;
+  text-transform: none;
+}
+
 .hero-copy {
   max-width: 62ch;
   margin-bottom: 0.55rem;

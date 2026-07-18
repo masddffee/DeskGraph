@@ -59,6 +59,7 @@ import {
   getLocalizedMetadata,
   isLocale,
   loadLocale,
+  localeOptions,
   resolveLocale,
   storeLocale,
   type Catalog,
@@ -385,6 +386,7 @@ export default function App() {
   useEffect(() => {
     const metadata = getLocalizedMetadata(locale);
     document.documentElement.lang = metadata.htmlLang;
+    document.documentElement.dir = metadata.dir;
     document.title = metadata.title;
     document
       .querySelector('meta[name="description"]')
@@ -935,8 +937,11 @@ export default function App() {
               value={locale}
               onChange={(event) => changeLocale(event.target.value)}
             >
-              <option value="en">{catalog.language.english}</option>
-              <option value="zh-TW">{catalog.language.traditionalChinese}</option>
+              {localeOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
             </select>
           </label>
           <span className="release-badge">{catalog.hero.release}</span>
@@ -966,7 +971,7 @@ export default function App() {
       ) : null}
 
       {state.kind === 'ready' ? (
-        <div className="dashboard" aria-live="polite">
+        <div className="dashboard">
           <section className="panel" aria-labelledby="runtime-title">
             <div className="panel-heading">
               <div>
