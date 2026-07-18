@@ -175,6 +175,29 @@ export type Catalog = {
     scan: (jobId: number) => string;
     noScan: string;
   };
+  cleanup: {
+    kicker: string;
+    heading: string;
+    description: string;
+    suggestionOnly: string;
+    scopeLabel: string;
+    chooseScope: string;
+    refresh: string;
+    refreshing: string;
+    controlsAria: string;
+    authorizationRequired: string;
+    empty: string;
+    partial: (notCurrent: number) => string;
+    error: string;
+    exactDuplicate: string;
+    version: string;
+    screenshotReviewGroup: string;
+    exactDuplicateExplanation: string;
+    versionExplanation: string;
+    screenshotReviewGroupExplanation: string;
+    itemMeta: (members: number, evidenceScoreBasisPoints: number, observedAt: string) => string;
+    verification: string;
+  };
   extraction: {
     kicker: string;
     emptyHeading: string;

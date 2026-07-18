@@ -15,8 +15,8 @@ use deskgraph_projects::{
     check_exact_duplicate_at, decide_exact_duplicate_at, decide_file_version_at,
     decide_project_candidate_at, folder_profile_at, project_candidate_at, propose_project_at,
     recent_file_relation_candidates_at, recent_project_candidates_at, recent_screenshot_groups_at,
-    screenshot_group_at, suggest_file_version_at, suggest_screenshot_groups_at,
-    verify_exact_duplicate_at, verify_file_version_at,
+    refresh_smart_cleanup_inbox_at, screenshot_group_at, suggest_file_version_at,
+    suggest_screenshot_groups_at, verify_exact_duplicate_at, verify_file_version_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
@@ -348,6 +348,13 @@ enum RelationCommand {
 
 #[derive(Debug, Subcommand)]
 enum CleanupCommand {
+    /// Explicitly revalidate and list one scope's path-free cleanup review Inbox.
+    Inbox {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
+    },
     /// Find explainable screenshot review groups from current local provenance.
     #[command(name = "screenshot-groups")]
     Groups {
@@ -1069,6 +1076,21 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             }
         },
         Command::Cleanup { command } => match command {
+            CleanupCommand::Inbox { database, scope } => {
+                let inbox = refresh_smart_cleanup_inbox_at(&database, scope)
+                    .map_err(|error| error.code())?;
+                print_json(&inbox)?;
+                info!(
+                    event = "smart_cleanup_inbox_refreshed",
+                    scope_id = inbox.scope_id,
+                    item_count = inbox.items.len(),
+                    evaluated_source_count = inbox.evaluated_source_count,
+                    not_current_source_count = inbox.not_current_source_count,
+                    evaluation_complete = inbox.evaluation_complete,
+                    action_authorized = false
+                );
+                Ok(())
+            }
             CleanupCommand::Groups { database, scope } => {
                 let discovery =
                     suggest_screenshot_groups_at(&database, scope).map_err(|error| error.code())?;

@@ -6,11 +6,12 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use deskgraph_database::{ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase};
 use deskgraph_domain::{
-    FileRelationCandidate, FileRelationCandidateSummary, FileRelationDecisionKind,
-    FileVersionCandidate, FolderProfile, ProjectCandidate, ProjectCandidateSummary,
-    ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
-    ProjectSuggestionCreator, ScreenshotGroupCandidate, ScreenshotGroupCandidateSummary,
-    ScreenshotGroupDiscovery, parse_explicit_file_version_name,
+    FileRelationCandidate, FileRelationCandidateState, FileRelationCandidateSummary,
+    FileRelationDecisionKind, FileVersionCandidate, FolderProfile, ProjectCandidate,
+    ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal, ProjectSignalKind,
+    ProjectSuggestion, ProjectSuggestionCreator, ScreenshotGroupCandidate,
+    ScreenshotGroupCandidateSummary, ScreenshotGroupDiscovery, SmartCleanupInbox,
+    SmartCleanupSourceKind, parse_explicit_file_version_name,
 };
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
@@ -25,6 +26,7 @@ const DUPLICATE_COMPARE_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_SCREENSHOT_GROUP_IMAGES: u32 = 2_000;
 const MAX_SCREENSHOT_GROUPS: u32 = 20;
 const MAX_SCREENSHOT_GROUP_MEMBERS: u32 = 20;
+const MAX_SMART_CLEANUP_SOURCES: u32 = 20;
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -382,6 +384,126 @@ pub fn recent_screenshot_groups_at(
     ManifestDatabase::open(database_path)?
         .recent_screenshot_group_candidates()
         .map_err(Into::into)
+}
+
+pub fn refresh_smart_cleanup_inbox_at(
+    database_path: &Path,
+    scope_id: i64,
+) -> Result<SmartCleanupInbox, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    refresh_smart_cleanup_inbox(&mut database, scope_id)
+}
+
+pub fn refresh_smart_cleanup_inbox(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+) -> Result<SmartCleanupInbox, ProjectError> {
+    if !database.scope_has_active_access_grant(scope_id)? {
+        return Err(DatabaseError::ScopeAccessGrantNotActive.into());
+    }
+    let (references, mut evaluation_complete) =
+        database.smart_cleanup_source_references(scope_id, MAX_SMART_CLEANUP_SOURCES)?;
+    let evaluated_source_count =
+        u32::try_from(references.len()).map_err(|_| DatabaseError::InvalidCount)?;
+    let mut not_current_source_count = 0_u32;
+    let mut items = Vec::with_capacity(references.len());
+
+    for reference in references {
+        if reference.state != FileRelationCandidateState::Suggested {
+            continue;
+        }
+        if !database.scope_has_active_access_grant(scope_id)? {
+            return Err(DatabaseError::ScopeAccessGrantNotActive.into());
+        }
+        let result = match reference.kind {
+            SmartCleanupSourceKind::ExactDuplicate => {
+                let candidate = verify_exact_duplicate(database, reference.source_id);
+                candidate.and_then(|candidate| {
+                    database
+                        .smart_cleanup_relation_item(
+                            candidate.relation_id,
+                            candidate.evidence.observed_at_unix_ms,
+                        )
+                        .map_err(Into::into)
+                })
+            }
+            SmartCleanupSourceKind::Version => {
+                let candidate = verify_file_version(database, reference.source_id);
+                candidate.and_then(|candidate| {
+                    database
+                        .smart_cleanup_relation_item(
+                            candidate.relation_id,
+                            candidate.evidence.observed_at_unix_ms,
+                        )
+                        .map_err(Into::into)
+                })
+            }
+            SmartCleanupSourceKind::ScreenshotReviewGroup => database
+                .smart_cleanup_screenshot_item(reference.source_id)
+                .map_err(Into::into),
+        };
+        match result {
+            Ok(item) => items.push(item),
+            Err(error) if cleanup_source_is_not_current(&error) => {
+                not_current_source_count = not_current_source_count
+                    .checked_add(1)
+                    .ok_or(DatabaseError::InvalidCount)?;
+            }
+            Err(error) if cleanup_source_evaluation_is_incomplete(&error) => {
+                evaluation_complete = false;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    items.sort_by(|left, right| {
+        left.source_kind
+            .cmp(&right.source_kind)
+            .then_with(|| right.observed_at_unix_ms.cmp(&left.observed_at_unix_ms))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    Ok(SmartCleanupInbox {
+        api_version: SmartCleanupInbox::API_VERSION,
+        scope_id,
+        items,
+        evaluated_source_count,
+        not_current_source_count,
+        bounded_source_limit: MAX_SMART_CLEANUP_SOURCES,
+        evaluation_complete,
+        action_authorized: false,
+    })
+}
+
+fn cleanup_source_is_not_current(error: &ProjectError) -> bool {
+    matches!(
+        error,
+        ProjectError::RelationSourceUnavailable
+            | ProjectError::RelationSourceSymlinkOrReparseDenied
+            | ProjectError::RelationSourceOutsideScope
+            | ProjectError::RelationSourceMustBeFile
+            | ProjectError::RelationSourceIdentityUnavailable
+            | ProjectError::RelationSourceIdentityChanged
+            | ProjectError::RelationSourceMetadataChanged
+            | ProjectError::RelationSourceEmpty
+            | ProjectError::RelationSourceTooLarge
+            | ProjectError::RelationSameFileIdentity
+            | ProjectError::RelationContentDiffers
+            | ProjectError::VersionNameUnsupported
+            | ProjectError::VersionBaseMismatch
+            | ProjectError::VersionExtensionMismatch
+            | ProjectError::VersionNumberEqual
+            | ProjectError::Database(DatabaseError::FileRelationCandidateNotCurrent)
+            | ProjectError::Database(DatabaseError::ScreenshotGroupCandidateNotCurrent)
+    )
+}
+
+fn cleanup_source_evaluation_is_incomplete(error: &ProjectError) -> bool {
+    matches!(
+        error,
+        ProjectError::RelationSourceOpenFailed
+            | ProjectError::RelationSourceReadFailed
+            | ProjectError::RelationComparisonTimedOut
+    )
 }
 
 fn open_relation_source(
@@ -1288,5 +1410,180 @@ mod tests {
         )
         .expect_err("oversized files should be excluded before comparison");
         assert_eq!(large.code(), "file_relation_source_too_large");
+    }
+
+    #[test]
+    fn smart_cleanup_inbox_reverifies_suggested_relations_and_stays_path_free() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("cleanup-inbox");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let duplicate_left = scope_path.join("private-duplicate-left.bin");
+        let duplicate_right = scope_path.join("private-duplicate-right.bin");
+        let version_old = scope_path.join("private-plan-v1.md");
+        let version_new = scope_path.join("private-plan-v2.md");
+        std::fs::write(&duplicate_left, b"private duplicate bytes")
+            .expect("left duplicate should write");
+        std::fs::write(&duplicate_right, b"private duplicate bytes")
+            .expect("right duplicate should write");
+        std::fs::write(&version_old, b"old private version").expect("old version should write");
+        std::fs::write(&version_new, b"new private version").expect("new version should write");
+
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
+        let canonical_duplicate_left =
+            std::fs::canonicalize(&duplicate_left).expect("left should canonicalize");
+        let canonical_duplicate_right =
+            std::fs::canonicalize(&duplicate_right).expect("right should canonicalize");
+        let canonical_version_old =
+            std::fs::canonicalize(&version_old).expect("old version should canonicalize");
+        let canonical_version_new =
+            std::fs::canonicalize(&version_new).expect("new version should canonicalize");
+        let duplicate = check_exact_duplicate(
+            &mut database,
+            scope.id,
+            &canonical_duplicate_left,
+            &canonical_duplicate_right,
+        )
+        .expect("duplicate source should exist");
+        let version = suggest_file_version(
+            &mut database,
+            scope.id,
+            &canonical_version_old,
+            &canonical_version_new,
+        )
+        .expect("version source should exist");
+
+        let inbox = refresh_smart_cleanup_inbox(&mut database, scope.id)
+            .expect("current sources should refresh");
+        assert_eq!(inbox.items.len(), 2);
+        assert_eq!(
+            inbox.items[0].source_kind,
+            SmartCleanupSourceKind::ExactDuplicate
+        );
+        assert_eq!(inbox.items[1].source_kind, SmartCleanupSourceKind::Version);
+        assert!(inbox.items.iter().all(|item| item.current_evidence));
+        assert!(inbox.items.iter().all(|item| item.verification_required));
+        assert!(inbox.items.iter().all(|item| item.review_assistance_only));
+        assert!(inbox.items.iter().all(|item| !item.cleanup_authorized));
+        assert!(inbox.evaluation_complete);
+        assert!(!inbox.action_authorized);
+        let json = serde_json::to_string(&inbox).expect("Inbox should serialize");
+        for private in [
+            "private-duplicate-left",
+            "private-duplicate-right",
+            "private-plan-v1",
+            "private-plan-v2",
+            "display_path",
+            "base_key",
+            "extension_key",
+            "reclaimable",
+        ] {
+            assert!(!json.contains(private));
+        }
+        assert_eq!(
+            std::fs::read(&duplicate_left).expect("duplicate should remain"),
+            b"private duplicate bytes"
+        );
+
+        decide_exact_duplicate(
+            &mut database,
+            duplicate.relation_id,
+            FileRelationDecisionKind::Accepted,
+        )
+        .expect("duplicate graph feedback should persist");
+        decide_file_version(
+            &mut database,
+            version.relation_id,
+            FileRelationDecisionKind::Rejected,
+        )
+        .expect("version graph feedback should persist");
+        let filtered = refresh_smart_cleanup_inbox(&mut database, scope.id)
+            .expect("decided relations should be safely filtered");
+        assert!(filtered.items.is_empty());
+        assert_eq!(filtered.evaluated_source_count, 2);
+        assert!(!filtered.action_authorized);
+    }
+
+    #[test]
+    fn smart_cleanup_inbox_omits_stale_sources_and_denies_inactive_grants() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("cleanup-stale");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let left = scope_path.join("private-left.bin");
+        let right = scope_path.join("private-right.bin");
+        std::fs::write(&left, b"same private bytes").expect("left should write");
+        std::fs::write(&right, b"same private bytes").expect("right should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
+        check_exact_duplicate(
+            &mut database,
+            scope.id,
+            &std::fs::canonicalize(&left).expect("left should canonicalize"),
+            &std::fs::canonicalize(&right).expect("right should canonicalize"),
+        )
+        .expect("duplicate source should exist");
+
+        std::fs::write(&right, b"changed private bytes").expect("right should change");
+        let stale = refresh_smart_cleanup_inbox(&mut database, scope.id)
+            .expect("stale evidence should be omitted without a path leak");
+        assert!(stale.items.is_empty());
+        assert_eq!(stale.not_current_source_count, 1);
+        assert!(stale.evaluation_complete);
+
+        database
+            .mark_scope_access_grant_revoked(scope.id)
+            .expect("grant should revoke");
+        let denied = refresh_smart_cleanup_inbox(&mut database, scope.id)
+            .expect_err("revoked grant must fail before another file open");
+        assert_eq!(denied.code(), "scope_access_grant_not_active");
+    }
+
+    #[test]
+    fn smart_cleanup_stale_classifier_covers_safe_source_shape_changes() {
+        for error in [
+            ProjectError::RelationSourceUnavailable,
+            ProjectError::RelationSourceSymlinkOrReparseDenied,
+            ProjectError::RelationSourceOutsideScope,
+            ProjectError::RelationSourceMustBeFile,
+            ProjectError::RelationSourceIdentityUnavailable,
+            ProjectError::RelationSourceIdentityChanged,
+            ProjectError::RelationSourceMetadataChanged,
+            ProjectError::RelationSourceEmpty,
+            ProjectError::RelationSourceTooLarge,
+            ProjectError::RelationSameFileIdentity,
+            ProjectError::RelationContentDiffers,
+            ProjectError::VersionNameUnsupported,
+            ProjectError::VersionBaseMismatch,
+            ProjectError::VersionExtensionMismatch,
+            ProjectError::VersionNumberEqual,
+            ProjectError::Database(DatabaseError::FileRelationCandidateNotCurrent),
+            ProjectError::Database(DatabaseError::ScreenshotGroupCandidateNotCurrent),
+        ] {
+            assert!(cleanup_source_is_not_current(&error), "{}", error.code());
+        }
+        for error in [
+            ProjectError::RelationSourceOpenFailed,
+            ProjectError::RelationSourceReadFailed,
+            ProjectError::RelationComparisonTimedOut,
+        ] {
+            assert!(cleanup_source_evaluation_is_incomplete(&error));
+            assert!(!cleanup_source_is_not_current(&error));
+        }
+        for error in [
+            ProjectError::RelationPathMustBeAbsolute,
+            ProjectError::RelationPathDecodeFailed,
+            ProjectError::Database(DatabaseError::InvalidStoredValue),
+        ] {
+            assert!(!cleanup_source_is_not_current(&error));
+            assert!(!cleanup_source_evaluation_is_incomplete(&error));
+        }
     }
 }

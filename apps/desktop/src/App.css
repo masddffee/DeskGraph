@@ -197,6 +197,7 @@ h2 {
 .panel--content,
 .panel--actions,
 .panel--search,
+.panel--cleanup,
 .panel--scopes {
   grid-column: 1 / -1;
 }
@@ -346,6 +347,55 @@ footer {
   margin: 1.25rem 0 0;
   padding-top: 1rem;
   color: #657269;
+}
+
+.cleanup-controls {
+  margin-top: 1.5rem;
+}
+
+.cleanup-controls > label {
+  display: block;
+  margin-bottom: 0.55rem;
+  color: #46544c;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.cleanup-controls select {
+  flex: 1;
+  min-width: 0;
+}
+
+.cleanup-inbox-list {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0;
+  margin: 1.25rem 0 0;
+  list-style: none;
+}
+
+.cleanup-inbox-list li {
+  display: grid;
+  gap: 0.2rem;
+  border: 1px solid rgba(27, 59, 40, 0.12);
+  border-radius: 0.85rem;
+  padding: 0.85rem;
+  background: #f4f7f1;
+}
+
+.cleanup-inbox-list strong {
+  color: #235c3a;
+}
+
+.cleanup-inbox-list span,
+.cleanup-verification {
+  color: #657269;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.cleanup-message--error {
+  color: #783d29;
 }
 
 .scope-count {

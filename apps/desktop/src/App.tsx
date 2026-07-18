@@ -53,6 +53,11 @@ import {
   type WatchRuntimeStatus,
 } from './watch';
 import {
+  refreshSmartCleanupInbox,
+  type CleanupSourceKind,
+  type SmartCleanupInbox,
+} from './cleanup';
+import {
   collectLanguagePreferences,
   formatInteger,
   formatUtcDate,
@@ -132,6 +137,12 @@ type OcrActionState =
   | { kind: 'working'; scopeId: number; nodeId: number }
   | { kind: 'success'; scopeId: number; nodeId: number; message: OcrMessage }
   | { kind: 'error'; scopeId: number; nodeId: number; message: OcrMessage };
+type CleanupInboxState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'ready'; inbox: SmartCleanupInbox }
+  | { kind: 'partial'; inbox: SmartCleanupInbox }
+  | { kind: 'error' };
 
 interface StatusRowProps {
   label: string;
@@ -356,6 +367,18 @@ function browserLocaleStorage(): Storage | null {
   }
 }
 
+function cleanupSourceKindLabel(sourceKind: CleanupSourceKind, catalog: Catalog): string {
+  if (sourceKind === 'exact_duplicate') return catalog.cleanup.exactDuplicate;
+  if (sourceKind === 'version') return catalog.cleanup.version;
+  return catalog.cleanup.screenshotReviewGroup;
+}
+
+function cleanupSourceExplanation(sourceKind: CleanupSourceKind, catalog: Catalog): string {
+  if (sourceKind === 'exact_duplicate') return catalog.cleanup.exactDuplicateExplanation;
+  if (sourceKind === 'version') return catalog.cleanup.versionExplanation;
+  return catalog.cleanup.screenshotReviewGroupExplanation;
+}
+
 function browserLanguagePreferences(): readonly string[] {
   try {
     if (typeof navigator === 'undefined') return [];
@@ -387,6 +410,8 @@ export default function App() {
   const [renameNewName, setRenameNewName] = useState('');
   const [renameState, setRenameState] = useState<RenamePreviewState>({ kind: 'idle' });
   const [ocrAction, setOcrAction] = useState<OcrActionState>({ kind: 'idle' });
+  const [cleanupScopeId, setCleanupScopeId] = useState<number | null>(null);
+  const [cleanupInboxState, setCleanupInboxState] = useState<CleanupInboxState>({ kind: 'idle' });
   const ocrRequestInFlight = useRef(new Set<string>());
   const runningJobIds =
     state.kind === 'ready'
@@ -932,6 +957,20 @@ export default function App() {
         kind: 'error',
         message: 'denied',
       });
+    }
+  }
+
+  async function refreshCleanupInbox() {
+    if (cleanupScopeId === null) return;
+    setCleanupInboxState({ kind: 'loading' });
+    try {
+      const inbox = await refreshSmartCleanupInbox(cleanupScopeId);
+      setCleanupInboxState({
+        kind: inbox.evaluation_complete ? 'ready' : 'partial',
+        inbox,
+      });
+    } catch {
+      setCleanupInboxState({ kind: 'error' });
     }
   }
 
@@ -1543,6 +1582,98 @@ export default function App() {
             ) : (
               <p className="content-empty">{catalog.extraction.optInEmpty}</p>
             )}
+          </section>
+
+          <section className="panel panel--cleanup" aria-labelledby="cleanup-title">
+            <div className="panel-heading panel-heading--wrap">
+              <div>
+                <p className="panel-kicker">{catalog.cleanup.kicker}</p>
+                <h2 id="cleanup-title">{catalog.cleanup.heading}</h2>
+                <p>{catalog.cleanup.description}</p>
+              </div>
+              <span className="connected-indicator">{catalog.cleanup.suggestionOnly}</span>
+            </div>
+            <div className="cleanup-controls" aria-label={catalog.cleanup.controlsAria}>
+              <label htmlFor="cleanup-scope">{catalog.cleanup.scopeLabel}</label>
+              <div className="scope-form-row">
+                <select
+                  id="cleanup-scope"
+                  value={cleanupScopeId ?? ''}
+                  disabled={state.scopes.length === 0 || cleanupInboxState.kind === 'loading'}
+                  onChange={(event) => {
+                    setCleanupScopeId(event.target.value ? Number(event.target.value) : null);
+                    setCleanupInboxState({ kind: 'idle' });
+                  }}
+                >
+                  <option value="">{catalog.cleanup.chooseScope}</option>
+                  {state.scopes.map((scope) => (
+                    <option key={scope.id} value={scope.id}>
+                      {catalog.search.authorizedScope(scope.id)}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  disabled={cleanupScopeId === null || cleanupInboxState.kind === 'loading'}
+                  onClick={() => void refreshCleanupInbox()}
+                >
+                  {cleanupInboxState.kind === 'loading'
+                    ? catalog.cleanup.refreshing
+                    : catalog.cleanup.refresh}
+                </button>
+              </div>
+            </div>
+            {state.scopes.length === 0 ? (
+              <p className="content-empty" role="status">
+                {catalog.cleanup.authorizationRequired}
+              </p>
+            ) : null}
+            {state.scopes.length > 0 && cleanupScopeId === null ? (
+              <p className="content-empty" role="status">
+                {catalog.cleanup.chooseScope}
+              </p>
+            ) : null}
+            {cleanupInboxState.kind === 'loading' ? (
+              <p className="content-empty" role="status" aria-live="polite">
+                {catalog.cleanup.refreshing}
+              </p>
+            ) : null}
+            {cleanupInboxState.kind === 'error' ? (
+              <p className="content-empty cleanup-message--error" role="alert">
+                {catalog.cleanup.error}
+              </p>
+            ) : null}
+            {cleanupInboxState.kind === 'partial' ? (
+              <p className="content-empty" role="status">
+                {catalog.cleanup.partial(cleanupInboxState.inbox.not_current_source_count)}
+              </p>
+            ) : null}
+            {cleanupInboxState.kind === 'ready' || cleanupInboxState.kind === 'partial' ? (
+              cleanupInboxState.inbox.items.length === 0 ? (
+                <p className="content-empty" role="status">
+                  {catalog.cleanup.empty}
+                </p>
+              ) : (
+                <ol className="cleanup-inbox-list" aria-label={catalog.cleanup.heading}>
+                  {cleanupInboxState.inbox.items.map((item) => (
+                    <li key={`${item.source_kind}:${item.source_id}:${item.source_observation_id}`}>
+                      <strong>{cleanupSourceKindLabel(item.source_kind, catalog)}</strong>
+                      <span>
+                        {catalog.cleanup.itemMeta(
+                          item.member_count,
+                          item.confidence_basis_points,
+                          formatUtcDate(item.observed_at_unix_ms, locale),
+                        )}
+                      </span>
+                      <span>{cleanupSourceExplanation(item.source_kind, catalog)}</span>
+                    </li>
+                  ))}
+                </ol>
+              )
+            ) : null}
+            {cleanupInboxState.kind === 'ready' || cleanupInboxState.kind === 'partial' ? (
+              <p className="content-empty cleanup-verification">{catalog.cleanup.verification}</p>
+            ) : null}
           </section>
 
           <section className="panel panel--scopes" aria-labelledby="scopes-title">

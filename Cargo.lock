@@ -771,6 +771,7 @@ dependencies = [
  "deskgraph-database",
  "deskgraph-domain",
  "deskgraph-extractors",
+ "deskgraph-projects",
  "deskgraph-retrieval",
  "deskgraph-scanner",
  "deskgraph-telemetry",

@@ -228,6 +228,39 @@ export const ja = {
     scan: (jobId) => `スキャン ${jobId}`,
     noScan: 'まだスキャンしていません',
   },
+  cleanup: {
+    kicker: 'スマートクリーンアップ受信箱',
+    heading: 'ローカルのクリーンアップ候補を確認',
+    description:
+      '許可済みフォルダーを明示的に選ぶと、重複、旧バージョン、スクリーンショットグループの現在の証拠を更新します。読み取るのはローカル証拠のみです。',
+    suggestionOnly: '候補のみ · ファイルは変更しません',
+    scopeLabel: '許可済みフォルダー',
+    chooseScope: '許可済みフォルダーを選択',
+    refresh: '候補を更新',
+    refreshing: 'ローカル証拠を更新中…',
+    controlsAria: 'スマートクリーンアップ受信箱のコントロール',
+    authorizationRequired:
+      'ローカルのクリーンアップ候補を要求する前に、フォルダーを許可してください。',
+    empty: 'この許可済みフォルダーには、現在確認できるクリーンアップ候補はありません。',
+    partial: (notCurrent) =>
+      notCurrent === 0
+        ? '今回の制限付き更新は未完了です。一部のソースを安全に評価できませんでした。'
+        : `今回の制限付き更新は未完了です。${formatIntegerForLocale(notCurrent, 'ja')} 件の古い候補は、証拠が現在のものではないため除外されました。`,
+    error: '候補を安全に更新できませんでした。ファイルは変更されていません。',
+    exactDuplicate: '完全一致の重複',
+    version: '旧バージョン候補',
+    screenshotReviewGroup: 'スクリーンショット確認グループ',
+    exactDuplicateExplanation:
+      'このペアは制限付きの全バイト比較で一致しました。保持するファイルの選択やクリーンアップの許可ではありません。',
+    versionExplanation:
+      '明示的な数値 vN ファイル名規則が小さい番号から大きい番号への方向だけを示します。古いファイルを安全に破棄できる証明ではありません。',
+    screenshotReviewGroupExplanation:
+      '同じ寸法、10 分の時間枠、現在の OCR 来歴は確認用のグループ化にのみ使われます。スクリーンショット由来、内容の類似、重複、破棄可能性を証明しません。',
+    itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
+      `${formatIntegerForLocale(members, 'ja')} 件 · 証拠スコア ${formatIntegerForLocale(evidenceScoreBasisPoints, 'ja')} / 10,000 · 観測 ${observedAt}`,
+    verification:
+      '将来ユーザーが確認したクリーンアップの前には、現在の証拠を再検証する必要があります。この画面からファイルを選択、移動、ゴミ箱へ移動、削除、元に戻すことはできません。',
+  },
   extraction: {
     kicker: '制限付きローカルコンテンツ',
     emptyHeading: 'まだファイル内容を抽出していません',

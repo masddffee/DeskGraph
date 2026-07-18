@@ -468,6 +468,52 @@ impl ScreenshotGroupDiscovery {
     pub const API_VERSION: &str = "deskgraph.screenshot-group-discovery.v1";
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartCleanupSourceKind {
+    ExactDuplicate,
+    Version,
+    ScreenshotReviewGroup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SmartCleanupCandidateState {
+    Suggested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SmartCleanupInboxItem {
+    pub source_kind: SmartCleanupSourceKind,
+    pub source_id: i64,
+    pub source_observation_id: i64,
+    pub scope_id: i64,
+    pub state: SmartCleanupCandidateState,
+    pub member_count: u32,
+    pub confidence_basis_points: u16,
+    pub observed_at_unix_ms: i64,
+    pub current_evidence: bool,
+    pub verification_required: bool,
+    pub review_assistance_only: bool,
+    pub cleanup_authorized: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SmartCleanupInbox {
+    pub api_version: &'static str,
+    pub scope_id: i64,
+    pub items: Vec<SmartCleanupInboxItem>,
+    pub evaluated_source_count: u32,
+    pub not_current_source_count: u32,
+    pub bounded_source_limit: u32,
+    pub evaluation_complete: bool,
+    pub action_authorized: bool,
+}
+
+impl SmartCleanupInbox {
+    pub const API_VERSION: &str = "deskgraph.smart-cleanup-inbox.v1";
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FolderProfile {
     pub api_version: &'static str,
@@ -717,5 +763,52 @@ mod tests {
         assert!(value.get("members").is_none());
         assert_eq!(value["verification_required"], true);
         assert_eq!(value["cleanup_authorized"], false);
+    }
+
+    #[test]
+    fn smart_cleanup_inbox_contract_is_path_free_and_cannot_authorize_actions() {
+        let inbox = SmartCleanupInbox {
+            api_version: SmartCleanupInbox::API_VERSION,
+            scope_id: 2,
+            items: vec![SmartCleanupInboxItem {
+                source_kind: SmartCleanupSourceKind::ExactDuplicate,
+                source_id: 3,
+                source_observation_id: 4,
+                scope_id: 2,
+                state: SmartCleanupCandidateState::Suggested,
+                member_count: 2,
+                confidence_basis_points: 10_000,
+                observed_at_unix_ms: 5,
+                current_evidence: true,
+                verification_required: true,
+                review_assistance_only: true,
+                cleanup_authorized: false,
+            }],
+            evaluated_source_count: 1,
+            not_current_source_count: 0,
+            bounded_source_limit: 20,
+            evaluation_complete: true,
+            action_authorized: false,
+        };
+        let value = serde_json::to_value(inbox).expect("Inbox should serialize");
+        assert_eq!(value["api_version"], SmartCleanupInbox::API_VERSION);
+        assert_eq!(value["items"][0]["source_kind"], "exact_duplicate");
+        assert_eq!(value["items"][0]["cleanup_authorized"], false);
+        assert_eq!(value["action_authorized"], false);
+        for forbidden in [
+            "display_path",
+            "path_raw",
+            "path_key",
+            "file_name",
+            "ocr_text",
+            "base_key",
+            "extension_key",
+            "evidence_key",
+            "reclaimable_bytes",
+            "keeper",
+            "selection",
+        ] {
+            assert!(!value.to_string().contains(forbidden));
+        }
     }
 }

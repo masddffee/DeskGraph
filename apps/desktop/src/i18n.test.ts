@@ -119,6 +119,53 @@ describe('i18n catalog and registry contract', () => {
     }
   });
 
+  it('keeps Smart Cleanup Inbox suggestion-only and localized in every catalog', () => {
+    const phrases: Record<
+      Locale,
+      { suggestion: string; noChange: string; evidenceScore: string; screenshotDisclaimer: string }
+    > = {
+      en: {
+        suggestion: 'Suggestions only',
+        noChange: 'no file changes',
+        evidenceScore: 'evidence score',
+        screenshotDisclaimer: 'do not prove',
+      },
+      'zh-TW': {
+        suggestion: '僅建議',
+        noChange: '不變更檔案',
+        evidenceScore: '證據分數',
+        screenshotDisclaimer: '不證明',
+      },
+      'zh-CN': {
+        suggestion: '仅建议',
+        noChange: '不更改文件',
+        evidenceScore: '证据分数',
+        screenshotDisclaimer: '不证明',
+      },
+      ja: {
+        suggestion: '候補のみ',
+        noChange: 'ファイルは変更しません',
+        evidenceScore: '証拠スコア',
+        screenshotDisclaimer: '証明しません',
+      },
+    };
+
+    for (const locale of LOCALES) {
+      expect(catalogs[locale].cleanup.suggestionOnly).toContain(phrases[locale].suggestion);
+      expect(catalogs[locale].cleanup.suggestionOnly).toContain(phrases[locale].noChange);
+      expect(catalogs[locale].cleanup.itemMeta(2, 6_000, 'date')).toContain(
+        phrases[locale].evidenceScore,
+      );
+      expect(catalogs[locale].cleanup.itemMeta(2, 6_000, 'date')).not.toContain('%');
+      expect(catalogs[locale].cleanup.screenshotReviewGroupExplanation).toContain(
+        phrases[locale].screenshotDisclaimer,
+      );
+      expect(catalogs[locale].cleanup.verification.length).toBeGreaterThan(30);
+    }
+    expect(appSource).toContain('refreshSmartCleanupInbox(cleanupScopeId)');
+    expect(appSource).toContain("kind: inbox.evaluation_complete ? 'ready' : 'partial'");
+  });
+
   it('keeps catalogs text-only and user-owned values outside static message data', () => {
     const htmlElement = /<\/?[a-z][^>]*>/i;
     for (const locale of LOCALES) {

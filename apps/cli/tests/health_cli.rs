@@ -414,6 +414,7 @@ fn cleanup_help_exposes_review_only_screenshot_commands() {
         .expect("cleanup help should start");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    assert!(stdout.contains("inbox"));
     assert!(stdout.contains("screenshot-groups"));
     assert!(stdout.contains("screenshot-group-status"));
     assert!(stdout.contains("screenshot-group-list"));
@@ -425,6 +426,127 @@ fn cleanup_help_exposes_review_only_screenshot_commands() {
             "cleanup help exposed forbidden action command {forbidden}"
         );
     }
+}
+
+#[test]
+fn cleanup_inbox_revalidates_sources_without_paths_or_file_actions() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("private-manifest.sqlite3");
+    let scope_path = directory.path().join("private-cleanup-inbox");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let left_path = scope_path.join("secret-duplicate-left.bin");
+    let right_path = scope_path.join("secret-duplicate-right.bin");
+    let older_path = scope_path.join("secret-plan-v1.md");
+    let newer_path = scope_path.join("secret-plan-v2.md");
+    std::fs::write(&left_path, b"secret duplicate bytes").expect("left should write");
+    std::fs::write(&right_path, b"secret duplicate bytes").expect("right should write");
+    std::fs::write(&older_path, b"secret old plan").expect("older should write");
+    std::fs::write(&newer_path, b"secret new plan").expect("newer should write");
+    let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
+    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
+    database
+        .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+        .expect("active grant should persist");
+    drop(database);
+
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let scope_arg = scope.id.to_string();
+    let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
+    let canonical_right = std::fs::canonicalize(&right_path).expect("right should canonicalize");
+    let canonical_older = std::fs::canonicalize(&older_path).expect("older should canonicalize");
+    let canonical_newer = std::fs::canonicalize(&newer_path).expect("newer should canonicalize");
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "duplicate",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_arg,
+            "--left",
+            canonical_left.to_str().expect("left path should be UTF-8"),
+            "--right",
+            canonical_right
+                .to_str()
+                .expect("right path should be UTF-8"),
+        ])
+        .output()
+        .expect("duplicate command should start");
+    assert!(duplicate.status.success());
+    let version = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "relation",
+            "version",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_arg,
+            "--first",
+            canonical_older
+                .to_str()
+                .expect("older path should be UTF-8"),
+            "--second",
+            canonical_newer
+                .to_str()
+                .expect("newer path should be UTF-8"),
+        ])
+        .output()
+        .expect("version command should start");
+    assert!(version.status.success());
+
+    let inbox = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args([
+            "cleanup",
+            "inbox",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_arg,
+        ])
+        .output()
+        .expect("cleanup Inbox should start");
+    assert!(inbox.status.success());
+    let response: serde_json::Value =
+        serde_json::from_slice(&inbox.stdout).expect("Inbox should be JSON");
+    assert_eq!(response["api_version"], "deskgraph.smart-cleanup-inbox.v1");
+    assert_eq!(response["items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(response["items"][0]["source_kind"], "exact_duplicate");
+    assert_eq!(response["items"][1]["source_kind"], "version");
+    assert_eq!(response["action_authorized"], false);
+    let stdout = String::from_utf8_lossy(&inbox.stdout);
+    let stderr = String::from_utf8_lossy(&inbox.stderr);
+    for private in [
+        "secret-duplicate-left",
+        "secret-duplicate-right",
+        "secret-plan-v1",
+        "secret-plan-v2",
+        "secret duplicate bytes",
+        scope_path.to_str().expect("scope path should be UTF-8"),
+        database_arg,
+        "display_path",
+        "base_key",
+        "extension_key",
+        "reclaimable",
+    ] {
+        assert!(!stdout.contains(private));
+        assert!(!stderr.contains(private));
+    }
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+    assert_eq!(
+        std::fs::read(&left_path).expect("left should remain"),
+        b"secret duplicate bytes"
+    );
+    assert_eq!(
+        std::fs::read(&older_path).expect("older should remain"),
+        b"secret old plan"
+    );
 }
 
 #[test]

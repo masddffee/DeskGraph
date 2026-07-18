@@ -220,6 +220,38 @@ export const en = {
     scan: (jobId) => `Scan ${jobId}`,
     noScan: 'No scan yet',
   },
+  cleanup: {
+    kicker: 'Smart Cleanup Inbox',
+    heading: 'Review local cleanup suggestions',
+    description:
+      'Refresh one authorized folder explicitly to review current duplicate, older-version, and screenshot-group evidence. This only reads local evidence.',
+    suggestionOnly: 'Suggestions only · no file changes',
+    scopeLabel: 'Authorized folder',
+    chooseScope: 'Choose an authorized folder',
+    refresh: 'Refresh suggestions',
+    refreshing: 'Refreshing local evidence…',
+    controlsAria: 'Smart Cleanup Inbox controls',
+    authorizationRequired: 'Authorize a folder before requesting local cleanup suggestions.',
+    empty: 'No current cleanup suggestions were found for this authorized folder.',
+    partial: (notCurrent) =>
+      notCurrent === 0
+        ? 'This bounded refresh is partial. Some sources could not be evaluated safely.'
+        : `This bounded refresh is partial. ${formatIntegerForLocale(notCurrent, 'en')} older suggestion${notCurrent === 1 ? '' : 's'} were excluded because their evidence is no longer current.`,
+    error: 'Suggestions could not be refreshed safely. No file was changed.',
+    exactDuplicate: 'Exact duplicate',
+    version: 'Older version candidate',
+    screenshotReviewGroup: 'Screenshot review group',
+    exactDuplicateExplanation:
+      'A fresh bounded full-byte comparison matched this pair. It does not choose a keeper or authorize cleanup.',
+    versionExplanation:
+      'An explicit numeric vN filename rule points from the lower to the higher number. It does not prove that the older file is disposable.',
+    screenshotReviewGroupExplanation:
+      'Matching dimensions and a ten-minute window with current OCR provenance only group these items for review. They do not prove screenshot origin, similar content, duplication, or disposability.',
+    itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
+      `${formatIntegerForLocale(members, 'en')} members · evidence score ${formatIntegerForLocale(evidenceScoreBasisPoints, 'en')} / 10,000 · observed ${observedAt}`,
+    verification:
+      'Current evidence is required again before any future user-confirmed cleanup. This view cannot select, move, trash, delete, or undo files.',
+  },
   extraction: {
     kicker: 'Bounded local content',
     emptyHeading: 'No file content extracted yet',

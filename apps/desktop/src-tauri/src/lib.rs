@@ -14,7 +14,8 @@ use deskgraph_database::ManifestDatabase;
 use deskgraph_domain::{
     ActionPlanPreview, ActionPlanSummary, AuthorizedScope, ExtractionJobProgress,
     ExtractionOperation, ExtractionStats, HealthReport, ManifestStats, ScanJobProgress, ScanStatus,
-    SearchFilters, SearchResponse, WatchEventProgress, collect_health_with_manifest,
+    SearchFilters, SearchResponse, SmartCleanupInbox, WatchEventProgress,
+    collect_health_with_manifest,
 };
 #[cfg(test)]
 use deskgraph_domain::{WatchEventReason, WatchEventStatus};
@@ -25,6 +26,7 @@ use deskgraph_extractors::{
     recent_extraction_jobs_at as read_recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
+use deskgraph_projects::refresh_smart_cleanup_inbox_at;
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 #[cfg(test)]
 use deskgraph_scanner::{authorize_scope, run_scan_job_to_terminal};
@@ -787,6 +789,37 @@ fn recent_action_plans(state: State<'_, ManifestState>) -> Result<Vec<ActionPlan
         .map_err(str::to_string)
 }
 
+/// Revalidates existing immutable evidence for one explicitly selected scope.
+/// The response is path-free and cannot authorize or execute a file action.
+#[tauri::command]
+async fn refresh_cleanup_inbox(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+) -> Result<SmartCleanupInbox, String> {
+    require_active_scope(&state, scope_id)?;
+    let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let inbox = tauri::async_runtime::spawn_blocking(move || {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned".to_string())?;
+        refresh_smart_cleanup_inbox_at(&database_path, scope_id)
+            .map_err(|error| error.code().to_string())
+    })
+    .await
+    .map_err(|_| "smart_cleanup_inbox_worker_failed".to_string())??;
+    info!(
+        event = "smart_cleanup_inbox_refreshed",
+        scope_id = inbox.scope_id,
+        item_count = inbox.items.len(),
+        evaluated_source_count = inbox.evaluated_source_count,
+        not_current_source_count = inbox.not_current_source_count,
+        evaluation_complete = inbox.evaluation_complete,
+        action_authorized = false
+    );
+    Ok(inbox)
+}
+
 #[tauri::command]
 fn search_local(
     state: State<'_, ManifestState>,
@@ -1232,6 +1265,7 @@ pub fn run() {
             watch_runtime_status,
             create_rename_preview,
             recent_action_plans,
+            refresh_cleanup_inbox,
             search_local,
             pause_manifest_scan,
             resume_manifest_scan

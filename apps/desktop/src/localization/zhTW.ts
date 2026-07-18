@@ -207,6 +207,38 @@ export const zhTW = {
     scan: (jobId) => `掃描 ${jobId}`,
     noScan: '尚未掃描',
   },
+  cleanup: {
+    kicker: '智慧清理收件匣',
+    heading: '檢視本機清理建議',
+    description:
+      '明確選擇一個已授權資料夾後，才會重新整理目前的重複檔、舊版本與截圖群組證據；只讀取本機證據。',
+    suggestionOnly: '僅建議 · 不變更檔案',
+    scopeLabel: '已授權資料夾',
+    chooseScope: '選擇已授權資料夾',
+    refresh: '重新整理建議',
+    refreshing: '正在重新整理本機證據…',
+    controlsAria: '智慧清理收件匣控制項',
+    authorizationRequired: '請先授權一個資料夾，才能要求本機清理建議。',
+    empty: '此已授權資料夾沒有目前可檢視的清理建議。',
+    partial: (notCurrent) =>
+      notCurrent === 0
+        ? '此次受限重新整理尚未完整；部分來源無法安全完成評估。'
+        : `此次受限重新整理尚未完整。已有 ${formatIntegerForLocale(notCurrent, 'zh-TW')} 個較舊建議因證據不再是目前狀態而排除。`,
+    error: '無法安全重新整理建議；未變更任何檔案。',
+    exactDuplicate: '完全重複檔',
+    version: '舊版本候選項目',
+    screenshotReviewGroup: '截圖檢視群組',
+    exactDuplicateExplanation:
+      '這一對檔案已完成受限的完整位元比對；這不會選擇保留檔，也不授權清理。',
+    versionExplanation:
+      '明確的數字 vN 檔名規則只指出較小到較大的版本方向；不代表較舊檔案可安全丟棄。',
+    screenshotReviewGroupExplanation:
+      '相同尺寸、十分鐘時間窗與目前 OCR 來源證據只用來協助群組檢視；不證明截圖來源、內容相似、重複或可丟棄。',
+    itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
+      `${formatIntegerForLocale(members, 'zh-TW')} 個成員 · 證據分數 ${formatIntegerForLocale(evidenceScoreBasisPoints, 'zh-TW')} / 10,000 · 觀察於 ${observedAt}`,
+    verification:
+      '任何未來經使用者確認的清理前，都必須再次驗證目前證據。此畫面無法選取、移動、移至垃圾桶、刪除或復原檔案。',
+  },
   extraction: {
     kicker: '受限的本機內容',
     emptyHeading: '尚未抽取任何檔案內容',

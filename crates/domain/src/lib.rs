@@ -34,7 +34,8 @@ pub use project::{
     ProjectSignal, ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator,
     ScreenshotGroupCandidate, ScreenshotGroupCandidateState, ScreenshotGroupCandidateSummary,
     ScreenshotGroupCreator, ScreenshotGroupDiscovery, ScreenshotGroupEvidence,
-    ScreenshotGroupMember, ScreenshotGroupRuleKind, parse_explicit_file_version_name,
+    ScreenshotGroupMember, ScreenshotGroupRuleKind, SmartCleanupCandidateState, SmartCleanupInbox,
+    SmartCleanupInboxItem, SmartCleanupSourceKind, parse_explicit_file_version_name,
 };
 pub use search::{
     SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,

@@ -221,6 +221,38 @@ export const zhCN = {
     scan: (jobId) => `扫描 ${count(jobId)}`,
     noScan: '尚未扫描',
   },
+  cleanup: {
+    kicker: '智能清理收件箱',
+    heading: '查看本机清理建议',
+    description:
+      '明确选择一个已授权文件夹后，才会刷新当前的重复文件、旧版本和截图群组证据；只读取本机证据。',
+    suggestionOnly: '仅建议 · 不更改文件',
+    scopeLabel: '已授权文件夹',
+    chooseScope: '选择已授权文件夹',
+    refresh: '刷新建议',
+    refreshing: '正在刷新本机证据…',
+    controlsAria: '智能清理收件箱控件',
+    authorizationRequired: '请先授权一个文件夹，才能请求本机清理建议。',
+    empty: '此已授权文件夹没有当前可查看的清理建议。',
+    partial: (notCurrent) =>
+      notCurrent === 0
+        ? '此次受限刷新尚未完整；部分来源无法安全完成评估。'
+        : `此次受限刷新尚未完整。已有 ${count(notCurrent)} 条较旧建议因证据不再是当前状态而被排除。`,
+    error: '无法安全刷新建议；未更改任何文件。',
+    exactDuplicate: '完全重复文件',
+    version: '旧版本候选项',
+    screenshotReviewGroup: '截图审阅群组',
+    exactDuplicateExplanation:
+      '这一对文件已完成受限的完整字节比对；这不会选择保留文件，也不授权清理。',
+    versionExplanation:
+      '明确的数字 vN 文件名规则只指出较小到较大的版本方向；不代表较旧文件可安全丢弃。',
+    screenshotReviewGroupExplanation:
+      '相同尺寸、十分钟时间窗与当前 OCR 来源证据只用于辅助群组审阅；不证明截图来源、内容相似、重复或可丢弃。',
+    itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
+      `${count(members)} 个成员 · 证据分数 ${count(evidenceScoreBasisPoints)} / 10,000 · 观察于 ${observedAt}`,
+    verification:
+      '任何未来经用户确认的清理前，都必须再次验证当前证据。此视图无法选择、移动、移至废纸篓、删除或撤销文件。',
+  },
   extraction: {
     kicker: '受限的本机内容',
     emptyHeading: '尚未提取任何文件内容',

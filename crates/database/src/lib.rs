@@ -20,7 +20,8 @@ use deskgraph_domain::{
     ProjectDecisionKind, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
     ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, ScreenshotGroupCandidate,
     ScreenshotGroupCandidateState, ScreenshotGroupCandidateSummary, ScreenshotGroupCreator,
-    ScreenshotGroupEvidence, ScreenshotGroupMember, ScreenshotGroupRuleKind, WatchEventProgress,
+    ScreenshotGroupEvidence, ScreenshotGroupMember, ScreenshotGroupRuleKind,
+    SmartCleanupCandidateState, SmartCleanupInboxItem, SmartCleanupSourceKind, WatchEventProgress,
     WatchEventReason, WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
     parse_explicit_file_version_name, reduce_action_journal,
 };
@@ -571,6 +572,13 @@ pub struct FolderProfileFacts {
     pub project_markers: Vec<ProjectSignalKind>,
     pub observed_at_unix_ms: i64,
     pub bounded_entry_limit: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SmartCleanupSourceReference {
+    pub kind: SmartCleanupSourceKind,
+    pub source_id: i64,
+    pub state: FileRelationCandidateState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5161,6 +5169,216 @@ impl ManifestDatabase {
             .collect()
     }
 
+    /// Returns a bounded, path-free source inventory for one Smart Cleanup
+    /// refresh. This is only an inventory: relation entries still require the
+    /// Rust service's live byte/name verification before they can become Inbox
+    /// items.
+    pub fn smart_cleanup_source_references(
+        &self,
+        scope_id: i64,
+        limit: u32,
+    ) -> Result<(Vec<SmartCleanupSourceReference>, bool), DatabaseError> {
+        if !(1..=20).contains(&limit) {
+            return Err(DatabaseError::FileRelationCandidateInputInvalid);
+        }
+        ensure_scope_queryable(&self.connection, scope_id)?;
+        ensure_scope_access_permitted(&self.connection, scope_id)?;
+        let query_limit = i64::from(limit) + 1;
+        let sources = {
+            let mut statement = self.connection.prepare(
+                "SELECT source_kind, source_id FROM ( \
+                     SELECT relation.relation_kind AS source_kind, relation.id AS source_id, \
+                            CASE relation.relation_kind \
+                              WHEN 'exact_duplicate' THEN ( \
+                                SELECT observation.observed_at_unix_ms \
+                                FROM file_relation_observations observation \
+                                WHERE observation.relation_id = relation.id \
+                                ORDER BY observation.observed_at_unix_ms DESC, \
+                                         observation.id DESC LIMIT 1 \
+                              ) \
+                              WHEN 'version' THEN ( \
+                                SELECT observation.observed_at_unix_ms \
+                                FROM file_version_observations observation \
+                                WHERE observation.relation_id = relation.id \
+                                ORDER BY observation.observed_at_unix_ms DESC, \
+                                         observation.id DESC LIMIT 1 \
+                              ) \
+                            END AS observed_at_unix_ms \
+                     FROM file_relation_candidates relation \
+                     WHERE relation.scope_id = ?1 \
+                     UNION ALL \
+                     SELECT 'screenshot_review_group' AS source_kind, groups.id AS source_id, \
+                            (SELECT observation.observed_at_unix_ms \
+                             FROM screenshot_group_observations observation \
+                             WHERE observation.group_id = groups.id \
+                             ORDER BY observation.observed_at_unix_ms DESC, \
+                                      observation.id DESC LIMIT 1) AS observed_at_unix_ms \
+                     FROM screenshot_group_candidates groups WHERE groups.scope_id = ?1 \
+                 ) sources \
+                 WHERE observed_at_unix_ms IS NOT NULL \
+                 ORDER BY observed_at_unix_ms DESC, \
+                          CASE source_kind WHEN 'exact_duplicate' THEN 0 \
+                                           WHEN 'version' THEN 1 ELSE 2 END, \
+                          source_id ASC LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![scope_id, query_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let evaluation_complete =
+            sources.len() <= usize::try_from(limit).map_err(|_| DatabaseError::InvalidCount)?;
+        let mut references = Vec::with_capacity(sources.len().min(limit as usize));
+        for (source_kind, source_id) in sources.into_iter().take(limit as usize) {
+            let reference = match source_kind.as_str() {
+                "exact_duplicate" | "version" => {
+                    let (relation_kind, scope_id, left_node_id, right_node_id) =
+                        self.connection.query_row(
+                            "SELECT relation_kind, scope_id, left_node_id, right_node_id \
+                             FROM file_relation_candidates WHERE id = ?1",
+                            [source_id],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                ))
+                            },
+                        )?;
+                    let summary = self.file_relation_candidate_summary(
+                        source_id,
+                        &relation_kind,
+                        scope_id,
+                        left_node_id,
+                        right_node_id,
+                    )?;
+                    SmartCleanupSourceReference {
+                        kind: match summary.kind {
+                            FileRelationKind::ExactDuplicate => {
+                                SmartCleanupSourceKind::ExactDuplicate
+                            }
+                            FileRelationKind::Version => SmartCleanupSourceKind::Version,
+                        },
+                        source_id,
+                        state: summary.state,
+                    }
+                }
+                "screenshot_review_group" => SmartCleanupSourceReference {
+                    kind: SmartCleanupSourceKind::ScreenshotReviewGroup,
+                    source_id,
+                    state: FileRelationCandidateState::Suggested,
+                },
+                _ => return Err(DatabaseError::InvalidStoredValue),
+            };
+            references.push(reference);
+        }
+        Ok((references, evaluation_complete))
+    }
+
+    /// Converts only the latest observation produced by a caller-provided live
+    /// verification into a path-free Inbox item. The observation timestamp is
+    /// an explicit binding so a history row cannot be mistaken for the result
+    /// of the current refresh.
+    pub fn smart_cleanup_relation_item(
+        &self,
+        relation_id: i64,
+        expected_observed_at_unix_ms: i64,
+    ) -> Result<SmartCleanupInboxItem, DatabaseError> {
+        let (relation_kind, scope_id, left_node_id, right_node_id) = self
+            .connection
+            .query_row(
+                "SELECT relation_kind, scope_id, left_node_id, right_node_id \
+                 FROM file_relation_candidates WHERE id = ?1",
+                [relation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::FileRelationCandidateNotFound)?;
+        ensure_scope_queryable(&self.connection, scope_id)?;
+        ensure_scope_access_permitted(&self.connection, scope_id)?;
+        let summary = self.file_relation_candidate_summary(
+            relation_id,
+            &relation_kind,
+            scope_id,
+            left_node_id,
+            right_node_id,
+        )?;
+        if summary.state != FileRelationCandidateState::Suggested {
+            return Err(DatabaseError::FileRelationCandidateNotCurrent);
+        }
+        let (source_kind, observation_id, confidence_basis_points, observed_at_unix_ms) =
+            match summary.kind {
+                FileRelationKind::ExactDuplicate => {
+                    let observation = self.connection.query_row(
+                        "SELECT id, confidence_basis_points, observed_at_unix_ms \
+                         FROM file_relation_observations WHERE relation_id = ?1 \
+                         ORDER BY observed_at_unix_ms DESC, id DESC LIMIT 1",
+                        [relation_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )?;
+                    (
+                        SmartCleanupSourceKind::ExactDuplicate,
+                        observation.0,
+                        observation.1,
+                        observation.2,
+                    )
+                }
+                FileRelationKind::Version => {
+                    let observation = self.connection.query_row(
+                        "SELECT id, confidence_basis_points, observed_at_unix_ms \
+                         FROM file_version_observations WHERE relation_id = ?1 \
+                         ORDER BY observed_at_unix_ms DESC, id DESC LIMIT 1",
+                        [relation_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )?;
+                    (
+                        SmartCleanupSourceKind::Version,
+                        observation.0,
+                        observation.1,
+                        observation.2,
+                    )
+                }
+            };
+        if observation_id <= 0 || observed_at_unix_ms != expected_observed_at_unix_ms {
+            return Err(DatabaseError::FileRelationCandidateNotCurrent);
+        }
+        Ok(SmartCleanupInboxItem {
+            source_kind,
+            source_id: relation_id,
+            source_observation_id: observation_id,
+            scope_id,
+            state: SmartCleanupCandidateState::Suggested,
+            member_count: 2,
+            confidence_basis_points: u16::try_from(confidence_basis_points)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            observed_at_unix_ms,
+            current_evidence: true,
+            verification_required: true,
+            review_assistance_only: true,
+            cleanup_authorized: false,
+        })
+    }
+
     fn file_relation_candidate_summary(
         &self,
         relation_id: i64,
@@ -5568,6 +5786,51 @@ impl ManifestDatabase {
         };
         transaction.commit()?;
         Ok(summary)
+    }
+
+    /// Resolves the current screenshot membership directly to its immutable
+    /// evidence observation without materializing member paths or OCR
+    /// provenance in the response.
+    pub fn smart_cleanup_screenshot_item(
+        &self,
+        group_id: i64,
+    ) -> Result<SmartCleanupInboxItem, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let (scope_id, membership_key) =
+            screenshot_group_identity_from_connection(&transaction, group_id)?;
+        ensure_scope_queryable(&transaction, scope_id)?;
+        ensure_scope_access_permitted(&transaction, scope_id)?;
+        let sources =
+            current_screenshot_group_for_membership(&transaction, scope_id, &membership_key)?
+                .ok_or(DatabaseError::ScreenshotGroupCandidateNotCurrent)?;
+        let evidence_key = screenshot_group_evidence_key(&sources)?;
+        let observation =
+            screenshot_group_observation_for_evidence(&transaction, group_id, &evidence_key)?
+                .ok_or(DatabaseError::ScreenshotGroupCandidateNotCurrent)?;
+        validate_screenshot_group_observation(
+            &transaction,
+            scope_id,
+            &membership_key,
+            &observation,
+        )?;
+        let item = SmartCleanupInboxItem {
+            source_kind: SmartCleanupSourceKind::ScreenshotReviewGroup,
+            source_id: group_id,
+            source_observation_id: observation.id,
+            scope_id,
+            state: SmartCleanupCandidateState::Suggested,
+            member_count: u32::try_from(observation.member_count)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            confidence_basis_points: u16::try_from(observation.confidence_basis_points)
+                .map_err(|_| DatabaseError::InvalidStoredValue)?,
+            observed_at_unix_ms: observation.observed_at_unix_ms,
+            current_evidence: true,
+            verification_required: true,
+            review_assistance_only: true,
+            cleanup_authorized: false,
+        };
+        transaction.commit()?;
+        Ok(item)
     }
 
     pub fn exact_duplicate_sources(
@@ -12075,6 +12338,45 @@ mod tests {
             .remove(0);
         assert!(!summary.current_evidence);
         assert!(!summary.cleanup_authorized);
+    }
+
+    #[test]
+    fn smart_cleanup_screenshot_item_binds_current_path_free_observation() {
+        let (mut database, scope_id, _) = screenshot_group_setup();
+        let candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("group should persist")
+            .1
+            .remove(0);
+        let (references, complete) = database
+            .smart_cleanup_source_references(scope_id, 20)
+            .expect("current source inventory should load");
+        assert!(complete);
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            references[0].kind,
+            SmartCleanupSourceKind::ScreenshotReviewGroup
+        );
+        let item = database
+            .smart_cleanup_screenshot_item(candidate.group_id)
+            .expect("current observation should map without paths");
+        assert_eq!(item.source_id, candidate.group_id);
+        assert_eq!(
+            item.source_observation_id,
+            candidate.evidence.observation_id
+        );
+        assert_eq!(item.member_count, 2);
+        assert!(item.current_evidence);
+        assert!(item.verification_required);
+        assert!(item.review_assistance_only);
+        assert!(!item.cleanup_authorized);
+        database
+            .mark_scope_access_grant_revoked(scope_id)
+            .expect("grant should revoke");
+        assert!(matches!(
+            database.smart_cleanup_screenshot_item(candidate.group_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
     }
 
     #[test]
