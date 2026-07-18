@@ -2,15 +2,15 @@
 
 Last reviewed: 2026-07-19
 
-Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical, M4 project-graph, M5 fail-closed organization-protocol, M6 durable watch-core, M7 scoped read-only MCP search, and M8 localized Desktop-shell slices, while M0 remote CI and M1 cross-platform/memory/live scan-control evidence remain open.
+Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical, M4 project-graph, M5 fail-closed organization-protocol, M6 durable watch-core, M7 scoped read-only MCP search, M8 localized Desktop-shell, and a narrow M9a native-scope local foundation. M0 remote CI, M1 cross-platform/memory/live scan-control, signed packaging, and clean-machine platform evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |
 | ---------------------------------------------- | ------------------ | -------------------------------------------------------- |
-| macOS Apple Silicon package                    | Not started        | Signed/notarized App Sandbox install; native folder selection, security-scoped bookmark restore/revocation, selected-version SIP container contract, non-entitled same-user replacement probe, and clean-machine smoke |
-| macOS Intel or Universal package               | Not started        | Same App Sandbox/scope/protected-container contract and replacement probe on native Intel or the final Universal artifact |
-| Windows x64 installer                          | Not started        | Signed packaged identity shared by native OCR and the protected action-fence namespace; clean-VM install/update/repair/uninstall smoke |
-| Linux experimental package                     | Not started        | Clearly labeled build and smoke                          |
-| Explicit authorized scopes                     | Verified locally   | Desktop/CLI authorization, component-aware protected-tree policy, symlink/reparse and platform hidden/system exclusions; Windows runtime fixtures remain |
+| macOS Apple Silicon package                    | In progress        | Local code/config now has a Rust-owned native folder picker, versioned opaque security-scoped bookmark create/resolve/start/stop lifecycle, stale-refresh persistence, active-grant migration and App Sandbox entitlement configuration. This is not acceptance: require a Developer-ID-signed/notarized clean install, restart restore, user revocation, corrupt/legacy reauthorization, selected-version SIP container contract, non-entitled same-user replacement probe, and clean-machine smoke |
+| macOS Intel or Universal package               | Not started        | Build and prove the same signed App Sandbox/scope/protected-container contract, including native Intel or final Universal restart/stale/revoke/replacement evidence; arm64-local code is not Intel/Universal evidence |
+| Windows x64 installer                          | Not started        | Full signed MSIX plus stable package-family identity shared by native OCR and the protected action-fence namespace; clean-VM install/update/repair/uninstall/runtime smoke. MSI/NSIS alone is insufficient. The current non-macOS release path fails closed until a real platform grant/identity adapter exists |
+| Linux experimental package                     | Not started        | Clearly labeled build and smoke; it is experimental and must not delay the required macOS/Windows gates |
+| Explicit authorized scopes                     | In progress        | CLI scope policy and the local macOS Desktop native-picker/bookmark foundation pass their current local tests; packaged Desktop hides legacy/corrupt/unrestorable grants and requires a live access guard. Signed/notarized clean-machine macOS restore/revoke/stale behavior, Windows package capability, Intel/Universal, Linux experimental and complete platform fixtures remain |
 | Initial manifest scan                          | In progress        | Release 10k idempotency/timing, durable progress/pause/resume, crash-reopen replay, atomic publish, and Unix permission fixture pass; memory, live updated-UI smoke, and remote CI remain |
 | Native Watch plus periodic safety reconciliation | In progress        | Exact-audited `notify 8.2.0` feeds one bounded shared native source into the durable debounce/stability/atomic reconcile core. Watch-set changes, callback overflow, `need_rescan`, source failure and unmatched routing force path-free all-scope recovery; a second distinct path in one scope requests per-scope recovery, so ordered old-temp/final renames cannot silently lose the final path. Only completed-scan scopes are eligible. The original event age caps the next wake and a root-only immediate transaction rebinds the event to the exact stored authorization and completed scan before guaranteeing metadata reconciliation at the five-minute maximum. Recovery arriving during a multi-batch scan forces a fresh follow-up root scan. Direct ignored observations cannot cancel unrelated stabilizing work; explicit transitions merge into bounded operational aggregates without deleting user data or action history. macOS arm64 source plus Desktop create/modify/rename/delete/identity previously passed outside the restricted sandbox, with modify checking published metadata; deterministic temp→final fixtures pass, while the expanded live temp→final host run is pending after external execution quota denial. The current packaged macOS arm64 accessibility tree verifies the four localized Watch states and native-hints-plus-five-minute-safety wording. This is not efficient incremental Watch: create/delete/rename/subtree delta, incremental extraction/indexing, placeholder handling, pause/battery/thermal policy, real storms/root replacement, large-tree/8 GB and Windows/Linux/macOS Intel runtime remain |
 | Extraction and OCR formats                     | In progress        | Text/Markdown/code, bounded text-layer PDF, allowlisted DOCX/PPTX/XLSX, image header metadata, and macOS arm64 Vision OCR route through durable jobs. Eligible Desktop Search results now provide explicit create/run/status/cancel/resume and bounded busy-retry controls through scope/node/job-ID-only IPC; no automatic OCR or path/text job payload is exposed. A bounded private-asset macOS runner shares production OCR validation; one manual synthetic outside-sandbox smoke passes but is not committed representative/release evidence. Windows OCR provider code/cfg gates cover package identity, owned bytes, resolved languages, nullable confidence, angle/box policy, async lifecycle, and bounded single-worker cleanup. Live UI evidence, real Windows/MSIX/OCR/cancel/cleanup, fallback runners/runtime, scanned-PDF routing, representative corpora, native remote runtimes and 8 GB residency remain |
@@ -27,12 +27,41 @@ Overall status: **not release-ready**. Local implementation is in M2 with parall
 | GitHub Release                                 | Blocked externally | Remote, auth, verified assets, public download smoke     |
 | README/demo/launch assets                      | In progress        | Pre-release README exists; demo and launch assets remain |
 | Post-launch issue/hotfix process               | In progress        | Issue/PR templates exist; labels and incident/hotfix drill remain |
-| Critical/high security findings                | In progress        | npm: prior unchanged-lock scan reports zero known vulnerabilities; the current 518-package RustSec scan has zero vulnerabilities plus the same 17 existing Tauri/Linux warnings as prior locks. The exact MCP SDK delta adds no advisory; its protocol/security review found no remaining P0/P1 after Windows fail-closed and forged cross-scope-content fixes. The online pnpm audit rerun is externally blocked after sandbox DNS failure, while `pnpm-lock.yaml` remains unchanged. Broader concurrent stress, Windows ACL, clean-machine/platform review, upstream warnings, notices and SBOM remain |
+| Critical/high security findings                | In progress        | The current online `pnpm audit --audit-level high` reports no known vulnerabilities. The current 522-package RustSec scan has zero vulnerabilities plus the same 17 existing Tauri/Linux warnings as prior locks; its crates.io cache-lock warning did not prevent the lockfile scan. Independent M9a review found and closed the live-grant Watch intersection issue, with no remaining P0/P1 before the final command gates. Broader concurrent stress, Windows ACL, signed clean-machine/no-egress platform review, upstream warnings, notices and SBOM remain |
 | Known data-loss bugs                           | Unknown            | Full action/recovery suite; zero known data-loss issues  |
 
 ## M0 readiness gate
 
 The M0 implementation is verified locally. Governance, ADRs, health slice, lockfiles, log-redaction checks, local format/lint/typecheck/test/build, isolated fresh-clone setup, CLI execution, debug app bundle, and live IPC UI smoke have passed. M0 itself remains **in progress** until a GitHub remote exists and the macOS/Windows/Linux matrix is green.
+
+## M9a native scope access local readiness note
+
+The local Desktop implementation now owns folder selection in narrow Rust IPC rather than accepting a
+frontend-supplied authorization path. On macOS, the local implementation creates an opaque,
+versioned security-scoped bookmark, resolves it with explicit start/stop lifetime ownership,
+refreshes a stale bookmark before reuse, and stores the scope and grant atomically. Migration
+0020 deliberately treats every legacy scope without a grant, every corrupt grant, and every
+unrestorable bookmark as `needs_reauthorization`; it never fabricates active access. The main
+window has no frontend filesystem or dialog permission, and normal IPC/log payloads omit grant
+bytes.
+
+This is local implementation evidence only. The checked-in profile grants App Sandbox,
+user-selected read/write, app-scoped bookmarks, and outbound client sockets. The last capability
+is required for the macOS WebKit networking subprocess on the current arm64 host: an otherwise
+identical ad-hoc sandbox copy logged a fixed network-permission failure and rendered blank, while
+adding only `com.apple.security.network.client` restored the bundled UI and native picker. It does
+not make a network connection a product requirement or authorize uploads; the current runtime has
+no remote content client and the production CSP excludes the development HTTP/WebSocket origins.
+`Entitlements.plist`, a bundle configuration, or an ad-hoc signature do not prove a production
+sandbox. The signed/notarized clean-machine matrix
+must prove first selection, restart restoration, stale refresh, user revocation, denial outside
+the selected scope, legacy/corrupt reauthorization, and the accepted protected-container hostile
+replacement probe. It must also capture outbound-connection attempts and prove that no filename,
+path, content, OCR, embedding, or graph data leaves the device during offline core workflows. The
+current non-macOS release branch intentionally fails closed rather than
+claiming that a picker receipt is Windows package identity. Linux remains experimental; Windows
+requires the full MSIX/package-family/update evidence before M9a or the Windows OCR/action fence
+can be considered ready.
 
 ## M1 local readiness note
 

@@ -37,23 +37,37 @@ Provide through a protected GitHub environment, never repository files:
 - updater signing private key stored as an environment secret.
 
 ADR-027 also requires the owner to approve the final macOS application identifier, minimum
-supported macOS version, and App Sandbox entitlement set. The local implementation must provide a
-native folder-selection flow and security-scoped bookmark persistence/revocation. A per-app-
-container `flock` remains a candidate until the selected OS version's SIP contract and a signed
-hostile probe prove that a non-entitled same-user process cannot silently open, unlink, rename, or
-recreate its entry without a user-authorized exception. If that proof fails, macOS production
-actions remain unavailable. Do not add an App Group unless a later accepted helper-topology ADR
-names the exact group, members, Team ID binding, IPC contract, and uninstall behavior.
+supported macOS version, and App Sandbox entitlement set. The local M9a foundation now provides a
+Rust-owned native folder-selection command, opaque versioned security-scoped bookmark
+create/resolve/start/stop ownership, stale refresh, and migration-backed
+`needs_reauthorization` handling for legacy, corrupt, or unrestorable grants. The checked-in
+entitlement configuration is only local configuration evidence: neither it nor an ad-hoc
+signature proves a production sandbox, user-selection persistence, notarization, or a release
+artifact. The current profile also contains `com.apple.security.network.client`: a current-host
+ad-hoc A/B run shows that the sandboxed WebKit networking subprocess exits without it and that
+adding only this entitlement restores the bundled local UI and native folder picker. This grants
+an outbound socket capability, not a product upload feature. Clean-machine evidence must therefore
+capture outbound connection attempts during first launch, selection, scan, extraction, search,
+Watch and action Preview and verify that no filename, path, content, OCR, embedding or graph data
+leaves the machine. The production CSP must continue to exclude development HTTP/WebSocket origins.
 
-On clean signed arm64 and Intel-or-Universal installs, preserve evidence for: the exact OS version
-and SIP/container contract; container identity validation without recording the path in ordinary
-logs; first scope selection; bookmark restore after restart; user revocation; denied unselected
-folders; unsigned/unsandboxed action denial; and a non-entitled same-user probe that attempts to
-open/unlink/rename/recreate the fence entry without user consent. Only after that proof passes may
-the matrix cover two-process fence contention, paused-owner exclusion beyond the SQLite lease,
-forced-crash release, close-on-exec, app update, repair/reinstall and uninstall behavior. The run
-must prove the fence is acquired before the action database opens and must not enable the
-ADR-026-rejected general Unix Rename/Move adapter.
+A per-app-container `flock` remains a candidate until the selected OS version's SIP contract and a
+Developer-ID-signed hostile probe prove that a non-entitled same-user process cannot silently
+open, unlink, rename, or recreate its entry without a user-authorized exception. If that proof
+fails, macOS production actions remain unavailable. Do not add an App Group unless a later
+accepted helper-topology ADR names the exact group, members, Team ID binding, IPC contract, and
+uninstall behavior.
+
+On clean Developer-ID-signed/notarized arm64 and Intel-or-Universal installs, preserve evidence
+for: the exact OS version and SIP/container contract; container identity validation without
+recording the path in ordinary logs; first scope selection; bookmark restore after restart; stale
+bookmark refresh; user revocation; legacy/corrupt/unrestorable grants becoming
+`needs_reauthorization`; denied unselected folders; unsigned/unsandboxed action denial; and a
+non-entitled same-user probe that attempts to open/unlink/rename/recreate the fence entry without
+user consent. Only after that proof passes may the matrix cover two-process fence contention,
+paused-owner exclusion beyond the SQLite lease, forced-crash release, close-on-exec, app update,
+repair/reinstall and uninstall behavior. The run must prove the fence is acquired before the
+action database opens and must not enable the ADR-026-rejected general Unix Rename/Move adapter.
 
 Exact secret names and validation commands will be fixed when the Tauri packaging workflow is implemented and reviewed against current official documentation.
 
@@ -64,12 +78,14 @@ Provide a protected certificate or signing service, its non-repository secret re
 ADR-027 requires one stable Windows package identity shared by native OCR and the action fence.
 The owner must approve the package name, publisher subject/identity, installer channel and update
 identity; provide the matching signing certificate; and state whether distribution uses Store
-identity or a reviewed non-Store MSIX/external-location identity. Do not claim AppContainer: the
-accepted v0.1 design is packaged classic desktop medium-integrity code unless separately changed.
+identity or a reviewed non-Store full MSIX/App Installer identity. MSI/NSIS alone is insufficient
+for this gate. Do not claim AppContainer: the accepted v0.1 design is packaged classic desktop
+medium-integrity code unless separately changed. The current non-macOS release branch fails closed
+for native scope grants; it is not a substitute for package-family identity.
 
-On a clean Windows x64 VM, record package-family identity stability across install and update,
-unpackaged denial, repair, uninstall and reinstall. Then prove the protected private namespace,
-boundary descriptor/DACL, same-native-thread mutex ownership/release, non-inheritable handles,
+On a clean Windows x64 VM, record package-family identity stability across MSIX install and App
+Installer update, unpackaged denial, repair, uninstall and reinstall. Then prove the protected
+private namespace, boundary descriptor/DACL, same-native-thread mutex ownership/release, non-inheritable handles,
 two-process contention, paused-owner exclusion beyond the SQLite lease, terminated-owner
 `WAIT_ABANDONED` recovery-only behavior, namespace squatting/replacement denial, fail-before-
 database ordering, and no SQLite WAL interference. Package names, SIDs, filesystem paths and
