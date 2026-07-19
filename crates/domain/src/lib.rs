@@ -11,7 +11,8 @@ pub use action::{
     ActionExecutionStrategy, ActionJournalEvent, ActionJournalEventKind,
     ActionJournalReductionError, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyCheck, ActionPolicyDecision, ActionPolicyReport,
-    reduce_action_journal,
+    CleanupActionOperation, CleanupActionPlanPreview, CleanupActionPlanState,
+    CleanupActionPolicyCheck, CleanupActionPolicyReport, reduce_action_journal,
 };
 pub use extraction::{
     ExtractionJobProgress, ExtractionOperation, ExtractionStats, ExtractionStatus, ImageFormat,

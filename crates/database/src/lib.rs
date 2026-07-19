@@ -9,8 +9,9 @@ use deskgraph_domain::{
     ActionCommandKind, ActionCommandStart, ActionExecutionBinding, ActionExecutionRecord,
     ActionExecutionStrategy, ActionJournalEvent, ActionJournalEventKind, ActionOperation,
     ActionPlanPreview, ActionPlanState, ActionPlanSummary, ActionPolicyReport, AuthorizedScope,
-    ExplicitFileVersionName, ExtractionJobProgress, ExtractionOperation, ExtractionStats,
-    ExtractionStatus, FileRelationCandidate, FileRelationCandidateState,
+    CleanupActionOperation, CleanupActionPlanPreview, CleanupActionPlanState,
+    CleanupActionPolicyReport, ExplicitFileVersionName, ExtractionJobProgress, ExtractionOperation,
+    ExtractionStats, ExtractionStatus, FileRelationCandidate, FileRelationCandidateState,
     FileRelationCandidateSummary, FileRelationComparisonKind, FileRelationCreator,
     FileRelationDecision, FileRelationDecisionCreator, FileRelationDecisionKind,
     FileRelationEndpoint, FileRelationEvidence, FileRelationKind, FileVersionCandidate,
@@ -136,6 +137,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 21,
         name: "screenshot_group_candidates",
         sql: include_str!("../../../migrations/0021_screenshot_group_candidates.sql"),
+    },
+    Migration {
+        version: 22,
+        name: "cleanup_action_plan_preview",
+        sql: include_str!("../../../migrations/0022_cleanup_action_plan_preview.sql"),
     },
 ];
 
@@ -513,6 +519,57 @@ pub struct ActionPlanWrite<'a> {
     pub execution_strategy: ActionExecutionStrategy,
 }
 
+/// Exact user selection from one already-refreshed Smart Cleanup source.
+/// This is not confirmation and cannot authorize a filesystem action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleanupActionSelection {
+    pub scope_id: i64,
+    pub source_kind: SmartCleanupSourceKind,
+    pub source_id: i64,
+    pub source_observation_id: i64,
+    pub keeper_node_id: Option<i64>,
+    pub target_node_id: i64,
+}
+
+/// Trusted internal write assembled after the transaction core hashes an open,
+/// identity-verified target. Paths are intentionally not duplicated into the
+/// cleanup preview family.
+#[derive(Clone, Copy, Debug)]
+pub struct CleanupActionPlanWrite<'a> {
+    pub selection: CleanupActionSelection,
+    pub keeper: Option<CleanupKeeperBindingWrite<'a>>,
+    pub target_location_id: i64,
+    pub target_identity_kind: &'a str,
+    pub target_identity_key: &'a [u8],
+    pub target_size_bytes: u64,
+    pub target_modified_unix_ns: Option<i64>,
+    pub target_sha256: &'a [u8],
+    pub target_hash_bytes: u64,
+    pub scope_root_node_id: i64,
+    pub scope_root_identity_kind: &'a str,
+    pub scope_root_identity_key: &'a [u8],
+    pub parent_node_id: i64,
+    pub parent_identity_kind: &'a str,
+    pub parent_identity_key: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CleanupKeeperBindingWrite<'a> {
+    pub location_id: i64,
+    pub identity_kind: &'a str,
+    pub identity_key: &'a [u8],
+    pub size_bytes: u64,
+    pub modified_unix_ns: Option<i64>,
+    pub sha256: &'a [u8],
+    pub hash_bytes: u64,
+    pub scope_root_node_id: i64,
+    pub scope_root_identity_kind: &'a str,
+    pub scope_root_identity_key: &'a [u8],
+    pub parent_node_id: i64,
+    pub parent_identity_kind: &'a str,
+    pub parent_identity_key: &'a [u8],
+}
+
 /// A caller-supplied, bounded idempotency key for an explicit user command.
 /// It is never a path and is persisted separately from immutable plan data.
 #[derive(Clone, Copy, Debug)]
@@ -734,6 +791,9 @@ pub enum DatabaseError {
     ActionJournalIdempotencyConflict,
     ActionJournalCommandNotFound,
     ActionExecutorLeaseUnavailable,
+    CleanupActionPlanNotFound,
+    CleanupActionPlanInputInvalid,
+    CleanupActionSourceNotCurrent,
     FolderNotFound,
     FolderProfileInputInvalid,
     FolderProfileTooLarge,
@@ -801,6 +861,9 @@ impl DatabaseError {
             Self::ActionJournalIdempotencyConflict => "action_journal_idempotency_conflict",
             Self::ActionJournalCommandNotFound => "action_journal_command_not_found",
             Self::ActionExecutorLeaseUnavailable => "action_executor_lease_unavailable",
+            Self::CleanupActionPlanNotFound => "cleanup_action_plan_not_found",
+            Self::CleanupActionPlanInputInvalid => "cleanup_action_plan_input_invalid",
+            Self::CleanupActionSourceNotCurrent => "cleanup_action_source_not_current",
             Self::FolderNotFound => "folder_not_found",
             Self::FolderProfileInputInvalid => "folder_profile_input_invalid",
             Self::FolderProfileTooLarge => "folder_profile_entry_limit_exceeded",
@@ -5833,6 +5896,60 @@ impl ManifestDatabase {
         Ok(item)
     }
 
+    /// Resolves one explicit, already-refreshed cleanup selection to the same
+    /// strong root/parent/file snapshot used by the transaction core. The
+    /// returned path-bearing record is internal only; cleanup preview payloads
+    /// and history remain path-free.
+    pub fn cleanup_action_source(
+        &self,
+        selection: CleanupActionSelection,
+    ) -> Result<ActionExecutionSourceRecord, DatabaseError> {
+        self.cleanup_action_sources(selection)
+            .map(|sources| sources.0)
+    }
+
+    /// Returns the selected target and, when present, its explicitly retained
+    /// keeper from the same exact immutable observation.
+    pub fn cleanup_action_sources(
+        &self,
+        selection: CleanupActionSelection,
+    ) -> Result<
+        (
+            ActionExecutionSourceRecord,
+            Option<ActionExecutionSourceRecord>,
+        ),
+        DatabaseError,
+    > {
+        validate_cleanup_selection_input(&selection)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let expected = cleanup_selection_snapshot(&transaction, &selection)?;
+        let target = cleanup_execution_source_from_connection(
+            &transaction,
+            selection.scope_id,
+            selection.target_node_id,
+            expected.location_id,
+            expected.size_bytes,
+            expected.modified_unix_ns,
+        )?;
+        let keeper = match selection.keeper_node_id {
+            None => None,
+            Some(keeper_node_id) => {
+                let keeper_expected =
+                    cleanup_keeper_snapshot(&transaction, &selection, keeper_node_id)?;
+                Some(cleanup_execution_source_from_connection(
+                    &transaction,
+                    selection.scope_id,
+                    keeper_node_id,
+                    keeper_expected.location_id,
+                    keeper_expected.size_bytes,
+                    keeper_expected.modified_unix_ns,
+                )?)
+            }
+        };
+        transaction.commit()?;
+        Ok((target, keeper))
+    }
+
     pub fn exact_duplicate_sources(
         &self,
         relation_id: i64,
@@ -6139,6 +6256,203 @@ impl ManifestDatabase {
         )?;
         transaction.commit()?;
         self.action_plan(plan_id)
+    }
+
+    /// Persists one immutable, path-free System Trash preview. This method has
+    /// no confirmation, command, execute, recovery, Trash, or Undo companion.
+    pub fn create_cleanup_action_plan(
+        &mut self,
+        plan: CleanupActionPlanWrite<'_>,
+    ) -> Result<CleanupActionPlanPreview, DatabaseError> {
+        validate_cleanup_action_plan_write(&plan)?;
+        let target_size = to_i64(plan.target_size_bytes)?;
+        let keeper_size = plan
+            .keeper
+            .map(|keeper| to_i64(keeper.size_bytes))
+            .transpose()?;
+        let keeper_hash_bytes = plan
+            .keeper
+            .map(|keeper| to_i64(keeper.hash_bytes))
+            .transpose()?;
+        let created_at = unix_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected = cleanup_selection_snapshot(&transaction, &plan.selection)?;
+        if expected.location_id != plan.target_location_id
+            || expected.size_bytes != plan.target_size_bytes
+            || expected.modified_unix_ns != plan.target_modified_unix_ns
+        {
+            return Err(DatabaseError::CleanupActionSourceNotCurrent);
+        }
+        let current = cleanup_execution_source_from_connection(
+            &transaction,
+            plan.selection.scope_id,
+            plan.selection.target_node_id,
+            plan.target_location_id,
+            plan.target_size_bytes,
+            plan.target_modified_unix_ns,
+        )?;
+        if current.source.identity_kind != plan.target_identity_kind
+            || current.source.identity_key != plan.target_identity_key
+            || current.scope_root_node_id != plan.scope_root_node_id
+            || current.scope_root_identity_kind != plan.scope_root_identity_kind
+            || current.scope_root_identity_key != plan.scope_root_identity_key
+            || current.parent_node_id != plan.parent_node_id
+            || current.parent_identity_kind != plan.parent_identity_kind
+            || current.parent_identity_key != plan.parent_identity_key
+        {
+            return Err(DatabaseError::CleanupActionSourceNotCurrent);
+        }
+        match (plan.selection.keeper_node_id, plan.keeper) {
+            (None, None) => {}
+            (Some(keeper_node_id), Some(keeper)) => {
+                let expected_keeper =
+                    cleanup_keeper_snapshot(&transaction, &plan.selection, keeper_node_id)?;
+                if expected_keeper.location_id != keeper.location_id
+                    || expected_keeper.size_bytes != keeper.size_bytes
+                    || expected_keeper.modified_unix_ns != keeper.modified_unix_ns
+                {
+                    return Err(DatabaseError::CleanupActionSourceNotCurrent);
+                }
+                let current_keeper = cleanup_execution_source_from_connection(
+                    &transaction,
+                    plan.selection.scope_id,
+                    keeper_node_id,
+                    keeper.location_id,
+                    keeper.size_bytes,
+                    keeper.modified_unix_ns,
+                )?;
+                if current_keeper.source.identity_kind != keeper.identity_kind
+                    || current_keeper.source.identity_key != keeper.identity_key
+                    || current_keeper.scope_root_node_id != keeper.scope_root_node_id
+                    || current_keeper.scope_root_identity_kind != keeper.scope_root_identity_kind
+                    || current_keeper.scope_root_identity_key != keeper.scope_root_identity_key
+                    || current_keeper.parent_node_id != keeper.parent_node_id
+                    || current_keeper.parent_identity_kind != keeper.parent_identity_kind
+                    || current_keeper.parent_identity_key != keeper.parent_identity_key
+                {
+                    return Err(DatabaseError::CleanupActionSourceNotCurrent);
+                }
+            }
+            _ => return Err(DatabaseError::CleanupActionPlanInputInvalid),
+        }
+        transaction.execute(
+            "INSERT INTO cleanup_action_plans( \
+                 api_version, policy_version, operation, state, scope_id, source_kind, \
+                 source_id, source_observation_id, keeper_node_id, keeper_location_id, \
+                 keeper_identity_kind, keeper_identity_key, keeper_size_bytes, \
+                 keeper_modified_unix_ns, keeper_sha256, keeper_hash_bytes, \
+                 keeper_scope_root_node_id, keeper_scope_root_identity_kind, \
+                 keeper_scope_root_identity_key, keeper_parent_node_id, \
+                 keeper_parent_identity_kind, keeper_parent_identity_key, target_node_id, \
+                 target_location_id, target_identity_kind, target_identity_key, \
+                 target_size_bytes, target_modified_unix_ns, target_sha256, target_hash_bytes, \
+                 scope_root_node_id, scope_root_identity_kind, scope_root_identity_key, \
+                 parent_node_id, parent_identity_kind, parent_identity_key, \
+                 confirmation_required, action_authorized, execution_available, created_at_unix_ms \
+             ) VALUES ( \
+                 'deskgraph.cleanup-action-plan.v1', 'deskgraph.cleanup-action-policy.v1', \
+                 'system_trash_preview', 'previewed', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+                 ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, \
+                 ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, 1, 0, 0, ?33 \
+             )",
+            params![
+                plan.selection.scope_id,
+                smart_cleanup_source_kind_str(plan.selection.source_kind),
+                plan.selection.source_id,
+                plan.selection.source_observation_id,
+                plan.selection.keeper_node_id,
+                plan.keeper.map(|keeper| keeper.location_id),
+                plan.keeper.map(|keeper| keeper.identity_kind),
+                plan.keeper.map(|keeper| keeper.identity_key),
+                keeper_size,
+                plan.keeper.and_then(|keeper| keeper.modified_unix_ns),
+                plan.keeper.map(|keeper| keeper.sha256),
+                keeper_hash_bytes,
+                plan.keeper.map(|keeper| keeper.scope_root_node_id),
+                plan.keeper.map(|keeper| keeper.scope_root_identity_kind),
+                plan.keeper.map(|keeper| keeper.scope_root_identity_key),
+                plan.keeper.map(|keeper| keeper.parent_node_id),
+                plan.keeper.map(|keeper| keeper.parent_identity_kind),
+                plan.keeper.map(|keeper| keeper.parent_identity_key),
+                plan.selection.target_node_id,
+                plan.target_location_id,
+                plan.target_identity_kind,
+                plan.target_identity_key,
+                target_size,
+                plan.target_modified_unix_ns,
+                plan.target_sha256,
+                to_i64(plan.target_hash_bytes)?,
+                plan.scope_root_node_id,
+                plan.scope_root_identity_kind,
+                plan.scope_root_identity_key,
+                plan.parent_node_id,
+                plan.parent_identity_kind,
+                plan.parent_identity_key,
+                created_at,
+            ],
+        )?;
+        let plan_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO cleanup_action_journal_events( \
+                 api_version, plan_id, sequence, event_kind, created_at_unix_ms \
+             ) VALUES ('deskgraph.cleanup-action-journal.v1', ?1, 1, 'preview_created', ?2)",
+            params![plan_id, created_at],
+        )?;
+        transaction.commit()?;
+        self.cleanup_action_plan(plan_id)
+    }
+
+    pub fn cleanup_action_plan(
+        &self,
+        plan_id: i64,
+    ) -> Result<CleanupActionPlanPreview, DatabaseError> {
+        if plan_id <= 0 {
+            return Err(DatabaseError::CleanupActionPlanNotFound);
+        }
+        self.connection
+            .query_row(
+                "SELECT scope_id, source_kind, source_id, source_observation_id, \
+                        keeper_node_id, target_node_id, target_size_bytes, created_at_unix_ms, \
+                        keeper_sha256 IS NOT NULL, \
+                        (SELECT COUNT(*) FROM cleanup_action_journal_events event \
+                         WHERE event.plan_id = cleanup_action_plans.id \
+                           AND event.sequence = 1 AND event.event_kind = 'preview_created') \
+                 FROM cleanup_action_plans WHERE id = ?1 \
+                   AND api_version = 'deskgraph.cleanup-action-plan.v1' \
+                   AND policy_version = 'deskgraph.cleanup-action-policy.v1' \
+                   AND operation = 'system_trash_preview' AND state = 'previewed' \
+                   AND confirmation_required = 1 AND action_authorized = 0 \
+                   AND execution_available = 0",
+                [plan_id],
+                |row| {
+                    let event_count = row.get::<_, i64>(9)?;
+                    if event_count != 1 {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok(CleanupActionPlanPreview {
+                        api_version: CleanupActionPlanPreview::API_VERSION,
+                        plan_id,
+                        operation: CleanupActionOperation::SystemTrashPreview,
+                        state: CleanupActionPlanState::Previewed,
+                        scope_id: row.get(0)?,
+                        source_kind: smart_cleanup_source_kind_from_str(&row.get::<_, String>(1)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        source_id: row.get(2)?,
+                        source_observation_id: row.get(3)?,
+                        keeper_node_id: row.get(4)?,
+                        target_node_id: row.get(5)?,
+                        expected_bytes: row_u64(row, 6)?,
+                        keeper_hash_bound: row.get(8)?,
+                        policy: CleanupActionPolicyReport::preview_only(),
+                        journal_sequence: 1,
+                        created_at_unix_ms: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::CleanupActionPlanNotFound)
     }
 
     pub fn action_plan(&self, plan_id: i64) -> Result<ActionPlanPreview, DatabaseError> {
@@ -7335,6 +7649,456 @@ fn preview_execution_binding(
         parent_identity_kind: binding.4,
         parent_identity_key: binding.5,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupSelectionSnapshot {
+    location_id: i64,
+    size_bytes: u64,
+    modified_unix_ns: Option<i64>,
+}
+
+fn smart_cleanup_source_kind_str(kind: SmartCleanupSourceKind) -> &'static str {
+    match kind {
+        SmartCleanupSourceKind::ExactDuplicate => "exact_duplicate",
+        SmartCleanupSourceKind::Version => "version",
+        SmartCleanupSourceKind::ScreenshotReviewGroup => "screenshot_review_group",
+    }
+}
+
+fn smart_cleanup_source_kind_from_str(
+    value: &str,
+) -> Result<SmartCleanupSourceKind, DatabaseError> {
+    match value {
+        "exact_duplicate" => Ok(SmartCleanupSourceKind::ExactDuplicate),
+        "version" => Ok(SmartCleanupSourceKind::Version),
+        "screenshot_review_group" => Ok(SmartCleanupSourceKind::ScreenshotReviewGroup),
+        _ => Err(DatabaseError::InvalidStoredValue),
+    }
+}
+
+fn validate_cleanup_selection_input(
+    selection: &CleanupActionSelection,
+) -> Result<(), DatabaseError> {
+    if selection.scope_id <= 0
+        || selection.source_id <= 0
+        || selection.source_observation_id <= 0
+        || selection.target_node_id <= 0
+        || selection.keeper_node_id.is_some_and(|node_id| node_id <= 0)
+        || selection.keeper_node_id == Some(selection.target_node_id)
+        || matches!(
+            selection.source_kind,
+            SmartCleanupSourceKind::ExactDuplicate | SmartCleanupSourceKind::Version
+        ) && selection.keeper_node_id.is_none()
+    {
+        return Err(DatabaseError::CleanupActionPlanInputInvalid);
+    }
+    Ok(())
+}
+
+fn cleanup_selection_snapshot(
+    connection: &Connection,
+    selection: &CleanupActionSelection,
+) -> Result<CleanupSelectionSnapshot, DatabaseError> {
+    validate_cleanup_selection_input(selection)?;
+    ensure_scope_queryable(connection, selection.scope_id)?;
+    ensure_scope_access_permitted(connection, selection.scope_id)?;
+    match selection.source_kind {
+        SmartCleanupSourceKind::ExactDuplicate => {
+            let row = connection
+                .query_row(
+                    "SELECT candidate.left_node_id, candidate.right_node_id, \
+                            observation.left_location_id, observation.right_location_id, \
+                            observation.source_size_bytes, observation.left_modified_unix_ns, \
+                            observation.right_modified_unix_ns \
+                     FROM file_relation_candidates candidate \
+                     JOIN file_relation_observations observation \
+                       ON observation.relation_id = candidate.id \
+                     JOIN locations left_location ON left_location.id = observation.left_location_id \
+                     JOIN locations right_location ON right_location.id = observation.right_location_id \
+                     JOIN nodes left_node ON left_node.id = candidate.left_node_id \
+                     JOIN nodes right_node ON right_node.id = candidate.right_node_id \
+                     JOIN files left_file ON left_file.node_id = candidate.left_node_id \
+                     JOIN files right_file ON right_file.node_id = candidate.right_node_id \
+                     WHERE candidate.id = ?1 AND candidate.scope_id = ?2 \
+                       AND candidate.relation_kind = 'exact_duplicate' AND observation.id = ?3 \
+                       AND observation.id = ( \
+                           SELECT latest.id FROM file_relation_observations latest \
+                           WHERE latest.relation_id = candidate.id \
+                           ORDER BY latest.observed_at_unix_ms DESC, latest.id DESC LIMIT 1 \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM file_relation_feedback_events feedback \
+                           WHERE feedback.relation_id = candidate.id \
+                       ) \
+                       AND left_location.scope_id = candidate.scope_id \
+                       AND right_location.scope_id = candidate.scope_id \
+                       AND left_location.node_id = candidate.left_node_id \
+                       AND right_location.node_id = candidate.right_node_id \
+                       AND left_location.present = 1 AND right_location.present = 1 \
+                       AND left_node.kind = 'file' AND right_node.kind = 'file' \
+                       AND left_node.identity_kind <> 'path_fallback' \
+                       AND right_node.identity_kind <> 'path_fallback' \
+                       AND left_file.size_bytes = observation.source_size_bytes \
+                       AND right_file.size_bytes = observation.source_size_bytes \
+                       AND left_file.modified_unix_ns IS observation.left_modified_unix_ns \
+                       AND right_file.modified_unix_ns IS observation.right_modified_unix_ns",
+                    params![
+                        selection.source_id,
+                        selection.scope_id,
+                        selection.source_observation_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row_u64(row, 4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or(DatabaseError::CleanupActionSourceNotCurrent)?;
+            let keeper = selection
+                .keeper_node_id
+                .ok_or(DatabaseError::CleanupActionPlanInputInvalid)?;
+            let (location_id, modified_unix_ns) =
+                if selection.target_node_id == row.0 && keeper == row.1 {
+                    (row.2, row.5)
+                } else if selection.target_node_id == row.1 && keeper == row.0 {
+                    (row.3, row.6)
+                } else {
+                    return Err(DatabaseError::CleanupActionPlanInputInvalid);
+                };
+            Ok(CleanupSelectionSnapshot {
+                location_id,
+                size_bytes: row.4,
+                modified_unix_ns,
+            })
+        }
+        SmartCleanupSourceKind::Version => {
+            let row = connection
+                .query_row(
+                    "SELECT older_location.node_id, newer_location.node_id, \
+                            observation.older_location_id, observation.newer_location_id, \
+                            observation.older_size_bytes, observation.newer_size_bytes, \
+                            observation.older_modified_unix_ns, observation.newer_modified_unix_ns \
+                     FROM file_relation_candidates candidate \
+                     JOIN file_version_observations observation \
+                       ON observation.relation_id = candidate.id \
+                     JOIN locations older_location ON older_location.id = observation.older_location_id \
+                     JOIN locations newer_location ON newer_location.id = observation.newer_location_id \
+                     JOIN nodes older_node ON older_node.id = older_location.node_id \
+                     JOIN nodes newer_node ON newer_node.id = newer_location.node_id \
+                     JOIN files older_file ON older_file.node_id = older_location.node_id \
+                     JOIN files newer_file ON newer_file.node_id = newer_location.node_id \
+                     WHERE candidate.id = ?1 AND candidate.scope_id = ?2 \
+                       AND candidate.relation_kind = 'version' AND observation.id = ?3 \
+                       AND observation.id = ( \
+                           SELECT latest.id FROM file_version_observations latest \
+                           WHERE latest.relation_id = candidate.id \
+                           ORDER BY latest.observed_at_unix_ms DESC, latest.id DESC LIMIT 1 \
+                       ) \
+                       AND older_location.scope_id = candidate.scope_id \
+                       AND newer_location.scope_id = candidate.scope_id \
+                       AND older_location.present = 1 AND newer_location.present = 1 \
+                       AND older_node.kind = 'file' AND newer_node.kind = 'file' \
+                       AND older_node.identity_kind <> 'path_fallback' \
+                       AND newer_node.identity_kind <> 'path_fallback' \
+                       AND older_file.size_bytes = observation.older_size_bytes \
+                       AND newer_file.size_bytes = observation.newer_size_bytes \
+                       AND older_file.modified_unix_ns IS observation.older_modified_unix_ns \
+                       AND newer_file.modified_unix_ns IS observation.newer_modified_unix_ns",
+                    params![
+                        selection.source_id,
+                        selection.scope_id,
+                        selection.source_observation_id
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row_u64(row, 4)?,
+                            row_u64(row, 5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or(DatabaseError::CleanupActionSourceNotCurrent)?;
+            if latest_equivalent_file_version_decision(
+                connection,
+                selection.source_id,
+                selection.source_observation_id,
+            )?
+            .is_some()
+            {
+                return Err(DatabaseError::CleanupActionSourceNotCurrent);
+            }
+            let keeper = selection
+                .keeper_node_id
+                .ok_or(DatabaseError::CleanupActionPlanInputInvalid)?;
+            if selection.target_node_id != row.0 || keeper != row.1 {
+                return Err(DatabaseError::CleanupActionPlanInputInvalid);
+            }
+            let (location_id, size_bytes, modified_unix_ns) = (row.2, row.4, row.6);
+            Ok(CleanupSelectionSnapshot {
+                location_id,
+                size_bytes,
+                modified_unix_ns,
+            })
+        }
+        SmartCleanupSourceKind::ScreenshotReviewGroup => {
+            let (scope_id, membership_key) =
+                screenshot_group_identity_from_connection(connection, selection.source_id)?;
+            if scope_id != selection.scope_id {
+                return Err(DatabaseError::CleanupActionSourceNotCurrent);
+            }
+            let sources = current_screenshot_group_for_membership(
+                connection,
+                selection.scope_id,
+                &membership_key,
+            )?
+            .ok_or(DatabaseError::CleanupActionSourceNotCurrent)?;
+            let evidence_key = screenshot_group_evidence_key(&sources)?;
+            let observation = screenshot_group_observation_for_evidence(
+                connection,
+                selection.source_id,
+                &evidence_key,
+            )?
+            .ok_or(DatabaseError::CleanupActionSourceNotCurrent)?;
+            if observation.id != selection.source_observation_id {
+                return Err(DatabaseError::CleanupActionSourceNotCurrent);
+            }
+            validate_screenshot_group_observation(
+                connection,
+                selection.scope_id,
+                &membership_key,
+                &observation,
+            )?;
+            if selection
+                .keeper_node_id
+                .is_some_and(|keeper| !sources.iter().any(|source| source.node_id == keeper))
+            {
+                return Err(DatabaseError::CleanupActionPlanInputInvalid);
+            }
+            let source = sources
+                .iter()
+                .find(|source| source.node_id == selection.target_node_id)
+                .ok_or(DatabaseError::CleanupActionPlanInputInvalid)?;
+            Ok(CleanupSelectionSnapshot {
+                location_id: source.location_id,
+                size_bytes: source.size_bytes,
+                modified_unix_ns: Some(source.modified_unix_ns),
+            })
+        }
+    }
+}
+
+fn cleanup_keeper_snapshot(
+    connection: &Connection,
+    selection: &CleanupActionSelection,
+    keeper_node_id: i64,
+) -> Result<CleanupSelectionSnapshot, DatabaseError> {
+    if selection.keeper_node_id != Some(keeper_node_id) || keeper_node_id <= 0 {
+        return Err(DatabaseError::CleanupActionPlanInputInvalid);
+    }
+    match selection.source_kind {
+        SmartCleanupSourceKind::Version => connection
+            .query_row(
+                "SELECT newer_location.id, observation.newer_size_bytes, \
+                        observation.newer_modified_unix_ns \
+                 FROM file_relation_candidates candidate \
+                 JOIN file_version_observations observation \
+                   ON observation.relation_id = candidate.id \
+                 JOIN locations newer_location ON newer_location.id = observation.newer_location_id \
+                 JOIN files newer_file ON newer_file.node_id = newer_location.node_id \
+                 WHERE candidate.id = ?1 AND candidate.scope_id = ?2 \
+                   AND candidate.relation_kind = 'version' AND observation.id = ?3 \
+                   AND newer_location.node_id = ?4 AND newer_location.present = 1 \
+                   AND newer_file.size_bytes = observation.newer_size_bytes \
+                   AND newer_file.modified_unix_ns IS observation.newer_modified_unix_ns \
+                   AND observation.id = ( \
+                       SELECT latest.id FROM file_version_observations latest \
+                       WHERE latest.relation_id = candidate.id \
+                       ORDER BY latest.observed_at_unix_ms DESC, latest.id DESC LIMIT 1 \
+                   )",
+                params![
+                    selection.source_id,
+                    selection.scope_id,
+                    selection.source_observation_id,
+                    keeper_node_id
+                ],
+                |row| {
+                    Ok(CleanupSelectionSnapshot {
+                        location_id: row.get(0)?,
+                        size_bytes: row_u64(row, 1)?,
+                        modified_unix_ns: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(DatabaseError::CleanupActionSourceNotCurrent),
+        SmartCleanupSourceKind::ExactDuplicate
+        | SmartCleanupSourceKind::ScreenshotReviewGroup => {
+            let keeper_selection = CleanupActionSelection {
+                keeper_node_id: Some(selection.target_node_id),
+                target_node_id: keeper_node_id,
+                ..*selection
+            };
+            cleanup_selection_snapshot(connection, &keeper_selection)
+        }
+    }
+}
+
+fn cleanup_execution_source_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+    node_id: i64,
+    location_id: i64,
+    size_bytes: u64,
+    modified_unix_ns: Option<i64>,
+) -> Result<ActionExecutionSourceRecord, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT source.scope_id, source.node_id, source.id, source.path_raw, \
+                    source.path_key, source.display_path, source_node.identity_kind, \
+                    source_node.identity_key, source_file.size_bytes, source_file.modified_unix_ns, \
+                    root_node.id, root_node.identity_kind, root_node.identity_key, \
+                    parent_node.id, parent_node.identity_kind, parent_node.identity_key \
+             FROM authorized_scopes scope \
+             JOIN locations source ON source.scope_id = scope.id AND source.id = ?3 \
+                AND source.node_id = ?2 AND source.present = 1 \
+             JOIN nodes source_node ON source_node.id = source.node_id AND source_node.kind = 'file' \
+                AND source_node.identity_kind <> 'path_fallback' \
+             JOIN files source_file ON source_file.node_id = source.node_id \
+                AND source_file.size_bytes = ?4 AND source_file.modified_unix_ns IS ?5 \
+             JOIN scan_jobs source_scan ON source_scan.id = source.last_seen_scan_id \
+                AND source_scan.scope_id = scope.id AND source_scan.status = 'completed' \
+             JOIN locations root ON root.scope_id = scope.id AND root.path_key = scope.path_key \
+                AND root.present = 1 \
+             JOIN nodes root_node ON root_node.id = root.node_id AND root_node.kind = 'folder' \
+                AND root_node.identity_kind <> 'path_fallback' \
+             JOIN edges parent_edge ON parent_edge.scope_id = scope.id \
+                AND parent_edge.source_node_id = source.node_id \
+                AND parent_edge.kind = 'located_in' AND parent_edge.active = 1 \
+             JOIN locations parent ON parent.scope_id = scope.id \
+                AND parent.node_id = parent_edge.target_node_id AND parent.present = 1 \
+             JOIN nodes parent_node ON parent_node.id = parent.node_id AND parent_node.kind = 'folder' \
+                AND parent_node.identity_kind <> 'path_fallback' \
+             WHERE scope.id = ?1 \
+               AND (SELECT COUNT(*) FROM locations only_source \
+                    WHERE only_source.scope_id = scope.id \
+                      AND only_source.node_id = source.node_id AND only_source.present = 1) = 1 \
+               AND (SELECT COUNT(*) FROM locations only_root \
+                    WHERE only_root.scope_id = scope.id AND only_root.path_key = scope.path_key \
+                      AND only_root.present = 1) = 1 \
+               AND (SELECT COUNT(*) FROM edges only_parent \
+                    WHERE only_parent.scope_id = scope.id \
+                      AND only_parent.source_node_id = source.node_id \
+                      AND only_parent.kind = 'located_in' AND only_parent.active = 1) = 1 \
+               AND (SELECT COUNT(*) FROM locations only_parent_location \
+                    WHERE only_parent_location.scope_id = scope.id \
+                      AND only_parent_location.node_id = parent_node.id \
+                      AND only_parent_location.present = 1) = 1",
+            params![
+                scope_id,
+                node_id,
+                location_id,
+                to_i64(size_bytes)?,
+                modified_unix_ns
+            ],
+            |row| {
+                Ok(ActionExecutionSourceRecord {
+                    source: ActionSourceRecord {
+                        scope_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        location_id: row.get(2)?,
+                        path_raw: row.get(3)?,
+                        path_key: row.get(4)?,
+                        display_path: row.get(5)?,
+                        identity_kind: row.get(6)?,
+                        identity_key: row.get(7)?,
+                        size_bytes: row_u64(row, 8)?,
+                        modified_unix_ns: row.get(9)?,
+                    },
+                    scope_root_node_id: row.get(10)?,
+                    scope_root_identity_kind: row.get(11)?,
+                    scope_root_identity_key: row.get(12)?,
+                    parent_node_id: row.get(13)?,
+                    parent_identity_kind: row.get(14)?,
+                    parent_identity_key: row.get(15)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::CleanupActionSourceNotCurrent)
+}
+
+fn validate_cleanup_action_plan_write(
+    plan: &CleanupActionPlanWrite<'_>,
+) -> Result<(), DatabaseError> {
+    validate_cleanup_selection_input(&plan.selection)?;
+    let keeper_valid = match (plan.selection.keeper_node_id, plan.keeper) {
+        (None, None) => plan.selection.source_kind == SmartCleanupSourceKind::ScreenshotReviewGroup,
+        (Some(_), Some(keeper)) => {
+            keeper.location_id > 0
+                && !keeper.identity_kind.is_empty()
+                && keeper.identity_kind.len() <= 128
+                && keeper.identity_kind != "path_fallback"
+                && !keeper.identity_key.is_empty()
+                && keeper.identity_key.len() <= 4096
+                && keeper.sha256.len() == 32
+                && keeper.hash_bytes == keeper.size_bytes
+                && keeper.scope_root_node_id > 0
+                && !keeper.scope_root_identity_kind.is_empty()
+                && keeper.scope_root_identity_kind.len() <= 128
+                && keeper.scope_root_identity_kind != "path_fallback"
+                && !keeper.scope_root_identity_key.is_empty()
+                && keeper.scope_root_identity_key.len() <= 4096
+                && keeper.parent_node_id > 0
+                && !keeper.parent_identity_kind.is_empty()
+                && keeper.parent_identity_kind.len() <= 128
+                && keeper.parent_identity_kind != "path_fallback"
+                && !keeper.parent_identity_key.is_empty()
+                && keeper.parent_identity_key.len() <= 4096
+                && (plan.selection.source_kind != SmartCleanupSourceKind::ExactDuplicate
+                    || (keeper.sha256 == plan.target_sha256
+                        && keeper.hash_bytes == plan.target_hash_bytes))
+        }
+        _ => false,
+    };
+    if !keeper_valid
+        || plan.target_location_id <= 0
+        || plan.target_identity_kind.is_empty()
+        || plan.target_identity_kind.len() > 128
+        || plan.target_identity_kind == "path_fallback"
+        || plan.target_identity_key.is_empty()
+        || plan.target_identity_key.len() > 4096
+        || plan.target_sha256.len() != 32
+        || plan.target_hash_bytes != plan.target_size_bytes
+        || plan.scope_root_node_id <= 0
+        || plan.scope_root_identity_kind.is_empty()
+        || plan.scope_root_identity_kind.len() > 128
+        || plan.scope_root_identity_kind == "path_fallback"
+        || plan.scope_root_identity_key.is_empty()
+        || plan.scope_root_identity_key.len() > 4096
+        || plan.parent_node_id <= 0
+        || plan.parent_identity_kind.is_empty()
+        || plan.parent_identity_kind.len() > 128
+        || plan.parent_identity_kind == "path_fallback"
+        || plan.parent_identity_key.is_empty()
+        || plan.parent_identity_key.len() > 4096
+    {
+        return Err(DatabaseError::CleanupActionPlanInputInvalid);
+    }
+    Ok(())
 }
 
 fn validate_action_plan_write(plan: &ActionPlanWrite<'_>) -> Result<(), DatabaseError> {
@@ -10699,6 +11463,126 @@ mod tests {
         (database, left, right)
     }
 
+    fn cleanup_exact_duplicate_setup() -> (
+        ManifestDatabase,
+        CleanupActionSelection,
+        ActionExecutionSourceRecord,
+        ActionExecutionSourceRecord,
+    ) {
+        let (mut database, left, right) = exact_duplicate_setup();
+        database
+            .upsert_scope_access_grant(left.scope_id, "macos", b"test-active-grant")
+            .expect("scope grant should activate");
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed'",
+                [left.scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should exist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO nodes( \
+                     kind, identity_kind, identity_key, created_at_unix_ms, updated_at_unix_ms \
+                 ) VALUES ('folder', 'test_identity', X'6964656E746974793A726F6F74', 1, 1)",
+                [],
+            )
+            .expect("root node should persist");
+        let root_node_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute("INSERT INTO folders(node_id) VALUES (?1)", [root_node_id])
+            .expect("root folder should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations( \
+                     scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id \
+                 ) VALUES (?1, ?2, '/scope', '/scope', '/scope', 1, ?3)",
+                params![left.scope_id, root_node_id, scan_id],
+            )
+            .expect("root location should persist");
+        for node_id in [left.node_id, right.node_id] {
+            database
+                .connection
+                .execute(
+                    "INSERT INTO edges( \
+                         scope_id, source_node_id, target_node_id, kind, active, last_seen_scan_id \
+                     ) VALUES (?1, ?2, ?3, 'located_in', 1, ?4)",
+                    params![left.scope_id, node_id, root_node_id, scan_id],
+                )
+                .expect("parent edge should persist");
+        }
+        let candidate = database
+            .record_exact_duplicate_candidate(&left, &right)
+            .expect("duplicate evidence should persist");
+        let item = database
+            .smart_cleanup_relation_item(
+                candidate.relation_id,
+                candidate.evidence.observed_at_unix_ms,
+            )
+            .expect("current observation should map");
+        let selection = CleanupActionSelection {
+            scope_id: left.scope_id,
+            source_kind: SmartCleanupSourceKind::ExactDuplicate,
+            source_id: candidate.relation_id,
+            source_observation_id: item.source_observation_id,
+            keeper_node_id: Some(left.node_id),
+            target_node_id: right.node_id,
+        };
+        let (source, keeper) = database
+            .cleanup_action_sources(selection)
+            .expect("current selected members should resolve");
+        (
+            database,
+            selection,
+            source,
+            keeper.expect("exact duplicate should bind a keeper"),
+        )
+    }
+
+    fn cleanup_exact_duplicate_plan_write<'a>(
+        selection: CleanupActionSelection,
+        source: &'a ActionExecutionSourceRecord,
+        keeper: &'a ActionExecutionSourceRecord,
+        target_sha256: &'a [u8],
+        keeper_sha256: &'a [u8],
+    ) -> CleanupActionPlanWrite<'a> {
+        CleanupActionPlanWrite {
+            selection,
+            keeper: Some(CleanupKeeperBindingWrite {
+                location_id: keeper.source.location_id,
+                identity_kind: &keeper.source.identity_kind,
+                identity_key: &keeper.source.identity_key,
+                size_bytes: keeper.source.size_bytes,
+                modified_unix_ns: keeper.source.modified_unix_ns,
+                sha256: keeper_sha256,
+                hash_bytes: keeper.source.size_bytes,
+                scope_root_node_id: keeper.scope_root_node_id,
+                scope_root_identity_kind: &keeper.scope_root_identity_kind,
+                scope_root_identity_key: &keeper.scope_root_identity_key,
+                parent_node_id: keeper.parent_node_id,
+                parent_identity_kind: &keeper.parent_identity_kind,
+                parent_identity_key: &keeper.parent_identity_key,
+            }),
+            target_location_id: source.source.location_id,
+            target_identity_kind: &source.source.identity_kind,
+            target_identity_key: &source.source.identity_key,
+            target_size_bytes: source.source.size_bytes,
+            target_modified_unix_ns: source.source.modified_unix_ns,
+            target_sha256,
+            target_hash_bytes: source.source.size_bytes,
+            scope_root_node_id: source.scope_root_node_id,
+            scope_root_identity_kind: &source.scope_root_identity_kind,
+            scope_root_identity_key: &source.scope_root_identity_key,
+            parent_node_id: source.parent_node_id,
+            parent_identity_kind: &source.parent_identity_kind,
+            parent_identity_key: &source.parent_identity_key,
+        }
+    }
+
     fn file_version_setup() -> (ManifestDatabase, ActionSourceRecord, ActionSourceRecord) {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
@@ -13013,6 +13897,368 @@ mod tests {
         assert!(matches!(
             database.file_relation_candidate(candidate.relation_id),
             Err(DatabaseError::FileRelationCandidateNotCurrent)
+        ));
+    }
+
+    #[test]
+    fn cleanup_action_preview_is_independent_immutable_and_observation_bound() {
+        let (mut database, selection, source, keeper) = cleanup_exact_duplicate_setup();
+        let sha256 = [7_u8; 32];
+        let preview = database
+            .create_cleanup_action_plan(cleanup_exact_duplicate_plan_write(
+                selection, &source, &keeper, &sha256, &sha256,
+            ))
+            .expect("bound preview should persist");
+        assert_eq!(preview.state, CleanupActionPlanState::Previewed);
+        assert_eq!(
+            preview.source_observation_id,
+            selection.source_observation_id
+        );
+        assert_eq!(preview.target_node_id, selection.target_node_id);
+        assert!(preview.policy.confirmation_required);
+        assert!(!preview.policy.action_authorized);
+        assert!(!preview.policy.execution_available);
+        assert!(preview.keeper_hash_bound);
+        assert_eq!(preview.journal_sequence, 1);
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM cleanup_action_plans WHERE id = ?1 \
+                       AND keeper_location_id = ?2 \
+                       AND keeper_identity_kind = ?3 AND keeper_identity_key = ?4 \
+                       AND keeper_size_bytes = ?5 AND keeper_modified_unix_ns IS ?6 \
+                       AND keeper_sha256 = ?7 AND keeper_hash_bytes = ?5 \
+                       AND keeper_scope_root_node_id = ?8 \
+                       AND keeper_scope_root_identity_kind = ?9 \
+                       AND keeper_scope_root_identity_key = ?10 \
+                       AND keeper_parent_node_id = ?11 \
+                       AND keeper_parent_identity_kind = ?12 \
+                       AND keeper_parent_identity_key = ?13",
+                    params![
+                        preview.plan_id,
+                        keeper.source.location_id,
+                        keeper.source.identity_kind,
+                        keeper.source.identity_key,
+                        to_i64(keeper.source.size_bytes).expect("keeper size should fit"),
+                        keeper.source.modified_unix_ns,
+                        sha256,
+                        keeper.scope_root_node_id,
+                        keeper.scope_root_identity_kind,
+                        keeper.scope_root_identity_key,
+                        keeper.parent_node_id,
+                        keeper.parent_identity_kind,
+                        keeper.parent_identity_key,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("keeper binding should load"),
+            1,
+            "the full keeper snapshot and hash must be durably bound"
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM action_plans", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("rename plan count should load"),
+            0,
+            "cleanup preview must not widen or reuse rename action_plans"
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE cleanup_action_plans SET target_size_bytes = target_size_bytes \
+                     WHERE id = ?1",
+                    [preview.plan_id]
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE cleanup_action_plans SET keeper_sha256 = zeroblob(32) WHERE id = ?1",
+                    [preview.plan_id]
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM cleanup_action_plans WHERE id = ?1",
+                    [preview.plan_id]
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM cleanup_action_journal_events WHERE plan_id = ?1",
+                    [preview.plan_id]
+                )
+                .is_err()
+        );
+        let (left, right) = database
+            .exact_duplicate_sources(selection.source_id)
+            .expect("relation sources should remain current");
+        database
+            .record_exact_duplicate_candidate(&left, &right)
+            .expect("refresh should append a new observation");
+        assert!(matches!(
+            database.cleanup_action_source(selection),
+            Err(DatabaseError::CleanupActionSourceNotCurrent)
+        ));
+    }
+
+    #[test]
+    fn cleanup_exact_duplicate_plan_rejects_mismatched_final_hashes() {
+        let (mut database, selection, source, keeper) = cleanup_exact_duplicate_setup();
+        let target_sha256 = [7_u8; 32];
+        let keeper_sha256 = [8_u8; 32];
+        assert!(matches!(
+            database.create_cleanup_action_plan(cleanup_exact_duplicate_plan_write(
+                selection,
+                &source,
+                &keeper,
+                &target_sha256,
+                &keeper_sha256,
+            )),
+            Err(DatabaseError::CleanupActionPlanInputInvalid)
+        ));
+        assert!(
+            database
+                .connection
+                .execute(
+                    "INSERT INTO cleanup_action_plans( \
+                         api_version, policy_version, operation, state, scope_id, source_kind, \
+                         source_id, source_observation_id, keeper_node_id, keeper_location_id, \
+                         keeper_identity_kind, keeper_identity_key, keeper_size_bytes, \
+                         keeper_modified_unix_ns, keeper_sha256, keeper_hash_bytes, \
+                         keeper_scope_root_node_id, keeper_scope_root_identity_kind, \
+                         keeper_scope_root_identity_key, keeper_parent_node_id, \
+                         keeper_parent_identity_kind, keeper_parent_identity_key, target_node_id, \
+                         target_location_id, target_identity_kind, target_identity_key, \
+                         target_size_bytes, target_modified_unix_ns, target_sha256, \
+                         target_hash_bytes, scope_root_node_id, scope_root_identity_kind, \
+                         scope_root_identity_key, parent_node_id, parent_identity_kind, \
+                         parent_identity_key, confirmation_required, action_authorized, \
+                         execution_available, created_at_unix_ms \
+                     ) VALUES ( \
+                         'deskgraph.cleanup-action-plan.v1', \
+                         'deskgraph.cleanup-action-policy.v1', 'system_trash_preview', \
+                         'previewed', ?1, 'exact_duplicate', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+                         ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, \
+                         ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, 1, 0, 0, 1 \
+                     )",
+                    params![
+                        selection.scope_id,
+                        selection.source_id,
+                        selection.source_observation_id,
+                        selection.keeper_node_id,
+                        keeper.source.location_id,
+                        keeper.source.identity_kind,
+                        keeper.source.identity_key,
+                        to_i64(keeper.source.size_bytes).expect("keeper size should fit"),
+                        keeper.source.modified_unix_ns,
+                        keeper_sha256,
+                        to_i64(keeper.source.size_bytes).expect("keeper hash bytes should fit"),
+                        keeper.scope_root_node_id,
+                        keeper.scope_root_identity_kind,
+                        keeper.scope_root_identity_key,
+                        keeper.parent_node_id,
+                        keeper.parent_identity_kind,
+                        keeper.parent_identity_key,
+                        selection.target_node_id,
+                        source.source.location_id,
+                        source.source.identity_kind,
+                        source.source.identity_key,
+                        to_i64(source.source.size_bytes).expect("target size should fit"),
+                        source.source.modified_unix_ns,
+                        target_sha256,
+                        to_i64(source.source.size_bytes).expect("target hash bytes should fit"),
+                        source.scope_root_node_id,
+                        source.scope_root_identity_kind,
+                        source.scope_root_identity_key,
+                        source.parent_node_id,
+                        source.parent_identity_kind,
+                        source.parent_identity_key,
+                    ],
+                )
+                .is_err(),
+            "the SQLite schema must independently reject mismatched exact-duplicate hashes"
+        );
+    }
+
+    #[test]
+    fn cleanup_action_preview_rejects_invalid_keeper_and_inactive_scope() {
+        let (database, selection, _, _) = cleanup_exact_duplicate_setup();
+        let invalid_keeper = CleanupActionSelection {
+            keeper_node_id: Some(selection.target_node_id),
+            ..selection
+        };
+        assert!(matches!(
+            database.cleanup_action_source(invalid_keeper),
+            Err(DatabaseError::CleanupActionPlanInputInvalid)
+        ));
+        database
+            .mark_scope_access_grant_revoked(selection.scope_id)
+            .expect("scope grant should revoke");
+        assert!(matches!(
+            database.cleanup_action_source(selection),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+    }
+
+    #[test]
+    fn cleanup_keeper_binding_check_allows_all_nulls_only_for_screenshot_groups() {
+        let (database, selection, source, keeper) = cleanup_exact_duplicate_setup();
+        let insert =
+            |source_kind: &str, keeper_node_id: Option<i64>, keeper_location_id: Option<i64>| {
+                database.connection.execute(
+                    "INSERT INTO cleanup_action_plans( \
+                     api_version, policy_version, operation, state, scope_id, source_kind, \
+                     source_id, source_observation_id, keeper_node_id, keeper_location_id, \
+                     target_node_id, target_location_id, target_identity_kind, \
+                     target_identity_key, target_size_bytes, target_modified_unix_ns, \
+                     target_sha256, target_hash_bytes, scope_root_node_id, \
+                     scope_root_identity_kind, scope_root_identity_key, parent_node_id, \
+                     parent_identity_kind, parent_identity_key, confirmation_required, \
+                     action_authorized, execution_available, created_at_unix_ms \
+                 ) VALUES ( \
+                     'deskgraph.cleanup-action-plan.v1', \
+                     'deskgraph.cleanup-action-policy.v1', 'system_trash_preview', \
+                     'previewed', ?1, ?18, ?2, ?3, ?4, ?5, ?6, ?7, \
+                     ?8, ?9, ?10, ?11, zeroblob(32), ?10, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, 1, 0, 0, 1 \
+                 )",
+                    params![
+                        selection.scope_id,
+                        selection.source_id,
+                        selection.source_observation_id,
+                        keeper_node_id,
+                        keeper_location_id,
+                        selection.target_node_id,
+                        source.source.location_id,
+                        source.source.identity_kind,
+                        source.source.identity_key,
+                        to_i64(source.source.size_bytes).expect("target size should fit"),
+                        source.source.modified_unix_ns,
+                        source.scope_root_node_id,
+                        source.scope_root_identity_kind,
+                        source.scope_root_identity_key,
+                        source.parent_node_id,
+                        source.parent_identity_kind,
+                        source.parent_identity_key,
+                        source_kind,
+                    ],
+                )
+            };
+
+        assert!(
+            insert(
+                "screenshot_review_group",
+                selection.keeper_node_id,
+                Some(keeper.source.location_id)
+            )
+            .is_err(),
+            "SQLite NULL semantics must not admit a partially bound keeper"
+        );
+        assert!(
+            insert("exact_duplicate", None, None).is_err(),
+            "exact duplicates must never omit the full keeper binding"
+        );
+        assert!(
+            insert("version", None, None).is_err(),
+            "version previews must never omit the full keeper binding"
+        );
+        assert_eq!(
+            insert("screenshot_review_group", None, None)
+                .expect("screenshot review may explicitly omit a keeper"),
+            1
+        );
+    }
+
+    #[test]
+    fn cleanup_selection_binds_version_and_screenshot_members_to_exact_observations() {
+        let (mut version_database, older, newer) = file_version_setup();
+        version_database
+            .upsert_scope_access_grant(older.scope_id, "macos", b"test-active-grant")
+            .expect("version scope should activate");
+        let version = version_database
+            .record_file_version_candidate(&older, &newer)
+            .expect("version evidence should persist");
+        let version_item = version_database
+            .smart_cleanup_relation_item(version.relation_id, version.evidence.observed_at_unix_ms)
+            .expect("version should map to current cleanup evidence");
+        let version_selection = CleanupActionSelection {
+            scope_id: older.scope_id,
+            source_kind: SmartCleanupSourceKind::Version,
+            source_id: version.relation_id,
+            source_observation_id: version_item.source_observation_id,
+            keeper_node_id: Some(version.newer.node_id),
+            target_node_id: version.older.node_id,
+        };
+        let version_snapshot =
+            cleanup_selection_snapshot(&version_database.connection, &version_selection)
+                .expect("exact version observation should resolve selected members");
+        assert_eq!(version_snapshot.location_id, version.older.location_id);
+        assert!(matches!(
+            cleanup_selection_snapshot(
+                &version_database.connection,
+                &CleanupActionSelection {
+                    keeper_node_id: Some(version.older.node_id),
+                    target_node_id: version.newer.node_id,
+                    ..version_selection
+                }
+            ),
+            Err(DatabaseError::CleanupActionPlanInputInvalid)
+        ));
+        assert!(matches!(
+            cleanup_selection_snapshot(
+                &version_database.connection,
+                &CleanupActionSelection {
+                    source_observation_id: version_item.source_observation_id + 1,
+                    ..version_selection
+                }
+            ),
+            Err(DatabaseError::CleanupActionSourceNotCurrent)
+        ));
+
+        let (mut screenshot_database, scope_id, _) = screenshot_group_setup();
+        let group = screenshot_database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("screenshot evidence should persist")
+            .1
+            .remove(0);
+        let screenshot_selection = CleanupActionSelection {
+            scope_id,
+            source_kind: SmartCleanupSourceKind::ScreenshotReviewGroup,
+            source_id: group.group_id,
+            source_observation_id: group.evidence.observation_id,
+            keeper_node_id: Some(group.members[0].node_id),
+            target_node_id: group.members[1].node_id,
+        };
+        let screenshot_snapshot =
+            cleanup_selection_snapshot(&screenshot_database.connection, &screenshot_selection)
+                .expect("exact screenshot observation should resolve selected members");
+        assert_eq!(
+            screenshot_snapshot.location_id,
+            group.members[1].location_id
+        );
+        assert!(matches!(
+            cleanup_selection_snapshot(
+                &screenshot_database.connection,
+                &CleanupActionSelection {
+                    keeper_node_id: Some(999_999),
+                    ..screenshot_selection
+                }
+            ),
+            Err(DatabaseError::CleanupActionPlanInputInvalid)
         ));
     }
 

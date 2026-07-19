@@ -13,11 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
     ActionCommandWrite, ActionExecutionPlan, ActionExecutionSourceRecord, ActionJournalAppend,
-    ActionPlanWrite, ActionSourceRecord, DatabaseError, ManifestDatabase,
+    ActionPlanWrite, ActionSourceRecord, CleanupActionPlanWrite, CleanupActionSelection,
+    CleanupKeeperBindingWrite, DatabaseError, ManifestDatabase,
 };
 use deskgraph_domain::{
     ActionCommandKind, ActionExecutionRecord, ActionExecutionStrategy, ActionJournalEventKind,
-    ActionPlanPreview, ActionPlanState, ActionPlanSummary,
+    ActionPlanPreview, ActionPlanState, ActionPlanSummary, CleanupActionPlanPreview,
+    SmartCleanupSourceKind,
 };
 #[cfg(not(unix))]
 use deskgraph_identity::platform_identity_for_open_file;
@@ -36,6 +38,7 @@ const MAX_ACTION_HASH_DURATION: Duration = Duration::from_secs(90);
 const ACTION_EXECUTOR_LEASE_MS: i64 = 120_000;
 const ACTION_RECOVERY_LIMIT: u32 = 100;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
+const CLEANUP_COMPARE_DURATION: Duration = Duration::from_secs(5);
 static EXECUTOR_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -60,6 +63,7 @@ pub enum TransactionError {
     SourceHashReadFailed,
     SourceHashTimedOut,
     SourceHashChanged,
+    CleanupEvidenceChanged,
     ExecutionStrategyUnsupported,
     ExecutionPathInvalid,
     ActionNeedsAttention,
@@ -91,6 +95,7 @@ impl TransactionError {
             Self::SourceHashReadFailed => "action_source_hash_read_failed",
             Self::SourceHashTimedOut => "action_source_hash_timed_out",
             Self::SourceHashChanged => "action_source_hash_changed",
+            Self::CleanupEvidenceChanged => "cleanup_source_evidence_changed",
             Self::ExecutionStrategyUnsupported => "action_execution_strategy_unsupported",
             Self::ExecutionPathInvalid => "action_execution_path_invalid",
             Self::ActionNeedsAttention => "action_needs_attention",
@@ -253,6 +258,94 @@ pub fn create_rename_preview(
             parent_identity_kind: &live.parent_identity_kind,
             parent_identity_key: &live.parent_identity_key,
             execution_strategy,
+        })
+        .map_err(Into::into)
+}
+
+pub fn create_cleanup_preview_at(
+    database_path: &Path,
+    selection: CleanupActionSelection,
+) -> Result<CleanupActionPlanPreview, TransactionError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    create_cleanup_preview(&mut database, selection)
+}
+
+/// Creates one immutable, path-free preview for one explicitly selected Smart
+/// Cleanup target. This performs no filesystem mutation and deliberately has
+/// no confirm, execute, Trash, recovery, or Undo companion.
+pub fn create_cleanup_preview(
+    database: &mut ManifestDatabase,
+    selection: CleanupActionSelection,
+) -> Result<CleanupActionPlanPreview, TransactionError> {
+    let (execution_source, keeper_execution_source) = database.cleanup_action_sources(selection)?;
+    let source = &execution_source.source;
+    let canonical_root = validated_scope_root(database, selection.scope_id)?;
+    let source_path =
+        path_from_raw(&source.path_raw).map_err(|_| TransactionError::ExecutionPathInvalid)?;
+    if !source_path.is_absolute() {
+        return Err(TransactionError::SourcePathMustBeAbsolute);
+    }
+    let source_link_metadata = fs::symlink_metadata(&source_path).map_err(map_source_error)?;
+    if is_symlink_or_reparse_point(&source_link_metadata) {
+        return Err(TransactionError::SourceSymlinkOrReparseDenied);
+    }
+    if !source_link_metadata.is_file() {
+        return Err(TransactionError::SourceMustBeFile);
+    }
+    let canonical_source = fs::canonicalize(&source_path).map_err(map_source_error)?;
+    if canonical_source == canonical_root || !canonical_source.starts_with(&canonical_root) {
+        return Err(TransactionError::SourceOutsideScope);
+    }
+    if comparison_key(&canonical_source) != source.path_key {
+        return Err(TransactionError::SourceSymlinkOrReparseDenied);
+    }
+    validate_source_snapshot(&canonical_source, source, &source_link_metadata)?;
+    let keeper_path = keeper_execution_source
+        .as_ref()
+        .map(|keeper| cleanup_peer_path(&canonical_root, &keeper.source))
+        .transpose()?;
+    let binding = create_cleanup_live_binding(
+        &canonical_root,
+        &canonical_source,
+        &execution_source,
+        keeper_path.as_deref(),
+        keeper_execution_source.as_ref(),
+        selection.source_kind,
+    )?;
+    database
+        .create_cleanup_action_plan(CleanupActionPlanWrite {
+            selection,
+            target_location_id: source.location_id,
+            target_identity_kind: &source.identity_kind,
+            target_identity_key: &source.identity_key,
+            target_size_bytes: source.size_bytes,
+            target_modified_unix_ns: source.modified_unix_ns,
+            target_sha256: &binding.target.source_sha256,
+            target_hash_bytes: binding.target.source_hash_bytes,
+            keeper: keeper_execution_source
+                .as_ref()
+                .zip(binding.keeper.as_ref())
+                .map(|(keeper, binding)| CleanupKeeperBindingWrite {
+                    location_id: keeper.source.location_id,
+                    identity_kind: &keeper.source.identity_kind,
+                    identity_key: &keeper.source.identity_key,
+                    size_bytes: keeper.source.size_bytes,
+                    modified_unix_ns: keeper.source.modified_unix_ns,
+                    sha256: &binding.source_sha256,
+                    hash_bytes: binding.source_hash_bytes,
+                    scope_root_node_id: keeper.scope_root_node_id,
+                    scope_root_identity_kind: &binding.scope_root_identity_kind,
+                    scope_root_identity_key: &binding.scope_root_identity_key,
+                    parent_node_id: keeper.parent_node_id,
+                    parent_identity_kind: &binding.parent_identity_kind,
+                    parent_identity_key: &binding.parent_identity_key,
+                }),
+            scope_root_node_id: execution_source.scope_root_node_id,
+            scope_root_identity_kind: &binding.target.scope_root_identity_kind,
+            scope_root_identity_key: &binding.target.scope_root_identity_key,
+            parent_node_id: execution_source.parent_node_id,
+            parent_identity_kind: &binding.target.parent_identity_kind,
+            parent_identity_key: &binding.target.parent_identity_key,
         })
         .map_err(Into::into)
 }
@@ -837,6 +930,12 @@ struct PreviewLiveBinding {
     parent_identity_key: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct CleanupLiveBinding {
+    target: PreviewLiveBinding,
+    keeper: Option<PreviewLiveBinding>,
+}
+
 #[cfg(unix)]
 fn create_preview_live_binding(
     canonical_root: &Path,
@@ -951,6 +1050,364 @@ fn create_preview_live_binding(
         parent_identity_kind: parent_identity.kind.to_owned(),
         parent_identity_key: parent_identity.key,
     })
+}
+
+fn cleanup_peer_path(
+    canonical_root: &Path,
+    source: &ActionSourceRecord,
+) -> Result<PathBuf, TransactionError> {
+    let path =
+        path_from_raw(&source.path_raw).map_err(|_| TransactionError::ExecutionPathInvalid)?;
+    if !path.is_absolute() {
+        return Err(TransactionError::SourcePathMustBeAbsolute);
+    }
+    let link_metadata = fs::symlink_metadata(&path).map_err(map_source_error)?;
+    if is_symlink_or_reparse_point(&link_metadata) {
+        return Err(TransactionError::SourceSymlinkOrReparseDenied);
+    }
+    if !link_metadata.is_file() {
+        return Err(TransactionError::SourceMustBeFile);
+    }
+    let canonical = fs::canonicalize(&path).map_err(map_source_error)?;
+    if canonical == canonical_root || !canonical.starts_with(canonical_root) {
+        return Err(TransactionError::SourceOutsideScope);
+    }
+    if comparison_key(&canonical) != source.path_key {
+        return Err(TransactionError::SourceSymlinkOrReparseDenied);
+    }
+    validate_source_snapshot(&canonical, source, &link_metadata)?;
+    Ok(canonical)
+}
+
+#[cfg(unix)]
+fn create_cleanup_live_binding(
+    canonical_root: &Path,
+    canonical_target: &Path,
+    target: &ActionExecutionSourceRecord,
+    canonical_keeper: Option<&Path>,
+    keeper: Option<&ActionExecutionSourceRecord>,
+    source_kind: SmartCleanupSourceKind,
+) -> Result<CleanupLiveBinding, TransactionError> {
+    if canonical_keeper.is_some() != keeper.is_some() {
+        return Err(TransactionError::CleanupEvidenceChanged);
+    }
+    let target_binding = bind_action_file(
+        canonical_root,
+        canonical_target,
+        IdentityExpectation {
+            kind: &target.scope_root_identity_kind,
+            key: &target.scope_root_identity_key,
+        },
+        IdentityExpectation {
+            kind: &target.parent_identity_kind,
+            key: &target.parent_identity_key,
+        },
+        IdentityExpectation {
+            kind: &target.source.identity_kind,
+            key: &target.source.identity_key,
+        },
+    )?;
+    if target_binding.source_size_bytes() != target.source.size_bytes
+        || target_binding.source_modified_unix_ns() != target.source.modified_unix_ns
+    {
+        return Err(TransactionError::SourceMetadataChanged);
+    }
+    let keeper_binding = match (canonical_keeper, keeper) {
+        (Some(path), Some(source)) => {
+            let binding = bind_action_file(
+                canonical_root,
+                path,
+                IdentityExpectation {
+                    kind: &source.scope_root_identity_kind,
+                    key: &source.scope_root_identity_key,
+                },
+                IdentityExpectation {
+                    kind: &source.parent_identity_kind,
+                    key: &source.parent_identity_key,
+                },
+                IdentityExpectation {
+                    kind: &source.source.identity_kind,
+                    key: &source.source.identity_key,
+                },
+            )?;
+            if binding.source_size_bytes() != source.source.size_bytes
+                || binding.source_modified_unix_ns() != source.source.modified_unix_ns
+            {
+                return Err(TransactionError::SourceMetadataChanged);
+            }
+            Some(binding)
+        }
+        (None, None) => None,
+        _ => return Err(TransactionError::CleanupEvidenceChanged),
+    };
+    if source_kind == SmartCleanupSourceKind::ExactDuplicate {
+        let keeper_binding = keeper_binding
+            .as_ref()
+            .ok_or(TransactionError::CleanupEvidenceChanged)?;
+        compare_open_files_exact(
+            target_binding.source_file(),
+            keeper_binding.source_file(),
+            target_binding.source_size_bytes(),
+        )?;
+    }
+    let source_sha256 = hash_open_file(
+        target_binding.source_file(),
+        target_binding.source_size_bytes(),
+    )?;
+    let keeper_sha256 = keeper_binding
+        .as_ref()
+        .map(|binding| hash_open_file(binding.source_file(), binding.source_size_bytes()))
+        .transpose()?;
+    target_binding.revalidate_bound_source()?;
+    if let Some(binding) = &keeper_binding {
+        binding.revalidate_bound_source()?;
+    }
+    validate_cleanup_final_hashes(
+        source_kind,
+        &source_sha256,
+        target_binding.source_size_bytes(),
+        keeper_sha256.as_deref(),
+        keeper_binding
+            .as_ref()
+            .map(ActionFileBinding::source_size_bytes),
+    )?;
+    let keeper = keeper_binding
+        .zip(keeper_sha256)
+        .map(|(binding, sha256)| PreviewLiveBinding {
+            source_sha256: sha256,
+            source_hash_bytes: binding.source_size_bytes(),
+            scope_root_identity_kind: binding.root_identity().kind.to_owned(),
+            scope_root_identity_key: binding.root_identity().key.clone(),
+            parent_identity_kind: binding.parent_identity().kind.to_owned(),
+            parent_identity_key: binding.parent_identity().key.clone(),
+        });
+    Ok(CleanupLiveBinding {
+        target: PreviewLiveBinding {
+            source_sha256,
+            source_hash_bytes: target_binding.source_size_bytes(),
+            scope_root_identity_kind: target_binding.root_identity().kind.to_owned(),
+            scope_root_identity_key: target_binding.root_identity().key.clone(),
+            parent_identity_kind: target_binding.parent_identity().kind.to_owned(),
+            parent_identity_key: target_binding.parent_identity().key.clone(),
+        },
+        keeper,
+    })
+}
+
+#[cfg(not(unix))]
+fn create_cleanup_live_binding(
+    canonical_root: &Path,
+    canonical_target: &Path,
+    target: &ActionExecutionSourceRecord,
+    canonical_keeper: Option<&Path>,
+    keeper: Option<&ActionExecutionSourceRecord>,
+    source_kind: SmartCleanupSourceKind,
+) -> Result<CleanupLiveBinding, TransactionError> {
+    if canonical_keeper.is_some() != keeper.is_some() {
+        return Err(TransactionError::CleanupEvidenceChanged);
+    }
+    let target_parent = canonical_target
+        .parent()
+        .ok_or(TransactionError::ExecutionPathInvalid)?;
+    let root_file = File::open(canonical_root).map_err(|_| TransactionError::SourceOpenFailed)?;
+    let target_parent_file =
+        File::open(target_parent).map_err(|_| TransactionError::SourceOpenFailed)?;
+    let target_file =
+        File::open(canonical_target).map_err(|_| TransactionError::SourceOpenFailed)?;
+    let root_metadata = root_file
+        .metadata()
+        .map_err(|_| TransactionError::SourceOpenFailed)?;
+    let target_parent_metadata = target_parent_file
+        .metadata()
+        .map_err(|_| TransactionError::SourceOpenFailed)?;
+    let target_metadata = target_file
+        .metadata()
+        .map_err(|_| TransactionError::SourceOpenFailed)?;
+    let root_identity = platform_identity_for_open_file(
+        &root_file,
+        canonical_root,
+        &root_metadata,
+        IdentityNodeKind::Folder,
+    )
+    .map_err(|_| TransactionError::SourceIdentityUnavailable)?;
+    let target_parent_identity = platform_identity_for_open_file(
+        &target_parent_file,
+        target_parent,
+        &target_parent_metadata,
+        IdentityNodeKind::Folder,
+    )
+    .map_err(|_| TransactionError::SourceIdentityUnavailable)?;
+    validate_open_source(
+        &target_file,
+        canonical_target,
+        &target_metadata,
+        &target.source,
+    )?;
+    if root_identity.kind != target.scope_root_identity_kind
+        || root_identity.key != target.scope_root_identity_key
+        || target_parent_identity.kind != target.parent_identity_kind
+        || target_parent_identity.key != target.parent_identity_key
+    {
+        return Err(TransactionError::SourceIdentityChanged);
+    }
+    let keeper_file = match (canonical_keeper, keeper) {
+        (Some(path), Some(source)) => {
+            let parent = path
+                .parent()
+                .ok_or(TransactionError::ExecutionPathInvalid)?;
+            let parent_file = File::open(parent).map_err(|_| TransactionError::SourceOpenFailed)?;
+            let file = File::open(path).map_err(|_| TransactionError::SourceOpenFailed)?;
+            let parent_metadata = parent_file
+                .metadata()
+                .map_err(|_| TransactionError::SourceOpenFailed)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| TransactionError::SourceOpenFailed)?;
+            let parent_identity = platform_identity_for_open_file(
+                &parent_file,
+                parent,
+                &parent_metadata,
+                IdentityNodeKind::Folder,
+            )
+            .map_err(|_| TransactionError::SourceIdentityUnavailable)?;
+            validate_open_source(&file, path, &metadata, &source.source)?;
+            if root_identity.kind != source.scope_root_identity_kind
+                || root_identity.key != source.scope_root_identity_key
+                || parent_identity.kind != source.parent_identity_kind
+                || parent_identity.key != source.parent_identity_key
+            {
+                return Err(TransactionError::SourceIdentityChanged);
+            }
+            Some((file, path, source))
+        }
+        (None, None) => None,
+        _ => return Err(TransactionError::CleanupEvidenceChanged),
+    };
+    if source_kind == SmartCleanupSourceKind::ExactDuplicate {
+        let (file, _, _) = keeper_file
+            .as_ref()
+            .ok_or(TransactionError::CleanupEvidenceChanged)?;
+        compare_open_files_exact(&target_file, file, target_metadata.len())?;
+    }
+    let source_sha256 = hash_open_file(&target_file, target_metadata.len())?;
+    let keeper_sha256 = keeper_file
+        .as_ref()
+        .map(|(file, _, source)| hash_open_file(file, source.source.size_bytes))
+        .transpose()?;
+    validate_open_source(
+        &target_file,
+        canonical_target,
+        &target_file
+            .metadata()
+            .map_err(|_| TransactionError::SourceOpenFailed)?,
+        &target.source,
+    )?;
+    if let Some((file, path, source)) = &keeper_file {
+        validate_open_source(
+            file,
+            path,
+            &file
+                .metadata()
+                .map_err(|_| TransactionError::SourceOpenFailed)?,
+            &source.source,
+        )?;
+    }
+    validate_cleanup_final_hashes(
+        source_kind,
+        &source_sha256,
+        target_metadata.len(),
+        keeper_sha256.as_deref(),
+        keeper_file
+            .as_ref()
+            .map(|(_, _, source)| source.source.size_bytes),
+    )?;
+    let keeper = keeper_file
+        .zip(keeper_sha256)
+        .map(|((_, _, source), sha256)| PreviewLiveBinding {
+            source_sha256: sha256,
+            source_hash_bytes: source.source.size_bytes,
+            scope_root_identity_kind: source.scope_root_identity_kind.clone(),
+            scope_root_identity_key: source.scope_root_identity_key.clone(),
+            parent_identity_kind: source.parent_identity_kind.clone(),
+            parent_identity_key: source.parent_identity_key.clone(),
+        });
+    Ok(CleanupLiveBinding {
+        target: PreviewLiveBinding {
+            source_sha256,
+            source_hash_bytes: target_metadata.len(),
+            scope_root_identity_kind: root_identity.kind.to_owned(),
+            scope_root_identity_key: root_identity.key,
+            parent_identity_kind: target_parent_identity.kind.to_owned(),
+            parent_identity_key: target_parent_identity.key,
+        },
+        keeper,
+    })
+}
+
+fn compare_open_files_exact(
+    left: &File,
+    right: &File,
+    expected_size: u64,
+) -> Result<(), TransactionError> {
+    let started = Instant::now();
+    let mut left = left
+        .try_clone()
+        .map_err(|_| TransactionError::SourceHashReadFailed)?;
+    let mut right = right
+        .try_clone()
+        .map_err(|_| TransactionError::SourceHashReadFailed)?;
+    left.seek(SeekFrom::Start(0))
+        .map_err(|_| TransactionError::SourceHashReadFailed)?;
+    right
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| TransactionError::SourceHashReadFailed)?;
+    let mut left_buffer = [0_u8; HASH_BUFFER_BYTES];
+    let mut right_buffer = [0_u8; HASH_BUFFER_BYTES];
+    let mut total = 0_u64;
+    loop {
+        if started.elapsed() > CLEANUP_COMPARE_DURATION {
+            return Err(TransactionError::SourceHashTimedOut);
+        }
+        let left_read = left
+            .read(&mut left_buffer)
+            .map_err(|_| TransactionError::SourceHashReadFailed)?;
+        let right_read = right
+            .read(&mut right_buffer)
+            .map_err(|_| TransactionError::SourceHashReadFailed)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Err(TransactionError::CleanupEvidenceChanged);
+        }
+        if left_read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(
+                u64::try_from(left_read).map_err(|_| TransactionError::SourceHashReadFailed)?,
+            )
+            .ok_or(TransactionError::SourceHashTooLarge)?;
+        if total > expected_size {
+            return Err(TransactionError::SourceMetadataChanged);
+        }
+    }
+    if total != expected_size {
+        return Err(TransactionError::SourceMetadataChanged);
+    }
+    Ok(())
+}
+
+fn validate_cleanup_final_hashes(
+    source_kind: SmartCleanupSourceKind,
+    target_sha256: &[u8],
+    target_hash_bytes: u64,
+    keeper_sha256: Option<&[u8]>,
+    keeper_hash_bytes: Option<u64>,
+) -> Result<(), TransactionError> {
+    if source_kind == SmartCleanupSourceKind::ExactDuplicate
+        && (keeper_sha256 != Some(target_sha256) || keeper_hash_bytes != Some(target_hash_bytes))
+    {
+        return Err(TransactionError::CleanupEvidenceChanged);
+    }
+    Ok(())
 }
 
 fn hash_open_file(file: &File, expected_size: u64) -> Result<Vec<u8>, TransactionError> {
@@ -1107,6 +1564,7 @@ mod tests {
     use super::*;
     use deskgraph_domain::{
         ActionJournalEventKind, ActionOperation, ActionPlanState, ActionPolicyDecision,
+        CleanupActionOperation, CleanupActionPlanState, SmartCleanupSourceKind,
     };
     use deskgraph_scanner::{authorize_scope, scan_scope};
     use std::fs::OpenOptions;
@@ -1141,6 +1599,219 @@ mod tests {
                 scope_id: scope.id,
             }
         }
+    }
+
+    struct CleanupFixture {
+        _directory: tempfile::TempDir,
+        database_path: PathBuf,
+        keeper_path: PathBuf,
+        target_path: PathBuf,
+        selection: CleanupActionSelection,
+    }
+
+    impl CleanupFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().expect("fixture root should exist");
+            let database_path = directory.path().join("manifest.sqlite3");
+            let scope_path = directory.path().join("authorized");
+            fs::create_dir(&scope_path).expect("scope should create");
+            let keeper_path = scope_path.join("Keeper.txt");
+            let target_path = scope_path.join("Target.txt");
+            fs::write(&keeper_path, "same cleanup bytes").expect("keeper should write");
+            fs::write(&target_path, "same cleanup bytes").expect("target should write");
+            let mut database =
+                ManifestDatabase::open(&database_path).expect("database should initialize");
+            let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+            database
+                .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-active-grant")
+                .expect("test grant should activate");
+            scan_scope(&mut database, scope.id).expect("scope should scan");
+            let canonical_keeper =
+                fs::canonicalize(&keeper_path).expect("keeper should canonicalize");
+            let canonical_target =
+                fs::canonicalize(&target_path).expect("target should canonicalize");
+            let keeper = database
+                .action_source_for_path_key(scope.id, &comparison_key(&canonical_keeper))
+                .expect("keeper should load");
+            let target = database
+                .action_source_for_path_key(scope.id, &comparison_key(&canonical_target))
+                .expect("target should load");
+            let candidate = database
+                .record_exact_duplicate_candidate(&keeper, &target)
+                .expect("fresh evidence should persist");
+            let inbox_item = database
+                .smart_cleanup_relation_item(
+                    candidate.relation_id,
+                    candidate.evidence.observed_at_unix_ms,
+                )
+                .expect("fresh evidence should become a path-free item");
+            let selection = CleanupActionSelection {
+                scope_id: scope.id,
+                source_kind: SmartCleanupSourceKind::ExactDuplicate,
+                source_id: candidate.relation_id,
+                source_observation_id: inbox_item.source_observation_id,
+                keeper_node_id: Some(keeper.node_id),
+                target_node_id: target.node_id,
+            };
+            drop(database);
+            Self {
+                _directory: directory,
+                database_path,
+                keeper_path,
+                target_path,
+                selection,
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_preview_is_durable_path_free_and_never_mutates_the_target() {
+        let fixture = CleanupFixture::new();
+        let preview = create_cleanup_preview_at(&fixture.database_path, fixture.selection)
+            .expect("current explicit cleanup selection should preview");
+        assert_eq!(
+            preview.operation,
+            CleanupActionOperation::SystemTrashPreview
+        );
+        assert_eq!(preview.state, CleanupActionPlanState::Previewed);
+        assert_eq!(preview.journal_sequence, 1);
+        assert!(preview.policy.confirmation_required);
+        assert!(!preview.policy.action_authorized);
+        assert!(!preview.policy.execution_available);
+        assert!(preview.keeper_hash_bound);
+        assert!(fixture.keeper_path.exists());
+        assert!(fixture.target_path.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.target_path).expect("target should remain readable"),
+            "same cleanup bytes"
+        );
+
+        let reopened = ManifestDatabase::open(&fixture.database_path)
+            .expect("database should reopen")
+            .cleanup_action_plan(preview.plan_id)
+            .expect("preview should survive reopen");
+        assert_eq!(reopened, preview);
+        let serialized = serde_json::to_string(&preview).expect("preview should serialize");
+        assert!(!serialized.contains("Keeper.txt"));
+        assert!(!serialized.contains("Target.txt"));
+        assert!(!serialized.contains("sha256"));
+    }
+
+    #[test]
+    fn cleanup_preview_rejects_same_size_and_mtime_keeper_content_change() {
+        let fixture = CleanupFixture::new();
+        let original_metadata =
+            fs::metadata(&fixture.keeper_path).expect("keeper metadata should exist");
+        let original_modified = original_metadata
+            .modified()
+            .expect("keeper mtime should exist");
+        let original_modified_unix_ns = modified_unix_ns(&original_metadata);
+        let changed =
+            vec![b'X'; usize::try_from(original_metadata.len()).expect("size should fit")];
+        fs::write(&fixture.keeper_path, changed).expect("same-size keeper change should write");
+        let keeper = OpenOptions::new()
+            .write(true)
+            .open(&fixture.keeper_path)
+            .expect("keeper should reopen");
+        keeper
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .expect("keeper mtime should restore");
+        drop(keeper);
+        let restored_metadata =
+            fs::metadata(&fixture.keeper_path).expect("restored metadata should exist");
+        assert_eq!(restored_metadata.len(), original_metadata.len());
+        assert_eq!(
+            modified_unix_ns(&restored_metadata),
+            original_modified_unix_ns
+        );
+
+        let error = create_cleanup_preview_at(&fixture.database_path, fixture.selection)
+            .expect_err("keeper content drift must invalidate exact-duplicate evidence");
+        assert_eq!(error.code(), "cleanup_source_evidence_changed");
+        assert!(fixture.keeper_path.exists());
+        assert!(fixture.target_path.exists());
+    }
+
+    #[test]
+    fn cleanup_preview_rejects_refreshed_observation_and_changed_target() {
+        let fixture = CleanupFixture::new();
+        let mut database =
+            ManifestDatabase::open(&fixture.database_path).expect("database should reopen");
+        let (left, right) = database
+            .exact_duplicate_sources(fixture.selection.source_id)
+            .expect("relation sources should load");
+        let refreshed = database
+            .record_exact_duplicate_candidate(&left, &right)
+            .expect("refresh should append a new observation");
+        let refreshed_item = database
+            .smart_cleanup_relation_item(
+                refreshed.relation_id,
+                refreshed.evidence.observed_at_unix_ms,
+            )
+            .expect("refreshed observation should become current");
+        drop(database);
+        let stale = create_cleanup_preview_at(&fixture.database_path, fixture.selection)
+            .expect_err("old observation must not be silently replaced");
+        assert_eq!(stale.code(), "cleanup_action_source_not_current");
+        fs::write(&fixture.target_path, "changed after manifest").expect("target should change");
+        let mut latest_selection = fixture.selection;
+        latest_selection.source_observation_id = refreshed_item.source_observation_id;
+        let changed = create_cleanup_preview_at(&fixture.database_path, latest_selection)
+            .expect_err("changed target must fail before preview persistence");
+        assert!(matches!(
+            changed,
+            TransactionError::SourceIdentityChanged | TransactionError::SourceMetadataChanged
+        ));
+    }
+
+    #[test]
+    fn cleanup_exact_pair_comparison_rejects_equal_length_different_bytes() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let left_path = directory.path().join("left.bin");
+        let right_path = directory.path().join("right.bin");
+        fs::write(&left_path, b"same-size-left!").expect("left should write");
+        fs::write(&right_path, b"same-size-right").expect("right should write");
+        let left = File::open(&left_path).expect("left should open read-only");
+        let right = File::open(&right_path).expect("right should open read-only");
+        let error = compare_open_files_exact(&left, &right, 15)
+            .expect_err("equal-length different content must invalidate exact evidence");
+        assert_eq!(error.code(), "cleanup_source_evidence_changed");
+    }
+
+    #[test]
+    fn cleanup_exact_duplicate_requires_matching_final_hashes_and_byte_counts() {
+        let target_sha256 = [7_u8; 32];
+        let keeper_sha256 = [8_u8; 32];
+        assert!(matches!(
+            validate_cleanup_final_hashes(
+                SmartCleanupSourceKind::ExactDuplicate,
+                &target_sha256,
+                42,
+                Some(&keeper_sha256),
+                Some(42),
+            ),
+            Err(TransactionError::CleanupEvidenceChanged)
+        ));
+        assert!(matches!(
+            validate_cleanup_final_hashes(
+                SmartCleanupSourceKind::ExactDuplicate,
+                &target_sha256,
+                42,
+                Some(&target_sha256),
+                Some(41),
+            ),
+            Err(TransactionError::CleanupEvidenceChanged)
+        ));
+        assert!(
+            validate_cleanup_final_hashes(
+                SmartCleanupSourceKind::ExactDuplicate,
+                &target_sha256,
+                42,
+                Some(&target_sha256),
+                Some(42),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

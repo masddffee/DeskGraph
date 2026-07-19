@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::project::SmartCleanupSourceKind;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionOperation {
@@ -275,6 +277,96 @@ impl ActionPlanSummary {
     pub const API_VERSION: &str = "deskgraph.action-plan-summary.v2";
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupActionOperation {
+    SystemTrashPreview,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupActionPlanState {
+    Previewed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupActionPolicyCheck {
+    ExplicitAuthorizedScope,
+    ActiveScopeGrant,
+    SuggestedSource,
+    ExactSourceObservation,
+    SelectedMember,
+    KeeperDistinctWhenPresent,
+    PresentManifestFile,
+    StrongTargetIdentity,
+    ReadOnlyHandleIdentityMatches,
+    TargetHashBound,
+    KeeperSnapshotAndHashBoundWhenPresent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupActionPolicyReport {
+    pub api_version: &'static str,
+    pub checks: Vec<CleanupActionPolicyCheck>,
+    pub confirmation_required: bool,
+    pub action_authorized: bool,
+    pub execution_available: bool,
+}
+
+impl CleanupActionPolicyReport {
+    pub const API_VERSION: &str = "deskgraph.cleanup-action-policy.v1";
+
+    #[must_use]
+    pub fn preview_only() -> Self {
+        Self {
+            api_version: Self::API_VERSION,
+            checks: vec![
+                CleanupActionPolicyCheck::ExplicitAuthorizedScope,
+                CleanupActionPolicyCheck::ActiveScopeGrant,
+                CleanupActionPolicyCheck::SuggestedSource,
+                CleanupActionPolicyCheck::ExactSourceObservation,
+                CleanupActionPolicyCheck::SelectedMember,
+                CleanupActionPolicyCheck::KeeperDistinctWhenPresent,
+                CleanupActionPolicyCheck::PresentManifestFile,
+                CleanupActionPolicyCheck::StrongTargetIdentity,
+                CleanupActionPolicyCheck::ReadOnlyHandleIdentityMatches,
+                CleanupActionPolicyCheck::TargetHashBound,
+                CleanupActionPolicyCheck::KeeperSnapshotAndHashBoundWhenPresent,
+            ],
+            confirmation_required: true,
+            action_authorized: false,
+            execution_available: false,
+        }
+    }
+}
+
+/// A path-free, immutable preview of one explicitly selected cleanup target.
+/// It is deliberately not a command, confirmation, transaction receipt, or
+/// authorization to invoke a platform Trash API.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupActionPlanPreview {
+    pub api_version: &'static str,
+    pub plan_id: i64,
+    pub operation: CleanupActionOperation,
+    pub state: CleanupActionPlanState,
+    pub scope_id: i64,
+    pub source_kind: SmartCleanupSourceKind,
+    pub source_id: i64,
+    pub source_observation_id: i64,
+    pub keeper_node_id: Option<i64>,
+    pub target_node_id: i64,
+    pub expected_bytes: u64,
+    pub keeper_hash_bound: bool,
+    pub policy: CleanupActionPolicyReport,
+    pub journal_sequence: u64,
+    pub created_at_unix_ms: i64,
+}
+
+impl CleanupActionPlanPreview {
+    pub const API_VERSION: &str = "deskgraph.cleanup-action-plan-preview.v1";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +399,36 @@ mod tests {
                 .checks
                 .contains(&ActionPolicyCheck::DestinationAvailable)
         );
+    }
+
+    #[test]
+    fn cleanup_preview_contract_is_path_free_and_cannot_authorize_an_action() {
+        let preview = CleanupActionPlanPreview {
+            api_version: CleanupActionPlanPreview::API_VERSION,
+            plan_id: 1,
+            operation: CleanupActionOperation::SystemTrashPreview,
+            state: CleanupActionPlanState::Previewed,
+            scope_id: 2,
+            source_kind: SmartCleanupSourceKind::ExactDuplicate,
+            source_id: 3,
+            source_observation_id: 4,
+            keeper_node_id: Some(5),
+            target_node_id: 6,
+            expected_bytes: 7,
+            keeper_hash_bound: true,
+            policy: CleanupActionPolicyReport::preview_only(),
+            journal_sequence: 1,
+            created_at_unix_ms: 8,
+        };
+        let value = serde_json::to_value(preview).expect("cleanup preview should serialize");
+        assert_eq!(value["operation"], "system_trash_preview");
+        assert_eq!(value["policy"]["confirmation_required"], true);
+        assert_eq!(value["policy"]["action_authorized"], false);
+        assert_eq!(value["policy"]["execution_available"], false);
+        assert_eq!(value["keeper_hash_bound"], true);
+        assert!(value.get("source_path").is_none());
+        assert!(value.get("target_path").is_none());
+        assert!(value.get("target_sha256").is_none());
     }
 
     #[test]
