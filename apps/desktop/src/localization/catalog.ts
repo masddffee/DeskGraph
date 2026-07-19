@@ -244,6 +244,41 @@ export type Catalog = {
       noExecution: string;
     };
   };
+  projects: {
+    kicker: string;
+    heading: string;
+    description: string;
+    scopeLabel: string;
+    chooseScope: string;
+    discover: string;
+    discovering: string;
+    checkingReadiness: string;
+    readinessError: string;
+    controlsAria: string;
+    authorizationRequired: string;
+    scanRequired: string;
+    empty: string;
+    partial: string;
+    error: string;
+    candidateMeta: (confidence: number, observedAt: string) => string;
+    viewEvidence: string;
+    suggestionOnly: string;
+    noAutomaticMembership: string;
+    noFileActions: string;
+    state: { suggested: string; accepted: string; rejected: string };
+    detail: {
+      loading: string;
+      transientNotice: string;
+      rootLabel: string;
+      signalsLabel: string;
+      close: string;
+      accept: string;
+      reject: string;
+      saving: string;
+      decisionError: string;
+      detailError: string;
+    };
+  };
   extraction: {
     kicker: string;
     emptyHeading: string;

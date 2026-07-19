@@ -265,6 +265,8 @@ enum ProjectCommand {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
+        scope: i64,
+        #[arg(long)]
         project: i64,
         #[arg(long, value_enum)]
         decision: ProjectDecisionArg,
@@ -273,6 +275,8 @@ enum ProjectCommand {
     Status {
         #[arg(long)]
         database: PathBuf,
+        #[arg(long)]
+        scope: i64,
         #[arg(long)]
         project: i64,
     },
@@ -908,11 +912,13 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             }
             ProjectCommand::Decide {
                 database,
+                scope,
                 project,
                 decision,
             } => {
-                let candidate = decide_project_candidate_at(&database, project, decision.into())
-                    .map_err(|error| error.code())?;
+                let candidate =
+                    decide_project_candidate_at(&database, scope, project, decision.into())
+                        .map_err(|error| error.code())?;
                 print_json(&candidate)?;
                 info!(
                     event = "project_candidate_decided",
@@ -927,9 +933,13 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 );
                 Ok(())
             }
-            ProjectCommand::Status { database, project } => {
-                let candidate =
-                    project_candidate_at(&database, project).map_err(|error| error.code())?;
+            ProjectCommand::Status {
+                database,
+                scope,
+                project,
+            } => {
+                let candidate = project_candidate_at(&database, scope, project)
+                    .map_err(|error| error.code())?;
                 print_json(&candidate)?;
                 info!(
                     event = "project_candidate_status_read",

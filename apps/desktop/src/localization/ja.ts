@@ -344,6 +344,50 @@ export const ja = {
         'プレビューのみです。ファイルの確認、移動、ゴミ箱への移動、削除、復元、元に戻す操作は行いません。',
     },
   },
+  projects: {
+    kicker: 'プロジェクト検出',
+    heading: 'ローカルのプロジェクト候補を確認',
+    description:
+      'スキャン済みの許可フォルダーを 1 つ明示的に選び、決定的なローカルフォルダーマーカーで評価します。',
+    scopeLabel: '許可済みフォルダー',
+    chooseScope: '許可済みフォルダーを選択',
+    discover: 'プロジェクトを検出',
+    discovering: 'ローカルフォルダーの証拠を評価中…',
+    checkingReadiness: '永続化されたスキャン状態を確認しています…',
+    readinessError: 'このフォルダーのスキャン状態を安全に確認できませんでした。',
+    controlsAria: 'プロジェクト検出コントロール',
+    authorizationRequired:
+      'ローカルのプロジェクト候補を要求する前に、フォルダーを許可してください。',
+    scanRequired:
+      'プロジェクトを検出する前に、このフォルダーのメタデータスキャンを完了してください。',
+    empty: '現在のフォルダーマーカーに一致するプロジェクト候補はありません。',
+    partial: 'この制限付き評価は部分的です。一部のルートを安全に評価できませんでした。',
+    error: 'プロジェクト候補を安全に評価できませんでした。',
+    candidateMeta: (confidence, observedAt) =>
+      `証拠スコア ${formatIntegerForLocale(confidence, 'ja')} / 10,000 · 観測 ${observedAt}`,
+    viewEvidence: '証拠を確認',
+    suggestionOnly: '候補のみ',
+    noAutomaticMembership: 'ルートを承認してもファイルの所属は作成されません。',
+    noFileActions: 'ファイルを移動、名前変更、削除、ゴミ箱への移動、復元しません。',
+    state: {
+      suggested: '候補のプロジェクトルート',
+      accepted: '承認済みプロジェクトルート',
+      rejected: '拒否済みプロジェクトルート',
+    },
+    detail: {
+      loading: 'このプロジェクト候補をローカルで再検証中…',
+      transientNotice:
+        'この明示的なローカル確認でのみ現在のパスを表示します。通常の一覧やログには含まれません。',
+      rootLabel: '現在のプロジェクトルート',
+      signalsLabel: '検出されたフォルダーマーカー',
+      close: 'プロジェクト確認を閉じる',
+      accept: 'プロジェクトルートを承認',
+      reject: 'プロジェクトルートを拒否',
+      saving: '追記専用の判断を保存中…',
+      decisionError: '判断を安全に保存できませんでした。',
+      detailError: 'このプロジェクト候補は現在の状態ではありません。更新して再試行してください。',
+    },
+  },
   extraction: {
     kicker: '制限付きローカルコンテンツ',
     emptyHeading: 'まだファイル内容を抽出していません',

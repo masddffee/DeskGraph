@@ -64,6 +64,16 @@ import {
   type SmartCleanupInboxItem,
 } from './cleanup';
 import {
+  decideProjectCandidate,
+  discoverProjects,
+  getProjectCandidateDetail,
+  projectScopeHasCompletedScan,
+  type ProjectCandidateDetail,
+  type ProjectCandidateState,
+  type ProjectDecisionKind,
+  type ProjectDiscovery,
+} from './projects';
+import {
   collectLanguagePreferences,
   formatInteger,
   formatUtcDate,
@@ -156,6 +166,19 @@ type CleanupReviewState =
   | { kind: 'creating'; detail: CleanupSourceDetail; targetNodeId: number }
   | { kind: 'ready'; preview: CleanupActionPlanPreview }
   | { kind: 'error'; message: 'detail' | 'selection' | 'preview' };
+type ProjectDiscoveryState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'ready'; discovery: ProjectDiscovery }
+  | { kind: 'partial'; discovery: ProjectDiscovery }
+  | { kind: 'error' };
+type ProjectReadinessState = 'idle' | 'loading' | 'ready' | 'scanRequired' | 'error';
+type ProjectReviewState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'detail'; detail: ProjectCandidateDetail; decisionError: boolean }
+  | { kind: 'saving'; detail: ProjectCandidateDetail; decision: ProjectDecisionKind }
+  | { kind: 'error' };
 type AppView = 'home' | 'search' | 'projects' | 'inbox' | 'history' | 'settings';
 
 const APP_VIEWS: readonly AppView[] = [
@@ -411,6 +434,12 @@ function cleanupMemberRoleLabel(member: CleanupSourceDetailMember, catalog: Cata
   return catalog.cleanup.review.roles.screenshotCandidate;
 }
 
+function projectStateLabel(state: ProjectCandidateState, catalog: Catalog): string {
+  if (state === 'accepted') return catalog.projects.state.accepted;
+  if (state === 'rejected') return catalog.projects.state.rejected;
+  return catalog.projects.state.suggested;
+}
+
 function browserLanguagePreferences(): readonly string[] {
   try {
     if (typeof navigator === 'undefined') return [];
@@ -447,12 +476,26 @@ export default function App() {
   const [cleanupReviewState, setCleanupReviewState] = useState<CleanupReviewState>({
     kind: 'idle',
   });
+  const [projectScopeId, setProjectScopeId] = useState<number | null>(null);
+  const [projectDiscoveryState, setProjectDiscoveryState] = useState<ProjectDiscoveryState>({
+    kind: 'idle',
+  });
+  const [projectReadinessState, setProjectReadinessState] = useState<ProjectReadinessState>('idle');
+  const [projectReviewState, setProjectReviewState] = useState<ProjectReviewState>({
+    kind: 'idle',
+  });
   const [activeView, setActiveView] = useState<AppView>('home');
   const ocrRequestInFlight = useRef(new Set<string>());
   const viewHeadingRef = useRef<HTMLHeadingElement>(null);
   const cleanupReviewHeadingRef = useRef<HTMLHeadingElement>(null);
   const cleanupReviewGenerationRef = useRef(0);
   const cleanupReviewTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const projectReviewGenerationRef = useRef(0);
+  const projectDiscoveryGenerationRef = useRef(0);
+  const projectReadinessGenerationRef = useRef(0);
+  const projectScopeIdRef = useRef<number | null>(null);
+  const projectReviewTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const projectReviewHeadingRef = useRef<HTMLHeadingElement>(null);
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
@@ -485,6 +528,12 @@ export default function App() {
     }
   }, [cleanupReviewState.kind]);
 
+  useEffect(() => {
+    if (projectReviewState.kind === 'detail' || projectReviewState.kind === 'error') {
+      projectReviewHeadingRef.current?.focus();
+    }
+  }, [projectReviewState.kind]);
+
   function changeLocale(nextLocale: string) {
     if (!isLocale(nextLocale)) return;
     setLocale(nextLocale);
@@ -496,6 +545,7 @@ export default function App() {
 
   function showView(nextView: AppView) {
     if (nextView !== 'inbox') invalidateCleanupReview();
+    if (nextView !== 'projects') invalidateProjectReview();
     setActiveView(nextView);
     window.requestAnimationFrame(() => viewHeadingRef.current?.focus());
   }
@@ -509,6 +559,52 @@ export default function App() {
           cleanupReviewTriggerRef.current.focus();
         }
       });
+    }
+  }
+
+  function invalidateProjectReview(returnFocus = false) {
+    projectReviewGenerationRef.current += 1;
+    setProjectReviewState({ kind: 'idle' });
+    if (returnFocus) {
+      window.requestAnimationFrame(() => {
+        if (projectReviewTriggerRef.current?.isConnected) projectReviewTriggerRef.current.focus();
+      });
+    }
+  }
+
+  function chooseProjectScope(scopeId: number | null) {
+    projectScopeIdRef.current = scopeId;
+    setProjectScopeId(scopeId);
+    projectDiscoveryGenerationRef.current += 1;
+    setProjectDiscoveryState({ kind: 'idle' });
+    invalidateProjectReview();
+    void refreshProjectReadiness(scopeId);
+  }
+
+  async function refreshProjectReadiness(scopeId: number | null) {
+    if (projectScopeIdRef.current !== scopeId) return;
+    const generation = projectReadinessGenerationRef.current + 1;
+    projectReadinessGenerationRef.current = generation;
+    if (scopeId === null) {
+      setProjectReadinessState('idle');
+      return;
+    }
+    setProjectReadinessState('loading');
+    try {
+      const completed = await projectScopeHasCompletedScan(scopeId);
+      if (
+        projectReadinessGenerationRef.current !== generation ||
+        projectScopeIdRef.current !== scopeId
+      )
+        return;
+      setProjectReadinessState(completed ? 'ready' : 'scanRequired');
+    } catch {
+      if (
+        projectReadinessGenerationRef.current !== generation ||
+        projectScopeIdRef.current !== scopeId
+      )
+        return;
+      setProjectReadinessState('error');
     }
   }
 
@@ -739,6 +835,7 @@ export default function App() {
       const job = await createManifestScan(scope.id);
       updateJob(job);
       await runJob(job);
+      await refreshProjectReadiness(scope.id);
     } catch {
       await refreshManifest().catch(() => undefined);
       setAction({
@@ -1041,6 +1138,91 @@ export default function App() {
       });
     } catch {
       setCleanupInboxState({ kind: 'error' });
+    }
+  }
+
+  async function discoverProjectCandidates() {
+    const scopeId = projectScopeIdRef.current;
+    if (scopeId === null || projectReadinessState !== 'ready') return;
+    invalidateProjectReview();
+    const generation = projectDiscoveryGenerationRef.current + 1;
+    projectDiscoveryGenerationRef.current = generation;
+    setProjectDiscoveryState({ kind: 'loading' });
+    try {
+      const discovery = await discoverProjects(scopeId);
+      if (
+        projectDiscoveryGenerationRef.current !== generation ||
+        projectScopeIdRef.current !== scopeId
+      )
+        return;
+      setProjectDiscoveryState({
+        kind: discovery.evaluation_complete ? 'ready' : 'partial',
+        discovery,
+      });
+    } catch {
+      if (
+        projectDiscoveryGenerationRef.current !== generation ||
+        projectScopeIdRef.current !== scopeId
+      )
+        return;
+      setProjectDiscoveryState({ kind: 'error' });
+    }
+  }
+
+  async function openProjectReview(projectId: number, trigger: HTMLButtonElement) {
+    if (projectScopeId === null) return;
+    projectReviewTriggerRef.current = trigger;
+    const generation = projectReviewGenerationRef.current + 1;
+    projectReviewGenerationRef.current = generation;
+    setProjectReviewState({ kind: 'loading' });
+    try {
+      const detail = await getProjectCandidateDetail(projectScopeId, projectId);
+      if (projectReviewGenerationRef.current !== generation) return;
+      setProjectReviewState({ kind: 'detail', detail, decisionError: false });
+    } catch {
+      if (projectReviewGenerationRef.current !== generation) return;
+      setProjectReviewState({ kind: 'error' });
+    }
+  }
+
+  async function submitProjectDecision(decision: ProjectDecisionKind) {
+    if (projectReviewState.kind !== 'detail') return;
+    const { detail } = projectReviewState;
+    const generation = projectReviewGenerationRef.current + 1;
+    projectReviewGenerationRef.current = generation;
+    setProjectReviewState({ kind: 'saving', detail, decision });
+    try {
+      const updated = await decideProjectCandidate(
+        detail.candidate.scope_id,
+        detail.candidate.project_id,
+        decision,
+      );
+      if (projectReviewGenerationRef.current !== generation) return;
+      setProjectDiscoveryState((current) => {
+        if (current.kind !== 'ready' && current.kind !== 'partial') return current;
+        return {
+          ...current,
+          discovery: {
+            ...current.discovery,
+            candidates: current.discovery.candidates.map((candidate) =>
+              candidate.project_id === updated.candidate.project_id
+                ? {
+                    ...candidate,
+                    state: updated.candidate.state,
+                    confidence_basis_points: updated.candidate.suggestion.confidence_basis_points,
+                    observed_at_unix_ms: updated.candidate.suggestion.observed_at_unix_ms,
+                    latest_decision_at_unix_ms:
+                      updated.candidate.latest_decision?.decided_at_unix_ms ?? null,
+                  }
+                : candidate,
+            ),
+          },
+        };
+      });
+      setProjectReviewState({ kind: 'detail', detail: updated, decisionError: false });
+    } catch {
+      if (projectReviewGenerationRef.current !== generation) return;
+      setProjectReviewState({ kind: 'detail', detail, decisionError: true });
     }
   }
 
@@ -2075,104 +2257,322 @@ export default function App() {
             ) : null}
 
             {activeView === 'projects' ? (
-              <section className="panel panel--scopes" aria-labelledby="scopes-title">
-                <div className="panel-heading panel-heading--wrap">
-                  <div>
-                    <p className="panel-kicker">{catalog.scope.kicker}</p>
-                    <h2 id="scopes-title">{catalog.scope.heading}</h2>
-                    <p>{catalog.scope.description}</p>
+              <>
+                <section className="panel panel--projects" aria-labelledby="projects-title">
+                  <div className="panel-heading panel-heading--wrap">
+                    <div>
+                      <p className="panel-kicker">{catalog.projects.kicker}</p>
+                      <h2 id="projects-title">{catalog.projects.heading}</h2>
+                      <p>{catalog.projects.description}</p>
+                    </div>
+                    <span className="connected-indicator">{catalog.projects.suggestionOnly}</span>
                   </div>
-                  <span className="scope-count">{catalog.scope.count(state.scopes.length)}</span>
-                </div>
+                  <div className="project-controls" aria-label={catalog.projects.controlsAria}>
+                    <label htmlFor="project-scope">{catalog.projects.scopeLabel}</label>
+                    <div className="scope-form-row">
+                      <select
+                        id="project-scope"
+                        value={projectScopeId ?? ''}
+                        disabled={
+                          state.scopes.length === 0 ||
+                          projectDiscoveryState.kind === 'loading' ||
+                          projectReviewState.kind === 'saving'
+                        }
+                        onChange={(event) => {
+                          chooseProjectScope(
+                            event.target.value ? Number(event.target.value) : null,
+                          );
+                        }}
+                      >
+                        <option value="">{catalog.projects.chooseScope}</option>
+                        {state.scopes.map((scope) => (
+                          <option key={scope.id} value={scope.id}>
+                            {catalog.search.authorizedScope(scope.id)}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={
+                          projectScopeId === null ||
+                          projectReadinessState !== 'ready' ||
+                          projectDiscoveryState.kind === 'loading' ||
+                          projectReviewState.kind === 'saving'
+                        }
+                        onClick={() => void discoverProjectCandidates()}
+                      >
+                        {projectDiscoveryState.kind === 'loading'
+                          ? catalog.projects.discovering
+                          : catalog.projects.discover}
+                      </button>
+                    </div>
+                  </div>
+                  {state.scopes.length === 0 ? (
+                    <p className="content-empty" role="status">
+                      {catalog.projects.authorizationRequired}
+                    </p>
+                  ) : null}
+                  {state.scopes.length > 0 && projectScopeId === null ? (
+                    <p className="content-empty" role="status">
+                      {catalog.projects.chooseScope}
+                    </p>
+                  ) : null}
+                  {projectReadinessState === 'loading' ? (
+                    <p className="content-empty" role="status" aria-live="polite">
+                      {catalog.projects.checkingReadiness}
+                    </p>
+                  ) : null}
+                  {projectReadinessState === 'scanRequired' ? (
+                    <p className="content-empty" role="status">
+                      {catalog.projects.scanRequired}
+                    </p>
+                  ) : null}
+                  {projectReadinessState === 'error' ? (
+                    <p className="content-empty project-message--error" role="alert">
+                      {catalog.projects.readinessError}
+                    </p>
+                  ) : null}
+                  {projectDiscoveryState.kind === 'loading' ? (
+                    <p className="content-empty" role="status" aria-live="polite">
+                      {catalog.projects.discovering}
+                    </p>
+                  ) : null}
+                  {projectDiscoveryState.kind === 'error' ? (
+                    <p className="content-empty project-message--error" role="alert">
+                      {catalog.projects.error}
+                    </p>
+                  ) : null}
+                  {projectDiscoveryState.kind === 'partial' ? (
+                    <p className="content-empty" role="status">
+                      {catalog.projects.partial}
+                    </p>
+                  ) : null}
+                  {projectDiscoveryState.kind === 'ready' ||
+                  projectDiscoveryState.kind === 'partial' ? (
+                    projectDiscoveryState.discovery.candidates.length === 0 ? (
+                      <p className="content-empty" role="status">
+                        {catalog.projects.empty}
+                      </p>
+                    ) : (
+                      <ol className="project-candidate-list" aria-label={catalog.projects.heading}>
+                        {projectDiscoveryState.discovery.candidates.map((candidate) => (
+                          <li key={candidate.project_id}>
+                            <div>
+                              <strong>{projectStateLabel(candidate.state, catalog)}</strong>
+                              <span>
+                                {catalog.projects.candidateMeta(
+                                  candidate.confidence_basis_points,
+                                  formatUtcDate(candidate.observed_at_unix_ms, locale),
+                                )}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              className="project-detail-open"
+                              disabled={
+                                projectReviewState.kind === 'loading' ||
+                                projectReviewState.kind === 'saving'
+                              }
+                              onClick={(event) =>
+                                void openProjectReview(candidate.project_id, event.currentTarget)
+                              }
+                            >
+                              {catalog.projects.viewEvidence}
+                            </button>
+                          </li>
+                        ))}
+                      </ol>
+                    )
+                  ) : null}
+                  {projectDiscoveryState.kind === 'ready' ||
+                  projectDiscoveryState.kind === 'partial' ? (
+                    <p className="content-empty project-verification">
+                      {catalog.projects.noAutomaticMembership} {catalog.projects.noFileActions}
+                    </p>
+                  ) : null}
+                  {projectReviewState.kind === 'loading' ? (
+                    <p className="content-empty" role="status" aria-live="polite">
+                      {catalog.projects.detail.loading}
+                    </p>
+                  ) : null}
+                  {projectReviewState.kind === 'detail' || projectReviewState.kind === 'saving' ? (
+                    <section className="project-review" aria-labelledby="project-review-title">
+                      <div className="project-review-heading">
+                        <div>
+                          <h3 id="project-review-title" ref={projectReviewHeadingRef} tabIndex={-1}>
+                            {projectStateLabel(projectReviewState.detail.candidate.state, catalog)}
+                          </h3>
+                          <p>{catalog.projects.detail.transientNotice}</p>
+                        </div>
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          disabled={projectReviewState.kind === 'saving'}
+                          onClick={() => invalidateProjectReview(true)}
+                        >
+                          {catalog.projects.detail.close}
+                        </button>
+                      </div>
+                      <dl className="project-evidence">
+                        <div>
+                          <dt>{catalog.projects.detail.rootLabel}</dt>
+                          <dd>
+                            <code>{projectReviewState.detail.candidate.display_path}</code>
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>{catalog.projects.detail.signalsLabel}</dt>
+                          <dd>
+                            {projectReviewState.detail.candidate.suggestion.provenance
+                              .map((signal) => signal.marker_name)
+                              .join(' · ')}
+                          </dd>
+                        </div>
+                      </dl>
+                      {projectReviewState.kind === 'detail' && projectReviewState.decisionError ? (
+                        <p className="project-message--error" role="alert">
+                          {catalog.projects.detail.decisionError}
+                        </p>
+                      ) : null}
+                      <div className="project-decision-actions">
+                        <button
+                          type="button"
+                          disabled={projectReviewState.kind === 'saving'}
+                          onClick={() => void submitProjectDecision('accepted')}
+                        >
+                          {projectReviewState.kind === 'saving' &&
+                          projectReviewState.decision === 'accepted'
+                            ? catalog.projects.detail.saving
+                            : catalog.projects.detail.accept}
+                        </button>
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          disabled={projectReviewState.kind === 'saving'}
+                          onClick={() => void submitProjectDecision('rejected')}
+                        >
+                          {projectReviewState.kind === 'saving' &&
+                          projectReviewState.decision === 'rejected'
+                            ? catalog.projects.detail.saving
+                            : catalog.projects.detail.reject}
+                        </button>
+                      </div>
+                    </section>
+                  ) : null}
+                  {projectReviewState.kind === 'error' ? (
+                    <div className="project-review project-review--error" role="alert">
+                      <h3 ref={projectReviewHeadingRef} tabIndex={-1}>
+                        {catalog.projects.detail.detailError}
+                      </h3>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => invalidateProjectReview(true)}
+                      >
+                        {catalog.projects.detail.close}
+                      </button>
+                    </div>
+                  ) : null}
+                </section>
+                <section className="panel panel--scopes" aria-labelledby="scopes-title">
+                  <div className="panel-heading panel-heading--wrap">
+                    <div>
+                      <p className="panel-kicker">{catalog.scope.kicker}</p>
+                      <h2 id="scopes-title">{catalog.scope.heading}</h2>
+                      <p>{catalog.scope.description}</p>
+                    </div>
+                    <span className="scope-count">{catalog.scope.count(state.scopes.length)}</span>
+                  </div>
 
-                <div className="scope-form">
-                  <div className="scope-form-row">
-                    <button
-                      type="button"
-                      disabled={action.kind === 'working'}
-                      aria-label={catalog.scope.inputLabel}
-                      onClick={() => void authorizeRequestedScope()}
+                  <div className="scope-form">
+                    <div className="scope-form-row">
+                      <button
+                        type="button"
+                        disabled={action.kind === 'working'}
+                        aria-label={catalog.scope.inputLabel}
+                        onClick={() => void authorizeRequestedScope()}
+                      >
+                        {catalog.scope.authorize}
+                      </button>
+                    </div>
+                  </div>
+
+                  {action.kind !== 'idle' ? (
+                    <p
+                      className={`action-message action-message--${action.kind}`}
+                      role={action.kind === 'error' ? 'alert' : 'status'}
                     >
-                      {catalog.scope.authorize}
-                    </button>
-                  </div>
-                </div>
+                      {actionMessageLabel(catalog, action.message)}
+                    </p>
+                  ) : null}
 
-                {action.kind !== 'idle' ? (
-                  <p
-                    className={`action-message action-message--${action.kind}`}
-                    role={action.kind === 'error' ? 'alert' : 'status'}
-                  >
-                    {actionMessageLabel(catalog, action.message)}
-                  </p>
-                ) : null}
-
-                {state.scopes.length === 0 ? (
-                  <div className="empty-scope">
-                    <strong>{catalog.scope.emptyHeading}</strong>
-                    <span>{catalog.scope.emptyDescription}</span>
-                  </div>
-                ) : (
-                  <ul className="scope-list">
-                    {state.scopes.map((scope) => {
-                      const latestJob = state.jobs.find((job) => job.scope_id === scope.id);
-                      const resumableJob =
-                        latestJob &&
-                        (latestJob.status === 'running' ||
-                          latestJob.status === 'paused' ||
-                          latestJob.status === 'interrupted')
-                          ? latestJob
-                          : undefined;
-                      return (
-                        <li key={scope.id}>
-                          <div className="scope-details">
-                            <span className="scope-label">{catalog.scope.label(scope.id)}</span>
-                            <code>{scope.display_path}</code>
-                            {latestJob ? (
-                              <div className="scan-progress" role="status">
-                                <span>{scanStatusLabel(latestJob, catalog)}</span>
-                                <span>
-                                  {catalog.scope.progress(
-                                    latestJob.processed_entries,
-                                    latestJob.queued_entries,
-                                    latestJob.issue_count,
-                                  )}
-                                </span>
-                              </div>
+                  {state.scopes.length === 0 ? (
+                    <div className="empty-scope">
+                      <strong>{catalog.scope.emptyHeading}</strong>
+                      <span>{catalog.scope.emptyDescription}</span>
+                    </div>
+                  ) : (
+                    <ul className="scope-list">
+                      {state.scopes.map((scope) => {
+                        const latestJob = state.jobs.find((job) => job.scope_id === scope.id);
+                        const resumableJob =
+                          latestJob &&
+                          (latestJob.status === 'running' ||
+                            latestJob.status === 'paused' ||
+                            latestJob.status === 'interrupted')
+                            ? latestJob
+                            : undefined;
+                        return (
+                          <li key={scope.id}>
+                            <div className="scope-details">
+                              <span className="scope-label">{catalog.scope.label(scope.id)}</span>
+                              <code>{scope.display_path}</code>
+                              {latestJob ? (
+                                <div className="scan-progress" role="status">
+                                  <span>{scanStatusLabel(latestJob, catalog)}</span>
+                                  <span>
+                                    {catalog.scope.progress(
+                                      latestJob.processed_entries,
+                                      latestJob.queued_entries,
+                                      latestJob.issue_count,
+                                    )}
+                                  </span>
+                                </div>
+                              ) : null}
+                            </div>
+                            {resumableJob?.status === 'running' ? (
+                              <button
+                                type="button"
+                                disabled={resumableJob.pause_requested}
+                                onClick={() => void pause(resumableJob)}
+                              >
+                                {resumableJob.pause_requested
+                                  ? catalog.scope.pausing
+                                  : catalog.scope.pause}
+                              </button>
                             ) : null}
-                          </div>
-                          {resumableJob?.status === 'running' ? (
-                            <button
-                              type="button"
-                              disabled={resumableJob.pause_requested}
-                              onClick={() => void pause(resumableJob)}
-                            >
-                              {resumableJob.pause_requested
-                                ? catalog.scope.pausing
-                                : catalog.scope.pause}
-                            </button>
-                          ) : null}
-                          {resumableJob?.status === 'paused' ||
-                          resumableJob?.status === 'interrupted' ? (
-                            <button type="button" onClick={() => void resume(resumableJob)}>
-                              {catalog.scope.resume}
-                            </button>
-                          ) : null}
-                          {!resumableJob ? (
-                            <button
-                              type="button"
-                              disabled={action.kind === 'working'}
-                              onClick={() => void scan(scope)}
-                            >
-                              {catalog.scope.scan}
-                            </button>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-              </section>
+                            {resumableJob?.status === 'paused' ||
+                            resumableJob?.status === 'interrupted' ? (
+                              <button type="button" onClick={() => void resume(resumableJob)}>
+                                {catalog.scope.resume}
+                              </button>
+                            ) : null}
+                            {!resumableJob ? (
+                              <button
+                                type="button"
+                                disabled={action.kind === 'working'}
+                                onClick={() => void scan(scope)}
+                              >
+                                {catalog.scope.scan}
+                              </button>
+                            ) : null}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </section>
+              </>
             ) : null}
 
             {activeView === 'settings' ? (

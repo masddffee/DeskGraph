@@ -859,6 +859,9 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
     let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
     scan_scope(&mut database, scope.id).expect("scope should scan");
+    database
+        .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"project-cli-test-grant")
+        .expect("test grant should activate");
     drop(database);
 
     let database_arg = database_path
@@ -902,6 +905,8 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
         "decide",
         "--database",
         database_arg,
+        "--scope",
+        &scope_arg,
         "--project",
         &project_arg,
         "--decision",
@@ -935,6 +940,8 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
         "decide",
         "--database",
         database_arg,
+        "--scope",
+        &scope_arg,
         "--project",
         &project_arg,
         "--decision",
@@ -951,6 +958,8 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
         "decide",
         "--database",
         database_arg,
+        "--scope",
+        &scope_arg,
         "--project",
         &project_arg,
         "--decision",
@@ -999,6 +1008,59 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
                 .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
         );
     }
+
+    ManifestDatabase::open(&database_path)
+        .expect("database should reopen")
+        .mark_scope_access_grant_revoked(scope.id)
+        .expect("test grant should revoke");
+    let revoked_propose = run(&[
+        "project",
+        "propose",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_arg,
+        "--path",
+        path_arg,
+    ]);
+    let revoked_status = run(&[
+        "project",
+        "status",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_arg,
+        "--project",
+        &project_arg,
+    ]);
+    let revoked_decide = run(&[
+        "project",
+        "decide",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_arg,
+        "--project",
+        &project_arg,
+        "--decision",
+        "reject",
+    ]);
+    for denied in [&revoked_propose, &revoked_status, &revoked_decide] {
+        assert!(!denied.status.success());
+        assert!(denied.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&denied.stderr);
+        assert!(stderr.contains("scope_access_grant_not_active"));
+        assert!(!stderr.contains(path_arg));
+        assert!(!stderr.contains("secret_context.rs"));
+    }
+    let candidate = ManifestDatabase::open(&database_path)
+        .expect("database should reopen")
+        .project_candidate(project_id)
+        .expect("candidate should remain readable to the test");
+    assert_eq!(
+        candidate.state,
+        deskgraph_domain::ProjectCandidateState::Accepted
+    );
 }
 
 #[test]

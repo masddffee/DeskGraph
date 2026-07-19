@@ -368,6 +368,7 @@ h2 {
 .panel--actions,
 .panel--search,
 .panel--cleanup,
+.panel--projects,
 .panel--scopes,
 .panel--settings {
   grid-column: 1 / -1;
@@ -522,6 +523,150 @@ footer {
 
 .cleanup-controls {
   margin-top: 1.5rem;
+}
+
+.project-controls {
+  margin-top: 1.5rem;
+}
+
+.project-controls > label {
+  display: block;
+  margin-bottom: 0.55rem;
+  color: #46544c;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.project-controls select {
+  flex: 1;
+  min-width: 0;
+}
+
+.project-candidate-list {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0;
+  margin: 1.25rem 0 0;
+  list-style: none;
+}
+
+.project-candidate-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  border: 1px solid rgba(27, 59, 40, 0.12);
+  border-radius: 0.85rem;
+  padding: 0.85rem;
+  background: #f4f7f1;
+}
+
+.project-candidate-list li > div {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.project-candidate-list strong {
+  color: #235c3a;
+}
+
+.project-candidate-list span,
+.project-verification {
+  color: #657269;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.project-detail-open {
+  flex: 0 0 auto;
+  padding: 0.58rem 0.85rem;
+  font-size: 0.78rem;
+}
+
+.project-review {
+  display: grid;
+  gap: 1rem;
+  border: 1px solid rgba(31, 98, 72, 0.22);
+  border-radius: 1rem;
+  margin-top: 1.25rem;
+  padding: 1rem;
+  background: #fbfcf8;
+  box-shadow: 0 0.75rem 1.8rem rgba(27, 59, 40, 0.07);
+}
+
+.project-review-heading,
+.project-review--error {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.project-review h3 {
+  margin: 0;
+  color: #1d3e2d;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: clamp(1.15rem, 2vw, 1.45rem);
+}
+
+.project-review h3:focus-visible {
+  border-radius: 0.35rem;
+  outline: 3px solid #e3a33a;
+  outline-offset: 4px;
+}
+
+.project-review-heading p {
+  max-width: 48rem;
+  margin: 0.4rem 0 0;
+  color: #5d6b63;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.project-evidence {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin: 0;
+}
+
+.project-evidence div {
+  border: 1px solid rgba(27, 59, 40, 0.11);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.project-evidence dt {
+  color: #68766d;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.project-evidence dd {
+  overflow-wrap: anywhere;
+  margin: 0.35rem 0 0;
+  color: #244334;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.project-decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.project-review--error {
+  border-color: rgba(139, 68, 40, 0.3);
+  color: #783d29;
+  background: #fbf0e9;
+}
+
+.project-message--error {
+  color: #783d29;
 }
 
 .cleanup-controls > label {

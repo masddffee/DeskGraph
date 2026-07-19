@@ -139,6 +139,40 @@ impl ProjectCandidateSummary {
     pub const API_VERSION: &str = "deskgraph.project-candidate-summary.v1";
 }
 
+/// A bounded, path-free result from an explicit manifest-only discovery run.
+/// Root paths and marker evidence remain behind an explicit detail request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectDiscovery {
+    pub api_version: &'static str,
+    pub scope_id: i64,
+    pub candidates: Vec<ProjectCandidateSummary>,
+    pub evaluated_root_count: u32,
+    pub bounded_root_limit: u32,
+    pub evaluation_complete: bool,
+    pub automatic_membership_created: bool,
+    pub file_actions_available: bool,
+}
+
+impl ProjectDiscovery {
+    pub const API_VERSION: &str = "deskgraph.project-discovery.v1";
+}
+
+/// Path-bearing project evidence returned only for an explicitly selected
+/// candidate. It cannot create membership or authorize a filesystem action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectCandidateDetail {
+    pub api_version: &'static str,
+    pub candidate: ProjectCandidate,
+    pub user_requested_path: bool,
+    pub current_evidence: bool,
+    pub automatic_membership_created: bool,
+    pub file_actions_available: bool,
+}
+
+impl ProjectCandidateDetail {
+    pub const API_VERSION: &str = "deskgraph.project-candidate-detail.v1";
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRelationKind {

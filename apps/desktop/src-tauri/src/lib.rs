@@ -14,8 +14,9 @@ use deskgraph_database::{CleanupActionSelection, ManifestDatabase};
 use deskgraph_domain::{
     ActionPlanPreview, ActionPlanSummary, AuthorizedScope, CleanupActionPlanPreview,
     CleanupSourceDetail, ExtractionJobProgress, ExtractionOperation, ExtractionStats, HealthReport,
-    ManifestStats, ScanJobProgress, ScanStatus, SearchFilters, SearchResponse, SmartCleanupInbox,
-    SmartCleanupSourceKind, WatchEventProgress, collect_health_with_manifest,
+    ManifestStats, ProjectCandidateDetail, ProjectDecisionKind, ProjectDiscovery, ScanJobProgress,
+    ScanStatus, SearchFilters, SearchResponse, SmartCleanupInbox, SmartCleanupSourceKind,
+    WatchEventProgress, collect_health_with_manifest,
 };
 #[cfg(test)]
 use deskgraph_domain::{WatchEventReason, WatchEventStatus};
@@ -26,7 +27,10 @@ use deskgraph_extractors::{
     recent_extraction_jobs_at as read_recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
-use deskgraph_projects::{cleanup_source_detail_at, refresh_smart_cleanup_inbox_at};
+use deskgraph_projects::{
+    cleanup_source_detail_at, decide_current_project_candidate_at, discover_projects_at,
+    project_candidate_detail_at, refresh_smart_cleanup_inbox_at,
+};
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 #[cfg(test)]
 use deskgraph_scanner::{authorize_scope, run_scan_job_to_terminal};
@@ -624,6 +628,17 @@ fn recent_scan_jobs(state: State<'_, ManifestState>) -> Result<Vec<ScanJobProgre
         .map_err(str::to_string)
 }
 
+/// Returns durable per-scope scan readiness instead of asking the WebView to
+/// infer it from the bounded recent-job history.
+#[tauri::command]
+fn project_scope_has_completed_scan(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+) -> Result<bool, String> {
+    require_active_scope(&state, scope_id)?;
+    project_scope_has_completed_scan_at(&state.database_path, scope_id).map_err(str::to_string)
+}
+
 #[tauri::command]
 fn content_extraction_stats(state: State<'_, ManifestState>) -> Result<ExtractionStats, String> {
     content_extraction_stats_with_active_access_grants_at(&state.database_path)
@@ -928,6 +943,124 @@ async fn create_cleanup_preview(
     Ok(preview)
 }
 
+/// Discovers bounded Project roots from the current manifest for one explicit
+/// active scope. The response is path-free and creates no membership or file
+/// action capability.
+#[tauri::command]
+async fn discover_projects(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+) -> Result<ProjectDiscovery, String> {
+    require_active_scope(&state, scope_id)?;
+    let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let discovery = tauri::async_runtime::spawn_blocking(move || {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned".to_string())?;
+        let scope_guard = scope_accesses
+            .lock()
+            .map_err(|_| "scope_access_registry_poisoned".to_string())?;
+        if !scope_guard.contains_key(&scope_id) {
+            return Err("scope_reauthorization_required".to_string());
+        }
+        discover_projects_at(&database_path, scope_id).map_err(|error| error.code().to_string())
+    })
+    .await
+    .map_err(|_| "project_discovery_worker_failed".to_string())??;
+    info!(
+        event = "project_discovery_completed",
+        scope_id = discovery.scope_id,
+        candidate_count = discovery.candidates.len(),
+        evaluated_root_count = discovery.evaluated_root_count,
+        evaluation_complete = discovery.evaluation_complete,
+        automatic_membership_created = false,
+        file_actions_available = false
+    );
+    Ok(discovery)
+}
+
+/// Resolves one explicitly selected Project root and current marker evidence.
+/// The path-bearing response is transient and never written to ordinary logs.
+#[tauri::command]
+async fn get_project_candidate_detail(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    project_id: i64,
+) -> Result<ProjectCandidateDetail, String> {
+    require_active_scope(&state, scope_id)?;
+    let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned".to_string())?;
+        let scope_guard = scope_accesses
+            .lock()
+            .map_err(|_| "scope_access_registry_poisoned".to_string())?;
+        if !scope_guard.contains_key(&scope_id) {
+            return Err("scope_reauthorization_required".to_string());
+        }
+        project_candidate_detail_at(&database_path, scope_id, project_id)
+            .map_err(|error| error.code().to_string())
+    })
+    .await
+    .map_err(|_| "project_candidate_detail_worker_failed".to_string())??;
+    info!(
+        event = "project_candidate_detail_opened",
+        scope_id = detail.candidate.scope_id,
+        project_id = detail.candidate.project_id,
+        root_folder_node_id = detail.candidate.root_folder_node_id,
+        state = ?detail.candidate.state,
+        current_evidence = true,
+        automatic_membership_created = false,
+        file_actions_available = false
+    );
+    Ok(detail)
+}
+
+/// Appends one explicit local correction after current marker evidence is
+/// revalidated. Accept/reject never creates membership or mutates files.
+#[tauri::command]
+async fn decide_project_candidate(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    project_id: i64,
+    decision: ProjectDecisionKind,
+) -> Result<ProjectCandidateDetail, String> {
+    require_active_scope(&state, scope_id)?;
+    let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned".to_string())?;
+        let scope_guard = scope_accesses
+            .lock()
+            .map_err(|_| "scope_access_registry_poisoned".to_string())?;
+        if !scope_guard.contains_key(&scope_id) {
+            return Err("scope_reauthorization_required".to_string());
+        }
+        decide_current_project_candidate_at(&database_path, scope_id, project_id, decision)
+            .map_err(|error| error.code().to_string())
+    })
+    .await
+    .map_err(|_| "project_candidate_decision_worker_failed".to_string())??;
+    info!(
+        event = "project_candidate_decision_recorded",
+        scope_id = detail.candidate.scope_id,
+        project_id = detail.candidate.project_id,
+        root_folder_node_id = detail.candidate.root_folder_node_id,
+        state = ?detail.candidate.state,
+        automatic_membership_created = false,
+        file_actions_available = false
+    );
+    Ok(detail)
+}
+
 #[tauri::command]
 fn search_local(
     state: State<'_, ManifestState>,
@@ -1174,6 +1307,12 @@ fn recent_scan_jobs_at(path: &Path) -> Result<Vec<ScanJobProgress>, &'static str
         .map_err(|error| error.code())
 }
 
+fn project_scope_has_completed_scan_at(path: &Path, scope_id: i64) -> Result<bool, &'static str> {
+    ManifestDatabase::open(path)
+        .and_then(|database| database.scope_has_completed_scan(scope_id))
+        .map_err(|error| error.code())
+}
+
 #[cfg(test)]
 fn content_extraction_stats_at(path: &Path) -> Result<ExtractionStats, &'static str> {
     read_extraction_stats_at(path).map_err(|error| error.code())
@@ -1361,6 +1500,7 @@ pub fn run() {
             run_manifest_scan,
             scan_job_status,
             recent_scan_jobs,
+            project_scope_has_completed_scan,
             content_extraction_stats,
             recent_content_extractions,
             create_screenshot_ocr_job,
@@ -1376,6 +1516,9 @@ pub fn run() {
             refresh_cleanup_inbox,
             get_cleanup_source_detail,
             create_cleanup_preview,
+            discover_projects,
+            get_project_candidate_detail,
+            decide_project_candidate,
             search_local,
             pause_manifest_scan,
             resume_manifest_scan
@@ -1558,6 +1701,11 @@ mod tests {
                 .expect("scope list should load")
                 .is_empty()
         );
+        assert_eq!(
+            project_scope_has_completed_scan(app.state(), scope.id)
+                .expect_err("Project readiness should require a live grant"),
+            "scope_reauthorization_required"
+        );
         let manifest = manifest_status(app.state()).expect("manifest status should load");
         assert_eq!(manifest.authorized_scope_count, 0);
         assert_eq!(manifest.node_count, 0);
@@ -1667,6 +1815,26 @@ mod tests {
                 Some(node_id + 1),
             ))
             .expect_err("Cleanup Preview must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(discover_projects(app.state(), scope.id))
+                .expect_err("Project discovery must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(get_project_candidate_detail(app.state(), scope.id, 1,))
+                .expect_err("Project detail must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(decide_project_candidate(
+                app.state(),
+                scope.id,
+                1,
+                ProjectDecisionKind::Accepted,
+            ))
+            .expect_err("Project correction must require a live grant"),
             "scope_reauthorization_required"
         );
         let all_scope_search = search_local(
@@ -1794,6 +1962,102 @@ mod tests {
         assert_eq!(
             std::fs::read(&second_path).expect("second file should remain"),
             b"same local bytes"
+        );
+    }
+
+    #[test]
+    fn project_discovery_detail_and_correction_are_local_explainable_and_non_mutating() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-projects");
+        let marker_path = scope_path.join("Cargo.toml");
+        let source_path = scope_path.join("src/lib.rs");
+        std::fs::create_dir_all(source_path.parent().expect("source parent should exist"))
+            .expect("scope should create");
+        std::fs::write(&marker_path, "[package]\nname = \"deskgraph-test\"")
+            .expect("marker should create");
+        std::fs::write(&source_path, "pub fn local_only() {}").expect("source should create");
+
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let prepared = prepare_selected_scope(&scope_path).expect("test access should prepare");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &prepared.resolved_path,
+            prepared.platform,
+            &prepared.opaque_grant,
+        )
+        .expect("scope and grant should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared.access);
+        let app = tauri::test::mock_builder()
+            .manage(start_manifest_state_with_accesses(
+                database_path.clone(),
+                accesses,
+            ))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Desktop app should build");
+
+        assert!(
+            project_scope_has_completed_scan(app.state(), scope.id)
+                .expect("durable Project readiness should load")
+        );
+
+        let discovery = tauri::async_runtime::block_on(discover_projects(app.state(), scope.id))
+            .expect("Project discovery should complete");
+        assert_eq!(discovery.candidates.len(), 1);
+        assert!(discovery.evaluation_complete);
+        assert!(!discovery.automatic_membership_created);
+        assert!(!discovery.file_actions_available);
+        let discovery_payload =
+            serde_json::to_string(&discovery).expect("discovery should serialize");
+        assert!(!discovery_payload.contains("authorized-projects"));
+        assert!(!discovery_payload.contains("Cargo.toml"));
+        assert!(!discovery_payload.contains("lib.rs"));
+
+        let summary = &discovery.candidates[0];
+        let detail = tauri::async_runtime::block_on(get_project_candidate_detail(
+            app.state(),
+            scope.id,
+            summary.project_id,
+        ))
+        .expect("explicit detail should load");
+        assert!(detail.user_requested_path);
+        assert!(detail.current_evidence);
+        assert_eq!(detail.candidate.scope_id, scope.id);
+        assert!(
+            detail
+                .candidate
+                .display_path
+                .ends_with("authorized-projects")
+        );
+        assert_eq!(detail.candidate.suggestion.provenance.len(), 1);
+
+        let rejected = tauri::async_runtime::block_on(decide_project_candidate(
+            app.state(),
+            scope.id,
+            summary.project_id,
+            ProjectDecisionKind::Rejected,
+        ))
+        .expect("user correction should append");
+        assert_eq!(
+            rejected.candidate.state,
+            deskgraph_domain::ProjectCandidateState::Rejected
+        );
+        assert_eq!(
+            rejected
+                .candidate
+                .latest_decision
+                .as_ref()
+                .map(|decision| decision.sequence),
+            Some(1)
+        );
+        assert!(marker_path.exists());
+        assert!(source_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("source should remain unchanged"),
+            "pub fn local_only() {}"
         );
     }
 

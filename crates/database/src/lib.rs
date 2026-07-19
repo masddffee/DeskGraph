@@ -631,6 +631,15 @@ pub struct FolderProfileFacts {
     pub bounded_entry_limit: u64,
 }
 
+/// Current manifest roots that have at least one direct strong project marker.
+/// The IDs are path-free; callers must explicitly request one candidate before
+/// resolving its current display path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectDiscoveryRoots {
+    pub root_folder_node_ids: Vec<i64>,
+    pub evaluation_complete: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SmartCleanupSourceReference {
     pub kind: SmartCleanupSourceKind,
@@ -4169,6 +4178,90 @@ impl ManifestDatabase {
             project_markers: project_markers.into_iter().collect(),
             observed_at_unix_ms,
             bounded_entry_limit: entry_limit,
+        })
+    }
+
+    /// Finds bounded project roots from direct-child marker entries already in
+    /// the current manifest. It never traverses the live filesystem and
+    /// requires both a completed scan and a durable active scope grant.
+    pub fn project_discovery_roots(
+        &self,
+        scope_id: i64,
+        root_limit: u32,
+    ) -> Result<ProjectDiscoveryRoots, DatabaseError> {
+        if scope_id <= 0 || root_limit == 0 || root_limit > 100 {
+            return Err(DatabaseError::ProjectCandidateInputInvalid);
+        }
+        if !self.scope_has_active_access_grant(scope_id)? {
+            return Err(DatabaseError::ScopeAccessGrantNotActive);
+        }
+        if !self.scope_has_completed_scan(scope_id)? {
+            return Err(DatabaseError::ScanJobIncomplete);
+        }
+
+        let row_limit = to_i64(
+            MAX_FOLDER_PROFILE_ENTRIES
+                .checked_add(1)
+                .ok_or(DatabaseError::InvalidCount)?,
+        )?;
+        let separator = MAIN_SEPARATOR.to_string();
+        let mut statement = self.connection.prepare(
+            "SELECT parent_edge.target_node_id, marker_node.kind, marker_location.display_path \
+             FROM edges parent_edge \
+             JOIN nodes marker_node ON marker_node.id = parent_edge.source_node_id \
+             JOIN locations marker_location \
+               ON marker_location.scope_id = parent_edge.scope_id \
+              AND marker_location.node_id = marker_node.id \
+              AND marker_location.present = 1 \
+             JOIN nodes root_node \
+               ON root_node.id = parent_edge.target_node_id AND root_node.kind = 'folder' \
+             JOIN locations root_location \
+               ON root_location.scope_id = parent_edge.scope_id \
+              AND root_location.node_id = root_node.id \
+              AND root_location.present = 1 \
+             WHERE parent_edge.scope_id = ?1 \
+               AND parent_edge.kind = 'located_in' AND parent_edge.active = 1 \
+               AND length(marker_location.path_key) > length(root_location.path_key) \
+               AND substr(marker_location.path_key, 1, length(root_location.path_key)) \
+                   = root_location.path_key \
+               AND substr(marker_location.path_key, length(root_location.path_key) + 1, 1) = ?2 \
+               AND instr( \
+                    substr(marker_location.path_key, length(root_location.path_key) + 2), ?2 \
+               ) = 0 \
+             ORDER BY parent_edge.target_node_id ASC, marker_location.id ASC \
+             LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![scope_id, separator, row_limit])?;
+        let mut roots = std::collections::BTreeSet::new();
+        let mut processed_rows = 0_u64;
+        let mut evaluation_complete = true;
+        while let Some(row) = rows.next()? {
+            processed_rows = processed_rows
+                .checked_add(1)
+                .ok_or(DatabaseError::InvalidCount)?;
+            if processed_rows > MAX_FOLDER_PROFILE_ENTRIES {
+                evaluation_complete = false;
+                break;
+            }
+            let root_node_id = row.get::<_, i64>(0)?;
+            let marker_kind = NodeKind::from_db(&row.get::<_, String>(1)?)?;
+            let display_path = row.get::<_, String>(2)?;
+            if project_marker(Path::new(&display_path), marker_kind)
+                .is_some_and(|kind| kind != ProjectSignalKind::Readme)
+            {
+                roots.insert(root_node_id);
+                if roots.len()
+                    > usize::try_from(root_limit).map_err(|_| DatabaseError::InvalidCount)?
+                {
+                    roots.pop_last();
+                    evaluation_complete = false;
+                    break;
+                }
+            }
+        }
+        Ok(ProjectDiscoveryRoots {
+            root_folder_node_ids: roots.into_iter().collect(),
+            evaluation_complete,
         })
     }
 

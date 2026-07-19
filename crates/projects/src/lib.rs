@@ -9,10 +9,11 @@ use deskgraph_domain::{
     CleanupSourceDetail, CleanupSourceDetailMember, CleanupSourceMemberRole,
     CleanupSourceSelectionRule, FileRelationCandidate, FileRelationCandidateState,
     FileRelationCandidateSummary, FileRelationDecisionKind, FileVersionCandidate, FolderProfile,
-    ProjectCandidate, ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal,
-    ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator, ScreenshotGroupCandidate,
-    ScreenshotGroupCandidateSummary, ScreenshotGroupDiscovery, SmartCleanupInbox,
-    SmartCleanupInboxItem, SmartCleanupSourceKind, parse_explicit_file_version_name,
+    ProjectCandidate, ProjectCandidateDetail, ProjectCandidateSummary, ProjectDecisionKind,
+    ProjectDiscovery, ProjectSignal, ProjectSignalKind, ProjectSuggestion,
+    ProjectSuggestionCreator, ScreenshotGroupCandidate, ScreenshotGroupCandidateSummary,
+    ScreenshotGroupDiscovery, SmartCleanupInbox, SmartCleanupInboxItem, SmartCleanupSourceKind,
+    parse_explicit_file_version_name,
 };
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
@@ -28,6 +29,7 @@ const MAX_SCREENSHOT_GROUP_IMAGES: u32 = 2_000;
 const MAX_SCREENSHOT_GROUPS: u32 = 20;
 const MAX_SCREENSHOT_GROUP_MEMBERS: u32 = 20;
 const MAX_SMART_CLEANUP_SOURCES: u32 = 20;
+pub const MAX_PROJECT_DISCOVERY_ROOTS: u32 = 100;
 
 #[derive(Debug)]
 pub enum ProjectError {
@@ -148,6 +150,15 @@ pub fn propose_project(
     scope_id: i64,
     root_folder_node_id: i64,
 ) -> Result<ProjectCandidate, ProjectError> {
+    require_current_project_scope(database, scope_id)?;
+    record_current_project_suggestion(database, scope_id, root_folder_node_id)
+}
+
+fn record_current_project_suggestion(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    root_folder_node_id: i64,
+) -> Result<ProjectCandidate, ProjectError> {
     let profile = folder_profile(database, scope_id, root_folder_node_id)?;
     let suggestion = profile
         .project_suggestion
@@ -159,22 +170,22 @@ pub fn propose_project(
 
 pub fn project_candidate_at(
     database_path: &Path,
+    scope_id: i64,
     project_id: i64,
 ) -> Result<ProjectCandidate, ProjectError> {
-    ManifestDatabase::open(database_path)?
-        .project_candidate(project_id)
-        .map_err(Into::into)
+    Ok(project_candidate_detail_at(database_path, scope_id, project_id)?.candidate)
 }
 
 pub fn decide_project_candidate_at(
     database_path: &Path,
+    scope_id: i64,
     project_id: i64,
     decision: ProjectDecisionKind,
 ) -> Result<ProjectCandidate, ProjectError> {
-    let mut database = ManifestDatabase::open(database_path)?;
-    database
-        .decide_project_candidate(project_id, decision)
-        .map_err(Into::into)
+    Ok(
+        decide_current_project_candidate_at(database_path, scope_id, project_id, decision)?
+            .candidate,
+    )
 }
 
 pub fn recent_project_candidates_at(
@@ -183,6 +194,134 @@ pub fn recent_project_candidates_at(
     ManifestDatabase::open(database_path)?
         .recent_project_candidates()
         .map_err(Into::into)
+}
+
+/// Discovers path-free Project candidates from the selected scope's current
+/// manifest. No filesystem traversal, membership edge, or file action occurs.
+pub fn discover_projects_at(
+    database_path: &Path,
+    scope_id: i64,
+) -> Result<ProjectDiscovery, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    discover_projects(&mut database, scope_id)
+}
+
+pub fn discover_projects(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+) -> Result<ProjectDiscovery, ProjectError> {
+    let roots = database.project_discovery_roots(scope_id, MAX_PROJECT_DISCOVERY_ROOTS)?;
+    let mut candidates = Vec::with_capacity(roots.root_folder_node_ids.len());
+    for root_folder_node_id in roots.root_folder_node_ids {
+        let candidate = record_current_project_suggestion(database, scope_id, root_folder_node_id)?;
+        candidates.push(project_candidate_summary(candidate));
+    }
+    Ok(ProjectDiscovery {
+        api_version: ProjectDiscovery::API_VERSION,
+        scope_id,
+        evaluated_root_count: u32::try_from(candidates.len())
+            .map_err(|_| ProjectError::Database(DatabaseError::InvalidCount))?,
+        bounded_root_limit: MAX_PROJECT_DISCOVERY_ROOTS,
+        evaluation_complete: roots.evaluation_complete,
+        candidates,
+        automatic_membership_created: false,
+        file_actions_available: false,
+    })
+}
+
+/// Re-derives current marker evidence before exposing one explicitly selected
+/// root path. The returned detail is transient and cannot authorize actions.
+pub fn project_candidate_detail_at(
+    database_path: &Path,
+    scope_id: i64,
+    project_id: i64,
+) -> Result<ProjectCandidateDetail, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    project_candidate_detail(&mut database, scope_id, project_id)
+}
+
+pub fn project_candidate_detail(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    project_id: i64,
+) -> Result<ProjectCandidateDetail, ProjectError> {
+    require_current_project_scope(database, scope_id)?;
+    let current = database.project_candidate(project_id)?;
+    if current.scope_id != scope_id {
+        return Err(ProjectError::Database(
+            DatabaseError::ProjectCandidateInputInvalid,
+        ));
+    }
+    let candidate =
+        record_current_project_suggestion(database, scope_id, current.root_folder_node_id)?;
+    Ok(ProjectCandidateDetail {
+        api_version: ProjectCandidateDetail::API_VERSION,
+        candidate,
+        user_requested_path: true,
+        current_evidence: true,
+        automatic_membership_created: false,
+        file_actions_available: false,
+    })
+}
+
+/// Appends one user correction only after the same current marker evidence used
+/// by detail has been revalidated. It never creates Project membership.
+pub fn decide_current_project_candidate_at(
+    database_path: &Path,
+    scope_id: i64,
+    project_id: i64,
+    decision: ProjectDecisionKind,
+) -> Result<ProjectCandidateDetail, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    decide_current_project_candidate(&mut database, scope_id, project_id, decision)
+}
+
+pub fn decide_current_project_candidate(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    project_id: i64,
+    decision: ProjectDecisionKind,
+) -> Result<ProjectCandidateDetail, ProjectError> {
+    let detail = project_candidate_detail(database, scope_id, project_id)?;
+    let candidate = database.decide_project_candidate(detail.candidate.project_id, decision)?;
+    Ok(ProjectCandidateDetail {
+        api_version: ProjectCandidateDetail::API_VERSION,
+        candidate,
+        user_requested_path: true,
+        current_evidence: true,
+        automatic_membership_created: false,
+        file_actions_available: false,
+    })
+}
+
+fn require_current_project_scope(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<(), ProjectError> {
+    if !database.scope_has_active_access_grant(scope_id)? {
+        return Err(ProjectError::Database(
+            DatabaseError::ScopeAccessGrantNotActive,
+        ));
+    }
+    if !database.scope_has_completed_scan(scope_id)? {
+        return Err(ProjectError::Database(DatabaseError::ScanJobIncomplete));
+    }
+    Ok(())
+}
+
+fn project_candidate_summary(candidate: ProjectCandidate) -> ProjectCandidateSummary {
+    ProjectCandidateSummary {
+        api_version: ProjectCandidateSummary::API_VERSION,
+        project_id: candidate.project_id,
+        scope_id: candidate.scope_id,
+        root_folder_node_id: candidate.root_folder_node_id,
+        state: candidate.state,
+        confidence_basis_points: candidate.suggestion.confidence_basis_points,
+        observed_at_unix_ms: candidate.suggestion.observed_at_unix_ms,
+        latest_decision_at_unix_ms: candidate
+            .latest_decision
+            .map(|decision| decision.decided_at_unix_ms),
+    }
 }
 
 pub fn check_exact_duplicate_at(
@@ -1010,6 +1149,9 @@ mod tests {
             let mut database = ManifestDatabase::open_in_memory().expect("database should open");
             let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
             scan_scope(&mut database, scope.id).expect("scope should scan");
+            database
+                .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"project-test-grant")
+                .expect("test grant should activate");
             let canonical_root =
                 std::fs::canonicalize(&scope_path).expect("root should canonicalize");
             let canonical_source =
@@ -1170,6 +1312,155 @@ mod tests {
         let summary = serde_json::to_value(&summaries[0]).expect("summary should serialize");
         assert!(summary.get("display_path").is_none());
         assert!(summary.get("suggestion").is_none());
+    }
+
+    #[test]
+    fn discovery_is_manifest_only_path_free_and_preserves_user_feedback() {
+        let mut fixture = Fixture::new();
+        let nested_marker = fixture
+            ._directory
+            .path()
+            .join("sample-project/src/package.json");
+        std::fs::write(&nested_marker, r#"{"name":"nested"}"#).expect("nested marker should write");
+        scan_scope(&mut fixture.database, fixture.scope_id).expect("updated scope should scan");
+        fixture
+            .database
+            .upsert_scope_access_grant(
+                fixture.scope_id,
+                std::env::consts::OS,
+                b"project-discovery-test-grant",
+            )
+            .expect("test grant should activate");
+
+        let discovery = discover_projects(&mut fixture.database, fixture.scope_id)
+            .expect("current strong markers should be discovered");
+        assert_eq!(discovery.candidates.len(), 2);
+        assert_eq!(discovery.evaluated_root_count, 2);
+        assert_eq!(discovery.bounded_root_limit, 100);
+        assert!(discovery.evaluation_complete);
+        assert!(!discovery.automatic_membership_created);
+        assert!(!discovery.file_actions_available);
+        let payload = serde_json::to_string(&discovery).expect("discovery should serialize");
+        assert!(!payload.contains("display_path"));
+        assert!(!payload.contains("sample-project"));
+        assert!(!payload.contains("Cargo.toml"));
+        assert!(!payload.contains("package.json"));
+
+        let root = discovery
+            .candidates
+            .iter()
+            .find(|candidate| candidate.root_folder_node_id == fixture.root_node_id)
+            .expect("root project should be present");
+        let root_project_id = root.project_id;
+        let detail =
+            project_candidate_detail(&mut fixture.database, fixture.scope_id, root_project_id)
+                .expect("explicit detail should expose current evidence");
+        assert!(detail.user_requested_path);
+        assert!(detail.current_evidence);
+        assert!(detail.candidate.display_path.ends_with("sample-project"));
+        assert!(!detail.automatic_membership_created);
+        assert!(!detail.file_actions_available);
+
+        let rejected = decide_current_project_candidate(
+            &mut fixture.database,
+            fixture.scope_id,
+            root_project_id,
+            ProjectDecisionKind::Rejected,
+        )
+        .expect("explicit correction should append");
+        assert_eq!(rejected.candidate.state, ProjectCandidateState::Rejected);
+        let repeated = discover_projects(&mut fixture.database, fixture.scope_id)
+            .expect("repeated discovery should be idempotent");
+        assert_eq!(repeated.candidates.len(), 2);
+        assert_eq!(
+            repeated
+                .candidates
+                .iter()
+                .find(|candidate| candidate.project_id == root_project_id)
+                .map(|candidate| candidate.state),
+            Some(ProjectCandidateState::Rejected)
+        );
+    }
+
+    #[test]
+    fn discovery_requires_active_grant_and_completed_scan() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("unscanned-project");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(scope_path.join("Cargo.toml"), "[package]").expect("marker should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+
+        assert_eq!(
+            discover_projects(&mut database, scope.id)
+                .expect_err("missing grant should fail closed")
+                .code(),
+            "scope_access_grant_not_active"
+        );
+        database
+            .upsert_scope_access_grant(
+                scope.id,
+                std::env::consts::OS,
+                b"project-discovery-test-grant",
+            )
+            .expect("test grant should activate");
+        assert_eq!(
+            discover_projects(&mut database, scope.id)
+                .expect_err("missing completed scan should fail closed")
+                .code(),
+            "scan_job_incomplete"
+        );
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .mark_scope_access_grant_revoked(scope.id)
+            .expect("test grant should revoke");
+        assert_eq!(
+            discover_projects(&mut database, scope.id)
+                .expect_err("revoked grant should fail closed")
+                .code(),
+            "scope_access_grant_not_active"
+        );
+        assert!(
+            database
+                .recent_project_candidates()
+                .expect("no candidates should persist")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn discovery_reports_an_honest_bounded_partial_result() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("many-projects");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        for index in 0..=MAX_PROJECT_DISCOVERY_ROOTS {
+            let project = scope_path.join(format!("project-{index:03}"));
+            std::fs::create_dir(&project).expect("project root should create");
+            std::fs::write(project.join("Cargo.toml"), "[package]")
+                .expect("project marker should write");
+        }
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(
+                scope.id,
+                std::env::consts::OS,
+                b"project-discovery-test-grant",
+            )
+            .expect("test grant should activate");
+
+        let discovery = discover_projects(&mut database, scope.id)
+            .expect("bounded discovery should return verified roots");
+        assert_eq!(discovery.candidates.len(), 100);
+        assert_eq!(discovery.evaluated_root_count, 100);
+        assert!(!discovery.evaluation_complete);
+        assert!(
+            discovery
+                .candidates
+                .iter()
+                .all(|candidate| candidate.scope_id == scope.id)
+        );
     }
 
     #[test]

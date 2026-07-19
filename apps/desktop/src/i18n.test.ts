@@ -189,13 +189,51 @@ describe('i18n catalog and registry contract', () => {
     expect(appSource).toContain("cleanupReviewState.kind === 'creating'");
   });
 
+  it('keeps Project Discovery path-free by default and localized in every catalog', () => {
+    const phrases: Record<Locale, { suggestion: string; noMembership: string; noAction: string }> =
+      {
+        en: {
+          suggestion: 'Suggestions only',
+          noMembership: 'does not create file membership',
+          noAction: 'No file is moved',
+        },
+        'zh-TW': {
+          suggestion: '僅建議',
+          noMembership: '不會建立檔案隸屬關係',
+          noAction: '不會移動',
+        },
+        'zh-CN': {
+          suggestion: '仅建议',
+          noMembership: '不会创建文件归属关系',
+          noAction: '不会移动',
+        },
+        ja: {
+          suggestion: '候補のみ',
+          noMembership: 'ファイルの所属は作成されません',
+          noAction: 'ファイルを移動',
+        },
+      };
+    for (const locale of LOCALES) {
+      const projects = catalogs[locale].projects;
+      expect(projects.suggestionOnly).toContain(phrases[locale].suggestion);
+      expect(projects.noAutomaticMembership).toContain(phrases[locale].noMembership);
+      expect(projects.noFileActions).toContain(phrases[locale].noAction);
+      expect(projects.detail.transientNotice.length).toBeGreaterThan(20);
+      expect(projects.state.accepted).toBeTruthy();
+      expect(projects.state.rejected).toBeTruthy();
+    }
+    expect(appSource).toContain('discoverProjectCandidates()');
+    expect(appSource).toContain('openProjectReview(candidate.project_id, event.currentTarget)');
+    expect(appSource).toContain('projectReviewGenerationRef.current !== generation');
+    expect(appSource).toContain("if (nextView !== 'projects') invalidateProjectReview()");
+  });
+
   it('keeps primary navigation complete and honest in every catalog', () => {
     const phrases: Record<
       Locale,
       {
         localOnly: string;
         noNetwork: string;
-        projectsNotDiscovery: string;
         inboxNoAction: string;
         historyNoAction: string;
       }
@@ -203,28 +241,24 @@ describe('i18n catalog and registry contract', () => {
       en: {
         localOnly: 'Local only',
         noNetwork: 'No network required',
-        projectsNotDiscovery: 'not available',
         inboxNoAction: 'cannot change, trash, delete, or undo',
         historyNoAction: 'does not execute or undo',
       },
       'zh-TW': {
         localOnly: '僅限本機',
         noNetwork: '不需要網路',
-        projectsNotDiscovery: '尚未提供',
         inboxNoAction: '無法變更、移至垃圾桶、刪除或復原',
         historyNoAction: '不會執行或復原',
       },
       'zh-CN': {
         localOnly: '仅限本机',
         noNetwork: '不需要网络',
-        projectsNotDiscovery: '尚未提供',
         inboxNoAction: '无法更改、移至废纸篓、删除或撤销',
         historyNoAction: '不会执行或撤销',
       },
       ja: {
         localOnly: 'ローカルのみ',
         noNetwork: 'ネットワーク不要',
-        projectsNotDiscovery: 'まだ利用できません',
         inboxNoAction: '変更、ゴミ箱への移動、削除、Undo はできません',
         historyNoAction: '実行またはUndoできません',
       },
@@ -243,7 +277,6 @@ describe('i18n catalog and registry contract', () => {
         expect(navigation.views[view].title.length).toBeGreaterThan(0);
         expect(navigation.views[view].description.length).toBeGreaterThan(0);
       }
-      expect(navigation.views.projects.description).toContain(phrases[locale].projectsNotDiscovery);
       expect(navigation.views.inbox.description).toContain(phrases[locale].inboxNoAction);
       expect(navigation.views.history.description).toContain(phrases[locale].historyNoAction);
     }

@@ -29,9 +29,9 @@ export const en = {
       },
       projects: {
         label: 'Projects',
-        title: 'Authorized folders and metadata scans',
+        title: 'Authorized folders and project suggestions',
         description:
-          'Authorize folders and run metadata scans. Project Discovery is not available in this view yet.',
+          'Authorize folders, scan metadata, and review explainable local project suggestions.',
       },
       inbox: {
         label: 'Inbox',
@@ -332,6 +332,48 @@ export const en = {
       checksPassed: (count) => `${formatIntegerForLocale(count, 'en')} policy checks recorded`,
       noExecution:
         'Preview only. This does not confirm, move, trash, delete, restore, or undo any file.',
+    },
+  },
+  projects: {
+    kicker: 'Project Discovery',
+    heading: 'Review local project suggestions',
+    description:
+      'Explicitly evaluate one scanned authorized folder using deterministic local folder markers.',
+    scopeLabel: 'Authorized folder',
+    chooseScope: 'Choose an authorized folder',
+    discover: 'Discover projects',
+    discovering: 'Evaluating local folder evidence…',
+    checkingReadiness: 'Checking durable scan readiness…',
+    readinessError: 'This folder’s scan readiness could not be verified safely.',
+    controlsAria: 'Project Discovery controls',
+    authorizationRequired: 'Authorize a folder before requesting local project suggestions.',
+    scanRequired: 'Complete a metadata scan for this folder before discovering projects.',
+    empty: 'No current folder-marker project suggestions were found.',
+    partial: 'This bounded evaluation is partial; some roots could not be evaluated safely.',
+    error: 'Project suggestions could not be evaluated safely.',
+    candidateMeta: (confidence, observedAt) =>
+      `Evidence score ${formatIntegerForLocale(confidence, 'en')} / 10,000 · observed ${observedAt}`,
+    viewEvidence: 'View evidence',
+    suggestionOnly: 'Suggestions only',
+    noAutomaticMembership: 'Accepting a root does not create file membership.',
+    noFileActions: 'No file is moved, renamed, deleted, trashed, or restored.',
+    state: {
+      suggested: 'Suggested project root',
+      accepted: 'Accepted project root',
+      rejected: 'Rejected project root',
+    },
+    detail: {
+      loading: 'Revalidating this project suggestion locally…',
+      transientNotice:
+        'This explicit local review shows the current path only. It is not included in ordinary lists or logs.',
+      rootLabel: 'Current project root',
+      signalsLabel: 'Observed folder markers',
+      close: 'Close project review',
+      accept: 'Accept project root',
+      reject: 'Reject project root',
+      saving: 'Saving your append-only decision…',
+      decisionError: 'The decision could not be saved safely.',
+      detailError: 'This project suggestion is no longer current. Refresh and try again.',
     },
   },
   extraction: {
