@@ -19,6 +19,14 @@ Turn your computer into a private, searchable context graph.
 - 找出可解釋的重複檔、舊版本與截圖群組，經確認後安全移至系統垃圾桶並可復原。
 - 讓 AI Agent 在使用者授權下取得可靠的本地 Context。
 
+### 授權與覆蓋原則
+
+DeskGraph 的目標是低摩擦地涵蓋電腦中有用的工作情境，但不以「先讀完整顆磁碟、之後再排除」作為預設。v0.1 採用使用者一次檢視並明確確認的 Coverage Set：可在同一個原生流程選取 Desktop、Documents、Downloads、Pictures、Screenshots 等主要範圍，Home 則是有清楚風險說明的進階選項。有效覆蓋範圍為：
+
+`effective coverage = union(active user-confirmed roots) - union(active hard exclusions)`
+
+Hard Exclusion 是真正的本機存取與索引拒絕，不是隱藏搜尋結果。新增排除或撤銷範圍後，DeskGraph 必須原子清除受影響的路徑、內容、OCR、FTS、Embedding、Graph 與衍生候選資料，且永遠不修改或刪除來源檔。Metadata 授權也不等同於 Content、OCR、Embedding 或檔案動作授權。
+
 ## 2. 第一目標使用者
 
 ### Primary

@@ -2,6 +2,8 @@
 
 Last reviewed: 2026-07-19
 
+Authorization-model note: ADR-033 requires no new package. The already locked `tauri-plugin-dialog 2.7.1` exposes `blocking_pick_folders() -> Option<Vec<FilePath>>`; its existing `rfd` desktop backends request native multiple-directory selection on macOS and Windows. DeskGraph must still create and atomically persist one platform grant per selected canonical root, and packaged Windows retained-access evidence remains open. Hard exclusions, policy revision and SQLite privacy purge use existing Rust/SQLite layers and must not add an LLM, network, Python, Docker or filesystem-delete dependency.
+
 ## Policy
 
 Every new runtime, build, model, binary, crate, npm package, and GitHub Action must record official source, resolved version, purpose, maintenance evidence, supported platforms, license, and security notes. Lockfiles and checksums are authoritative for actual resolved artifacts. Candidates are not approved merely because they appear in this file.

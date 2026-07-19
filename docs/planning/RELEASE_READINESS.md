@@ -2,6 +2,8 @@
 
 Last reviewed: 2026-07-19
 
+Authorization model note: ADR-033 is accepted, but only the legacy one-root native picker is implemented. Public v0.1 remains blocked on atomic multi-root coverage authorization plus durable hard exclusions, policy revision, privacy purge, revocation/reconciliation UI, and adversarial race/crash evidence. Do not describe the current build as whole-computer coverage or exclusion-capable.
+
 Overall status: **not release-ready**. Local implementation is in M2 with parallel M3 lexical, M4 project-graph, M5 fail-closed organization-protocol, M6 durable watch-core, M7 scoped read-only MCP search, M8 localized Desktop-shell, and a narrow M9a native-scope local foundation. M0 remote CI, M1 cross-platform/memory/live scan-control, signed packaging, and clean-machine platform evidence remain open.
 
 | Gate                                           | Status             | Evidence required                                        |

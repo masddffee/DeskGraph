@@ -29,7 +29,7 @@ M0 Foundation
 ## Critical path
 
 1. **M0** — establish reproducible repository, tests, privacy-safe health slice, CI.
-2. **M1** — authorize scopes and create an idempotent, identity-preserving SQLite manifest graph.
+2. **M1** — authorize one explicit Coverage Set, enforce hard exclusions with privacy purge, and create an idempotent, identity-preserving SQLite manifest graph.
 3. **M2** — safely extract required formats and OCR into provenance-bearing chunks.
 4. **M3** — deliver model-optional multilingual hybrid retrieval with diagnostics.
 5. **M4** — create explainable/correctable project, folder, related, duplicate, and version relations.
@@ -72,14 +72,14 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 - Rollback: remove the new workspace/app files; planning baseline remains intact.
 - Exit: local implementation is verified and every acceptance item has evidence or an explicit external blocker; M0 stays in progress until the macOS/Windows/Linux remote matrix is green.
 
-### Step 2 — M1 scope and manifest schema
+### Step 2 — M1 coverage policy and manifest schema
 
 - Context: begin from `prompts/02_MANIFEST_GRAPH.md`; SQLite/file identity dependencies are unaudited until selected.
-- Build: scope allowlist, canonical policy, exclusions, migrations, File/Folder graph, scan job state.
-- Tests: symlink/junction/case/Unicode/permission/idempotency fixtures.
+- Build: atomic native multi-root authorization, canonical Coverage Set, durable hard exclusions and policy revision, privacy purge, File/Folder graph, scan job state.
+- Tests: all-or-nothing picker/grant persistence; root overlap; symlink/junction/case/Unicode/permission/idempotency; pre-scan exclusion; post-index FTS/OCR/Graph purge; in-flight revision races and crash rollback.
 - Verify: 10k scan, rescan, move identity, scope escape.
 - Rollback: forward-only development migration or documented reversible migration before release.
-- Exit: CLI and UI show real graph statistics for authorized scopes.
+- Exit: CLI and UI show real graph statistics for confirmed coverage; excluded paths never enter or remain in current manifest/search/MCP/graph/action state, and source files are byte-for-byte unchanged by privacy purge.
 
 ### Step 3 — M2 extraction/OCR
 

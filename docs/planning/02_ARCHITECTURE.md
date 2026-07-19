@@ -10,6 +10,14 @@
 - 每個外部模型、Binary 與權重都必須有版本、License、SHA-256。
 - 系統必須支援 Crash Recovery 與冪等重試。
 
+### Coverage Policy
+
+授權不是逐一對話框的產品限制，而是使用者一次檢視並確認的 Coverage Set。Rust core 只接受由原生平台 picker/capability 建立的 coverage roots，WebView 不得提交任意路徑。有效讀取範圍固定為 `union(active roots) - union(active hard exclusions)`；Home 可以是進階顯式選項，但不預設要求 macOS Full Disk Access 或 Windows `broadFileSystemAccess`。
+
+Coverage root 只授權 metadata discovery。Content extraction、Screenshot OCR、Embedding 與任何檔案動作維持獨立 consent/policy。每個 root 具有 durable policy revision；Scan、Watch、Extraction、Search/MCP 回傳、Project/Cleanup detail 與 Action planning 必須在發布前 compare-and-swap 該 revision。
+
+Hard exclusion 必須在 traversal/read/persist/query/action 每一層 fail closed。新增排除與 privacy purge 使用單一 immediate transaction：遞增 revision、失效舊工作、刪除受影響的路徑/FTS/內容/OCR/Embedding/Graph/候選與可安全刪除的衍生歷史，寫入 path-free receipt 後一起 commit。隱私撤回優先於一般 derived-evidence immutability；只允許 Rust database layer 在 transaction-scoped purge capability 下繞過 delete trigger。此例外不能刪除來源檔，也不能變成通用 Delete API。完整合約見 ADR-033。
+
 ## 2. Repository Structure
 
 ```text
