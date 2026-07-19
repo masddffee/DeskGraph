@@ -51,7 +51,7 @@ export const zhTW = {
     eyebrow: 'DeskGraph · M2 本機脈絡',
     heading: '讓你的電腦脈絡化。',
     description:
-      '一次明確授權一個本機資料夾，建立其中繼資料清單，並將受限文字抽取留在這台電腦上，不上傳路徑或內容。',
+      '一次明確確認一個或多個本機資料夾，建立其中繼資料清單，並將受限文字抽取留在這台電腦上，不上傳路徑或內容。',
     release: '預先發行版',
   },
   loading: { heading: '正在開啟本機清單', description: '不會自動掃描任何已授權資料夾。' },
@@ -374,9 +374,9 @@ export const zhTW = {
     kicker: '明確授權',
     heading: 'DeskGraph 可檢查的資料夾',
     description:
-      '請在系統資料夾選擇器中選取一個資料夾，明確授權本機存取。授權與掃描是分開的操作；不會追蹤符號連結或隱藏項目。既有範圍在更新或系統變更後可能需要再次授權。',
+      '請在同一個系統選擇器中選取一個或多個資料夾。DeskGraph 只會存取你確認的範圍；授權與掃描是分開的操作，選取本身不會開始掃描，也不會追蹤符號連結或隱藏項目。',
     count: (count) => `${formatIntegerForLocale(count, 'zh-TW')} 個已授權`,
-    inputLabel: '使用系統選擇器選取資料夾',
+    pickerAriaLabel: '使用系統選擇器選取一個或多個資料夾',
     authorize: '選取要授權的資料夾',
     emptyHeading: '沒有資料夾存取權',
     emptyDescription: '在這裡新增前，DeskGraph 無法檢查桌面、下載項目或文件。',
@@ -388,10 +388,14 @@ export const zhTW = {
     resume: '繼續掃描',
     scan: '掃描中繼資料',
     validation: {
-      cancelled: '已取消資料夾選取，沒有新增任何存取權。',
-      validating: '等待你選取資料夾，接著驗證資料夾邊界…',
-      authorized: '資料夾已授權。在你選擇「掃描中繼資料」前不會掃描任何內容。',
-      denied: '無法授權選取的資料夾。它可能無法使用、受保護，或需要再次授權。',
+      cancelled: '已取消資料夾選取，沒有提交任何授權變更。',
+      validating: '等待你選取資料夾，接著逐一驗證所有資料夾邊界…',
+      authorized: (count) =>
+        `已一次授權 ${formatIntegerForLocale(count, 'zh-TW')} 個資料夾，尚未掃描；準備好後請為各範圍選擇「掃描中繼資料」。`,
+      refreshFailed: (count) =>
+        `已授權 ${formatIntegerForLocale(count, 'zh-TW')} 個資料夾且尚未掃描，但無法重新整理最新本機狀態；請重新載入以同步畫面。`,
+      denied:
+        '無法將選取的資料夾作為一組授權，沒有提交任何選取變更。請移除無法使用、受保護、重複或重疊的資料夾後再試一次。',
       reading: '正在讀取已授權資料夾中的中繼資料…',
       complete: (files, folders) =>
         `掃描完成：${formatIntegerForLocale(files, 'zh-TW')} 個檔案與 ${formatIntegerForLocale(folders, 'zh-TW')} 個資料夾。`,

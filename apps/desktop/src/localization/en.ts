@@ -57,7 +57,7 @@ export const en = {
     eyebrow: 'DeskGraph · M2 Local Context',
     heading: 'Graphify your computer.',
     description:
-      'Authorize one local folder at a time, build its metadata manifest, and keep bounded text extraction on this computer—without uploading paths or content.',
+      'Confirm one or more local folders in one step, build their metadata manifests, and keep bounded text extraction on this computer—without uploading paths or content.',
     release: 'PRE-RELEASE',
   },
   loading: {
@@ -399,10 +399,10 @@ export const en = {
     kicker: 'Explicit authorization',
     heading: 'Folders DeskGraph may inspect',
     description:
-      'Choose one folder in the system folder picker to grant explicit local access. Authorization and scanning are separate actions; symlinks and hidden entries are not followed. Existing scopes may need authorization again after an update or system change.',
+      'Choose one or more folders together in the system picker. DeskGraph accesses only the folders you confirm. Authorization and scanning are separate actions; selection never starts a scan, and symlinks or hidden entries are not followed.',
     count: (count) => `${formatIntegerForLocale(count, 'en')} authorized`,
-    inputLabel: 'Choose a folder with the system picker',
-    authorize: 'Choose folder to authorize',
+    pickerAriaLabel: 'Choose one or more folders with the system picker',
+    authorize: 'Choose folders to authorize',
     emptyHeading: 'No folder access',
     emptyDescription: 'DeskGraph cannot inspect Desktop, Downloads, or Documents until added here.',
     label: (scopeId) => `Authorized scope ${scopeId}`,
@@ -413,11 +413,14 @@ export const en = {
     resume: 'Resume scan',
     scan: 'Scan metadata',
     validation: {
-      cancelled: 'Folder selection cancelled. No access was added.',
-      validating: 'Waiting for your folder choice, then validating the folder boundary…',
-      authorized: 'Folder authorized. Nothing was scanned until you choose Scan metadata.',
+      cancelled: 'Folder selection cancelled. No authorization change was committed.',
+      validating: 'Waiting for your folder choices, then validating every folder boundary…',
+      authorized: (count) =>
+        `${englishCount(count, 'folder')} authorized together. Nothing was scanned; choose Scan metadata for each folder when ready.`,
+      refreshFailed: (count) =>
+        `${englishCount(count, 'folder')} authorized and not scanned, but the latest local status could not be refreshed. Reload to reconcile the view.`,
       denied:
-        'The selected folder could not be authorized. It may be unavailable, protected, or require authorization again.',
+        'The selected folders could not be authorized as one set. No selected change was committed; remove unavailable, protected, duplicate, or overlapping folders and try again.',
       reading: 'Reading metadata inside the authorized folder…',
       complete: (files, folders) =>
         `Scan complete: ${englishCount(files, 'file')} and ${englishCount(folders, 'folder')}.`,

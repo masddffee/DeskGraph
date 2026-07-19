@@ -31,10 +31,11 @@ import {
   loadManifestStatus,
   loadRecentScanJobs,
   loadScanJobStatus,
+  mergeAuthorizedScopes,
   pauseManifestScan,
   resumeManifestScan,
   runManifestScan,
-  selectAndAuthorizeScope,
+  selectAndAuthorizeScopes,
   type AuthorizedScope,
   type ManifestStats,
   type ScanJobProgress,
@@ -106,7 +107,6 @@ type ActionMessage =
       key:
         | 'cancelled'
         | 'validating'
-        | 'authorized'
         | 'denied'
         | 'reading'
         | 'interrupted'
@@ -118,6 +118,7 @@ type ActionMessage =
         | 'revalidating'
         | 'resumeDenied';
     }
+  | { key: 'authorized' | 'refreshFailed'; count: number }
   | { key: 'complete'; files: number; folders: number }
   | { key: 'paused'; processed: number; queued: number };
 type ActionState =
@@ -274,6 +275,9 @@ function screenshotOcrJobForResult(
 }
 
 function actionMessageLabel(catalog: Catalog, message: ActionMessage): string {
+  if (message.key === 'authorized' || message.key === 'refreshFailed') {
+    return catalog.scope.validation[message.key](message.count);
+  }
   if (message.key === 'complete') {
     return catalog.scope.validation.complete(message.files, message.folders);
   }
@@ -769,23 +773,39 @@ export default function App() {
     );
   }
 
-  async function authorizeRequestedScope() {
+  async function authorizeRequestedScopes() {
     setAction({ kind: 'working', message: { key: 'validating' } });
+    let scopes: AuthorizedScope[] | null;
     try {
-      const scope = await selectAndAuthorizeScope();
-      if (scope === null) {
-        setAction({ kind: 'cancelled', message: { key: 'cancelled' } });
-        return;
-      }
-      await refreshManifest();
-      setAction({
-        kind: 'success',
-        message: { key: 'authorized' },
-      });
+      scopes = await selectAndAuthorizeScopes();
     } catch {
       setAction({
         kind: 'error',
         message: { key: 'denied' },
+      });
+      return;
+    }
+    if (scopes === null) {
+      setAction({ kind: 'cancelled', message: { key: 'cancelled' } });
+      return;
+    }
+    setState((current) => {
+      if (current.kind !== 'ready') return current;
+      return {
+        ...current,
+        scopes: mergeAuthorizedScopes(current.scopes, scopes),
+      };
+    });
+    try {
+      await refreshManifest();
+      setAction({
+        kind: 'success',
+        message: { key: 'authorized', count: scopes.length },
+      });
+    } catch {
+      setAction({
+        kind: 'success',
+        message: { key: 'refreshFailed', count: scopes.length },
       });
     }
   }
@@ -2489,8 +2509,8 @@ export default function App() {
                       <button
                         type="button"
                         disabled={action.kind === 'working'}
-                        aria-label={catalog.scope.inputLabel}
-                        onClick={() => void authorizeRequestedScope()}
+                        aria-label={catalog.scope.pickerAriaLabel}
+                        onClick={() => void authorizeRequestedScopes()}
                       >
                         {catalog.scope.authorize}
                       </button>

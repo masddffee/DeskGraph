@@ -6,7 +6,7 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 
 ### Changed
 
-- Accepted ADR-033: folder authorization will become one explicitly reviewed multi-root Coverage Set minus durable hard exclusions. The current application still exposes the existing one-root picker; multi-root atomic grants and privacy purge remain implementation work and are not release claims.
+- Accepted ADR-033 and implemented its first bounded slice: one native selection may atomically authorize 1–32 non-overlapping roots, each with its own opaque platform grant and explicit later metadata scan. Active-grant schema guards cover every writer, and upgrades fail closed by quarantining narrower legacy grants when a broad/narrow pair already exists. Durable hard exclusions, policy revision, privacy purge, revocation UI and signed cross-platform evidence remain release work.
 
 ### Added
 

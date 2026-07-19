@@ -78,6 +78,48 @@ describe('i18n catalog and registry contract', () => {
     }
   });
 
+  it('keeps multi-folder authorization explicit, atomic, and separate from scanning', () => {
+    const phrases: Record<
+      Locale,
+      { multi: string; notScanned: string; atomicFailure: string; refreshSaved: string }
+    > = {
+      en: {
+        multi: 'one or more',
+        notScanned: 'Nothing was scanned',
+        atomicFailure: 'No selected change was committed',
+        refreshSaved: 'authorized and not scanned',
+      },
+      'zh-TW': {
+        multi: '一個或多個',
+        notScanned: '尚未掃描',
+        atomicFailure: '沒有提交任何選取變更',
+        refreshSaved: '已授權 2 個資料夾且尚未掃描',
+      },
+      'zh-CN': {
+        multi: '一个或多个',
+        notScanned: '尚未扫描',
+        atomicFailure: '没有提交任何所选变更',
+        refreshSaved: '已授权 2 个文件夹且尚未扫描',
+      },
+      ja: {
+        multi: '1 つ以上',
+        notScanned: 'まだスキャンしていません',
+        atomicFailure: '変更は確定されませんでした',
+        refreshSaved: '2 件のフォルダーを許可し、まだスキャンしていません',
+      },
+    };
+
+    for (const locale of LOCALES) {
+      const scope = catalogs[locale].scope;
+      expect(scope.description).toContain(phrases[locale].multi);
+      expect(scope.pickerAriaLabel).toContain(phrases[locale].multi);
+      expect(scope.validation.authorized(2)).toContain(phrases[locale].notScanned);
+      expect(scope.validation.authorized(2)).toContain('2');
+      expect(scope.validation.denied).toContain(phrases[locale].atomicFailure);
+      expect(scope.validation.refreshFailed(2)).toContain(phrases[locale].refreshSaved);
+    }
+  });
+
   it('keeps preview, upload, extraction, and watch limitations explicit in every locale', () => {
     const safetyPhrases: Record<
       Locale,

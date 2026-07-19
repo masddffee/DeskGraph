@@ -32,11 +32,14 @@ use deskgraph_projects::{
     project_candidate_detail_at, refresh_smart_cleanup_inbox_at,
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
-#[cfg(test)]
-use deskgraph_scanner::{authorize_scope, run_scan_job_to_terminal};
 use deskgraph_scanner::{
-    authorize_scope_with_access_grant, comparison_key, create_scan_job, pause_scan_job,
+    CoverageRootAuthorizationRequest, MAX_COVERAGE_ROOTS_PER_SELECTION,
+    authorize_coverage_roots_with_access_grants, comparison_key, create_scan_job, pause_scan_job,
     resume_scan_job, run_scan_job_batch, validated_scope_root,
+};
+#[cfg(test)]
+use deskgraph_scanner::{
+    authorize_scope, authorize_scope_with_access_grant, run_scan_job_to_terminal,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{
@@ -545,30 +548,61 @@ fn authorized_scopes(state: State<'_, ManifestState>) -> Result<Vec<AuthorizedSc
 }
 
 #[tauri::command]
-async fn select_and_authorize_scope(
+async fn select_and_authorize_scopes(
     app: AppHandle,
     state: State<'_, ManifestState>,
-) -> Result<Option<AuthorizedScope>, String> {
-    let Some(selected) = app.dialog().file().blocking_pick_folder() else {
+) -> Result<Option<Vec<AuthorizedScope>>, String> {
+    let Some(selected) = app.dialog().file().blocking_pick_folders() else {
         return Ok(None);
     };
-    let selected_path = selected
-        .into_path()
-        .map_err(|_| "scope_selection_invalid".to_string())?;
-    let prepared = prepare_selected_scope(&selected_path).map_err(str::to_string)?;
+    if selected.is_empty() {
+        return Err("coverage_set_empty".to_string());
+    }
+    if selected.len() > MAX_COVERAGE_ROOTS_PER_SELECTION {
+        return Err("coverage_set_too_large".to_string());
+    }
+    let selected_paths = selected
+        .into_iter()
+        .map(|path| {
+            path.into_path()
+                .map_err(|_| "scope_selection_invalid".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared = selected_paths
+        .iter()
+        .map(|path| prepare_selected_scope(path).map_err(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    let requests = prepared
+        .iter()
+        .map(|prepared| CoverageRootAuthorizationRequest {
+            requested_path: &prepared.resolved_path,
+            grant_platform: prepared.platform,
+            opaque_grant: &prepared.opaque_grant,
+        })
+        .collect::<Vec<_>>();
     let _database_guard = lock_database(&state)?;
-    let scope = authorize_scope_with_access_grant_at(
-        &state.database_path,
-        &prepared.resolved_path,
-        prepared.platform,
-        &prepared.opaque_grant,
-    )
-    .map_err(str::to_string)?;
-    lock_scope_accesses(&state)?.insert(scope.id, prepared.access);
+    let mut active_accesses = lock_scope_accesses(&state)?;
+    active_accesses
+        .try_reserve(prepared.len())
+        .map_err(|_| "scope_access_registry_capacity_exceeded".to_string())?;
+    let scopes = authorize_coverage_roots_with_access_grants_at(&state.database_path, &requests)
+        .map_err(str::to_string)?;
+    drop(requests);
+    let mut replaced_accesses = Vec::new();
+    for (scope, prepared) in scopes.iter().zip(prepared) {
+        if let Some(replaced) = active_accesses.insert(scope.id, prepared.access) {
+            replaced_accesses.push(replaced);
+        }
+    }
+    drop(active_accesses);
     drop(_database_guard);
+    drop(replaced_accesses);
     wake_watch_runtime(&state);
-    info!(event = "scope_authorized", scope_id = scope.id);
-    Ok(Some(scope))
+    info!(
+        event = "coverage_roots_authorized",
+        authorized_root_count = scopes.len()
+    );
+    Ok(Some(scopes))
 }
 
 #[tauri::command]
@@ -1240,6 +1274,7 @@ fn authorize_scope_at(path: &Path, requested_path: &Path) -> Result<AuthorizedSc
     authorize_scope(&database, requested_path).map_err(|error| error.code())
 }
 
+#[cfg(test)]
 fn authorize_scope_with_access_grant_at(
     path: &Path,
     requested_path: &Path,
@@ -1248,6 +1283,15 @@ fn authorize_scope_with_access_grant_at(
 ) -> Result<AuthorizedScope, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
     authorize_scope_with_access_grant(&mut database, requested_path, grant_platform, opaque_grant)
+        .map_err(|error| error.code())
+}
+
+fn authorize_coverage_roots_with_access_grants_at(
+    path: &Path,
+    requests: &[CoverageRootAuthorizationRequest<'_>],
+) -> Result<Vec<AuthorizedScope>, &'static str> {
+    let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    authorize_coverage_roots_with_access_grants(&mut database, requests)
         .map_err(|error| error.code())
 }
 
@@ -1495,7 +1539,7 @@ pub fn run() {
             health,
             manifest_status,
             authorized_scopes,
-            select_and_authorize_scope,
+            select_and_authorize_scopes,
             create_manifest_scan,
             run_manifest_scan,
             scan_job_status,
@@ -1619,31 +1663,41 @@ mod tests {
     }
 
     #[test]
-    fn native_scope_grant_persists_restores_and_stays_out_of_ipc_scope_shape() {
+    fn native_coverage_grants_persist_restore_and_stay_out_of_ipc_scope_shape() {
         let directory = tempfile::tempdir().expect("fixture root should exist");
         let database_path = directory.path().join("app-data/manifest.sqlite3");
-        let scope_path = directory.path().join("selected-scope");
-        std::fs::create_dir(&scope_path).expect("scope should create");
+        let desktop_path = directory.path().join("Desktop");
+        let documents_path = directory.path().join("Documents");
+        std::fs::create_dir(&desktop_path).expect("Desktop should create");
+        std::fs::create_dir(&documents_path).expect("Documents should create");
         initialize_manifest(&database_path).expect("manifest should initialize");
 
-        let prepared = prepare_selected_scope(&scope_path).expect("selection should prepare");
-        let scope = authorize_scope_with_access_grant_at(
-            &database_path,
-            &prepared.resolved_path,
-            prepared.platform,
-            &prepared.opaque_grant,
-        )
-        .expect("scope and grant should persist atomically");
-        drop(prepared.access);
+        let prepared = [desktop_path, documents_path]
+            .iter()
+            .map(|path| prepare_selected_scope(path).expect("selection should prepare"))
+            .collect::<Vec<_>>();
+        let requests = prepared
+            .iter()
+            .map(|prepared| CoverageRootAuthorizationRequest {
+                requested_path: &prepared.resolved_path,
+                grant_platform: prepared.platform,
+                opaque_grant: &prepared.opaque_grant,
+            })
+            .collect::<Vec<_>>();
+        let scopes = authorize_coverage_roots_with_access_grants_at(&database_path, &requests)
+            .expect("coverage roots and grants should persist atomically");
+        drop(requests);
+        drop(prepared);
 
         let restored = restore_scope_access_registry(&database_path)
             .expect("stored selection should restore safely");
-        assert!(restored.contains_key(&scope.id));
+        assert_eq!(restored.len(), 2);
+        assert!(scopes.iter().all(|scope| restored.contains_key(&scope.id)));
         let ordinary_scopes = authorized_scopes_at(&database_path).expect("scopes should load");
         let payload = serde_json::to_string(&ordinary_scopes).expect("scopes should serialize");
         assert!(!payload.contains("opaque_grant"));
         assert!(!payload.contains("access_grant"));
-        assert_eq!(ordinary_scopes, vec![scope]);
+        assert_eq!(ordinary_scopes, scopes);
     }
 
     #[cfg(target_os = "macos")]

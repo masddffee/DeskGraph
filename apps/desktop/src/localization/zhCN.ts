@@ -57,7 +57,7 @@ export const zhCN = {
     eyebrow: 'DeskGraph · M2 本机上下文',
     heading: '让你的电脑上下文化。',
     description:
-      '一次只明确授权一个本机文件夹，建立元数据清单，并将受限文本提取留在这台电脑上，不上传路径或内容。',
+      '一次明确确认一个或多个本机文件夹，建立元数据清单，并将受限文本提取留在这台电脑上，不上传路径或内容。',
     release: '预发布版',
   },
   loading: {
@@ -386,9 +386,9 @@ export const zhCN = {
     kicker: '明确授权',
     heading: 'DeskGraph 可以检查的文件夹',
     description:
-      '请在系统文件夹选择器中选择一个文件夹，明确授权本机访问。授权和扫描是分开的操作；不会跟踪符号链接或隐藏项目。现有范围在更新或系统变更后可能需要再次授权。',
+      '请在同一个系统选择器中选择一个或多个文件夹。DeskGraph 只会访问你确认的范围；授权和扫描是分开的操作，选择本身不会开始扫描，也不会跟踪符号链接或隐藏项目。',
     count: (scopeCount) => `${count(scopeCount)} 个已授权`,
-    inputLabel: '使用系统选择器选择文件夹',
+    pickerAriaLabel: '使用系统选择器选择一个或多个文件夹',
     authorize: '选择要授权的文件夹',
     emptyHeading: '没有文件夹访问权限',
     emptyDescription: '在这里添加前，DeskGraph 无法检查桌面、下载项或文档。',
@@ -400,10 +400,14 @@ export const zhCN = {
     resume: '继续扫描',
     scan: '扫描元数据',
     validation: {
-      cancelled: '已取消文件夹选择，没有新增任何访问权限。',
-      validating: '等待你选择文件夹，然后验证文件夹边界…',
-      authorized: '文件夹已授权。在你选择“扫描元数据”前不会扫描任何内容。',
-      denied: '无法授权所选文件夹。它可能不可用、受保护，或需要再次授权。',
+      cancelled: '已取消文件夹选择，没有提交任何授权变更。',
+      validating: '等待你选择文件夹，然后逐一验证所有文件夹边界…',
+      authorized: (scopeCount) =>
+        `已一次授权 ${count(scopeCount)} 个文件夹，尚未扫描；准备好后请为各范围选择“扫描元数据”。`,
+      refreshFailed: (scopeCount) =>
+        `已授权 ${count(scopeCount)} 个文件夹且尚未扫描，但无法刷新最新本机状态；请重新加载以同步界面。`,
+      denied:
+        '无法将所选文件夹作为一组授权，没有提交任何所选变更。请移除不可用、受保护、重复或重叠的文件夹后重试。',
       reading: '正在读取已授权文件夹中的元数据…',
       complete: (files, folders) =>
         `扫描完成：${count(files)} 个文件和 ${count(folders)} 个文件夹。`,

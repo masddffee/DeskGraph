@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -28,6 +29,7 @@ use deskgraph_domain::{
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use deskgraph_identity::{IdentityNodeKind, is_symlink_or_reparse_point, platform_identity};
+use deskgraph_identity::{comparison_key, path_from_raw};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use rusqlite::OpenFlags;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -143,6 +145,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "cleanup_action_plan_preview",
         sql: include_str!("../../../migrations/0022_cleanup_action_plan_preview.sql"),
     },
+    Migration {
+        version: 23,
+        name: "coverage_root_overlap_guard",
+        sql: include_str!("../../../migrations/0023_coverage_root_overlap_guard.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -223,6 +230,7 @@ pub struct ScopeRecord {
     pub path_raw: Vec<u8>,
     pub path_key: String,
     pub display_path: String,
+    pub platform: String,
 }
 
 /// The durable lifecycle state of a platform-owned scope access grant.
@@ -278,6 +286,30 @@ pub struct ScopeAccessGrantWrite<'a> {
     pub grant_platform: &'a str,
     pub opaque_grant: &'a [u8],
     pub state: ScopeAccessGrantState,
+}
+
+/// One root in an atomic coverage-set authorization transaction.
+///
+/// Paths and opaque grants remain Rust-backend inputs. Callers must validate
+/// canonical scope policy before constructing this write.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct CoverageRootAccessGrantWrite<'a> {
+    pub path_raw: &'a [u8],
+    pub path_key: &'a str,
+    pub display_path: &'a str,
+    pub grant: ScopeAccessGrantWrite<'a>,
+}
+
+impl fmt::Debug for CoverageRootAccessGrantWrite<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CoverageRootAccessGrantWrite")
+            .field("path_raw_len", &self.path_raw.len())
+            .field("path_key_len", &self.path_key.len())
+            .field("display_path_len", &self.display_path.len())
+            .field("grant", &self.grant)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for ScopeAccessGrantWrite<'_> {
@@ -1164,61 +1196,147 @@ impl ManifestDatabase {
         display_path: &str,
         grant: ScopeAccessGrantWrite<'_>,
     ) -> Result<AuthorizedScope, DatabaseError> {
-        validate_scope_access_grant_platform(grant.scope_platform)?;
-        validate_scope_access_grant_platform(grant.grant_platform)?;
-        validate_scope_access_grant_bytes(grant.opaque_grant)?;
-        if grant.scope_platform != grant.grant_platform {
+        self.add_coverage_roots_with_access_grants(&[CoverageRootAccessGrantWrite {
+            path_raw,
+            path_key,
+            display_path,
+            grant,
+        }])?
+        .into_iter()
+        .next()
+        .ok_or(DatabaseError::ScopeAccessGrantInputInvalid)
+    }
+
+    /// Atomically authorizes every root in one user-confirmed coverage set.
+    /// A validation or SQLite failure leaves both scope and grant tables
+    /// unchanged for the entire request.
+    pub fn add_coverage_roots_with_access_grants(
+        &mut self,
+        roots: &[CoverageRootAccessGrantWrite<'_>],
+    ) -> Result<Vec<AuthorizedScope>, DatabaseError> {
+        if roots.is_empty() {
             return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+        }
+        let mut unique_path_keys = HashSet::with_capacity(roots.len());
+        for root in roots {
+            if root.path_raw.is_empty()
+                || root.path_key.is_empty()
+                || root.display_path.is_empty()
+                || !unique_path_keys.insert(root.path_key)
+            {
+                return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+            }
+            validate_scope_access_grant_platform(root.grant.scope_platform)?;
+            validate_scope_access_grant_platform(root.grant.grant_platform)?;
+            validate_scope_access_grant_bytes(root.grant.opaque_grant)?;
+            if root.grant.scope_platform != root.grant.grant_platform {
+                return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+            }
         }
 
         let created_at = unix_ms()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO authorized_scopes(path_raw, path_key, display_path, platform, created_at_unix_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(path_key) DO UPDATE SET \
-                 path_raw = excluded.path_raw, display_path = excluded.display_path",
-            params![path_raw, path_key, display_path, grant.scope_platform, created_at],
-        )?;
-        let (scope, persisted_platform): (AuthorizedScope, String) = transaction.query_row(
-            "SELECT id, display_path, created_at_unix_ms, platform \
-             FROM authorized_scopes WHERE path_key = ?1",
-            [path_key],
-            |row| {
-                Ok((
-                    AuthorizedScope {
-                        id: row.get(0)?,
-                        display_path: row.get(1)?,
-                        created_at_unix_ms: row.get(2)?,
-                    },
-                    row.get(3)?,
-                ))
-            },
-        )?;
-        if persisted_platform != grant.grant_platform {
-            return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+        let selected_paths = roots
+            .iter()
+            .map(|root| {
+                path_from_raw(root.path_raw)
+                    .map_err(|_| DatabaseError::ScopeAccessGrantInputInvalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, selected) in selected_paths.iter().enumerate() {
+            if selected_paths
+                .iter()
+                .skip(index + 1)
+                .any(|other| coverage_paths_overlap(selected, other))
+            {
+                return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+            }
         }
-        transaction.execute(
-            "INSERT INTO scope_access_grants( \
-                 scope_id, platform, opaque_grant, state, updated_at_unix_ms \
-             ) VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(scope_id) DO UPDATE SET \
-                 platform = excluded.platform, \
-                 opaque_grant = excluded.opaque_grant, \
-                 state = excluded.state, \
-                 updated_at_unix_ms = excluded.updated_at_unix_ms",
-            params![
-                scope.id,
-                grant.grant_platform,
-                grant.opaque_grant,
-                grant.state.as_str(),
-                created_at
-            ],
-        )?;
+        let existing_roots = {
+            let mut statement = transaction.prepare(
+                "SELECT scope.path_raw, scope.path_key, scope.platform \
+                 FROM authorized_scopes scope \
+                 JOIN scope_access_grants grant \
+                   ON grant.scope_id = scope.id AND grant.state = 'active' \
+                 ORDER BY scope.id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (existing_raw, existing_key, existing_platform) in existing_roots {
+            let existing_path =
+                path_from_raw(&existing_raw).map_err(|_| DatabaseError::InvalidStoredValue)?;
+            for (index, root) in roots.iter().enumerate() {
+                if root.grant.scope_platform == existing_platform
+                    && root.path_key != existing_key
+                    && coverage_paths_overlap(&selected_paths[index], &existing_path)
+                {
+                    return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+                }
+            }
+        }
+        let mut scopes = Vec::with_capacity(roots.len());
+        for root in roots {
+            transaction.execute(
+                "INSERT INTO authorized_scopes(path_raw, path_key, display_path, platform, created_at_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(path_key) DO UPDATE SET \
+                     path_raw = excluded.path_raw, display_path = excluded.display_path",
+                params![
+                    root.path_raw,
+                    root.path_key,
+                    root.display_path,
+                    root.grant.scope_platform,
+                    created_at
+                ],
+            )?;
+            let (scope, persisted_platform): (AuthorizedScope, String) = transaction.query_row(
+                "SELECT id, display_path, created_at_unix_ms, platform \
+                 FROM authorized_scopes WHERE path_key = ?1",
+                [root.path_key],
+                |row| {
+                    Ok((
+                        AuthorizedScope {
+                            id: row.get(0)?,
+                            display_path: row.get(1)?,
+                            created_at_unix_ms: row.get(2)?,
+                        },
+                        row.get(3)?,
+                    ))
+                },
+            )?;
+            if persisted_platform != root.grant.grant_platform {
+                return Err(DatabaseError::ScopeAccessGrantInputInvalid);
+            }
+            transaction.execute(
+                "INSERT INTO scope_access_grants( \
+                     scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(scope_id) DO UPDATE SET \
+                     platform = excluded.platform, \
+                     opaque_grant = excluded.opaque_grant, \
+                     state = excluded.state, \
+                     updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![
+                    scope.id,
+                    root.grant.grant_platform,
+                    root.grant.opaque_grant,
+                    root.grant.state.as_str(),
+                    created_at
+                ],
+            )?;
+            scopes.push(scope);
+        }
         transaction.commit()?;
-        Ok(scope)
+        Ok(scopes)
     }
 
     pub fn list_scopes(&self) -> Result<Vec<AuthorizedScope>, DatabaseError> {
@@ -1235,10 +1353,52 @@ impl ManifestDatabase {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Backend-only canonical records for coverage-policy overlap validation.
+    /// Do not serialize this shape through ordinary IPC or logs.
+    pub fn list_scope_records(&self) -> Result<Vec<ScopeRecord>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, path_raw, path_key, display_path, platform FROM authorized_scopes ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ScopeRecord {
+                id: row.get(0)?,
+                path_raw: row.get(1)?,
+                path_key: row.get(2)?,
+                display_path: row.get(3)?,
+                platform: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Backend-only canonical records for roots with a currently usable OS
+    /// capability. Historical or quarantined scopes cannot block a new
+    /// coverage confirmation and are never treated as active roots.
+    pub fn list_active_scope_records(&self) -> Result<Vec<ScopeRecord>, DatabaseError> {
+        let mut statement = self.connection.prepare(
+            "SELECT scope.id, scope.path_raw, scope.path_key, scope.display_path, scope.platform \
+             FROM authorized_scopes scope \
+             JOIN scope_access_grants grant \
+               ON grant.scope_id = scope.id AND grant.state = 'active' \
+             ORDER BY scope.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ScopeRecord {
+                id: row.get(0)?,
+                path_raw: row.get(1)?,
+                path_key: row.get(2)?,
+                display_path: row.get(3)?,
+                platform: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn scope_record(&self, scope_id: i64) -> Result<ScopeRecord, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT id, path_raw, path_key, display_path FROM authorized_scopes WHERE id = ?1",
+                "SELECT id, path_raw, path_key, display_path, platform \
+                 FROM authorized_scopes WHERE id = ?1",
                 [scope_id],
                 |row| {
                     Ok(ScopeRecord {
@@ -1246,6 +1406,7 @@ impl ManifestDatabase {
                         path_raw: row.get(1)?,
                         path_key: row.get(2)?,
                         display_path: row.get(3)?,
+                        platform: row.get(4)?,
                     })
                 },
             )
@@ -9969,6 +10130,16 @@ fn validate_scope_access_grant_bytes(opaque_grant: &[u8]) -> Result<(), Database
     Ok(())
 }
 
+fn coverage_paths_overlap(left: &Path, right: &Path) -> bool {
+    let left_key = comparison_key(left);
+    let right_key = comparison_key(right);
+    left.ancestors()
+        .any(|ancestor| comparison_key(ancestor) == right_key)
+        || right
+            .ancestors()
+            .any(|ancestor| comparison_key(ancestor) == left_key)
+}
+
 fn scope_access_grant_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScopeAccessGrant> {
     let state = row.get::<_, String>(3)?;
     let state = ScopeAccessGrantState::from_db(&state).map_err(|_| {
@@ -11902,6 +12073,114 @@ mod tests {
     }
 
     #[test]
+    fn coverage_overlap_migration_quarantines_legacy_descendants_and_guards_reactivation() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("pre-coverage-overlap-guard.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations ( \
+                     version INTEGER PRIMARY KEY, \
+                     name TEXT NOT NULL, \
+                     checksum TEXT NOT NULL, \
+                     applied_at_unix_ms INTEGER NOT NULL \
+                 );",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..22] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("historical migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("historical migration should register");
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO authorized_scopes( \
+                     id, path_raw, path_key, display_path, platform, created_at_unix_ms \
+                 ) VALUES \
+                     (1, X'2F686F6D652F706572736F6E', '/home/person', '/home/person', 'macos', 0), \
+                     (2, X'2F686F6D652F706572736F6E2F4465736B746F70', '/home/person/Desktop', '/home/person/Desktop', 'macos', 0), \
+                     (3, X'2F65787465726E616C', '/external', '/external', 'macos', 0), \
+                     (4, X'2F', '/', '/', 'linux', 0), \
+                     (5, X'2F726F6F742D6368696C64', '/root-child', '/root-child', 'linux', 0), \
+                     (6, X'433A5C', 'c:\\', 'C:\\', 'windows', 0), \
+                     (7, X'433A5C726F6F742D6368696C64', 'c:\\root-child', 'C:\\root-child', 'windows', 0); \
+                 INSERT INTO scope_access_grants( \
+                     scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                 ) VALUES \
+                     (1, 'macos', X'706172656E74', 'active', 0), \
+                     (2, 'macos', X'6368696C64', 'active', 0), \
+                     (3, 'macos', X'7369626C696E67', 'active', 0), \
+                     (4, 'linux', X'756E69782D726F6F74', 'active', 0), \
+                     (5, 'linux', X'756E69782D6368696C64', 'active', 0), \
+                     (6, 'windows', X'77696E646F77732D726F6F74', 'active', 0), \
+                     (7, 'windows', X'77696E646F77732D6368696C64', 'active', 0);",
+            )
+            .expect("legacy overlapping grants should persist");
+        drop(connection);
+
+        let mut database = ManifestDatabase::open(&path).expect("overlap migration should apply");
+        assert_eq!(
+            database
+                .scope_access_grant_state(1)
+                .expect("broad grant state should load"),
+            ScopeAccessGrantState::Active
+        );
+        assert_eq!(
+            database
+                .scope_access_grant_state(2)
+                .expect("descendant grant state should load"),
+            ScopeAccessGrantState::NeedsReauthorization
+        );
+        for descendant_id in [5, 7] {
+            assert_eq!(
+                database
+                    .scope_access_grant_state(descendant_id)
+                    .expect("root descendant grant state should load"),
+                ScopeAccessGrantState::NeedsReauthorization
+            );
+        }
+        assert_eq!(
+            database
+                .list_active_scope_records()
+                .expect("active roots should load")
+                .into_iter()
+                .map(|scope| scope.id)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 4, 6]
+        );
+        assert!(
+            database
+                .upsert_scope_access_grant(2, "macos", b"reactivated-child")
+                .is_err(),
+            "an inactive descendant must not reactivate beside its active parent"
+        );
+        database
+            .add_scope_with_access_grant(
+                b"/home/person",
+                "/home/person",
+                "/home/person",
+                ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"refreshed-parent",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("the broad root must remain reauthorizable");
+    }
+
+    #[test]
     fn scope_access_grants_are_opaque_upserted_and_never_exposed_by_scope_listing() {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
@@ -12166,6 +12445,359 @@ mod tests {
             database.active_scope_grant(inactive_scope.id),
             Err(DatabaseError::ScopeAccessGrantNotActive)
         ));
+    }
+
+    #[test]
+    fn coverage_roots_and_grants_commit_as_one_bounded_set() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let roots = [
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/desktop",
+                path_key: "/desktop",
+                display_path: "/desktop",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"desktop-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/documents",
+                path_key: "/documents",
+                display_path: "/documents",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"documents-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+        ];
+
+        let scopes = database
+            .add_coverage_roots_with_access_grants(&roots)
+            .expect("coverage set should commit");
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(
+            database
+                .active_scope_grant(scopes[0].id)
+                .expect("first grant should persist")
+                .opaque_grant,
+            b"desktop-grant"
+        );
+        assert_eq!(
+            database
+                .active_scope_grant(scopes[1].id)
+                .expect("second grant should persist")
+                .opaque_grant,
+            b"documents-grant"
+        );
+        assert_eq!(
+            database
+                .list_scope_records()
+                .expect("backend scope records should load")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn coverage_root_overlap_trigger_guards_every_writer() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let parent = database
+            .add_scope_with_access_grant(
+                b"/home/person",
+                "/home/person",
+                "/home/person",
+                ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"home-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("parent root should persist");
+        assert!(
+            database
+                .add_scope(
+                    b"/home/person/Desktop",
+                    "/home/person/Desktop",
+                    "/home/person/Desktop",
+                    "macos",
+                )
+                .is_err(),
+            "a non-native writer must not bypass ancestor overlap policy"
+        );
+        let exact = database
+            .add_scope(b"/home/person", "/home/person", "/home/person", "macos")
+            .expect("exact reauthorization should remain valid");
+        assert_eq!(exact.id, parent.id);
+        database
+            .add_scope(
+                b"/home/person-2",
+                "/home/person-2",
+                "/home/person-2",
+                "macos",
+            )
+            .expect("component sibling must not be treated as a descendant");
+
+        database
+            .add_scope_with_access_grant(
+                b"C:\\Users\\person",
+                "c:\\users\\person",
+                "C:\\Users\\person",
+                ScopeAccessGrantWrite {
+                    scope_platform: "windows",
+                    grant_platform: "windows",
+                    opaque_grant: b"windows-home-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("Windows parent root should persist");
+        assert!(
+            database
+                .add_scope(
+                    b"C:\\Users\\person\\Desktop",
+                    "c:\\users\\person\\desktop",
+                    "C:\\Users\\person\\Desktop",
+                    "windows",
+                )
+                .is_err(),
+            "Windows normalized path keys must enforce component overlap"
+        );
+    }
+
+    #[test]
+    fn coverage_root_separator_keys_cannot_bypass_active_grant_overlap_guards() {
+        let mut unix_database =
+            ManifestDatabase::open_in_memory().expect("Unix database should initialize");
+        let unix_inactive_child = unix_database
+            .add_scope(
+                b"/inactive-child",
+                "/inactive-child",
+                "/inactive-child",
+                "macos",
+            )
+            .expect("inactive Unix child fixture should persist");
+        unix_database
+            .add_scope_with_access_grant(
+                b"/",
+                "/",
+                "/",
+                ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"unix-root-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("low-level Unix root fixture should persist");
+        assert!(
+            unix_database
+                .add_scope(b"/child", "/child", "/child", "macos",)
+                .is_err(),
+            "the scope trigger must reject a Unix descendant beneath '/'"
+        );
+        assert!(
+            unix_database
+                .upsert_scope_access_grant(
+                    unix_inactive_child.id,
+                    "macos",
+                    b"unix-inactive-child-grant",
+                )
+                .is_err(),
+            "the grant trigger must reject activating a Unix descendant beneath '/'"
+        );
+
+        let mut windows_database =
+            ManifestDatabase::open_in_memory().expect("Windows database should initialize");
+        let windows_inactive_child = windows_database
+            .add_scope(
+                b"C:\\inactive-child",
+                "c:\\inactive-child",
+                "C:\\inactive-child",
+                "windows",
+            )
+            .expect("inactive Windows child fixture should persist");
+        windows_database
+            .add_scope_with_access_grant(
+                b"C:\\",
+                "c:\\",
+                "C:\\",
+                ScopeAccessGrantWrite {
+                    scope_platform: "windows",
+                    grant_platform: "windows",
+                    opaque_grant: b"windows-root-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("low-level Windows root fixture should persist");
+        assert!(
+            windows_database
+                .add_scope(b"C:\\child", "c:\\child", "C:\\child", "windows",)
+                .is_err(),
+            "the scope trigger must reject a Windows descendant beneath 'C:\\'"
+        );
+        assert!(
+            windows_database
+                .upsert_scope_access_grant(
+                    windows_inactive_child.id,
+                    "windows",
+                    b"windows-inactive-child-grant",
+                )
+                .is_err(),
+            "the grant trigger must reject activating a Windows descendant beneath 'C:\\'"
+        );
+    }
+
+    #[test]
+    fn invalid_coverage_root_rolls_back_the_entire_set() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let roots = [
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/desktop",
+                path_key: "/desktop",
+                display_path: "/desktop",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"desktop-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/documents",
+                path_key: "/documents",
+                display_path: "/documents",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "windows",
+                    grant_platform: "macos",
+                    opaque_grant: b"invalid-mixed-platform-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+        ];
+
+        assert!(matches!(
+            database.add_coverage_roots_with_access_grants(&roots),
+            Err(DatabaseError::ScopeAccessGrantInputInvalid)
+        ));
+        assert!(
+            database
+                .list_scope_records()
+                .expect("failed set must leave no roots")
+                .is_empty()
+        );
+        assert!(
+            database
+                .list_active_scope_grants()
+                .expect("failed set must leave no grants")
+                .is_empty()
+        );
+
+        let duplicate_keys = [roots[0], roots[0]];
+        assert!(matches!(
+            database.add_coverage_roots_with_access_grants(&duplicate_keys),
+            Err(DatabaseError::ScopeAccessGrantInputInvalid)
+        ));
+        assert!(
+            database
+                .list_scope_records()
+                .expect("duplicate set must leave no roots")
+                .is_empty()
+        );
+
+        let nested_roots = [
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/home/person",
+                path_key: "/home/person",
+                display_path: "/home/person",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"home-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/home/person/Desktop",
+                path_key: "/home/person/Desktop",
+                display_path: "/home/person/Desktop",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"desktop-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+        ];
+        assert!(matches!(
+            database.add_coverage_roots_with_access_grants(&nested_roots),
+            Err(DatabaseError::ScopeAccessGrantInputInvalid)
+        ));
+        assert!(
+            database
+                .list_scope_records()
+                .expect("nested set must leave no roots")
+                .is_empty()
+        );
+
+        let existing = database
+            .add_scope_with_access_grant(
+                b"C:\\existing",
+                "c:\\existing",
+                "C:\\existing",
+                ScopeAccessGrantWrite {
+                    scope_platform: "windows",
+                    grant_platform: "windows",
+                    opaque_grant: b"existing-windows-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("existing platform-bound root should persist");
+        let transaction_failure = [
+            CoverageRootAccessGrantWrite {
+                path_raw: b"/first-new-root",
+                path_key: "/first-new-root",
+                display_path: "/first-new-root",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"first-new-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+            CoverageRootAccessGrantWrite {
+                path_raw: b"C:\\existing",
+                path_key: "c:\\existing",
+                display_path: "C:\\existing",
+                grant: ScopeAccessGrantWrite {
+                    scope_platform: "macos",
+                    grant_platform: "macos",
+                    opaque_grant: b"wrong-platform-replacement",
+                    state: ScopeAccessGrantState::Active,
+                },
+            },
+        ];
+        assert!(matches!(
+            database.add_coverage_roots_with_access_grants(&transaction_failure),
+            Err(DatabaseError::ScopeAccessGrantInputInvalid)
+        ));
+        assert_eq!(
+            database
+                .list_scope_records()
+                .expect("transaction failure should preserve only existing root")
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .active_scope_grant(existing.id)
+                .expect("existing grant should remain unchanged")
+                .opaque_grant,
+            b"existing-windows-grant"
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

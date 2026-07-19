@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 export const MANIFEST_STATUS_COMMAND = 'manifest_status';
 export const AUTHORIZED_SCOPES_COMMAND = 'authorized_scopes';
-export const SELECT_AND_AUTHORIZE_SCOPE_COMMAND = 'select_and_authorize_scope';
+export const SELECT_AND_AUTHORIZE_SCOPES_COMMAND = 'select_and_authorize_scopes';
 export const CREATE_SCAN_COMMAND = 'create_manifest_scan';
 export const RUN_SCAN_COMMAND = 'run_manifest_scan';
 export const SCAN_JOB_STATUS_COMMAND = 'scan_job_status';
@@ -78,8 +78,11 @@ export function parseManifestStats(value: unknown): ManifestStats {
 export function parseAuthorizedScope(value: unknown): AuthorizedScope {
   if (
     !isRecord(value) ||
+    Object.keys(value).length !== 3 ||
     !isCount(value.id) ||
+    value.id === 0 ||
     typeof value.display_path !== 'string' ||
+    value.display_path.trim().length === 0 ||
     !isCount(value.created_at_unix_ms)
   ) {
     throw new Error('Invalid authorized scope response');
@@ -94,14 +97,30 @@ export function parseAuthorizedScopes(value: unknown): AuthorizedScope[] {
   return value.map(parseAuthorizedScope);
 }
 
+export function mergeAuthorizedScopes(
+  current: AuthorizedScope[],
+  authorized: AuthorizedScope[],
+): AuthorizedScope[] {
+  const merged = new Map(current.map((scope) => [scope.id, scope]));
+  for (const scope of authorized) merged.set(scope.id, scope);
+  return [...merged.values()].sort((left, right) => left.id - right.id);
+}
+
 /**
  * The native picker command is intentionally parameterless. A cancelled picker
  * is a normal outcome, while every non-null response must still satisfy the
  * same durable scope contract as data loaded from the backend.
  */
-export function parseSelectedAuthorizedScope(value: unknown): AuthorizedScope | null {
+export function parseSelectedAuthorizedScopes(value: unknown): AuthorizedScope[] | null {
   if (value === null) return null;
-  return parseAuthorizedScope(value);
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('Invalid authorized coverage response');
+  }
+  const scopes = value.map(parseAuthorizedScope);
+  if (new Set(scopes.map((scope) => scope.id)).size !== scopes.length) {
+    throw new Error('Invalid authorized coverage response');
+  }
+  return scopes;
 }
 
 export function parseScanJobProgress(value: unknown): ScanJobProgress {
@@ -152,10 +171,10 @@ export async function loadAuthorizedScopes(
   return parseAuthorizedScopes(await invokeCommand(AUTHORIZED_SCOPES_COMMAND));
 }
 
-export async function selectAndAuthorizeScope(
+export async function selectAndAuthorizeScopes(
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
-): Promise<AuthorizedScope | null> {
-  return parseSelectedAuthorizedScope(await invokeCommand(SELECT_AND_AUTHORIZE_SCOPE_COMMAND));
+): Promise<AuthorizedScope[] | null> {
+  return parseSelectedAuthorizedScopes(await invokeCommand(SELECT_AND_AUTHORIZE_SCOPES_COMMAND));
 }
 
 export async function createManifestScan(

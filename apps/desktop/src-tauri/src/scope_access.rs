@@ -130,6 +130,7 @@ fn prepare_macos_bookmark(selected_path: &Path) -> Result<PreparedScopeAccess, &
         .resolved_path
         .clone()
         .ok_or("scope_bookmark_resolve_failed")?;
+    let opaque_grant = restored.refreshed_grant.unwrap_or(opaque_grant);
     Ok(PreparedScopeAccess {
         platform: std::env::consts::OS,
         opaque_grant,

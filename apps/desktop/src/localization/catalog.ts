@@ -296,7 +296,7 @@ export type Catalog = {
     heading: string;
     description: string;
     count: (count: number) => string;
-    inputLabel: string;
+    pickerAriaLabel: string;
     authorize: string;
     emptyHeading: string;
     emptyDescription: string;
@@ -309,7 +309,8 @@ export type Catalog = {
     validation: {
       cancelled: string;
       validating: string;
-      authorized: string;
+      authorized: (count: number) => string;
+      refreshFailed: (count: number) => string;
       denied: string;
       reading: string;
       complete: (files: number, folders: number) => string;

@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
-    DatabaseError, ManifestDatabase, NodeKind, Observation, QueueEntry, QueuedPath, ScanIssue,
-    ScopeAccessGrantState, ScopeAccessGrantWrite,
+    CoverageRootAccessGrantWrite, DatabaseError, ManifestDatabase, NodeKind, Observation,
+    QueueEntry, QueuedPath, ScanIssue, ScopeAccessGrantState, ScopeAccessGrantWrite,
 };
 use deskgraph_domain::{AuthorizedScope, ScanJobProgress, ScanReport, ScanStatus};
 pub use deskgraph_identity::comparison_key;
@@ -23,6 +23,9 @@ pub enum ScannerError {
     ProtectedSystemScope,
     ScopeChanged,
     ScopePathDecodeFailed,
+    CoverageSetEmpty,
+    CoverageSetTooLarge,
+    CoverageRootOverlap,
     ScanFailed,
     InvalidBatchSize,
     ScanNotCompleted,
@@ -37,6 +40,9 @@ impl ScannerError {
             Self::ProtectedSystemScope => "protected_system_scope_denied",
             Self::ScopeChanged => "authorized_scope_identity_changed",
             Self::ScopePathDecodeFailed => "scope_path_decode_failed",
+            Self::CoverageSetEmpty => "coverage_set_empty",
+            Self::CoverageSetTooLarge => "coverage_set_too_large",
+            Self::CoverageRootOverlap => "coverage_root_overlap",
             Self::ScanFailed => "metadata_scan_failed",
             Self::InvalidBatchSize => "scan_batch_size_out_of_range",
             Self::ScanNotCompleted => "scan_job_not_completed",
@@ -46,7 +52,17 @@ impl ScannerError {
 
 const DEFAULT_BATCH_SIZE: usize = 256;
 const MAX_BATCH_SIZE: usize = 10_000;
+pub const MAX_COVERAGE_ROOTS_PER_SELECTION: usize = 32;
 const RUNNER_LEASE_MS: i64 = 30_000;
+
+/// One native-picker result in a user-confirmed coverage-set transaction.
+/// The opaque grant remains backend-only and is never returned by this API.
+#[derive(Clone, Copy)]
+pub struct CoverageRootAuthorizationRequest<'a> {
+    pub requested_path: &'a Path,
+    pub grant_platform: &'a str,
+    pub opaque_grant: &'a [u8],
+}
 
 impl fmt::Display for ScannerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,6 +118,91 @@ pub fn authorize_scope_with_access_grant(
             },
         )
         .map_err(Into::into)
+}
+
+/// Validates every selected root before committing any scope or grant. Exact
+/// duplicates and ancestor/descendant roots are rejected as one set so the
+/// manifest cannot index the same subtree through overlapping coverage roots.
+pub fn authorize_coverage_roots_with_access_grants(
+    database: &mut ManifestDatabase,
+    requests: &[CoverageRootAuthorizationRequest<'_>],
+) -> Result<Vec<AuthorizedScope>, ScannerError> {
+    if requests.is_empty() {
+        return Err(ScannerError::CoverageSetEmpty);
+    }
+    if requests.len() > MAX_COVERAGE_ROOTS_PER_SELECTION {
+        return Err(ScannerError::CoverageSetTooLarge);
+    }
+
+    let mut canonical_roots = Vec::with_capacity(requests.len());
+    for request in requests {
+        canonical_roots.push(validated_requested_scope(request.requested_path)?);
+    }
+    for (index, root) in canonical_roots.iter().enumerate() {
+        if canonical_roots
+            .iter()
+            .skip(index + 1)
+            .any(|other| coverage_roots_overlap(root, other))
+        {
+            return Err(ScannerError::CoverageRootOverlap);
+        }
+    }
+
+    for existing in database.list_active_scope_records()? {
+        if existing.platform != std::env::consts::OS {
+            continue;
+        }
+        let existing_root =
+            path_from_raw(&existing.path_raw).map_err(|_| ScannerError::ScopePathDecodeFailed)?;
+        for selected_root in &canonical_roots {
+            if comparison_key(selected_root) != comparison_key(&existing_root)
+                && coverage_roots_overlap(selected_root, &existing_root)
+            {
+                return Err(ScannerError::CoverageRootOverlap);
+            }
+        }
+    }
+
+    let path_raw = canonical_roots
+        .iter()
+        .map(|root| path_to_raw(root))
+        .collect::<Vec<_>>();
+    let path_keys = canonical_roots
+        .iter()
+        .map(|root| comparison_key(root))
+        .collect::<Vec<_>>();
+    let display_paths = canonical_roots
+        .iter()
+        .map(|root| root.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let writes = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| CoverageRootAccessGrantWrite {
+            path_raw: &path_raw[index],
+            path_key: &path_keys[index],
+            display_path: &display_paths[index],
+            grant: ScopeAccessGrantWrite {
+                scope_platform: std::env::consts::OS,
+                grant_platform: request.grant_platform,
+                opaque_grant: request.opaque_grant,
+                state: ScopeAccessGrantState::Active,
+            },
+        })
+        .collect::<Vec<_>>();
+    database
+        .add_coverage_roots_with_access_grants(&writes)
+        .map_err(Into::into)
+}
+
+fn coverage_roots_overlap(left: &Path, right: &Path) -> bool {
+    let left_key = comparison_key(left);
+    let right_key = comparison_key(right);
+    left.ancestors()
+        .any(|ancestor| comparison_key(ancestor) == right_key)
+        || right
+            .ancestors()
+            .any(|ancestor| comparison_key(ancestor) == left_key)
 }
 
 fn validated_requested_scope(requested_path: &Path) -> Result<std::path::PathBuf, ScannerError> {
@@ -581,6 +682,166 @@ mod tests {
 
         let error = authorize_scope(&database, &file).expect_err("file scope must fail");
         assert!(matches!(error, ScannerError::ScopeIsNotDirectory));
+    }
+
+    #[test]
+    fn multiple_coverage_roots_and_grants_commit_together() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let desktop = directory.path().join("Desktop");
+        let documents = directory.path().join("Documents");
+        fs::create_dir(&desktop).expect("desktop root should create");
+        fs::create_dir(&documents).expect("documents root should create");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let requests = [
+            CoverageRootAuthorizationRequest {
+                requested_path: &desktop,
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"desktop-grant",
+            },
+            CoverageRootAuthorizationRequest {
+                requested_path: &documents,
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"documents-grant",
+            },
+        ];
+
+        let scopes = authorize_coverage_roots_with_access_grants(&mut database, &requests)
+            .expect("coverage set should authorize");
+
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(
+            database
+                .list_active_scope_grants()
+                .expect("active grants should load")
+                .len(),
+            2
+        );
+        assert_eq!(
+            database
+                .list_scopes()
+                .expect("authorized roots should load"),
+            scopes
+        );
+    }
+
+    #[test]
+    fn invalid_or_overlapping_coverage_set_commits_nothing() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let parent = directory.path().join("Home");
+        let child = parent.join("Desktop");
+        fs::create_dir_all(&child).expect("nested roots should create");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let overlapping = [
+            CoverageRootAuthorizationRequest {
+                requested_path: &parent,
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"home-grant",
+            },
+            CoverageRootAuthorizationRequest {
+                requested_path: &child,
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"desktop-grant",
+            },
+        ];
+
+        assert!(matches!(
+            authorize_coverage_roots_with_access_grants(&mut database, &overlapping),
+            Err(ScannerError::CoverageRootOverlap)
+        ));
+        assert!(
+            database
+                .list_scopes()
+                .expect("failed set must leave no scopes")
+                .is_empty()
+        );
+
+        let missing = directory.path().join("missing");
+        let one_missing = [
+            CoverageRootAuthorizationRequest {
+                requested_path: &parent,
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"home-grant",
+            },
+            CoverageRootAuthorizationRequest {
+                requested_path: &missing,
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"missing-grant",
+            },
+        ];
+        assert!(matches!(
+            authorize_coverage_roots_with_access_grants(&mut database, &one_missing),
+            Err(ScannerError::CanonicalizationFailed)
+        ));
+        assert!(
+            database
+                .list_active_scope_grants()
+                .expect("failed set must leave no grants")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn coverage_set_bounds_fail_before_any_write() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        assert!(matches!(
+            authorize_coverage_roots_with_access_grants(&mut database, &[]),
+            Err(ScannerError::CoverageSetEmpty)
+        ));
+
+        let requests = (0..=MAX_COVERAGE_ROOTS_PER_SELECTION)
+            .map(|_| CoverageRootAuthorizationRequest {
+                requested_path: directory.path(),
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"bounded-grant",
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            authorize_coverage_roots_with_access_grants(&mut database, &requests),
+            Err(ScannerError::CoverageSetTooLarge)
+        ));
+        assert!(
+            database
+                .list_scopes()
+                .expect("bounded failures must leave no scopes")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_root_reauthorization_preserves_scope_identity_and_replaces_grant() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let first = authorize_coverage_roots_with_access_grants(
+            &mut database,
+            &[CoverageRootAuthorizationRequest {
+                requested_path: directory.path(),
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"first-grant",
+            }],
+        )
+        .expect("first authorization should persist")
+        .remove(0);
+        let second = authorize_coverage_roots_with_access_grants(
+            &mut database,
+            &[CoverageRootAuthorizationRequest {
+                requested_path: directory.path(),
+                grant_platform: std::env::consts::OS,
+                opaque_grant: b"replacement-grant",
+            }],
+        )
+        .expect("exact reauthorization should persist")
+        .remove(0);
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.created_at_unix_ms, first.created_at_unix_ms);
+        assert_eq!(
+            database
+                .active_scope_grant(first.id)
+                .expect("replacement grant should be active")
+                .opaque_grant,
+            b"replacement-grant"
+        );
     }
 
     #[cfg(unix)]
