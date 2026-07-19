@@ -259,3 +259,10 @@ Status：Accepted。Cleanup 不擴張 rename-only 的 ActionPlan／journal，而
 
 Canonical detail：
 `docs/architecture/adr/0030-cleanup-action-plan-preview-is-independent.md`。
+
+## ADR-031 — Cleanup Preview detail is explicit, local and transient
+
+Status：Accepted。Path-free Smart Cleanup Inbox 只有在使用者明確開啟一個候選後，才可透過窄 Tauri command 暫時顯示目前授權範圍內的 member path。Rust 先驗 live runtime capability、active durable grant、completed scan、current suggested observation 與 source-specific evidence；exact duplicate 重新做完整受限位元比對，version 固定 older target／newer keeper，screenshot 一次只能選一個 target 且不設 keeper。Detail path 只以純文字存在目前 review state，關閉、重新整理、切換 scope、離開 Inbox、錯誤或 Preview 成功後即清除；不得進入 plan、history、log、preference、CLI、MCP 或遠端服務。`create_cleanup_preview` 只接受 IDs 並回傳 ADR-030 的 path-free、不可執行 durable Preview。D-017、confirmation、Trash、Delete、Execute、Recovery 與 Undo 均未批准。
+
+Canonical detail：
+`docs/architecture/adr/0031-cleanup-preview-detail-is-explicit-and-transient.md`。
