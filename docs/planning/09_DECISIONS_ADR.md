@@ -252,3 +252,10 @@ Status：Accepted。Smart Cleanup Inbox v1 不新增第四套 mutable candidate 
 
 Canonical detail：
 `docs/architecture/adr/0029-smart-cleanup-inbox-derived-read-model.md`。
+
+## ADR-030 — Cleanup ActionPlan Preview is an independent non-executable family
+
+Status：Accepted。Cleanup 不擴張 rename-only 的 ActionPlan／journal，而使用獨立 immutable plan family。每個 plan 只綁定一個 current suggested source observation、一個 target 與必要 keeper；version 只能 old target／new keeper，duplicate 與 version 必須有完整 keeper binding，screenshot item 可不指定 keeper。Target／keeper 的 location、strong identity、size／mtime、SHA-256、scope root 與 parent topology 都耐久保存並在同一 immediate transaction 重驗；exact duplicate 的最終 SHA 與 hashed bytes 另在 transaction、database 與 SQLite 三層要求相等。Plan 與 seq-1 journal 原子且不可變，DTO path-free 並固定 `action_authorized: false`／`execution_available: false`。此決策不批准 public creation entry、confirmation、Trash、Execute、Recovery 或 Undo；D-017 與後續 preview-detail／confirmation ADR 仍是前置。
+
+Canonical detail：
+`docs/architecture/adr/0030-cleanup-action-plan-preview-is-independent.md`。
