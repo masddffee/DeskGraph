@@ -153,6 +153,10 @@ The first M5 preview slice added only the local path-based `deskgraph-transactio
 
 `sha2` streams the preview's identity-bound source bytes under the fixed 8 GiB/90-second/64 KiB limits. `libc` supplies no-follow descriptor checks; its no-replace macOS/Linux rename calls compile only in tests because ADR-026 resolves D-018 by rejecting general Unix execution. The additional counterexample uses the same locked `libc` edge and adds no package. No process-fence dependency or implementation is accepted. Production adapters return unsupported before database, journal, lock, or source mutation. These reused dependencies therefore support an auditable fail-closed protocol and do not establish a shipped filesystem-action capability.
 
+## M4 Project Discovery dependency decision
+
+ADR-032 and the backend-backed Projects UI add no registry dependency, model, native runtime, network client, migration, or lockfile change. The slice reuses the existing domain/database/projects/Tauri/React layers and bundled SQLite manifest. Durable per-scope readiness uses the existing indexed scan history rather than adding a cache or state-management package. Strict TypeScript parsing and stale-response guards are dependency-free. Future background Project discovery, pagination, membership scoring or retrieval integration require separate performance and dependency review rather than inheriting this bounded explicit-refresh decision.
+
 ## M9a native folder-selection dependency decision
 
 | Dependency | Scope | Selected version/features | Official source / API evidence | Maintenance and platform evidence | License | Security and decision |

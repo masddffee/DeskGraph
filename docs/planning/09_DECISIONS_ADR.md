@@ -266,3 +266,10 @@ Status：Accepted。Path-free Smart Cleanup Inbox 只有在使用者明確開啟
 
 Canonical detail：
 `docs/architecture/adr/0031-cleanup-preview-detail-is-explicit-and-transient.md`。
+
+## ADR-032 — Project Discovery is manifest-only and path-progressive
+
+Status：Accepted。使用者明確選擇一個 active-grant、completed-scan scope 後，Project Discovery 只讀取目前 SQLite manifest，依 direct-child strong markers 評估最多 100 個 deterministic root identities，並在超過界線時誠實回傳 partial。一般清單不含 path 或 marker；只有使用者開啟單一候選時才暫時回傳重新驗證的 current path 與 evidence。Accept／reject 再次驗證目前證據並 append exact-root feedback，不建立 membership、related edge 或 filesystem action。Background discovery、pagination、membership、merge/split 與 learned scoring 不由此 ADR 批准。
+
+Canonical detail：
+`docs/architecture/adr/0032-project-discovery-is-manifest-only-and-path-progressive.md`。
