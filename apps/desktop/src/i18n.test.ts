@@ -166,6 +166,66 @@ describe('i18n catalog and registry contract', () => {
     expect(appSource).toContain("kind: inbox.evaluation_complete ? 'ready' : 'partial'");
   });
 
+  it('keeps primary navigation complete and honest in every catalog', () => {
+    const phrases: Record<
+      Locale,
+      {
+        localOnly: string;
+        noNetwork: string;
+        projectsNotDiscovery: string;
+        inboxNoAction: string;
+        historyNoAction: string;
+      }
+    > = {
+      en: {
+        localOnly: 'Local only',
+        noNetwork: 'No network required',
+        projectsNotDiscovery: 'not available',
+        inboxNoAction: 'cannot change, trash, delete, or undo',
+        historyNoAction: 'does not execute or undo',
+      },
+      'zh-TW': {
+        localOnly: '僅限本機',
+        noNetwork: '不需要網路',
+        projectsNotDiscovery: '尚未提供',
+        inboxNoAction: '無法變更、移至垃圾桶、刪除或復原',
+        historyNoAction: '不會執行或復原',
+      },
+      'zh-CN': {
+        localOnly: '仅限本机',
+        noNetwork: '不需要网络',
+        projectsNotDiscovery: '尚未提供',
+        inboxNoAction: '无法更改、移至废纸篓、删除或撤销',
+        historyNoAction: '不会执行或撤销',
+      },
+      ja: {
+        localOnly: 'ローカルのみ',
+        noNetwork: 'ネットワーク不要',
+        projectsNotDiscovery: 'まだ利用できません',
+        inboxNoAction: '変更、ゴミ箱への移動、削除、Undo はできません',
+        historyNoAction: '実行またはUndoできません',
+      },
+    };
+    const views = ['home', 'search', 'projects', 'inbox', 'history', 'settings'] as const;
+
+    for (const locale of LOCALES) {
+      const navigation = catalogs[locale].navigation;
+      expect(navigation.ariaLabel.length).toBeGreaterThan(0);
+      expect(navigation.skipToContent.length).toBeGreaterThan(0);
+      expect(navigation.brandDescription.length).toBeGreaterThan(0);
+      expect(navigation.localOnly).toContain(phrases[locale].localOnly);
+      expect(navigation.noNetwork).toContain(phrases[locale].noNetwork);
+      for (const view of views) {
+        expect(navigation.views[view].label.length).toBeGreaterThan(0);
+        expect(navigation.views[view].title.length).toBeGreaterThan(0);
+        expect(navigation.views[view].description.length).toBeGreaterThan(0);
+      }
+      expect(navigation.views.projects.description).toContain(phrases[locale].projectsNotDiscovery);
+      expect(navigation.views.inbox.description).toContain(phrases[locale].inboxNoAction);
+      expect(navigation.views.history.description).toContain(phrases[locale].historyNoAction);
+    }
+  });
+
   it('keeps catalogs text-only and user-owned values outside static message data', () => {
     const htmlElement = /<\/?[a-z][^>]*>/i;
     for (const locale of LOCALES) {
@@ -308,6 +368,8 @@ describe('localized helpers and UI wiring', () => {
     expect(appSource).toContain('localeOptions.map');
     expect(appSource).toContain('document.documentElement.lang = metadata.htmlLang');
     expect(appSource).toContain('document.documentElement.dir = metadata.dir');
+    expect(appSource).toContain('<main id="main-content" className="app-shell" tabIndex={-1}>');
+    expect(appSource).toContain('<h1 ref={viewHeadingRef} tabIndex={-1}>');
     expect(appSource).not.toMatch(/<option\s+value=["'](?:en|zh-TW|zh-CN|ja)["']/);
     expect(appSource).not.toContain('className="dashboard" aria-live="polite"');
   });

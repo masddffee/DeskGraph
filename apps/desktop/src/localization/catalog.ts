@@ -1,6 +1,21 @@
 export type Catalog = {
   metadata: { title: string; description: string };
   language: { selectorLabel: string };
+  navigation: {
+    ariaLabel: string;
+    skipToContent: string;
+    brandDescription: string;
+    localOnly: string;
+    noNetwork: string;
+    views: {
+      home: { label: string; title: string; description: string };
+      search: { label: string; title: string; description: string };
+      projects: { label: string; title: string; description: string };
+      inbox: { label: string; title: string; description: string };
+      history: { label: string; title: string; description: string };
+      settings: { label: string; title: string; description: string };
+    };
+  };
   hero: {
     eyebrow: string;
     heading: string;

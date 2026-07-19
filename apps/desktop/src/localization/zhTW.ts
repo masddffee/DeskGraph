@@ -8,6 +8,45 @@ export const zhTW = {
   language: {
     selectorLabel: '顯示語言',
   },
+  navigation: {
+    ariaLabel: '主要導覽',
+    skipToContent: '跳至主要內容',
+    brandDescription: '本機優先的電腦脈絡',
+    localOnly: '僅限本機',
+    noNetwork: '不需要網路',
+    views: {
+      home: {
+        label: '首頁',
+        title: '一眼掌握本機脈絡',
+        description: '檢視這台電腦上的授權、中繼資料掃描與本機清單狀態。',
+      },
+      search: {
+        label: '搜尋',
+        title: '搜尋本機脈絡',
+        description: '尋找目前檔名與明確選擇後抽取的文字，不將查詢傳送到外部。',
+      },
+      projects: {
+        label: '專案',
+        title: '已授權資料夾與中繼資料掃描',
+        description: '授權資料夾並執行中繼資料掃描；此畫面尚未提供完整的專案探索功能。',
+      },
+      inbox: {
+        label: '收件匣',
+        title: '檢視本機建議',
+        description: '檢視目前的本機清理建議；此收件匣無法變更、移至垃圾桶、刪除或復原檔案。',
+      },
+      history: {
+        label: '紀錄',
+        title: '預覽紀錄',
+        description: '檢視不含路徑的重新命名預覽；此畫面不會執行或復原檔案操作。',
+      },
+      settings: {
+        label: '設定',
+        title: '本機執行環境與隱私',
+        description: '選擇顯示語言，並檢視僅限本機的執行環境與隱私邊界。',
+      },
+    },
+  },
   hero: {
     eyebrow: 'DeskGraph · M2 本機脈絡',
     heading: '讓你的電腦脈絡化。',

@@ -14,6 +14,45 @@ export const zhCN = {
   language: {
     selectorLabel: '显示语言',
   },
+  navigation: {
+    ariaLabel: '主导航',
+    skipToContent: '跳至主要内容',
+    brandDescription: '本机优先的电脑上下文',
+    localOnly: '仅限本机',
+    noNetwork: '不需要网络',
+    views: {
+      home: {
+        label: '首页',
+        title: '一眼掌握本机上下文',
+        description: '查看这台电脑上的授权、元数据扫描和本机清单状态。',
+      },
+      search: {
+        label: '搜索',
+        title: '搜索本机上下文',
+        description: '查找当前文件名和明确选择后提取的文本，不会将查询发送到外部。',
+      },
+      projects: {
+        label: '项目',
+        title: '已授权文件夹与元数据扫描',
+        description: '授权文件夹并运行元数据扫描；此视图尚未提供完整的项目发现功能。',
+      },
+      inbox: {
+        label: '收件箱',
+        title: '查看本机建议',
+        description: '查看当前本机清理建议；此收件箱无法更改、移至废纸篓、删除或撤销文件。',
+      },
+      history: {
+        label: '历史',
+        title: '预览历史',
+        description: '查看不含路径的重命名预览；此视图不会执行或撤销文件操作。',
+      },
+      settings: {
+        label: '设置',
+        title: '本机运行环境与隐私',
+        description: '选择显示语言，并查看仅限本机的运行环境和隐私边界。',
+      },
+    },
+  },
   hero: {
     eyebrow: 'DeskGraph · M2 本机上下文',
     heading: '让你的电脑上下文化。',

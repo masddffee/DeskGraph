@@ -6,6 +6,50 @@ export const ja = {
     description: 'DeskGraph プレリリース版：ローカルファーストのコンピューターコンテキストグラフ',
   },
   language: { selectorLabel: '表示言語' },
+  navigation: {
+    ariaLabel: 'メインナビゲーション',
+    skipToContent: 'メインコンテンツへ移動',
+    brandDescription: 'ローカルファーストのコンピューターコンテキスト',
+    localOnly: 'ローカルのみ',
+    noNetwork: 'ネットワーク不要',
+    views: {
+      home: {
+        label: 'ホーム',
+        title: 'ローカルコンテキストをひと目で確認',
+        description:
+          'このコンピューター上の許可、メタデータスキャン、ローカルマニフェストの状態を確認します。',
+      },
+      search: {
+        label: '検索',
+        title: 'ローカルコンテキストを検索',
+        description:
+          '現在のファイル名と明示的に抽出したテキストを検索し、クエリを外部へ送信しません。',
+      },
+      projects: {
+        label: 'プロジェクト',
+        title: '許可済みフォルダーとメタデータスキャン',
+        description:
+          'フォルダーを許可してメタデータをスキャンします。この画面では完全なプロジェクト検出はまだ利用できません。',
+      },
+      inbox: {
+        label: '受信箱',
+        title: 'ローカル候補を確認',
+        description:
+          '現在のローカルクリーンアップ候補を確認します。この受信箱からファイルの変更、ゴミ箱への移動、削除、Undo はできません。',
+      },
+      history: {
+        label: '履歴',
+        title: 'プレビュー履歴',
+        description:
+          'パスを含まない名前変更プレビューを確認します。この画面ではファイル操作を実行またはUndoできません。',
+      },
+      settings: {
+        label: '設定',
+        title: 'ローカルランタイムとプライバシー',
+        description: '表示言語を選び、ローカルのみのランタイムとプライバシー境界を確認します。',
+      },
+    },
+  },
   hero: {
     eyebrow: 'DeskGraph · M2 ローカルコンテキスト',
     heading: 'コンピューターをグラフ化。',

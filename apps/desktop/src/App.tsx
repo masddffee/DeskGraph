@@ -143,6 +143,16 @@ type CleanupInboxState =
   | { kind: 'ready'; inbox: SmartCleanupInbox }
   | { kind: 'partial'; inbox: SmartCleanupInbox }
   | { kind: 'error' };
+type AppView = 'home' | 'search' | 'projects' | 'inbox' | 'history' | 'settings';
+
+const APP_VIEWS: readonly AppView[] = [
+  'home',
+  'search',
+  'projects',
+  'inbox',
+  'history',
+  'settings',
+];
 
 interface StatusRowProps {
   label: string;
@@ -412,7 +422,9 @@ export default function App() {
   const [ocrAction, setOcrAction] = useState<OcrActionState>({ kind: 'idle' });
   const [cleanupScopeId, setCleanupScopeId] = useState<number | null>(null);
   const [cleanupInboxState, setCleanupInboxState] = useState<CleanupInboxState>({ kind: 'idle' });
+  const [activeView, setActiveView] = useState<AppView>('home');
   const ocrRequestInFlight = useRef(new Set<string>());
+  const viewHeadingRef = useRef<HTMLHeadingElement>(null);
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
@@ -423,6 +435,7 @@ export default function App() {
   const activeExtractionJobKey = activeExtractionJobIds.join(',');
   const dashboardReady = state.kind === 'ready';
   const catalog = getCatalog(locale);
+  const activeViewCopy = catalog.navigation.views[activeView];
 
   useEffect(() => {
     const metadata = getLocalizedMetadata(locale);
@@ -441,6 +454,11 @@ export default function App() {
       const storage = browserLocaleStorage();
       if (storage) storeLocale(storage, nextLocale);
     }
+  }
+
+  function showView(nextView: AppView) {
+    setActiveView(nextView);
+    window.requestAnimationFrame(() => viewHeadingRef.current?.focus());
   }
 
   useEffect(() => {
@@ -975,14 +993,46 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="hero">
-        <div>
-          <p className="eyebrow">{catalog.hero.eyebrow}</p>
-          <h1>{catalog.hero.heading}</h1>
-          <p className="hero-copy">{catalog.hero.description}</p>
+    <div className="app-frame">
+      <a className="skip-link" href="#main-content">
+        {catalog.navigation.skipToContent}
+      </a>
+      <aside className="app-sidebar">
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">
+            DG
+          </span>
+          <div>
+            <strong>DeskGraph</strong>
+            <span>{catalog.navigation.brandDescription}</span>
+          </div>
         </div>
-        <div className="hero-controls">
+
+        <nav className="app-navigation" aria-label={catalog.navigation.ariaLabel}>
+          {APP_VIEWS.map((view) => (
+            <button
+              key={view}
+              type="button"
+              className={
+                activeView === view ? 'navigation-item navigation-item--active' : 'navigation-item'
+              }
+              aria-current={activeView === view ? 'page' : undefined}
+              onClick={() => showView(view)}
+            >
+              <span>{catalog.navigation.views[view].label}</span>
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-status" aria-label={catalog.runtime.localOnly}>
+          <span className="privacy-dot privacy-dot--on" aria-hidden="true" />
+          <div>
+            <strong>{catalog.navigation.localOnly}</strong>
+            <span>{catalog.navigation.noNetwork}</span>
+          </div>
+        </div>
+
+        <div className="sidebar-controls">
           <label className="language-selector" htmlFor="display-language">
             <span>{catalog.language.selectorLabel}</span>
             <select
@@ -999,790 +1049,889 @@ export default function App() {
           </label>
           <span className="release-badge">{catalog.hero.release}</span>
         </div>
-      </header>
+      </aside>
 
-      {state.kind === 'loading' ? (
-        <section className="state-card" aria-live="polite" aria-busy="true">
-          <span className="loader" aria-hidden="true" />
+      <main id="main-content" className="app-shell" tabIndex={-1}>
+        <header className="workspace-header">
           <div>
-            <h2>{catalog.loading.heading}</h2>
-            <p>{catalog.loading.description}</p>
+            <p className="eyebrow">{catalog.navigation.views[activeView].label}</p>
+            <h1 ref={viewHeadingRef} tabIndex={-1}>
+              {activeViewCopy.title}
+            </h1>
+            <p className="hero-copy">{activeViewCopy.description}</p>
           </div>
-        </section>
-      ) : null}
-
-      {state.kind === 'error' ? (
-        <section className="state-card state-card--error" role="alert">
-          <div>
-            <h2>{catalog.backendError.heading}</h2>
-            <p>{catalog.backendError.description}</p>
+          <div className="workspace-badges" aria-label={catalog.runtime.localOnly}>
+            <span className="connected-indicator">{catalog.navigation.localOnly}</span>
+            <span className="connected-indicator connected-indicator--quiet">
+              {catalog.navigation.noNetwork}
+            </span>
           </div>
-          <button type="button" onClick={() => setAttempt((value) => value + 1)}>
-            {catalog.backendError.retry}
-          </button>
-        </section>
-      ) : null}
+        </header>
 
-      {state.kind === 'ready' ? (
-        <div className="dashboard">
-          <section className="panel" aria-labelledby="runtime-title">
-            <div className="panel-heading">
-              <div>
-                <p className="panel-kicker">{catalog.runtime.kicker}</p>
-                <h2 id="runtime-title">{catalog.runtime.heading}</h2>
-              </div>
-              <span className="connected-indicator">{catalog.runtime.localOnly}</span>
-            </div>
-            <div className="status-list">
-              <StatusRow
-                label={catalog.runtime.platform}
-                value={`${state.report.platform.os} · ${state.report.platform.architecture}`}
-                tone="ok"
-              />
-              <StatusRow
-                label={catalog.runtime.sqliteManifest}
-                value={catalog.runtime.ready}
-                tone="ok"
-              />
-              <StatusRow
-                label={catalog.runtime.optionalLocalLlm}
-                value={
-                  state.report.providers.local_llm.state === 'ready'
-                    ? catalog.runtime.ready
-                    : state.report.providers.local_llm.state === 'not_initialized'
-                      ? catalog.runtime.lifecycle.notInitialized
-                      : catalog.runtime.lifecycle.disabled
-                }
-              />
-              <StatusRow
-                label={catalog.runtime.networkRequired}
-                value={catalog.runtime.no}
-                tone="ok"
-              />
+        {state.kind === 'loading' ? (
+          <section className="state-card" aria-live="polite" aria-busy="true">
+            <span className="loader" aria-hidden="true" />
+            <div>
+              <h2>{catalog.loading.heading}</h2>
+              <p>{catalog.loading.description}</p>
             </div>
           </section>
+        ) : null}
 
-          <section className="panel panel--privacy" aria-labelledby="manifest-title">
-            <p className="panel-kicker">{catalog.manifest.kicker}</p>
-            <h2 id="manifest-title">
-              {state.manifest.completed_scan_count === 0
-                ? catalog.manifest.emptyHeading
-                : catalog.manifest.readyHeading}
-            </h2>
-            <div className="metrics">
-              <Metric
-                label={catalog.manifest.files}
-                value={state.manifest.file_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.manifest.folders}
-                value={state.manifest.folder_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.manifest.locations}
-                value={state.manifest.active_location_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.manifest.scanIssues}
-                value={state.manifest.issue_count}
-                locale={locale}
-              />
+        {state.kind === 'error' ? (
+          <section className="state-card state-card--error" role="alert">
+            <div>
+              <h2>{catalog.backendError.heading}</h2>
+              <p>{catalog.backendError.description}</p>
             </div>
+            <button type="button" onClick={() => setAttempt((value) => value + 1)}>
+              {catalog.backendError.retry}
+            </button>
           </section>
+        ) : null}
 
-          <section className="panel panel--search" aria-labelledby="search-title">
-            <div className="panel-heading panel-heading--wrap">
-              <div>
-                <p className="panel-kicker">{catalog.search.kicker}</p>
-                <h2 id="search-title">{catalog.search.heading}</h2>
-                <p>{catalog.search.description}</p>
-              </div>
-              <span className="connected-indicator">{catalog.search.mode}</span>
-            </div>
-            <form
-              className="search-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void submitSearch();
-              }}
-            >
-              <label htmlFor="search-query">{catalog.search.queryLabel}</label>
-              <div className="search-form-row">
-                <input
-                  id="search-query"
-                  type="search"
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder={catalog.search.queryPlaceholder}
-                  autoComplete="off"
-                  spellCheck="false"
-                  maxLength={256}
-                />
-                <select
-                  aria-label={catalog.search.scopeAria}
-                  value={searchScopeId ?? ''}
-                  onChange={(event) =>
-                    setSearchScopeId(event.target.value ? Number(event.target.value) : null)
-                  }
-                >
-                  <option value="">{catalog.search.allFolders}</option>
-                  {state.scopes.map((scope) => (
-                    <option key={scope.id} value={scope.id}>
-                      {catalog.search.authorizedScope(scope.id)}
-                    </option>
-                  ))}
-                </select>
-                <button type="submit" disabled={searchState.kind === 'working'}>
-                  {searchState.kind === 'working'
-                    ? catalog.search.searching
-                    : catalog.search.search}
-                </button>
-              </div>
-              <div className="search-filter-grid" aria-label={catalog.search.filtersAria}>
-                <label>
-                  {catalog.search.sourceLabel}
-                  <select
-                    value={searchSource}
-                    onChange={(event) => setSearchSource(event.target.value as SearchSourceFilter)}
-                  >
-                    <option value="all">{catalog.search.sources.all}</option>
-                    <option value="metadata_path">{catalog.search.sources.paths}</option>
-                    <option value="extracted_text">{catalog.search.sources.extractedText}</option>
-                  </select>
-                </label>
-                <label>
-                  {catalog.search.fileType}
-                  <input
-                    value={searchExtension}
-                    onChange={(event) => setSearchExtension(event.target.value)}
-                    placeholder={catalog.search.fileTypePlaceholder}
-                    maxLength={17}
-                    autoComplete="off"
-                    spellCheck="false"
-                  />
-                </label>
-                <label>
-                  {catalog.search.modifiedSince}
-                  <input
-                    type="date"
-                    value={searchModifiedSince}
-                    onChange={(event) => setSearchModifiedSince(event.target.value)}
-                  />
-                </label>
-                <label>
-                  {catalog.search.modifiedBefore}
-                  <input
-                    type="date"
-                    value={searchModifiedBefore}
-                    onChange={(event) => setSearchModifiedBefore(event.target.value)}
-                  />
-                </label>
-              </div>
-            </form>
-
-            {searchState.kind === 'error' ? (
-              <p className="search-message search-message--error" role="alert">
-                {catalog.search.validation[searchState.message]}
-              </p>
-            ) : null}
-            {searchState.kind === 'ready' && searchState.response.results.length === 0 ? (
-              <p className="search-message" role="status">
-                {catalog.search.empty(searchState.response.query)}
-              </p>
-            ) : null}
-            {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
-              <div className="search-summary" role="status">
-                <span>
-                  {catalog.search.summary(
-                    searchState.response.result_count,
-                    searchState.response.elapsed_ms,
-                  )}
-                </span>
-                <span>{activeSearchFilters(searchState.response, catalog, locale)}</span>
-              </div>
-            ) : null}
-            {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
-              <ol className="search-results">
-                {searchState.response.results.map((result) => {
-                  const ocrJob = screenshotOcrJobForResult(state.extractionJobs, result);
-                  const ocrIsRunning = ocrJob?.status === 'running';
-                  const ocrIsQueued = ocrJob?.status === 'queued';
-                  const anotherOcrIsRunning = state.extractionJobs.some(
-                    (job) =>
-                      job.operation === 'screenshot_ocr' &&
-                      job.status === 'running' &&
-                      job.job_id !== ocrJob?.job_id,
-                  );
-                  const feedbackMatches =
-                    ocrAction.kind !== 'idle' &&
-                    ocrAction.scopeId === result.scope_id &&
-                    ocrAction.nodeId === result.node_id;
-                  return (
-                    <li key={`${result.node_id}:${result.location_id}`}>
-                      <div className="search-result-heading">
-                        <span className="search-rank">
-                          #{formatInteger(result.lexical_rank, locale)}
-                        </span>
-                        <strong>{searchExplanation(result, catalog)}</strong>
-                      </div>
-                      <code>{result.display_path}</code>
-                      {isScreenshotCandidateDisplayPath(result.display_path) ? (
-                        <div
-                          className="search-result-action"
-                          aria-label={catalog.search.ocr.controlsAria}
-                        >
-                          <div className="search-result-action-row">
-                            <div>
-                              <strong>
-                                {ocrJob
-                                  ? extractionStatusLabel(ocrJob, catalog)
-                                  : catalog.search.ocr.notRead}
-                              </strong>
-                              <span>{catalog.search.ocr.description}</span>
-                            </div>
-                            {ocrIsRunning && ocrJob ? (
-                              <button
-                                type="button"
-                                disabled={ocrJob.cancel_requested}
-                                onClick={() => void cancelScreenshotOcr(ocrJob)}
-                              >
-                                {ocrJob.cancel_requested
-                                  ? catalog.search.ocr.stopping
-                                  : catalog.search.ocr.cancel}
-                              </button>
-                            ) : ocrIsQueued && ocrJob ? (
-                              <div className="search-result-action-buttons">
-                                <button
-                                  type="button"
-                                  disabled={
-                                    anotherOcrIsRunning ||
-                                    (feedbackMatches && ocrAction.kind === 'working')
-                                  }
-                                  onClick={() => void retryQueuedScreenshotOcr(ocrJob)}
-                                >
-                                  {catalog.search.ocr.retryQueued}
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={ocrJob.cancel_requested}
-                                  onClick={() => void cancelScreenshotOcr(ocrJob)}
-                                >
-                                  {catalog.search.ocr.cancel}
-                                </button>
-                              </div>
-                            ) : ocrJob?.status === 'interrupted' ? (
-                              <button
-                                type="button"
-                                disabled={
-                                  activeExtractionJobIds.length > 0 ||
-                                  (feedbackMatches && ocrAction.kind === 'working')
-                                }
-                                onClick={() => void resumeScreenshotOcr(ocrJob)}
-                              >
-                                {catalog.search.ocr.resume}
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                disabled={
-                                  activeExtractionJobIds.length > 0 ||
-                                  (feedbackMatches && ocrAction.kind === 'working')
-                                }
-                                onClick={() => void startScreenshotOcr(result)}
-                              >
-                                {ocrJob ? catalog.search.ocr.readAgain : catalog.search.ocr.read}
-                              </button>
-                            )}
-                          </div>
-                          {feedbackMatches && ocrAction.kind === 'error' ? (
-                            <p className="ocr-feedback ocr-feedback--error" role="alert">
-                              {catalog.search.ocr[ocrAction.message]}
-                            </p>
-                          ) : null}
-                          {feedbackMatches && ocrAction.kind === 'success' ? (
-                            <p className="ocr-feedback" role="status">
-                              {catalog.search.ocr[ocrAction.message]}
-                            </p>
-                          ) : null}
-                        </div>
-                      ) : null}
-                      {result.snippet ? (
-                        <p className="search-snippet">
-                          <span>{catalog.search.ocr.untrustedText}</span>
-                          {result.snippet}
-                        </p>
-                      ) : null}
-                    </li>
-                  );
-                })}
-              </ol>
-            ) : null}
-          </section>
-
-          <section className="panel panel--actions" aria-labelledby="actions-title">
-            <div className="panel-heading panel-heading--wrap">
-              <div>
-                <p className="panel-kicker">{catalog.actions.kicker}</p>
-                <h2 id="actions-title">{catalog.actions.heading}</h2>
-                <p>{catalog.actions.description}</p>
-              </div>
-              <span className="connected-indicator connected-indicator--pending">
-                {catalog.actions.previewOnly}
-              </span>
-            </div>
-
-            <form
-              className="rename-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void submitRenamePreview();
-              }}
-            >
-              <label>
-                {catalog.actions.folderLabel}
-                <select
-                  value={renameScopeId ?? ''}
-                  onChange={(event) =>
-                    setRenameScopeId(event.target.value ? Number(event.target.value) : null)
-                  }
-                >
-                  <option value="">{catalog.actions.chooseFolder}</option>
-                  {state.scopes.map((scope) => (
-                    <option key={scope.id} value={scope.id}>
-                      {catalog.actions.scopeOption(scope.id, scope.display_path)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                {catalog.actions.sourceLabel}
-                <input
-                  value={renameSourcePath}
-                  onChange={(event) => setRenameSourcePath(event.target.value)}
-                  placeholder={catalog.actions.sourcePlaceholder}
-                  autoComplete="off"
-                  spellCheck="false"
-                />
-              </label>
-              <label>
-                {catalog.actions.newNameLabel}
-                <input
-                  value={renameNewName}
-                  onChange={(event) => setRenameNewName(event.target.value)}
-                  placeholder={catalog.actions.newNamePlaceholder}
-                  autoComplete="off"
-                  spellCheck="false"
-                  maxLength={255}
-                />
-              </label>
-              <button type="submit" disabled={renameState.kind === 'working'}>
-                {renameState.kind === 'working'
-                  ? catalog.actions.validating
-                  : catalog.actions.createPreview}
-              </button>
-            </form>
-
-            {renameState.kind === 'error' ? (
-              <p className="action-message action-message--error" role="alert">
-                {catalog.actions.validation[renameState.message]}
-              </p>
-            ) : null}
-
-            {renameState.kind === 'ready' ? (
-              <div
-                className="rename-preview"
-                role="status"
-                aria-label={catalog.actions.previewAria}
-              >
-                <div className="rename-preview-heading">
-                  <div>
-                    <strong>{catalog.actions.plan(renameState.preview.plan_id)}</strong>
-                    <span>
-                      {renameState.preview.execution_strategy === 'case_only_staged'
-                        ? catalog.actions.caseOnly
-                        : catalog.actions.direct}
-                    </span>
-                  </div>
-                  <span className="status-pill status-pill--ok">{catalog.actions.unchanged}</span>
-                </div>
-                <div className="rename-paths">
-                  <div>
-                    <span>{catalog.actions.before}</span>
-                    <code>{renameState.preview.source_path}</code>
-                  </div>
-                  <div>
-                    <span>{catalog.actions.after}</span>
-                    <code>{renameState.preview.destination_path}</code>
-                  </div>
-                </div>
-                <ul className="policy-checks" aria-label={catalog.actions.policyAria}>
-                  {renameState.preview.policy.checks.map((check) => (
-                    <li key={check}>{actionPolicyCheckLabel(check, catalog)}</li>
-                  ))}
-                </ul>
-                <p className="content-empty">{catalog.actions.noExecute}</p>
-              </div>
-            ) : null}
-
-            <div className="action-history-heading">
-              <strong>{catalog.actions.historyHeading}</strong>
-              <span>{catalog.actions.plans(state.actionPlans.length)}</span>
-            </div>
-            {state.actionPlans.length === 0 ? (
-              <p className="content-empty">{catalog.actions.historyEmpty}</p>
-            ) : (
-              <ol className="action-plan-list">
-                {state.actionPlans.slice(0, 5).map((plan) => (
-                  <li key={plan.plan_id}>
+        {state.kind === 'ready' ? (
+          <div className="dashboard">
+            {activeView === 'home' ? (
+              <>
+                <section className="panel" aria-labelledby="runtime-title">
+                  <div className="panel-heading">
                     <div>
-                      <strong>{catalog.actions.historyPlan(plan.plan_id)}</strong>
-                      <span>{catalog.actions.historyScopeNode(plan.scope_id, plan.node_id)}</span>
+                      <p className="panel-kicker">{catalog.runtime.kicker}</p>
+                      <h2 id="runtime-title">{catalog.runtime.heading}</h2>
                     </div>
-                    <span>
-                      {plan.execution_strategy === 'case_only_staged'
-                        ? catalog.actions.caseOnlyStaged
-                        : catalog.actions.directStrategy}
-                      {' · '}
-                      {actionPlanStateLabel(plan.state, catalog)}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </section>
+                    <span className="connected-indicator">{catalog.runtime.localOnly}</span>
+                  </div>
+                  <div className="status-list">
+                    <StatusRow
+                      label={catalog.runtime.platform}
+                      value={`${state.report.platform.os} · ${state.report.platform.architecture}`}
+                      tone="ok"
+                    />
+                    <StatusRow
+                      label={catalog.runtime.sqliteManifest}
+                      value={catalog.runtime.ready}
+                      tone="ok"
+                    />
+                    <StatusRow
+                      label={catalog.runtime.optionalLocalLlm}
+                      value={
+                        state.report.providers.local_llm.state === 'ready'
+                          ? catalog.runtime.ready
+                          : state.report.providers.local_llm.state === 'not_initialized'
+                            ? catalog.runtime.lifecycle.notInitialized
+                            : catalog.runtime.lifecycle.disabled
+                      }
+                    />
+                    <StatusRow
+                      label={catalog.runtime.networkRequired}
+                      value={catalog.runtime.no}
+                      tone="ok"
+                    />
+                  </div>
+                </section>
 
-          <section className="panel panel--watch" aria-labelledby="watch-title">
-            <div className="panel-heading panel-heading--wrap">
-              <div>
-                <p className="panel-kicker">{catalog.watch.kicker}</p>
-                <h2 id="watch-title">{catalog.watch.heading}</h2>
-                <p>{catalog.watch.description}</p>
-              </div>
-              <span
-                className={`connected-indicator${
-                  state.watchRuntime.state === 'running' ? '' : ' connected-indicator--pending'
-                }`}
-              >
-                {watchRuntimeLabel(state.watchRuntime, catalog)}
-              </span>
-            </div>
-            <div className="metrics metrics--content">
-              <Metric
-                label={catalog.watch.metrics.recent}
-                value={state.watchEvents.length}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.watch.metrics.observed}
-                value={state.watchEvents.reduce(
-                  (total, event) => total + event.observation_count,
-                  0,
-                )}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.watch.metrics.reconciled}
-                value={state.watchEvents.filter((event) => event.status === 'completed').length}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.watch.metrics.deferred}
-                value={state.watchRuntime.deferred_scope_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.watch.metrics.attention}
-                value={state.watchRuntime.degraded_scope_count}
-                locale={locale}
-              />
-            </div>
-            {state.watchEvents.length === 0 ? (
-              <p className="content-empty">{catalog.watch.empty}</p>
-            ) : (
-              <ol className="watch-event-list">
-                {state.watchEvents.slice(0, 3).map((event) => (
-                  <li key={event.event_id}>
-                    <div>
-                      <strong>{watchStatusLabel(event, catalog)}</strong>
-                      <span>
-                        {catalog.watch.event(
-                          event.event_id,
-                          event.scope_id,
-                          event.observation_count,
-                        )}
-                      </span>
-                    </div>
-                    <span>
-                      {event.scan_job_id
-                        ? catalog.watch.scan(event.scan_job_id)
-                        : catalog.watch.noScan}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </section>
+                <section className="panel panel--privacy" aria-labelledby="manifest-title">
+                  <p className="panel-kicker">{catalog.manifest.kicker}</p>
+                  <h2 id="manifest-title">
+                    {state.manifest.completed_scan_count === 0
+                      ? catalog.manifest.emptyHeading
+                      : catalog.manifest.readyHeading}
+                  </h2>
+                  <div className="metrics">
+                    <Metric
+                      label={catalog.manifest.files}
+                      value={state.manifest.file_count}
+                      locale={locale}
+                    />
+                    <Metric
+                      label={catalog.manifest.folders}
+                      value={state.manifest.folder_count}
+                      locale={locale}
+                    />
+                    <Metric
+                      label={catalog.manifest.locations}
+                      value={state.manifest.active_location_count}
+                      locale={locale}
+                    />
+                    <Metric
+                      label={catalog.manifest.scanIssues}
+                      value={state.manifest.issue_count}
+                      locale={locale}
+                    />
+                  </div>
+                </section>
+              </>
+            ) : null}
 
-          <section className="panel panel--content" aria-labelledby="content-title">
-            <div className="panel-heading panel-heading--wrap">
-              <div>
-                <p className="panel-kicker">{catalog.extraction.kicker}</p>
-                <h2 id="content-title">
-                  {state.extraction.extracted_file_count === 0
-                    ? catalog.extraction.emptyHeading
-                    : catalog.extraction.readyHeading}
-                </h2>
-                <p>{catalog.extraction.description}</p>
-              </div>
-              <span className="connected-indicator">{catalog.extraction.neverUploaded}</span>
-            </div>
-            <div className="metrics metrics--content">
-              <Metric
-                label={catalog.extraction.metrics.files}
-                value={state.extraction.extracted_file_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.extraction.metrics.chunks}
-                value={state.extraction.active_chunk_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.extraction.metrics.completed}
-                value={state.extraction.completed_job_count}
-                locale={locale}
-              />
-              <Metric
-                label={catalog.extraction.metrics.skipped}
-                value={state.extraction.failed_job_count + state.extraction.cancelled_job_count}
-                locale={locale}
-              />
-            </div>
-            {state.extractionJobs[0] ? (
-              <div className="extraction-progress" role="status">
-                <span>
-                  {catalog.extraction.latest(
-                    state.extractionJobs[0].operation === 'screenshot_ocr'
-                      ? catalog.extraction.operation.screenshotOcr
-                      : catalog.extraction.operation.content,
-                    state.extractionJobs[0].job_id,
-                  )}
-                </span>
-                <strong>{extractionStatusLabel(state.extractionJobs[0], catalog)}</strong>
-                <span>
-                  {catalog.extraction.progress(
-                    state.extractionJobs[0].chunk_count,
-                    state.extractionJobs[0].output_bytes,
-                  )}
-                </span>
-              </div>
-            ) : (
-              <p className="content-empty">{catalog.extraction.optInEmpty}</p>
-            )}
-          </section>
-
-          <section className="panel panel--cleanup" aria-labelledby="cleanup-title">
-            <div className="panel-heading panel-heading--wrap">
-              <div>
-                <p className="panel-kicker">{catalog.cleanup.kicker}</p>
-                <h2 id="cleanup-title">{catalog.cleanup.heading}</h2>
-                <p>{catalog.cleanup.description}</p>
-              </div>
-              <span className="connected-indicator">{catalog.cleanup.suggestionOnly}</span>
-            </div>
-            <div className="cleanup-controls" aria-label={catalog.cleanup.controlsAria}>
-              <label htmlFor="cleanup-scope">{catalog.cleanup.scopeLabel}</label>
-              <div className="scope-form-row">
-                <select
-                  id="cleanup-scope"
-                  value={cleanupScopeId ?? ''}
-                  disabled={state.scopes.length === 0 || cleanupInboxState.kind === 'loading'}
-                  onChange={(event) => {
-                    setCleanupScopeId(event.target.value ? Number(event.target.value) : null);
-                    setCleanupInboxState({ kind: 'idle' });
+            {activeView === 'search' ? (
+              <section className="panel panel--search" aria-labelledby="search-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.search.kicker}</p>
+                    <h2 id="search-title">{catalog.search.heading}</h2>
+                    <p>{catalog.search.description}</p>
+                  </div>
+                  <span className="connected-indicator">{catalog.search.mode}</span>
+                </div>
+                <form
+                  className="search-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void submitSearch();
                   }}
                 >
-                  <option value="">{catalog.cleanup.chooseScope}</option>
-                  {state.scopes.map((scope) => (
-                    <option key={scope.id} value={scope.id}>
-                      {catalog.search.authorizedScope(scope.id)}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  disabled={cleanupScopeId === null || cleanupInboxState.kind === 'loading'}
-                  onClick={() => void refreshCleanupInbox()}
-                >
-                  {cleanupInboxState.kind === 'loading'
-                    ? catalog.cleanup.refreshing
-                    : catalog.cleanup.refresh}
-                </button>
-              </div>
-            </div>
-            {state.scopes.length === 0 ? (
-              <p className="content-empty" role="status">
-                {catalog.cleanup.authorizationRequired}
-              </p>
-            ) : null}
-            {state.scopes.length > 0 && cleanupScopeId === null ? (
-              <p className="content-empty" role="status">
-                {catalog.cleanup.chooseScope}
-              </p>
-            ) : null}
-            {cleanupInboxState.kind === 'loading' ? (
-              <p className="content-empty" role="status" aria-live="polite">
-                {catalog.cleanup.refreshing}
-              </p>
-            ) : null}
-            {cleanupInboxState.kind === 'error' ? (
-              <p className="content-empty cleanup-message--error" role="alert">
-                {catalog.cleanup.error}
-              </p>
-            ) : null}
-            {cleanupInboxState.kind === 'partial' ? (
-              <p className="content-empty" role="status">
-                {catalog.cleanup.partial(cleanupInboxState.inbox.not_current_source_count)}
-              </p>
-            ) : null}
-            {cleanupInboxState.kind === 'ready' || cleanupInboxState.kind === 'partial' ? (
-              cleanupInboxState.inbox.items.length === 0 ? (
-                <p className="content-empty" role="status">
-                  {catalog.cleanup.empty}
-                </p>
-              ) : (
-                <ol className="cleanup-inbox-list" aria-label={catalog.cleanup.heading}>
-                  {cleanupInboxState.inbox.items.map((item) => (
-                    <li key={`${item.source_kind}:${item.source_id}:${item.source_observation_id}`}>
-                      <strong>{cleanupSourceKindLabel(item.source_kind, catalog)}</strong>
-                      <span>
-                        {catalog.cleanup.itemMeta(
-                          item.member_count,
-                          item.confidence_basis_points,
-                          formatUtcDate(item.observed_at_unix_ms, locale),
-                        )}
-                      </span>
-                      <span>{cleanupSourceExplanation(item.source_kind, catalog)}</span>
-                    </li>
-                  ))}
-                </ol>
-              )
-            ) : null}
-            {cleanupInboxState.kind === 'ready' || cleanupInboxState.kind === 'partial' ? (
-              <p className="content-empty cleanup-verification">{catalog.cleanup.verification}</p>
-            ) : null}
-          </section>
+                  <label htmlFor="search-query">{catalog.search.queryLabel}</label>
+                  <div className="search-form-row">
+                    <input
+                      id="search-query"
+                      type="search"
+                      value={searchQuery}
+                      onChange={(event) => setSearchQuery(event.target.value)}
+                      placeholder={catalog.search.queryPlaceholder}
+                      autoComplete="off"
+                      spellCheck="false"
+                      maxLength={256}
+                    />
+                    <select
+                      aria-label={catalog.search.scopeAria}
+                      value={searchScopeId ?? ''}
+                      onChange={(event) =>
+                        setSearchScopeId(event.target.value ? Number(event.target.value) : null)
+                      }
+                    >
+                      <option value="">{catalog.search.allFolders}</option>
+                      {state.scopes.map((scope) => (
+                        <option key={scope.id} value={scope.id}>
+                          {catalog.search.authorizedScope(scope.id)}
+                        </option>
+                      ))}
+                    </select>
+                    <button type="submit" disabled={searchState.kind === 'working'}>
+                      {searchState.kind === 'working'
+                        ? catalog.search.searching
+                        : catalog.search.search}
+                    </button>
+                  </div>
+                  <div className="search-filter-grid" aria-label={catalog.search.filtersAria}>
+                    <label>
+                      {catalog.search.sourceLabel}
+                      <select
+                        value={searchSource}
+                        onChange={(event) =>
+                          setSearchSource(event.target.value as SearchSourceFilter)
+                        }
+                      >
+                        <option value="all">{catalog.search.sources.all}</option>
+                        <option value="metadata_path">{catalog.search.sources.paths}</option>
+                        <option value="extracted_text">
+                          {catalog.search.sources.extractedText}
+                        </option>
+                      </select>
+                    </label>
+                    <label>
+                      {catalog.search.fileType}
+                      <input
+                        value={searchExtension}
+                        onChange={(event) => setSearchExtension(event.target.value)}
+                        placeholder={catalog.search.fileTypePlaceholder}
+                        maxLength={17}
+                        autoComplete="off"
+                        spellCheck="false"
+                      />
+                    </label>
+                    <label>
+                      {catalog.search.modifiedSince}
+                      <input
+                        type="date"
+                        value={searchModifiedSince}
+                        onChange={(event) => setSearchModifiedSince(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      {catalog.search.modifiedBefore}
+                      <input
+                        type="date"
+                        value={searchModifiedBefore}
+                        onChange={(event) => setSearchModifiedBefore(event.target.value)}
+                      />
+                    </label>
+                  </div>
+                </form>
 
-          <section className="panel panel--scopes" aria-labelledby="scopes-title">
-            <div className="panel-heading panel-heading--wrap">
-              <div>
-                <p className="panel-kicker">{catalog.scope.kicker}</p>
-                <h2 id="scopes-title">{catalog.scope.heading}</h2>
-                <p>{catalog.scope.description}</p>
-              </div>
-              <span className="scope-count">{catalog.scope.count(state.scopes.length)}</span>
-            </div>
-
-            <div className="scope-form">
-              <div className="scope-form-row">
-                <button
-                  type="button"
-                  disabled={action.kind === 'working'}
-                  aria-label={catalog.scope.inputLabel}
-                  onClick={() => void authorizeRequestedScope()}
-                >
-                  {catalog.scope.authorize}
-                </button>
-              </div>
-            </div>
-
-            {action.kind !== 'idle' ? (
-              <p
-                className={`action-message action-message--${action.kind}`}
-                role={action.kind === 'error' ? 'alert' : 'status'}
-              >
-                {actionMessageLabel(catalog, action.message)}
-              </p>
-            ) : null}
-
-            {state.scopes.length === 0 ? (
-              <div className="empty-scope">
-                <strong>{catalog.scope.emptyHeading}</strong>
-                <span>{catalog.scope.emptyDescription}</span>
-              </div>
-            ) : (
-              <ul className="scope-list">
-                {state.scopes.map((scope) => {
-                  const latestJob = state.jobs.find((job) => job.scope_id === scope.id);
-                  const resumableJob =
-                    latestJob &&
-                    (latestJob.status === 'running' ||
-                      latestJob.status === 'paused' ||
-                      latestJob.status === 'interrupted')
-                      ? latestJob
-                      : undefined;
-                  return (
-                    <li key={scope.id}>
-                      <div className="scope-details">
-                        <span className="scope-label">{catalog.scope.label(scope.id)}</span>
-                        <code>{scope.display_path}</code>
-                        {latestJob ? (
-                          <div className="scan-progress" role="status">
-                            <span>{scanStatusLabel(latestJob, catalog)}</span>
-                            <span>
-                              {catalog.scope.progress(
-                                latestJob.processed_entries,
-                                latestJob.queued_entries,
-                                latestJob.issue_count,
-                              )}
+                {searchState.kind === 'error' ? (
+                  <p className="search-message search-message--error" role="alert">
+                    {catalog.search.validation[searchState.message]}
+                  </p>
+                ) : null}
+                {searchState.kind === 'ready' && searchState.response.results.length === 0 ? (
+                  <p className="search-message" role="status">
+                    {catalog.search.empty(searchState.response.query)}
+                  </p>
+                ) : null}
+                {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
+                  <div className="search-summary" role="status">
+                    <span>
+                      {catalog.search.summary(
+                        searchState.response.result_count,
+                        searchState.response.elapsed_ms,
+                      )}
+                    </span>
+                    <span>{activeSearchFilters(searchState.response, catalog, locale)}</span>
+                  </div>
+                ) : null}
+                {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (
+                  <ol className="search-results">
+                    {searchState.response.results.map((result) => {
+                      const ocrJob = screenshotOcrJobForResult(state.extractionJobs, result);
+                      const ocrIsRunning = ocrJob?.status === 'running';
+                      const ocrIsQueued = ocrJob?.status === 'queued';
+                      const anotherOcrIsRunning = state.extractionJobs.some(
+                        (job) =>
+                          job.operation === 'screenshot_ocr' &&
+                          job.status === 'running' &&
+                          job.job_id !== ocrJob?.job_id,
+                      );
+                      const feedbackMatches =
+                        ocrAction.kind !== 'idle' &&
+                        ocrAction.scopeId === result.scope_id &&
+                        ocrAction.nodeId === result.node_id;
+                      return (
+                        <li key={`${result.node_id}:${result.location_id}`}>
+                          <div className="search-result-heading">
+                            <span className="search-rank">
+                              #{formatInteger(result.lexical_rank, locale)}
                             </span>
+                            <strong>{searchExplanation(result, catalog)}</strong>
                           </div>
-                        ) : null}
-                      </div>
-                      {resumableJob?.status === 'running' ? (
-                        <button
-                          type="button"
-                          disabled={resumableJob.pause_requested}
-                          onClick={() => void pause(resumableJob)}
-                        >
-                          {resumableJob.pause_requested
-                            ? catalog.scope.pausing
-                            : catalog.scope.pause}
-                        </button>
-                      ) : null}
-                      {resumableJob?.status === 'paused' ||
-                      resumableJob?.status === 'interrupted' ? (
-                        <button type="button" onClick={() => void resume(resumableJob)}>
-                          {catalog.scope.resume}
-                        </button>
-                      ) : null}
-                      {!resumableJob ? (
-                        <button
-                          type="button"
-                          disabled={action.kind === 'working'}
-                          onClick={() => void scan(scope)}
-                        >
-                          {catalog.scope.scan}
-                        </button>
-                      ) : null}
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </section>
-        </div>
-      ) : null}
+                          <code>{result.display_path}</code>
+                          {isScreenshotCandidateDisplayPath(result.display_path) ? (
+                            <div
+                              className="search-result-action"
+                              aria-label={catalog.search.ocr.controlsAria}
+                            >
+                              <div className="search-result-action-row">
+                                <div>
+                                  <strong>
+                                    {ocrJob
+                                      ? extractionStatusLabel(ocrJob, catalog)
+                                      : catalog.search.ocr.notRead}
+                                  </strong>
+                                  <span>{catalog.search.ocr.description}</span>
+                                </div>
+                                {ocrIsRunning && ocrJob ? (
+                                  <button
+                                    type="button"
+                                    disabled={ocrJob.cancel_requested}
+                                    onClick={() => void cancelScreenshotOcr(ocrJob)}
+                                  >
+                                    {ocrJob.cancel_requested
+                                      ? catalog.search.ocr.stopping
+                                      : catalog.search.ocr.cancel}
+                                  </button>
+                                ) : ocrIsQueued && ocrJob ? (
+                                  <div className="search-result-action-buttons">
+                                    <button
+                                      type="button"
+                                      disabled={
+                                        anotherOcrIsRunning ||
+                                        (feedbackMatches && ocrAction.kind === 'working')
+                                      }
+                                      onClick={() => void retryQueuedScreenshotOcr(ocrJob)}
+                                    >
+                                      {catalog.search.ocr.retryQueued}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={ocrJob.cancel_requested}
+                                      onClick={() => void cancelScreenshotOcr(ocrJob)}
+                                    >
+                                      {catalog.search.ocr.cancel}
+                                    </button>
+                                  </div>
+                                ) : ocrJob?.status === 'interrupted' ? (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      activeExtractionJobIds.length > 0 ||
+                                      (feedbackMatches && ocrAction.kind === 'working')
+                                    }
+                                    onClick={() => void resumeScreenshotOcr(ocrJob)}
+                                  >
+                                    {catalog.search.ocr.resume}
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={
+                                      activeExtractionJobIds.length > 0 ||
+                                      (feedbackMatches && ocrAction.kind === 'working')
+                                    }
+                                    onClick={() => void startScreenshotOcr(result)}
+                                  >
+                                    {ocrJob
+                                      ? catalog.search.ocr.readAgain
+                                      : catalog.search.ocr.read}
+                                  </button>
+                                )}
+                              </div>
+                              {feedbackMatches && ocrAction.kind === 'error' ? (
+                                <p className="ocr-feedback ocr-feedback--error" role="alert">
+                                  {catalog.search.ocr[ocrAction.message]}
+                                </p>
+                              ) : null}
+                              {feedbackMatches && ocrAction.kind === 'success' ? (
+                                <p className="ocr-feedback" role="status">
+                                  {catalog.search.ocr[ocrAction.message]}
+                                </p>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          {result.snippet ? (
+                            <p className="search-snippet">
+                              <span>{catalog.search.ocr.untrustedText}</span>
+                              {result.snippet}
+                            </p>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ol>
+                ) : null}
+              </section>
+            ) : null}
 
-      <footer>
-        <span>
-          {catalog.footer.version(state.kind === 'ready' ? state.report.app_version : '0.1.0')}
-        </span>
-        <span>{catalog.footer.description}</span>
-      </footer>
-    </main>
+            {activeView === 'history' ? (
+              <section className="panel panel--actions" aria-labelledby="actions-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.actions.kicker}</p>
+                    <h2 id="actions-title">{catalog.actions.heading}</h2>
+                    <p>{catalog.actions.description}</p>
+                  </div>
+                  <span className="connected-indicator connected-indicator--pending">
+                    {catalog.actions.previewOnly}
+                  </span>
+                </div>
+
+                <form
+                  className="rename-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void submitRenamePreview();
+                  }}
+                >
+                  <label>
+                    {catalog.actions.folderLabel}
+                    <select
+                      value={renameScopeId ?? ''}
+                      onChange={(event) =>
+                        setRenameScopeId(event.target.value ? Number(event.target.value) : null)
+                      }
+                    >
+                      <option value="">{catalog.actions.chooseFolder}</option>
+                      {state.scopes.map((scope) => (
+                        <option key={scope.id} value={scope.id}>
+                          {catalog.actions.scopeOption(scope.id, scope.display_path)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {catalog.actions.sourceLabel}
+                    <input
+                      value={renameSourcePath}
+                      onChange={(event) => setRenameSourcePath(event.target.value)}
+                      placeholder={catalog.actions.sourcePlaceholder}
+                      autoComplete="off"
+                      spellCheck="false"
+                    />
+                  </label>
+                  <label>
+                    {catalog.actions.newNameLabel}
+                    <input
+                      value={renameNewName}
+                      onChange={(event) => setRenameNewName(event.target.value)}
+                      placeholder={catalog.actions.newNamePlaceholder}
+                      autoComplete="off"
+                      spellCheck="false"
+                      maxLength={255}
+                    />
+                  </label>
+                  <button type="submit" disabled={renameState.kind === 'working'}>
+                    {renameState.kind === 'working'
+                      ? catalog.actions.validating
+                      : catalog.actions.createPreview}
+                  </button>
+                </form>
+
+                {renameState.kind === 'error' ? (
+                  <p className="action-message action-message--error" role="alert">
+                    {catalog.actions.validation[renameState.message]}
+                  </p>
+                ) : null}
+
+                {renameState.kind === 'ready' ? (
+                  <div
+                    className="rename-preview"
+                    role="status"
+                    aria-label={catalog.actions.previewAria}
+                  >
+                    <div className="rename-preview-heading">
+                      <div>
+                        <strong>{catalog.actions.plan(renameState.preview.plan_id)}</strong>
+                        <span>
+                          {renameState.preview.execution_strategy === 'case_only_staged'
+                            ? catalog.actions.caseOnly
+                            : catalog.actions.direct}
+                        </span>
+                      </div>
+                      <span className="status-pill status-pill--ok">
+                        {catalog.actions.unchanged}
+                      </span>
+                    </div>
+                    <div className="rename-paths">
+                      <div>
+                        <span>{catalog.actions.before}</span>
+                        <code>{renameState.preview.source_path}</code>
+                      </div>
+                      <div>
+                        <span>{catalog.actions.after}</span>
+                        <code>{renameState.preview.destination_path}</code>
+                      </div>
+                    </div>
+                    <ul className="policy-checks" aria-label={catalog.actions.policyAria}>
+                      {renameState.preview.policy.checks.map((check) => (
+                        <li key={check}>{actionPolicyCheckLabel(check, catalog)}</li>
+                      ))}
+                    </ul>
+                    <p className="content-empty">{catalog.actions.noExecute}</p>
+                  </div>
+                ) : null}
+
+                <div className="action-history-heading">
+                  <strong>{catalog.actions.historyHeading}</strong>
+                  <span>{catalog.actions.plans(state.actionPlans.length)}</span>
+                </div>
+                {state.actionPlans.length === 0 ? (
+                  <p className="content-empty">{catalog.actions.historyEmpty}</p>
+                ) : (
+                  <ol className="action-plan-list">
+                    {state.actionPlans.slice(0, 5).map((plan) => (
+                      <li key={plan.plan_id}>
+                        <div>
+                          <strong>{catalog.actions.historyPlan(plan.plan_id)}</strong>
+                          <span>
+                            {catalog.actions.historyScopeNode(plan.scope_id, plan.node_id)}
+                          </span>
+                        </div>
+                        <span>
+                          {plan.execution_strategy === 'case_only_staged'
+                            ? catalog.actions.caseOnlyStaged
+                            : catalog.actions.directStrategy}
+                          {' · '}
+                          {actionPlanStateLabel(plan.state, catalog)}
+                        </span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </section>
+            ) : null}
+
+            {activeView === 'home' ? (
+              <section className="panel panel--watch" aria-labelledby="watch-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.watch.kicker}</p>
+                    <h2 id="watch-title">{catalog.watch.heading}</h2>
+                    <p>{catalog.watch.description}</p>
+                  </div>
+                  <span
+                    className={`connected-indicator${
+                      state.watchRuntime.state === 'running' ? '' : ' connected-indicator--pending'
+                    }`}
+                  >
+                    {watchRuntimeLabel(state.watchRuntime, catalog)}
+                  </span>
+                </div>
+                <div className="metrics metrics--content">
+                  <Metric
+                    label={catalog.watch.metrics.recent}
+                    value={state.watchEvents.length}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.watch.metrics.observed}
+                    value={state.watchEvents.reduce(
+                      (total, event) => total + event.observation_count,
+                      0,
+                    )}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.watch.metrics.reconciled}
+                    value={state.watchEvents.filter((event) => event.status === 'completed').length}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.watch.metrics.deferred}
+                    value={state.watchRuntime.deferred_scope_count}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.watch.metrics.attention}
+                    value={state.watchRuntime.degraded_scope_count}
+                    locale={locale}
+                  />
+                </div>
+                {state.watchEvents.length === 0 ? (
+                  <p className="content-empty">{catalog.watch.empty}</p>
+                ) : (
+                  <ol className="watch-event-list">
+                    {state.watchEvents.slice(0, 3).map((event) => (
+                      <li key={event.event_id}>
+                        <div>
+                          <strong>{watchStatusLabel(event, catalog)}</strong>
+                          <span>
+                            {catalog.watch.event(
+                              event.event_id,
+                              event.scope_id,
+                              event.observation_count,
+                            )}
+                          </span>
+                        </div>
+                        <span>
+                          {event.scan_job_id
+                            ? catalog.watch.scan(event.scan_job_id)
+                            : catalog.watch.noScan}
+                        </span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </section>
+            ) : null}
+
+            {activeView === 'search' ? (
+              <section className="panel panel--content" aria-labelledby="content-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.extraction.kicker}</p>
+                    <h2 id="content-title">
+                      {state.extraction.extracted_file_count === 0
+                        ? catalog.extraction.emptyHeading
+                        : catalog.extraction.readyHeading}
+                    </h2>
+                    <p>{catalog.extraction.description}</p>
+                  </div>
+                  <span className="connected-indicator">{catalog.extraction.neverUploaded}</span>
+                </div>
+                <div className="metrics metrics--content">
+                  <Metric
+                    label={catalog.extraction.metrics.files}
+                    value={state.extraction.extracted_file_count}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.extraction.metrics.chunks}
+                    value={state.extraction.active_chunk_count}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.extraction.metrics.completed}
+                    value={state.extraction.completed_job_count}
+                    locale={locale}
+                  />
+                  <Metric
+                    label={catalog.extraction.metrics.skipped}
+                    value={state.extraction.failed_job_count + state.extraction.cancelled_job_count}
+                    locale={locale}
+                  />
+                </div>
+                {state.extractionJobs[0] ? (
+                  <div className="extraction-progress" role="status">
+                    <span>
+                      {catalog.extraction.latest(
+                        state.extractionJobs[0].operation === 'screenshot_ocr'
+                          ? catalog.extraction.operation.screenshotOcr
+                          : catalog.extraction.operation.content,
+                        state.extractionJobs[0].job_id,
+                      )}
+                    </span>
+                    <strong>{extractionStatusLabel(state.extractionJobs[0], catalog)}</strong>
+                    <span>
+                      {catalog.extraction.progress(
+                        state.extractionJobs[0].chunk_count,
+                        state.extractionJobs[0].output_bytes,
+                      )}
+                    </span>
+                  </div>
+                ) : (
+                  <p className="content-empty">{catalog.extraction.optInEmpty}</p>
+                )}
+              </section>
+            ) : null}
+
+            {activeView === 'inbox' ? (
+              <section className="panel panel--cleanup" aria-labelledby="cleanup-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.cleanup.kicker}</p>
+                    <h2 id="cleanup-title">{catalog.cleanup.heading}</h2>
+                    <p>{catalog.cleanup.description}</p>
+                  </div>
+                  <span className="connected-indicator">{catalog.cleanup.suggestionOnly}</span>
+                </div>
+                <div className="cleanup-controls" aria-label={catalog.cleanup.controlsAria}>
+                  <label htmlFor="cleanup-scope">{catalog.cleanup.scopeLabel}</label>
+                  <div className="scope-form-row">
+                    <select
+                      id="cleanup-scope"
+                      value={cleanupScopeId ?? ''}
+                      disabled={state.scopes.length === 0 || cleanupInboxState.kind === 'loading'}
+                      onChange={(event) => {
+                        setCleanupScopeId(event.target.value ? Number(event.target.value) : null);
+                        setCleanupInboxState({ kind: 'idle' });
+                      }}
+                    >
+                      <option value="">{catalog.cleanup.chooseScope}</option>
+                      {state.scopes.map((scope) => (
+                        <option key={scope.id} value={scope.id}>
+                          {catalog.search.authorizedScope(scope.id)}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={cleanupScopeId === null || cleanupInboxState.kind === 'loading'}
+                      onClick={() => void refreshCleanupInbox()}
+                    >
+                      {cleanupInboxState.kind === 'loading'
+                        ? catalog.cleanup.refreshing
+                        : catalog.cleanup.refresh}
+                    </button>
+                  </div>
+                </div>
+                {state.scopes.length === 0 ? (
+                  <p className="content-empty" role="status">
+                    {catalog.cleanup.authorizationRequired}
+                  </p>
+                ) : null}
+                {state.scopes.length > 0 && cleanupScopeId === null ? (
+                  <p className="content-empty" role="status">
+                    {catalog.cleanup.chooseScope}
+                  </p>
+                ) : null}
+                {cleanupInboxState.kind === 'loading' ? (
+                  <p className="content-empty" role="status" aria-live="polite">
+                    {catalog.cleanup.refreshing}
+                  </p>
+                ) : null}
+                {cleanupInboxState.kind === 'error' ? (
+                  <p className="content-empty cleanup-message--error" role="alert">
+                    {catalog.cleanup.error}
+                  </p>
+                ) : null}
+                {cleanupInboxState.kind === 'partial' ? (
+                  <p className="content-empty" role="status">
+                    {catalog.cleanup.partial(cleanupInboxState.inbox.not_current_source_count)}
+                  </p>
+                ) : null}
+                {cleanupInboxState.kind === 'ready' || cleanupInboxState.kind === 'partial' ? (
+                  cleanupInboxState.inbox.items.length === 0 ? (
+                    <p className="content-empty" role="status">
+                      {catalog.cleanup.empty}
+                    </p>
+                  ) : (
+                    <ol className="cleanup-inbox-list" aria-label={catalog.cleanup.heading}>
+                      {cleanupInboxState.inbox.items.map((item) => (
+                        <li
+                          key={`${item.source_kind}:${item.source_id}:${item.source_observation_id}`}
+                        >
+                          <strong>{cleanupSourceKindLabel(item.source_kind, catalog)}</strong>
+                          <span>
+                            {catalog.cleanup.itemMeta(
+                              item.member_count,
+                              item.confidence_basis_points,
+                              formatUtcDate(item.observed_at_unix_ms, locale),
+                            )}
+                          </span>
+                          <span>{cleanupSourceExplanation(item.source_kind, catalog)}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )
+                ) : null}
+                {cleanupInboxState.kind === 'ready' || cleanupInboxState.kind === 'partial' ? (
+                  <p className="content-empty cleanup-verification">
+                    {catalog.cleanup.verification}
+                  </p>
+                ) : null}
+              </section>
+            ) : null}
+
+            {activeView === 'projects' ? (
+              <section className="panel panel--scopes" aria-labelledby="scopes-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.scope.kicker}</p>
+                    <h2 id="scopes-title">{catalog.scope.heading}</h2>
+                    <p>{catalog.scope.description}</p>
+                  </div>
+                  <span className="scope-count">{catalog.scope.count(state.scopes.length)}</span>
+                </div>
+
+                <div className="scope-form">
+                  <div className="scope-form-row">
+                    <button
+                      type="button"
+                      disabled={action.kind === 'working'}
+                      aria-label={catalog.scope.inputLabel}
+                      onClick={() => void authorizeRequestedScope()}
+                    >
+                      {catalog.scope.authorize}
+                    </button>
+                  </div>
+                </div>
+
+                {action.kind !== 'idle' ? (
+                  <p
+                    className={`action-message action-message--${action.kind}`}
+                    role={action.kind === 'error' ? 'alert' : 'status'}
+                  >
+                    {actionMessageLabel(catalog, action.message)}
+                  </p>
+                ) : null}
+
+                {state.scopes.length === 0 ? (
+                  <div className="empty-scope">
+                    <strong>{catalog.scope.emptyHeading}</strong>
+                    <span>{catalog.scope.emptyDescription}</span>
+                  </div>
+                ) : (
+                  <ul className="scope-list">
+                    {state.scopes.map((scope) => {
+                      const latestJob = state.jobs.find((job) => job.scope_id === scope.id);
+                      const resumableJob =
+                        latestJob &&
+                        (latestJob.status === 'running' ||
+                          latestJob.status === 'paused' ||
+                          latestJob.status === 'interrupted')
+                          ? latestJob
+                          : undefined;
+                      return (
+                        <li key={scope.id}>
+                          <div className="scope-details">
+                            <span className="scope-label">{catalog.scope.label(scope.id)}</span>
+                            <code>{scope.display_path}</code>
+                            {latestJob ? (
+                              <div className="scan-progress" role="status">
+                                <span>{scanStatusLabel(latestJob, catalog)}</span>
+                                <span>
+                                  {catalog.scope.progress(
+                                    latestJob.processed_entries,
+                                    latestJob.queued_entries,
+                                    latestJob.issue_count,
+                                  )}
+                                </span>
+                              </div>
+                            ) : null}
+                          </div>
+                          {resumableJob?.status === 'running' ? (
+                            <button
+                              type="button"
+                              disabled={resumableJob.pause_requested}
+                              onClick={() => void pause(resumableJob)}
+                            >
+                              {resumableJob.pause_requested
+                                ? catalog.scope.pausing
+                                : catalog.scope.pause}
+                            </button>
+                          ) : null}
+                          {resumableJob?.status === 'paused' ||
+                          resumableJob?.status === 'interrupted' ? (
+                            <button type="button" onClick={() => void resume(resumableJob)}>
+                              {catalog.scope.resume}
+                            </button>
+                          ) : null}
+                          {!resumableJob ? (
+                            <button
+                              type="button"
+                              disabled={action.kind === 'working'}
+                              onClick={() => void scan(scope)}
+                            >
+                              {catalog.scope.scan}
+                            </button>
+                          ) : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </section>
+            ) : null}
+
+            {activeView === 'settings' ? (
+              <section className="panel panel--settings" aria-labelledby="settings-title">
+                <div className="panel-heading panel-heading--wrap">
+                  <div>
+                    <p className="panel-kicker">{catalog.runtime.kicker}</p>
+                    <h2 id="settings-title">{catalog.navigation.views.settings.title}</h2>
+                    <p>{catalog.navigation.views.settings.description}</p>
+                  </div>
+                  <span className="connected-indicator">{catalog.runtime.localOnly}</span>
+                </div>
+                <div className="settings-grid">
+                  <div className="settings-block">
+                    <span className="settings-label">{catalog.language.selectorLabel}</span>
+                    <strong>
+                      {localeOptions.find((option) => option.value === locale)?.label}
+                    </strong>
+                  </div>
+                  <div className="settings-block">
+                    <span className="settings-label">{catalog.runtime.platform}</span>
+                    <strong>
+                      {state.report.platform.os} · {state.report.platform.architecture}
+                    </strong>
+                  </div>
+                  <div className="settings-block">
+                    <span className="settings-label">{catalog.runtime.networkRequired}</span>
+                    <strong>{catalog.runtime.no}</strong>
+                  </div>
+                  <div className="settings-block">
+                    <span className="settings-label">{catalog.runtime.optionalLocalLlm}</span>
+                    <strong>
+                      {state.report.providers.local_llm.state === 'ready'
+                        ? catalog.runtime.ready
+                        : state.report.providers.local_llm.state === 'not_initialized'
+                          ? catalog.runtime.lifecycle.notInitialized
+                          : catalog.runtime.lifecycle.disabled}
+                    </strong>
+                  </div>
+                </div>
+                <ul className="privacy-list privacy-list--settings">
+                  <li>
+                    <span className="privacy-dot privacy-dot--on" aria-hidden="true" />
+                    {catalog.navigation.localOnly}
+                  </li>
+                  <li>
+                    <span className="privacy-dot privacy-dot--on" aria-hidden="true" />
+                    {catalog.navigation.noNetwork}
+                  </li>
+                </ul>
+              </section>
+            ) : null}
+          </div>
+        ) : null}
+
+        <footer>
+          <span>
+            {catalog.footer.version(state.kind === 'ready' ? state.report.app_version : '0.1.0')}
+          </span>
+          <span>{catalog.footer.description}</span>
+        </footer>
+      </main>
+    </div>
   );
 }

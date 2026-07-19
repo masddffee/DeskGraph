@@ -8,6 +8,51 @@ export const en = {
   language: {
     selectorLabel: 'Display language',
   },
+  navigation: {
+    ariaLabel: 'Primary navigation',
+    skipToContent: 'Skip to main content',
+    brandDescription: 'Local-first computer context',
+    localOnly: 'Local only',
+    noNetwork: 'No network required',
+    views: {
+      home: {
+        label: 'Home',
+        title: 'Your local context, at a glance',
+        description:
+          'Review authorization, metadata scan, and local manifest status on this computer.',
+      },
+      search: {
+        label: 'Search',
+        title: 'Search local context',
+        description:
+          'Find current filenames and opt-in extracted text without sending a query away.',
+      },
+      projects: {
+        label: 'Projects',
+        title: 'Authorized folders and metadata scans',
+        description:
+          'Authorize folders and run metadata scans. Project Discovery is not available in this view yet.',
+      },
+      inbox: {
+        label: 'Inbox',
+        title: 'Review local suggestions',
+        description:
+          'Review current local cleanup suggestions. This inbox cannot change, trash, delete, or undo files.',
+      },
+      history: {
+        label: 'History',
+        title: 'Preview history',
+        description:
+          'Review path-free rename previews. This view does not execute or undo file operations.',
+      },
+      settings: {
+        label: 'Settings',
+        title: 'Local runtime and privacy',
+        description:
+          'Choose the display language and review local-only runtime and privacy boundaries.',
+      },
+    },
+  },
   hero: {
     eyebrow: 'DeskGraph · M2 Local Context',
     heading: 'Graphify your computer.',
