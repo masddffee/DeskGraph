@@ -163,7 +163,30 @@ describe('i18n catalog and registry contract', () => {
       expect(catalogs[locale].cleanup.verification.length).toBeGreaterThan(30);
     }
     expect(appSource).toContain('refreshSmartCleanupInbox(cleanupScopeId)');
+    expect(appSource).toContain('getCleanupSourceDetail(item)');
+    expect(appSource).toContain('createCleanupActionPreview(detail, targetNodeId, keeperNodeId)');
     expect(appSource).toContain("kind: inbox.evaluation_complete ? 'ready' : 'partial'");
+  });
+
+  it('keeps explicit cleanup Preview review transient and non-executable in every catalog', () => {
+    const phrases: Record<Locale, { transient: string; previewOnly: string }> = {
+      en: { transient: 'not saved', previewOnly: 'Preview only' },
+      'zh-TW': { transient: '不會寫入', previewOnly: '僅供預覽' },
+      'zh-CN': { transient: '不会写入', previewOnly: '仅供预览' },
+      ja: { transient: '保存しません', previewOnly: 'プレビューのみ' },
+    };
+
+    for (const locale of LOCALES) {
+      expect(catalogs[locale].cleanup.review.transientNotice).toContain(phrases[locale].transient);
+      expect(catalogs[locale].cleanup.review.noExecution).toContain(phrases[locale].previewOnly);
+      expect(catalogs[locale].cleanup.review.previewReady(12)).toBeTruthy();
+      expect(catalogs[locale].cleanup.review.roles.olderVersion).toBeTruthy();
+      expect(catalogs[locale].cleanup.review.roles.newerVersion).toBeTruthy();
+      expect(catalogs[locale].cleanup.review.noKeeper).toBeTruthy();
+    }
+    expect(appSource).toContain('cleanupReviewGenerationRef.current !== generation');
+    expect(appSource).toContain("if (nextView !== 'inbox') invalidateCleanupReview()");
+    expect(appSource).toContain("cleanupReviewState.kind === 'creating'");
   });
 
   it('keeps primary navigation complete and honest in every catalog', () => {

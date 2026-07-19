@@ -295,7 +295,44 @@ export const en = {
     itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
       `${formatIntegerForLocale(members, 'en')} members · evidence score ${formatIntegerForLocale(evidenceScoreBasisPoints, 'en')} / 10,000 · observed ${observedAt}`,
     verification:
-      'Current evidence is required again before any future user-confirmed cleanup. This view cannot select, move, trash, delete, or undo files.',
+      'Opening a review revalidates current evidence before a durable Preview is created. This Inbox cannot confirm, move, trash, delete, restore, or undo files.',
+    review: {
+      open: 'Review files and create preview',
+      loading: 'Revalidating this suggestion locally…',
+      close: 'Close file review',
+      transientNotice:
+        'Paths are shown only for this explicit local review. They are not saved in the cleanup plan, history, logs, or language preference.',
+      selectionLegend: 'Choose one cleanup target',
+      selectTarget: 'Select as preview target',
+      keeper: 'Kept as the comparison file',
+      keeperSwitch: 'Will be kept · select to make this the target instead',
+      noKeeper: 'No keeper is assigned for screenshot review. Each Preview binds one target only.',
+      roles: {
+        duplicateCandidate: 'Exact duplicate candidate',
+        olderVersion: 'Older version · eligible target',
+        newerVersion: 'Newer version · required keeper',
+        screenshotCandidate: 'Screenshot-group member',
+      },
+      memberSize: (bytes) => `${formatIntegerForLocale(bytes, 'en')} bytes`,
+      createPreview: 'Create durable preview',
+      creatingPreview: 'Binding current file evidence…',
+      selectionRequired: 'Choose one file to preview before continuing.',
+      detailError: 'This suggestion is no longer safe to review. Refresh the Inbox and try again.',
+      previewError:
+        'The file or its evidence changed before the preview was sealed. No action was authorized.',
+      previewReady: (planId) =>
+        `Preview ${formatIntegerForLocale(planId, 'en')} was sealed locally`,
+      expectedBytesLabel: 'Bound file size',
+      expectedBytes: (bytes) =>
+        `${formatIntegerForLocale(bytes, 'en')} bytes bound to this preview`,
+      journalLabel: 'Journal',
+      journalSequence: (sequence) =>
+        `Immutable journal sequence ${formatIntegerForLocale(sequence, 'en')}`,
+      checksLabel: 'Policy validation',
+      checksPassed: (count) => `${formatIntegerForLocale(count, 'en')} policy checks recorded`,
+      noExecution:
+        'Preview only. This does not confirm, move, trash, delete, restore, or undo any file.',
+    },
   },
   extraction: {
     kicker: 'Bounded local content',

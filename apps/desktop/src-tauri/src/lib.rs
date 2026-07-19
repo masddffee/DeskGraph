@@ -10,12 +10,12 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use deskgraph_database::ManifestDatabase;
+use deskgraph_database::{CleanupActionSelection, ManifestDatabase};
 use deskgraph_domain::{
-    ActionPlanPreview, ActionPlanSummary, AuthorizedScope, ExtractionJobProgress,
-    ExtractionOperation, ExtractionStats, HealthReport, ManifestStats, ScanJobProgress, ScanStatus,
-    SearchFilters, SearchResponse, SmartCleanupInbox, WatchEventProgress,
-    collect_health_with_manifest,
+    ActionPlanPreview, ActionPlanSummary, AuthorizedScope, CleanupActionPlanPreview,
+    CleanupSourceDetail, ExtractionJobProgress, ExtractionOperation, ExtractionStats, HealthReport,
+    ManifestStats, ScanJobProgress, ScanStatus, SearchFilters, SearchResponse, SmartCleanupInbox,
+    SmartCleanupSourceKind, WatchEventProgress, collect_health_with_manifest,
 };
 #[cfg(test)]
 use deskgraph_domain::{WatchEventReason, WatchEventStatus};
@@ -26,7 +26,7 @@ use deskgraph_extractors::{
     recent_extraction_jobs_at as read_recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
-use deskgraph_projects::refresh_smart_cleanup_inbox_at;
+use deskgraph_projects::{cleanup_source_detail_at, refresh_smart_cleanup_inbox_at};
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 #[cfg(test)]
 use deskgraph_scanner::{authorize_scope, run_scan_job_to_terminal};
@@ -35,7 +35,9 @@ use deskgraph_scanner::{
     resume_scan_job, run_scan_job_batch, validated_scope_root,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
-use deskgraph_transactions::{create_rename_preview_at, recent_action_plans_at};
+use deskgraph_transactions::{
+    create_cleanup_preview_at, create_rename_preview_at, recent_action_plans_at,
+};
 use deskgraph_watcher::{
     NativeWatchEventSource, PollingWatchPolicy, WatchCoordinator, WatchPolicy,
     recent_watch_events_at as read_recent_watch_events_at,
@@ -820,6 +822,112 @@ async fn refresh_cleanup_inbox(
     Ok(inbox)
 }
 
+/// Returns transient, path-bearing member detail only after an explicit local
+/// review request. Paths are never persisted in Cleanup plans, history, logs,
+/// preferences, or the path-free Inbox.
+#[tauri::command]
+async fn get_cleanup_source_detail(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    source_kind: SmartCleanupSourceKind,
+    source_id: i64,
+    source_observation_id: i64,
+) -> Result<CleanupSourceDetail, String> {
+    require_active_scope(&state, scope_id)?;
+    let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned".to_string())?;
+        let scope_guard = scope_accesses
+            .lock()
+            .map_err(|_| "scope_access_registry_poisoned".to_string())?;
+        if !scope_guard.contains_key(&scope_id) {
+            return Err("scope_reauthorization_required".to_string());
+        }
+        cleanup_source_detail_at(
+            &database_path,
+            scope_id,
+            source_kind,
+            source_id,
+            source_observation_id,
+        )
+        .map_err(|error| error.code().to_string())
+    })
+    .await
+    .map_err(|_| "cleanup_source_detail_worker_failed".to_string())??;
+    info!(
+        event = "cleanup_source_detail_opened",
+        scope_id = detail.scope_id,
+        source_kind = ?detail.source_kind,
+        source_id = detail.source_id,
+        source_observation_id = detail.source_observation_id,
+        member_count = detail.members.len(),
+        action_authorized = false,
+        execution_available = false
+    );
+    Ok(detail)
+}
+
+/// Creates one immutable Cleanup Preview from explicit member IDs. This
+/// command performs no file mutation and has no confirmation, Trash, Delete,
+/// Execute, recovery, or Undo companion.
+#[tauri::command]
+async fn create_cleanup_preview(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    source_kind: SmartCleanupSourceKind,
+    source_id: i64,
+    source_observation_id: i64,
+    target_node_id: i64,
+    keeper_node_id: Option<i64>,
+) -> Result<CleanupActionPlanPreview, String> {
+    require_active_scope(&state, scope_id)?;
+    let database_path = state.database_path.clone();
+    let database_gate = Arc::clone(&state.database_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        let _database_guard = database_gate
+            .lock()
+            .map_err(|_| "manifest_writer_gate_poisoned".to_string())?;
+        let scope_guard = scope_accesses
+            .lock()
+            .map_err(|_| "scope_access_registry_poisoned".to_string())?;
+        if !scope_guard.contains_key(&scope_id) {
+            return Err("scope_reauthorization_required".to_string());
+        }
+        create_cleanup_preview_at(
+            &database_path,
+            CleanupActionSelection {
+                scope_id,
+                source_kind,
+                source_id,
+                source_observation_id,
+                keeper_node_id,
+                target_node_id,
+            },
+        )
+        .map_err(|error| error.code().to_string())
+    })
+    .await
+    .map_err(|_| "cleanup_preview_worker_failed".to_string())??;
+    info!(
+        event = "cleanup_preview_created",
+        plan_id = preview.plan_id,
+        scope_id = preview.scope_id,
+        source_kind = ?preview.source_kind,
+        source_id = preview.source_id,
+        source_observation_id = preview.source_observation_id,
+        target_node_id = preview.target_node_id,
+        keeper_node_id = preview.keeper_node_id,
+        action_authorized = false,
+        execution_available = false
+    );
+    Ok(preview)
+}
+
 #[tauri::command]
 fn search_local(
     state: State<'_, ManifestState>,
@@ -1266,6 +1374,8 @@ pub fn run() {
             create_rename_preview,
             recent_action_plans,
             refresh_cleanup_inbox,
+            get_cleanup_source_detail,
+            create_cleanup_preview,
             search_local,
             pause_manifest_scan,
             resume_manifest_scan
@@ -1530,6 +1640,35 @@ mod tests {
                 .expect_err("OCR run must require a live grant"),
             "scope_reauthorization_required"
         );
+        assert_eq!(
+            tauri::async_runtime::block_on(refresh_cleanup_inbox(app.state(), scope.id))
+                .expect_err("Cleanup Inbox refresh must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(get_cleanup_source_detail(
+                app.state(),
+                scope.id,
+                SmartCleanupSourceKind::ExactDuplicate,
+                1,
+                1,
+            ))
+            .expect_err("Cleanup detail must require a live grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(create_cleanup_preview(
+                app.state(),
+                scope.id,
+                SmartCleanupSourceKind::ExactDuplicate,
+                1,
+                1,
+                node_id,
+                Some(node_id + 1),
+            ))
+            .expect_err("Cleanup Preview must require a live grant"),
+            "scope_reauthorization_required"
+        );
         let all_scope_search = search_local(
             app.state(),
             "private".to_string(),
@@ -1557,6 +1696,104 @@ mod tests {
             recent_action_plans_for_database(&database_path)
                 .expect("no action should be created")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn cleanup_detail_and_preview_commands_revalidate_without_changing_files() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-cleanup");
+        let first_path = scope_path.join("report.md");
+        let second_path = scope_path.join("report copy.md");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        std::fs::write(&first_path, b"same local bytes").expect("first file should create");
+        std::fs::write(&second_path, b"same local bytes").expect("second file should create");
+
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let prepared =
+            prepare_selected_scope(&scope_path).expect("test scope access should prepare");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &prepared.resolved_path,
+            prepared.platform,
+            &prepared.opaque_grant,
+        )
+        .expect("scope and grant should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let canonical_first =
+            std::fs::canonicalize(&first_path).expect("first path should canonicalize");
+        let canonical_second =
+            std::fs::canonicalize(&second_path).expect("second path should canonicalize");
+        deskgraph_projects::check_exact_duplicate_at(
+            &database_path,
+            scope.id,
+            &canonical_first,
+            &canonical_second,
+        )
+        .expect("duplicate evidence should create");
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared.access);
+        let app = tauri::test::mock_builder()
+            .manage(start_manifest_state_with_accesses(
+                database_path.clone(),
+                accesses,
+            ))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Desktop app should build");
+
+        let inbox = tauri::async_runtime::block_on(refresh_cleanup_inbox(app.state(), scope.id))
+            .expect("Inbox should refresh");
+        let item = inbox
+            .items
+            .into_iter()
+            .find(|item| item.source_kind == SmartCleanupSourceKind::ExactDuplicate)
+            .expect("duplicate item should be present");
+        let detail = tauri::async_runtime::block_on(get_cleanup_source_detail(
+            app.state(),
+            item.scope_id,
+            item.source_kind,
+            item.source_id,
+            item.source_observation_id,
+        ))
+        .expect("explicit detail should revalidate");
+        assert_eq!(detail.members.len(), 2);
+        assert!(detail.user_requested_paths);
+        assert!(!detail.action_authorized);
+        assert!(!detail.execution_available);
+        assert!(
+            detail
+                .members
+                .iter()
+                .any(|member| member.display_path.ends_with("report.md"))
+        );
+
+        let target = &detail.members[0];
+        let keeper = &detail.members[1];
+        let preview = tauri::async_runtime::block_on(create_cleanup_preview(
+            app.state(),
+            detail.scope_id,
+            detail.source_kind,
+            detail.source_id,
+            detail.source_observation_id,
+            target.node_id,
+            Some(keeper.node_id),
+        ))
+        .expect("durable Preview should create");
+        assert_eq!(preview.journal_sequence, 1);
+        assert!(!preview.policy.action_authorized);
+        assert!(!preview.policy.execution_available);
+        let payload = serde_json::to_string(&preview).expect("preview should serialize");
+        assert!(!payload.contains("report.md"));
+        assert!(!payload.contains("report copy.md"));
+        assert_eq!(
+            std::fs::read(&first_path).expect("first file should remain"),
+            b"same local bytes"
+        );
+        assert_eq!(
+            std::fs::read(&second_path).expect("second file should remain"),
+            b"same local bytes"
         );
     }
 

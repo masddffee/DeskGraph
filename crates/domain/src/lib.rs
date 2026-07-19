@@ -12,7 +12,9 @@ pub use action::{
     ActionJournalReductionError, ActionOperation, ActionPlanPreview, ActionPlanState,
     ActionPlanSummary, ActionPolicyCheck, ActionPolicyDecision, ActionPolicyReport,
     CleanupActionOperation, CleanupActionPlanPreview, CleanupActionPlanState,
-    CleanupActionPolicyCheck, CleanupActionPolicyReport, reduce_action_journal,
+    CleanupActionPolicyCheck, CleanupActionPolicyReport, CleanupSourceDetail,
+    CleanupSourceDetailMember, CleanupSourceMemberRole, CleanupSourceSelectionRule,
+    reduce_action_journal,
 };
 pub use extraction::{
     ExtractionJobProgress, ExtractionOperation, ExtractionStats, ExtractionStatus, ImageFormat,

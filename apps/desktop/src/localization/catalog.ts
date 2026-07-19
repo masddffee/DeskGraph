@@ -212,6 +212,37 @@ export type Catalog = {
     screenshotReviewGroupExplanation: string;
     itemMeta: (members: number, evidenceScoreBasisPoints: number, observedAt: string) => string;
     verification: string;
+    review: {
+      open: string;
+      loading: string;
+      close: string;
+      transientNotice: string;
+      selectionLegend: string;
+      selectTarget: string;
+      keeper: string;
+      keeperSwitch: string;
+      noKeeper: string;
+      roles: {
+        duplicateCandidate: string;
+        olderVersion: string;
+        newerVersion: string;
+        screenshotCandidate: string;
+      };
+      memberSize: (bytes: number) => string;
+      createPreview: string;
+      creatingPreview: string;
+      selectionRequired: string;
+      detailError: string;
+      previewError: string;
+      previewReady: (planId: number) => string;
+      expectedBytesLabel: string;
+      expectedBytes: (bytes: number) => string;
+      journalLabel: string;
+      journalSequence: (sequence: number) => string;
+      checksLabel: string;
+      checksPassed: (count: number) => string;
+      noExecution: string;
+    };
   };
   extraction: {
     kicker: string;

@@ -6,12 +6,13 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use deskgraph_database::{ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase};
 use deskgraph_domain::{
-    FileRelationCandidate, FileRelationCandidateState, FileRelationCandidateSummary,
-    FileRelationDecisionKind, FileVersionCandidate, FolderProfile, ProjectCandidate,
-    ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal, ProjectSignalKind,
-    ProjectSuggestion, ProjectSuggestionCreator, ScreenshotGroupCandidate,
+    CleanupSourceDetail, CleanupSourceDetailMember, CleanupSourceMemberRole,
+    CleanupSourceSelectionRule, FileRelationCandidate, FileRelationCandidateState,
+    FileRelationCandidateSummary, FileRelationDecisionKind, FileVersionCandidate, FolderProfile,
+    ProjectCandidate, ProjectCandidateSummary, ProjectDecisionKind, ProjectSignal,
+    ProjectSignalKind, ProjectSuggestion, ProjectSuggestionCreator, ScreenshotGroupCandidate,
     ScreenshotGroupCandidateSummary, ScreenshotGroupDiscovery, SmartCleanupInbox,
-    SmartCleanupSourceKind, parse_explicit_file_version_name,
+    SmartCleanupInboxItem, SmartCleanupSourceKind, parse_explicit_file_version_name,
 };
 use deskgraph_identity::{
     IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
@@ -53,6 +54,7 @@ pub enum ProjectError {
     VersionBaseMismatch,
     VersionExtensionMismatch,
     VersionNumberEqual,
+    CleanupSourceMemberLimitExceeded,
 }
 
 impl ProjectError {
@@ -84,6 +86,7 @@ impl ProjectError {
             Self::VersionBaseMismatch => "file_version_base_mismatch",
             Self::VersionExtensionMismatch => "file_version_extension_mismatch",
             Self::VersionNumberEqual => "file_version_number_equal",
+            Self::CleanupSourceMemberLimitExceeded => "cleanup_source_member_limit_exceeded",
         }
     }
 }
@@ -472,6 +475,152 @@ pub fn refresh_smart_cleanup_inbox(
         evaluation_complete,
         action_authorized: false,
     })
+}
+
+pub fn cleanup_source_detail_at(
+    database_path: &Path,
+    scope_id: i64,
+    source_kind: SmartCleanupSourceKind,
+    source_id: i64,
+    source_observation_id: i64,
+) -> Result<CleanupSourceDetail, ProjectError> {
+    let mut database = ManifestDatabase::open(database_path)?;
+    cleanup_source_detail(
+        &mut database,
+        scope_id,
+        source_kind,
+        source_id,
+        source_observation_id,
+    )
+}
+
+pub fn cleanup_source_detail(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    source_kind: SmartCleanupSourceKind,
+    source_id: i64,
+    source_observation_id: i64,
+) -> Result<CleanupSourceDetail, ProjectError> {
+    database.validate_cleanup_source_observation(
+        scope_id,
+        source_kind,
+        source_id,
+        source_observation_id,
+    )?;
+
+    let (item, members, selection_rule) = match source_kind {
+        SmartCleanupSourceKind::ExactDuplicate => {
+            let candidate = verify_exact_duplicate(database, source_id)?;
+            let item = database.smart_cleanup_relation_item(
+                candidate.relation_id,
+                candidate.evidence.observed_at_unix_ms,
+            )?;
+            let members = [candidate.left, candidate.right]
+                .into_iter()
+                .map(|member| CleanupSourceDetailMember {
+                    node_id: member.node_id,
+                    display_path: member.display_path,
+                    size_bytes: member.size_bytes,
+                    role: CleanupSourceMemberRole::DuplicateCandidate,
+                })
+                .collect();
+            (
+                item,
+                members,
+                CleanupSourceSelectionRule::EitherMemberIsTarget,
+            )
+        }
+        SmartCleanupSourceKind::Version => {
+            let candidate = verify_file_version(database, source_id)?;
+            let item = database.smart_cleanup_relation_item(
+                candidate.relation_id,
+                candidate.evidence.observed_at_unix_ms,
+            )?;
+            let members = vec![
+                CleanupSourceDetailMember {
+                    node_id: candidate.older.node_id,
+                    display_path: candidate.older.display_path,
+                    size_bytes: candidate.older.size_bytes,
+                    role: CleanupSourceMemberRole::OlderVersion,
+                },
+                CleanupSourceDetailMember {
+                    node_id: candidate.newer.node_id,
+                    display_path: candidate.newer.display_path,
+                    size_bytes: candidate.newer.size_bytes,
+                    role: CleanupSourceMemberRole::NewerVersion,
+                },
+            ];
+            (
+                item,
+                members,
+                CleanupSourceSelectionRule::OlderTargetNewerKeeper,
+            )
+        }
+        SmartCleanupSourceKind::ScreenshotReviewGroup => {
+            let candidate = database.screenshot_group_candidate(source_id)?;
+            let members = candidate
+                .members
+                .into_iter()
+                .map(|member| CleanupSourceDetailMember {
+                    node_id: member.node_id,
+                    display_path: member.display_path,
+                    size_bytes: member.size_bytes,
+                    role: CleanupSourceMemberRole::ScreenshotCandidate,
+                })
+                .collect();
+            let item = database.validate_cleanup_source_observation(
+                scope_id,
+                source_kind,
+                source_id,
+                source_observation_id,
+            )?;
+            (
+                item,
+                members,
+                CleanupSourceSelectionRule::SingleTargetNoKeeper,
+            )
+        }
+    };
+    validate_cleanup_detail_item(&item, scope_id, source_kind, source_id)?;
+    let item = database.validate_cleanup_source_observation(
+        scope_id,
+        source_kind,
+        source_id,
+        item.source_observation_id,
+    )?;
+    if members.is_empty() || members.len() > CleanupSourceDetail::MAX_MEMBERS {
+        return Err(ProjectError::CleanupSourceMemberLimitExceeded);
+    }
+    Ok(CleanupSourceDetail {
+        api_version: CleanupSourceDetail::API_VERSION,
+        scope_id,
+        source_kind,
+        source_id,
+        source_observation_id: item.source_observation_id,
+        members,
+        selection_rule,
+        current_evidence: true,
+        user_requested_paths: true,
+        action_authorized: false,
+        execution_available: false,
+    })
+}
+
+fn validate_cleanup_detail_item(
+    item: &SmartCleanupInboxItem,
+    scope_id: i64,
+    source_kind: SmartCleanupSourceKind,
+    source_id: i64,
+) -> Result<(), ProjectError> {
+    if item.scope_id != scope_id
+        || item.source_kind != source_kind
+        || item.source_id != source_id
+        || !item.current_evidence
+        || item.cleanup_authorized
+    {
+        return Err(DatabaseError::CleanupActionSourceNotCurrent.into());
+    }
+    Ok(())
 }
 
 fn cleanup_source_is_not_current(error: &ProjectError) -> bool {
@@ -1506,6 +1655,151 @@ mod tests {
         assert!(filtered.items.is_empty());
         assert_eq!(filtered.evaluated_source_count, 2);
         assert!(!filtered.action_authorized);
+    }
+
+    #[test]
+    fn cleanup_duplicate_detail_reverifies_paths_and_rejects_stale_or_inactive_requests() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("cleanup-detail-duplicate");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let left = scope_path.join("private-left.bin");
+        let right = scope_path.join("private-right.bin");
+        std::fs::write(&left, b"same private detail bytes").expect("left should write");
+        std::fs::write(&right, b"same private detail bytes").expect("right should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
+        let canonical_left = std::fs::canonicalize(&left).expect("left should canonicalize");
+        let canonical_right = std::fs::canonicalize(&right).expect("right should canonicalize");
+        let candidate =
+            check_exact_duplicate(&mut database, scope.id, &canonical_left, &canonical_right)
+                .expect("duplicate should persist");
+        let item = database
+            .smart_cleanup_relation_item(
+                candidate.relation_id,
+                candidate.evidence.observed_at_unix_ms,
+            )
+            .expect("current observation should map");
+
+        let detail = cleanup_source_detail(
+            &mut database,
+            scope.id,
+            SmartCleanupSourceKind::ExactDuplicate,
+            candidate.relation_id,
+            item.source_observation_id,
+        )
+        .expect("explicit current detail should live-verify");
+        assert_eq!(detail.api_version, CleanupSourceDetail::API_VERSION);
+        assert_eq!(detail.members.len(), 2);
+        assert_eq!(
+            detail.selection_rule,
+            CleanupSourceSelectionRule::EitherMemberIsTarget
+        );
+        let detail_paths = detail
+            .members
+            .iter()
+            .map(|member| member.display_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            detail
+                .members
+                .iter()
+                .all(|member| member.role == CleanupSourceMemberRole::DuplicateCandidate)
+        );
+        assert!(detail_paths.contains(&canonical_left.to_string_lossy().as_ref()));
+        assert!(detail_paths.contains(&canonical_right.to_string_lossy().as_ref()));
+        assert_ne!(detail.source_observation_id, item.source_observation_id);
+        assert!(detail.current_evidence);
+        assert!(detail.user_requested_paths);
+        assert!(!detail.action_authorized);
+        assert!(!detail.execution_available);
+
+        let stale = cleanup_source_detail(
+            &mut database,
+            scope.id,
+            SmartCleanupSourceKind::ExactDuplicate,
+            candidate.relation_id,
+            item.source_observation_id,
+        )
+        .expect_err("an older Inbox observation must fail closed");
+        assert_eq!(stale.code(), "cleanup_action_source_not_current");
+
+        database
+            .mark_scope_access_grant_revoked(scope.id)
+            .expect("grant should revoke");
+        let denied = cleanup_source_detail(
+            &mut database,
+            scope.id,
+            SmartCleanupSourceKind::ExactDuplicate,
+            candidate.relation_id,
+            detail.source_observation_id,
+        )
+        .expect_err("an inactive grant must fail before another live read");
+        assert_eq!(denied.code(), "scope_access_grant_not_active");
+    }
+
+    #[test]
+    fn cleanup_version_detail_preserves_older_target_newer_keeper_direction() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("cleanup-detail-version");
+        std::fs::create_dir(&scope_path).expect("scope should create");
+        let older = scope_path.join("private-plan-v1.md");
+        let newer = scope_path.join("private-plan-v2.md");
+        std::fs::write(&older, b"old revision").expect("older should write");
+        std::fs::write(&newer, b"new revision with different bytes").expect("newer should write");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should open");
+        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
+        let canonical_newer = std::fs::canonicalize(&newer).expect("newer should canonicalize");
+        let canonical_older = std::fs::canonicalize(&older).expect("older should canonicalize");
+        let candidate =
+            suggest_file_version(&mut database, scope.id, &canonical_newer, &canonical_older)
+                .expect("version should persist");
+        let item = database
+            .smart_cleanup_relation_item(
+                candidate.relation_id,
+                candidate.evidence.observed_at_unix_ms,
+            )
+            .expect("current observation should map");
+
+        let detail = cleanup_source_detail(
+            &mut database,
+            scope.id,
+            SmartCleanupSourceKind::Version,
+            candidate.relation_id,
+            item.source_observation_id,
+        )
+        .expect("explicit version detail should live-verify");
+        assert_eq!(
+            detail.selection_rule,
+            CleanupSourceSelectionRule::OlderTargetNewerKeeper
+        );
+        assert_eq!(detail.members.len(), 2);
+        assert_eq!(
+            detail.members[0].role,
+            CleanupSourceMemberRole::OlderVersion
+        );
+        assert_eq!(
+            detail.members[0].display_path,
+            canonical_older.to_string_lossy()
+        );
+        assert_eq!(
+            detail.members[1].role,
+            CleanupSourceMemberRole::NewerVersion
+        );
+        assert_eq!(
+            detail.members[1].display_path,
+            canonical_newer.to_string_lossy()
+        );
+        assert_ne!(detail.source_observation_id, item.source_observation_id);
+        assert!(!detail.action_authorized);
+        assert!(!detail.execution_available);
     }
 
     #[test]

@@ -53,9 +53,15 @@ import {
   type WatchRuntimeStatus,
 } from './watch';
 import {
+  createCleanupActionPreview,
+  getCleanupSourceDetail,
   refreshSmartCleanupInbox,
+  type CleanupActionPlanPreview,
+  type CleanupSourceDetail,
+  type CleanupSourceDetailMember,
   type CleanupSourceKind,
   type SmartCleanupInbox,
+  type SmartCleanupInboxItem,
 } from './cleanup';
 import {
   collectLanguagePreferences,
@@ -143,6 +149,13 @@ type CleanupInboxState =
   | { kind: 'ready'; inbox: SmartCleanupInbox }
   | { kind: 'partial'; inbox: SmartCleanupInbox }
   | { kind: 'error' };
+type CleanupReviewState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'detail'; detail: CleanupSourceDetail; targetNodeId: number | null }
+  | { kind: 'creating'; detail: CleanupSourceDetail; targetNodeId: number }
+  | { kind: 'ready'; preview: CleanupActionPlanPreview }
+  | { kind: 'error'; message: 'detail' | 'selection' | 'preview' };
 type AppView = 'home' | 'search' | 'projects' | 'inbox' | 'history' | 'settings';
 
 const APP_VIEWS: readonly AppView[] = [
@@ -389,6 +402,15 @@ function cleanupSourceExplanation(sourceKind: CleanupSourceKind, catalog: Catalo
   return catalog.cleanup.screenshotReviewGroupExplanation;
 }
 
+function cleanupMemberRoleLabel(member: CleanupSourceDetailMember, catalog: Catalog): string {
+  if (member.role === 'duplicate_candidate') {
+    return catalog.cleanup.review.roles.duplicateCandidate;
+  }
+  if (member.role === 'older_version') return catalog.cleanup.review.roles.olderVersion;
+  if (member.role === 'newer_version') return catalog.cleanup.review.roles.newerVersion;
+  return catalog.cleanup.review.roles.screenshotCandidate;
+}
+
 function browserLanguagePreferences(): readonly string[] {
   try {
     if (typeof navigator === 'undefined') return [];
@@ -422,9 +444,15 @@ export default function App() {
   const [ocrAction, setOcrAction] = useState<OcrActionState>({ kind: 'idle' });
   const [cleanupScopeId, setCleanupScopeId] = useState<number | null>(null);
   const [cleanupInboxState, setCleanupInboxState] = useState<CleanupInboxState>({ kind: 'idle' });
+  const [cleanupReviewState, setCleanupReviewState] = useState<CleanupReviewState>({
+    kind: 'idle',
+  });
   const [activeView, setActiveView] = useState<AppView>('home');
   const ocrRequestInFlight = useRef(new Set<string>());
   const viewHeadingRef = useRef<HTMLHeadingElement>(null);
+  const cleanupReviewHeadingRef = useRef<HTMLHeadingElement>(null);
+  const cleanupReviewGenerationRef = useRef(0);
+  const cleanupReviewTriggerRef = useRef<HTMLButtonElement | null>(null);
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
@@ -447,6 +475,16 @@ export default function App() {
       ?.setAttribute('content', metadata.description);
   }, [locale]);
 
+  useEffect(() => {
+    if (
+      cleanupReviewState.kind === 'detail' ||
+      cleanupReviewState.kind === 'ready' ||
+      cleanupReviewState.kind === 'error'
+    ) {
+      cleanupReviewHeadingRef.current?.focus();
+    }
+  }, [cleanupReviewState.kind]);
+
   function changeLocale(nextLocale: string) {
     if (!isLocale(nextLocale)) return;
     setLocale(nextLocale);
@@ -457,8 +495,21 @@ export default function App() {
   }
 
   function showView(nextView: AppView) {
+    if (nextView !== 'inbox') invalidateCleanupReview();
     setActiveView(nextView);
     window.requestAnimationFrame(() => viewHeadingRef.current?.focus());
+  }
+
+  function invalidateCleanupReview(returnFocus = false) {
+    cleanupReviewGenerationRef.current += 1;
+    setCleanupReviewState({ kind: 'idle' });
+    if (returnFocus) {
+      window.requestAnimationFrame(() => {
+        if (cleanupReviewTriggerRef.current?.isConnected) {
+          cleanupReviewTriggerRef.current.focus();
+        }
+      });
+    }
   }
 
   useEffect(() => {
@@ -980,6 +1031,7 @@ export default function App() {
 
   async function refreshCleanupInbox() {
     if (cleanupScopeId === null) return;
+    invalidateCleanupReview();
     setCleanupInboxState({ kind: 'loading' });
     try {
       const inbox = await refreshSmartCleanupInbox(cleanupScopeId);
@@ -989,6 +1041,47 @@ export default function App() {
       });
     } catch {
       setCleanupInboxState({ kind: 'error' });
+    }
+  }
+
+  async function openCleanupReview(item: SmartCleanupInboxItem, trigger: HTMLButtonElement) {
+    cleanupReviewTriggerRef.current = trigger;
+    const generation = cleanupReviewGenerationRef.current + 1;
+    cleanupReviewGenerationRef.current = generation;
+    setCleanupReviewState({ kind: 'loading' });
+    try {
+      const detail = await getCleanupSourceDetail(item);
+      if (cleanupReviewGenerationRef.current !== generation) return;
+      setCleanupReviewState({ kind: 'detail', detail, targetNodeId: null });
+    } catch {
+      if (cleanupReviewGenerationRef.current !== generation) return;
+      setCleanupReviewState({ kind: 'error', message: 'detail' });
+    }
+  }
+
+  async function submitCleanupPreview() {
+    if (cleanupReviewState.kind !== 'detail') return;
+    const { detail, targetNodeId } = cleanupReviewState;
+    if (targetNodeId === null) {
+      setCleanupReviewState({ kind: 'error', message: 'selection' });
+      return;
+    }
+    const keeperNodeId =
+      detail.selection_rule === 'either_member_is_target'
+        ? (detail.members.find((member) => member.node_id !== targetNodeId)?.node_id ?? null)
+        : detail.selection_rule === 'older_target_newer_keeper'
+          ? (detail.members.find((member) => member.role === 'newer_version')?.node_id ?? null)
+          : null;
+    const generation = cleanupReviewGenerationRef.current + 1;
+    cleanupReviewGenerationRef.current = generation;
+    setCleanupReviewState({ kind: 'creating', detail, targetNodeId });
+    try {
+      const preview = await createCleanupActionPreview(detail, targetNodeId, keeperNodeId);
+      if (cleanupReviewGenerationRef.current !== generation) return;
+      setCleanupReviewState({ kind: 'ready', preview });
+    } catch {
+      if (cleanupReviewGenerationRef.current !== generation) return;
+      setCleanupReviewState({ kind: 'error', message: 'preview' });
     }
   }
 
@@ -1689,10 +1782,15 @@ export default function App() {
                     <select
                       id="cleanup-scope"
                       value={cleanupScopeId ?? ''}
-                      disabled={state.scopes.length === 0 || cleanupInboxState.kind === 'loading'}
+                      disabled={
+                        state.scopes.length === 0 ||
+                        cleanupInboxState.kind === 'loading' ||
+                        cleanupReviewState.kind === 'creating'
+                      }
                       onChange={(event) => {
                         setCleanupScopeId(event.target.value ? Number(event.target.value) : null);
                         setCleanupInboxState({ kind: 'idle' });
+                        invalidateCleanupReview();
                       }}
                     >
                       <option value="">{catalog.cleanup.chooseScope}</option>
@@ -1704,7 +1802,11 @@ export default function App() {
                     </select>
                     <button
                       type="button"
-                      disabled={cleanupScopeId === null || cleanupInboxState.kind === 'loading'}
+                      disabled={
+                        cleanupScopeId === null ||
+                        cleanupInboxState.kind === 'loading' ||
+                        cleanupReviewState.kind === 'creating'
+                      }
                       onClick={() => void refreshCleanupInbox()}
                     >
                       {cleanupInboxState.kind === 'loading'
@@ -1758,6 +1860,17 @@ export default function App() {
                             )}
                           </span>
                           <span>{cleanupSourceExplanation(item.source_kind, catalog)}</span>
+                          <button
+                            type="button"
+                            className="cleanup-review-open"
+                            disabled={
+                              cleanupReviewState.kind === 'loading' ||
+                              cleanupReviewState.kind === 'creating'
+                            }
+                            onClick={(event) => void openCleanupReview(item, event.currentTarget)}
+                          >
+                            {catalog.cleanup.review.open}
+                          </button>
                         </li>
                       ))}
                     </ol>
@@ -1767,6 +1880,196 @@ export default function App() {
                   <p className="content-empty cleanup-verification">
                     {catalog.cleanup.verification}
                   </p>
+                ) : null}
+
+                {cleanupReviewState.kind === 'loading' ? (
+                  <p className="content-empty" role="status" aria-live="polite">
+                    {catalog.cleanup.review.loading}
+                  </p>
+                ) : null}
+
+                {cleanupReviewState.kind === 'detail' || cleanupReviewState.kind === 'creating' ? (
+                  <section className="cleanup-review" aria-labelledby="cleanup-review-title">
+                    <div className="cleanup-review-heading">
+                      <div>
+                        <h3 id="cleanup-review-title" ref={cleanupReviewHeadingRef} tabIndex={-1}>
+                          {cleanupSourceKindLabel(cleanupReviewState.detail.source_kind, catalog)}
+                        </h3>
+                        <p>{catalog.cleanup.review.transientNotice}</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        disabled={cleanupReviewState.kind === 'creating'}
+                        onClick={() => invalidateCleanupReview(true)}
+                      >
+                        {catalog.cleanup.review.close}
+                      </button>
+                    </div>
+
+                    <fieldset className="cleanup-member-selection">
+                      <legend>{catalog.cleanup.review.selectionLegend}</legend>
+                      {cleanupReviewState.detail.selection_rule === 'single_target_no_keeper' ? (
+                        <p className="cleanup-selection-hint">{catalog.cleanup.review.noKeeper}</p>
+                      ) : null}
+                      {cleanupReviewState.detail.members.map((member) => {
+                        const selected = cleanupReviewState.targetNodeId === member.node_id;
+                        const canBeTarget = member.role !== 'newer_version';
+                        const isKeeper =
+                          member.role === 'newer_version' ||
+                          (cleanupReviewState.detail.selection_rule === 'either_member_is_target' &&
+                            cleanupReviewState.targetNodeId !== null &&
+                            !selected);
+                        const memberCopy = (
+                          <span className="cleanup-member-copy">
+                            <span className="cleanup-member-role">
+                              {isKeeper && canBeTarget
+                                ? catalog.cleanup.review.keeperSwitch
+                                : canBeTarget
+                                  ? catalog.cleanup.review.selectTarget
+                                  : catalog.cleanup.review.keeper}
+                            </span>
+                            <code>{member.display_path}</code>
+                            <span>
+                              {cleanupMemberRoleLabel(member, catalog)}
+                              {' · '}
+                              {catalog.cleanup.review.memberSize(member.size_bytes)}
+                            </span>
+                          </span>
+                        );
+                        if (!canBeTarget) {
+                          return (
+                            <div
+                              key={member.node_id}
+                              className="cleanup-member cleanup-member--keeper"
+                            >
+                              <span className="cleanup-member-marker" aria-hidden="true">
+                                ✓
+                              </span>
+                              {memberCopy}
+                            </div>
+                          );
+                        }
+                        return (
+                          <label
+                            key={member.node_id}
+                            className={
+                              selected
+                                ? 'cleanup-member cleanup-member--selected'
+                                : 'cleanup-member'
+                            }
+                          >
+                            <input
+                              type="radio"
+                              name="cleanup-target"
+                              value={member.node_id}
+                              checked={selected}
+                              disabled={cleanupReviewState.kind === 'creating'}
+                              onChange={() =>
+                                setCleanupReviewState({
+                                  kind: 'detail',
+                                  detail: cleanupReviewState.detail,
+                                  targetNodeId: member.node_id,
+                                })
+                              }
+                            />
+                            {memberCopy}
+                          </label>
+                        );
+                      })}
+                    </fieldset>
+
+                    <button
+                      type="button"
+                      className="cleanup-preview-create"
+                      disabled={
+                        cleanupReviewState.kind === 'creating' ||
+                        cleanupReviewState.targetNodeId === null
+                      }
+                      onClick={() => void submitCleanupPreview()}
+                    >
+                      {cleanupReviewState.kind === 'creating'
+                        ? catalog.cleanup.review.creatingPreview
+                        : catalog.cleanup.review.createPreview}
+                    </button>
+                    {cleanupReviewState.targetNodeId === null ? (
+                      <p className="cleanup-selection-hint">
+                        {catalog.cleanup.review.selectionRequired}
+                      </p>
+                    ) : null}
+                    <p className="content-empty cleanup-verification">
+                      {catalog.cleanup.review.noExecution}
+                    </p>
+                  </section>
+                ) : null}
+
+                {cleanupReviewState.kind === 'error' ? (
+                  <div className="cleanup-review cleanup-review--error" role="alert">
+                    <h3 ref={cleanupReviewHeadingRef} tabIndex={-1}>
+                      {cleanupReviewState.message === 'detail'
+                        ? catalog.cleanup.review.detailError
+                        : cleanupReviewState.message === 'selection'
+                          ? catalog.cleanup.review.selectionRequired
+                          : catalog.cleanup.review.previewError}
+                    </h3>
+                    <button
+                      type="button"
+                      className="button-secondary"
+                      onClick={() => invalidateCleanupReview(true)}
+                    >
+                      {catalog.cleanup.review.close}
+                    </button>
+                  </div>
+                ) : null}
+
+                {cleanupReviewState.kind === 'ready' ? (
+                  <section
+                    className="cleanup-review cleanup-preview-receipt"
+                    aria-labelledby="cleanup-preview-title"
+                    aria-live="polite"
+                  >
+                    <div className="cleanup-review-heading">
+                      <div>
+                        <h3 id="cleanup-preview-title" ref={cleanupReviewHeadingRef} tabIndex={-1}>
+                          {catalog.cleanup.review.previewReady(cleanupReviewState.preview.plan_id)}
+                        </h3>
+                        <p>{catalog.cleanup.review.noExecution}</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => invalidateCleanupReview(true)}
+                      >
+                        {catalog.cleanup.review.close}
+                      </button>
+                    </div>
+                    <dl className="cleanup-preview-facts">
+                      <div>
+                        <dt>{catalog.cleanup.review.expectedBytesLabel}</dt>
+                        <dd>
+                          {catalog.cleanup.review.expectedBytes(
+                            cleanupReviewState.preview.expected_bytes,
+                          )}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{catalog.cleanup.review.journalLabel}</dt>
+                        <dd>
+                          {catalog.cleanup.review.journalSequence(
+                            cleanupReviewState.preview.journal_sequence,
+                          )}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>{catalog.cleanup.review.checksLabel}</dt>
+                        <dd>
+                          {catalog.cleanup.review.checksPassed(
+                            cleanupReviewState.preview.policy.checks.length,
+                          )}
+                        </dd>
+                      </div>
+                    </dl>
+                  </section>
                 ) : null}
               </section>
             ) : null}

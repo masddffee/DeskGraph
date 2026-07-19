@@ -794,6 +794,7 @@ pub enum DatabaseError {
     CleanupActionPlanNotFound,
     CleanupActionPlanInputInvalid,
     CleanupActionSourceNotCurrent,
+    SmartCleanupSourceInputInvalid,
     FolderNotFound,
     FolderProfileInputInvalid,
     FolderProfileTooLarge,
@@ -864,6 +865,7 @@ impl DatabaseError {
             Self::CleanupActionPlanNotFound => "cleanup_action_plan_not_found",
             Self::CleanupActionPlanInputInvalid => "cleanup_action_plan_input_invalid",
             Self::CleanupActionSourceNotCurrent => "cleanup_action_source_not_current",
+            Self::SmartCleanupSourceInputInvalid => "smart_cleanup_source_input_invalid",
             Self::FolderNotFound => "folder_not_found",
             Self::FolderProfileInputInvalid => "folder_profile_input_invalid",
             Self::FolderProfileTooLarge => "folder_profile_entry_limit_exceeded",
@@ -5896,6 +5898,61 @@ impl ManifestDatabase {
         Ok(item)
     }
 
+    /// Validates an explicit path-free Inbox reference before a caller asks
+    /// the projects layer to reveal transient local member paths. This method
+    /// does not return or persist paths and cannot authorize an action.
+    pub fn validate_cleanup_source_observation(
+        &self,
+        scope_id: i64,
+        source_kind: SmartCleanupSourceKind,
+        source_id: i64,
+        source_observation_id: i64,
+    ) -> Result<SmartCleanupInboxItem, DatabaseError> {
+        if scope_id <= 0 || source_id <= 0 || source_observation_id <= 0 {
+            return Err(DatabaseError::SmartCleanupSourceInputInvalid);
+        }
+        ensure_scope_queryable(&self.connection, scope_id)?;
+        ensure_scope_access_permitted(&self.connection, scope_id)?;
+        let item = match source_kind {
+            SmartCleanupSourceKind::ExactDuplicate | SmartCleanupSourceKind::Version => {
+                let query = match source_kind {
+                    SmartCleanupSourceKind::ExactDuplicate => {
+                        "SELECT observed_at_unix_ms FROM file_relation_observations \
+                         WHERE id = ?1 AND relation_id = ?2"
+                    }
+                    SmartCleanupSourceKind::Version => {
+                        "SELECT observed_at_unix_ms FROM file_version_observations \
+                         WHERE id = ?1 AND relation_id = ?2"
+                    }
+                    SmartCleanupSourceKind::ScreenshotReviewGroup => unreachable!(),
+                };
+                let observed_at_unix_ms = self
+                    .connection
+                    .query_row(query, params![source_observation_id, source_id], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .optional()?
+                    .ok_or(DatabaseError::CleanupActionSourceNotCurrent)?;
+                self.smart_cleanup_relation_item(source_id, observed_at_unix_ms)
+                    .map_err(normalize_cleanup_source_validation_error)?
+            }
+            SmartCleanupSourceKind::ScreenshotReviewGroup => self
+                .smart_cleanup_screenshot_item(source_id)
+                .map_err(normalize_cleanup_source_validation_error)?,
+        };
+        if item.scope_id != scope_id
+            || item.source_kind != source_kind
+            || item.source_id != source_id
+            || item.source_observation_id != source_observation_id
+            || item.state != SmartCleanupCandidateState::Suggested
+            || !item.current_evidence
+            || item.cleanup_authorized
+        {
+            return Err(DatabaseError::CleanupActionSourceNotCurrent);
+        }
+        Ok(item)
+    }
+
     /// Resolves one explicit, already-refreshed cleanup selection to the same
     /// strong root/parent/file snapshot used by the transaction core. The
     /// returned path-bearing record is internal only; cleanup preview payloads
@@ -7674,6 +7731,18 @@ fn smart_cleanup_source_kind_from_str(
         "version" => Ok(SmartCleanupSourceKind::Version),
         "screenshot_review_group" => Ok(SmartCleanupSourceKind::ScreenshotReviewGroup),
         _ => Err(DatabaseError::InvalidStoredValue),
+    }
+}
+
+fn normalize_cleanup_source_validation_error(error: DatabaseError) -> DatabaseError {
+    match error {
+        DatabaseError::FileRelationCandidateNotFound
+        | DatabaseError::FileRelationCandidateNotCurrent
+        | DatabaseError::ScreenshotGroupCandidateNotFound
+        | DatabaseError::ScreenshotGroupCandidateNotCurrent => {
+            DatabaseError::CleanupActionSourceNotCurrent
+        }
+        error => error,
     }
 }
 
@@ -13254,11 +13323,34 @@ mod tests {
         assert!(item.verification_required);
         assert!(item.review_assistance_only);
         assert!(!item.cleanup_authorized);
+        let validated = database
+            .validate_cleanup_source_observation(
+                scope_id,
+                SmartCleanupSourceKind::ScreenshotReviewGroup,
+                candidate.group_id,
+                candidate.evidence.observation_id,
+            )
+            .expect("explicit current screenshot observation should validate");
+        assert_eq!(validated, item);
+        assert!(matches!(
+            database.validate_cleanup_source_observation(
+                scope_id,
+                SmartCleanupSourceKind::ScreenshotReviewGroup,
+                candidate.group_id,
+                candidate.evidence.observation_id + 1,
+            ),
+            Err(DatabaseError::CleanupActionSourceNotCurrent)
+        ));
         database
             .mark_scope_access_grant_revoked(scope_id)
             .expect("grant should revoke");
         assert!(matches!(
-            database.smart_cleanup_screenshot_item(candidate.group_id),
+            database.validate_cleanup_source_observation(
+                scope_id,
+                SmartCleanupSourceKind::ScreenshotReviewGroup,
+                candidate.group_id,
+                candidate.evidence.observation_id,
+            ),
             Err(DatabaseError::ScopeAccessGrantNotActive)
         ));
     }

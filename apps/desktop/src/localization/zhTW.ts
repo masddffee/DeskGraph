@@ -276,7 +276,40 @@ export const zhTW = {
     itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
       `${formatIntegerForLocale(members, 'zh-TW')} 個成員 · 證據分數 ${formatIntegerForLocale(evidenceScoreBasisPoints, 'zh-TW')} / 10,000 · 觀察於 ${observedAt}`,
     verification:
-      '任何未來經使用者確認的清理前，都必須再次驗證目前證據。此畫面無法選取、移動、移至垃圾桶、刪除或復原檔案。',
+      '開啟檢視後會先重新驗證目前證據，才能建立耐久預覽。此收件匣無法確認、移動、移至垃圾桶、刪除、還原或復原檔案。',
+    review: {
+      open: '檢視檔案並建立預覽',
+      loading: '正在本機重新驗證此建議…',
+      close: '關閉檔案檢視',
+      transientNotice:
+        '路徑只會顯示在這次明確要求的本機檢視中，不會寫入清理計畫、歷史、記錄或語言偏好。',
+      selectionLegend: '選擇一個清理預覽目標',
+      selectTarget: '選為預覽目標',
+      keeper: '保留作為比對檔案',
+      keeperSwitch: '將保留此檔案 · 選取後可改為預覽目標',
+      noKeeper: '截圖檢視不指定保留檔；每個預覽只綁定一個目標。',
+      roles: {
+        duplicateCandidate: '完全重複候選檔案',
+        olderVersion: '較舊版本 · 可選目標',
+        newerVersion: '較新版本 · 必須保留',
+        screenshotCandidate: '截圖群組成員',
+      },
+      memberSize: (bytes) => `${formatIntegerForLocale(bytes, 'zh-TW')} 位元組`,
+      createPreview: '建立耐久預覽',
+      creatingPreview: '正在綁定目前檔案證據…',
+      selectionRequired: '請先選擇一個要預覽的檔案。',
+      detailError: '此建議已無法安全檢視；請重新整理收件匣後再試一次。',
+      previewError: '檔案或證據在預覽封存前已變更；未授權任何操作。',
+      previewReady: (planId) => `預覽 ${formatIntegerForLocale(planId, 'zh-TW')} 已在本機封存`,
+      expectedBytesLabel: '綁定檔案大小',
+      expectedBytes: (bytes) => `此預覽已綁定 ${formatIntegerForLocale(bytes, 'zh-TW')} 位元組`,
+      journalLabel: '日誌',
+      journalSequence: (sequence) =>
+        `不可變更日誌序號 ${formatIntegerForLocale(sequence, 'zh-TW')}`,
+      checksLabel: '政策驗證',
+      checksPassed: (count) => `已記錄 ${formatIntegerForLocale(count, 'zh-TW')} 項政策檢查`,
+      noExecution: '僅供預覽。這不會確認、移動、移至垃圾桶、刪除、還原或復原任何檔案。',
+    },
   },
   extraction: {
     kicker: '受限的本機內容',

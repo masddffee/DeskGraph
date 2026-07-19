@@ -367,6 +367,55 @@ impl CleanupActionPlanPreview {
     pub const API_VERSION: &str = "deskgraph.cleanup-action-plan-preview.v1";
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupSourceMemberRole {
+    DuplicateCandidate,
+    OlderVersion,
+    NewerVersion,
+    ScreenshotCandidate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupSourceSelectionRule {
+    EitherMemberIsTarget,
+    OlderTargetNewerKeeper,
+    SingleTargetNoKeeper,
+}
+
+/// A transient, explicitly requested local detail response for one current
+/// Smart Cleanup source. Paths are intentionally allowed here so the user can
+/// identify local files, but this value is never persisted as a plan or
+/// journal event and cannot authorize an action.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupSourceDetailMember {
+    pub node_id: i64,
+    pub display_path: String,
+    pub size_bytes: u64,
+    pub role: CleanupSourceMemberRole,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CleanupSourceDetail {
+    pub api_version: &'static str,
+    pub scope_id: i64,
+    pub source_kind: SmartCleanupSourceKind,
+    pub source_id: i64,
+    pub source_observation_id: i64,
+    pub members: Vec<CleanupSourceDetailMember>,
+    pub selection_rule: CleanupSourceSelectionRule,
+    pub current_evidence: bool,
+    pub user_requested_paths: bool,
+    pub action_authorized: bool,
+    pub execution_available: bool,
+}
+
+impl CleanupSourceDetail {
+    pub const API_VERSION: &str = "deskgraph.cleanup-source-detail.v1";
+    pub const MAX_MEMBERS: usize = 20;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +478,41 @@ mod tests {
         assert!(value.get("source_path").is_none());
         assert!(value.get("target_path").is_none());
         assert!(value.get("target_sha256").is_none());
+    }
+
+    #[test]
+    fn cleanup_source_detail_paths_are_transient_and_non_executable() {
+        let detail = CleanupSourceDetail {
+            api_version: CleanupSourceDetail::API_VERSION,
+            scope_id: 1,
+            source_kind: SmartCleanupSourceKind::ExactDuplicate,
+            source_id: 2,
+            source_observation_id: 3,
+            members: vec![CleanupSourceDetailMember {
+                node_id: 4,
+                display_path: "/authorized/private.txt".to_string(),
+                size_bytes: 5,
+                role: CleanupSourceMemberRole::DuplicateCandidate,
+            }],
+            selection_rule: CleanupSourceSelectionRule::EitherMemberIsTarget,
+            current_evidence: true,
+            user_requested_paths: true,
+            action_authorized: false,
+            execution_available: false,
+        };
+        let value = serde_json::to_value(detail).expect("cleanup detail should serialize");
+        assert_eq!(value["api_version"], CleanupSourceDetail::API_VERSION);
+        assert_eq!(
+            value["members"][0]["display_path"],
+            "/authorized/private.txt"
+        );
+        assert_eq!(value["members"][0]["role"], "duplicate_candidate");
+        assert_eq!(value["selection_rule"], "either_member_is_target");
+        assert_eq!(value["current_evidence"], true);
+        assert_eq!(value["user_requested_paths"], true);
+        assert_eq!(value["action_authorized"], false);
+        assert_eq!(value["execution_available"], false);
+        assert!(value["members"][0].get("modified_unix_ns").is_none());
     }
 
     #[test]

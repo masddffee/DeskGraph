@@ -303,7 +303,46 @@ export const ja = {
     itemMeta: (members, evidenceScoreBasisPoints, observedAt) =>
       `${formatIntegerForLocale(members, 'ja')} 件 · 証拠スコア ${formatIntegerForLocale(evidenceScoreBasisPoints, 'ja')} / 10,000 · 観測 ${observedAt}`,
     verification:
-      '将来ユーザーが確認したクリーンアップの前には、現在の証拠を再検証する必要があります。この画面からファイルを選択、移動、ゴミ箱へ移動、削除、元に戻すことはできません。',
+      '確認画面を開くと現在の証拠を再検証し、その後に永続プレビューを作成できます。この受信箱から確認、移動、ゴミ箱への移動、削除、復元、元に戻す操作はできません。',
+    review: {
+      open: 'ファイルを確認してプレビューを作成',
+      loading: 'この候補をローカルで再検証しています…',
+      close: 'ファイル確認を閉じる',
+      transientNotice:
+        'パスは、この明示的なローカル確認中だけ表示します。クリーンアップ計画、履歴、ログ、言語設定には保存しません。',
+      selectionLegend: 'クリーンアップのプレビュー対象を 1 件選択',
+      selectTarget: 'プレビュー対象として選択',
+      keeper: '比較用ファイルとして保持',
+      keeperSwitch: 'このファイルを保持 · 選択すると対象を切り替えます',
+      noKeeper:
+        'スクリーンショット確認では保持ファイルを指定しません。各プレビューは対象 1 件だけを固定します。',
+      roles: {
+        duplicateCandidate: '完全一致の重複候補',
+        olderVersion: '旧バージョン · 対象に選択可能',
+        newerVersion: '新バージョン · 保持が必須',
+        screenshotCandidate: 'スクリーンショットグループの項目',
+      },
+      memberSize: (bytes) => `${formatIntegerForLocale(bytes, 'ja')} バイト`,
+      createPreview: '永続プレビューを作成',
+      creatingPreview: '現在のファイル証拠を固定しています…',
+      selectionRequired: '続行する前に、プレビューするファイルを 1 件選択してください。',
+      detailError:
+        'この候補は安全に確認できなくなりました。受信箱を更新してから再試行してください。',
+      previewError:
+        'プレビューを固定する前にファイルまたは証拠が変わりました。操作は許可されていません。',
+      previewReady: (planId) =>
+        `プレビュー ${formatIntegerForLocale(planId, 'ja')} をローカルで固定しました`,
+      expectedBytesLabel: '固定したファイルサイズ',
+      expectedBytes: (bytes) =>
+        `${formatIntegerForLocale(bytes, 'ja')} バイトをこのプレビューに固定`,
+      journalLabel: 'ジャーナル',
+      journalSequence: (sequence) =>
+        `変更不可のジャーナル連番 ${formatIntegerForLocale(sequence, 'ja')}`,
+      checksLabel: 'ポリシー検証',
+      checksPassed: (count) => `${formatIntegerForLocale(count, 'ja')} 件のポリシーチェックを記録`,
+      noExecution:
+        'プレビューのみです。ファイルの確認、移動、ゴミ箱への移動、削除、復元、元に戻す操作は行いません。',
+    },
   },
   extraction: {
     kicker: '制限付きローカルコンテンツ',
