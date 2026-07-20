@@ -260,6 +260,7 @@ pnpm build
 - [Implementation status](docs/planning/IMPLEMENTATION_STATUS.md)
 - [v0.1 task graph](docs/planning/TASK_GRAPH.md)
 - [Read-only MCP setup](docs/MCP.md)
+- [OpenAI Build Week submission pack](docs/HACKATHON_SUBMISSION.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 
