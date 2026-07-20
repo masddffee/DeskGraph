@@ -174,6 +174,144 @@ fn scope_add_child_process_creates_a_path_free_active_grant_for_scan_and_search(
 }
 
 #[test]
+fn demo_fixture_command_runs_the_real_bilingual_cleanup_vertical_slice_without_mutation() {
+    let directory = tempfile::tempdir().expect("fixture parent should exist");
+    let workspace_path = directory.path().join("judge-demo-workspace");
+    let workspace_arg = workspace_path
+        .to_str()
+        .expect("demo workspace path should be UTF-8");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args(["fixture", "demo", "--path", workspace_arg])
+        .output()
+        .expect("deskgraph fixture demo should start");
+    assert!(output.status.success());
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("demo report should be JSON");
+    assert_eq!(report["api_version"], "deskgraph.demo-fixture.v1");
+    assert_eq!(report["verified"], true);
+    assert_eq!(report["scan"]["status"], "completed");
+    assert_eq!(report["scan"]["discovered_files"], 7);
+    assert_eq!(report["extractions"].as_array().map(Vec::len), Some(2));
+    assert!(
+        report["extractions"]
+            .as_array()
+            .expect("extraction results should be an array")
+            .iter()
+            .all(|job| job["status"] == "completed" && job["chunk_count"].as_u64() > Some(0))
+    );
+    assert_eq!(
+        report["traditional_chinese_search"]["query"],
+        "電腦情境圖譜"
+    );
+    assert_eq!(report["english_search"]["query"], "bounded context");
+    for search in [
+        &report["traditional_chinese_search"],
+        &report["english_search"],
+    ] {
+        assert_eq!(search["mode"], "lexical");
+        assert_eq!(search["embeddings_enabled"], false);
+        assert!(search["result_count"].as_u64() > Some(0));
+        assert_eq!(search["results"][0]["matched_fields"][0], "extracted_text");
+    }
+    assert_eq!(report["project"]["state"], "suggested");
+    assert_eq!(
+        report["project"]["suggestion"]["provenance"][0]["kind"],
+        "cargo_manifest"
+    );
+    assert_eq!(report["exact_duplicate"]["kind"], "exact_duplicate");
+    assert_eq!(
+        report["exact_duplicate"]["evidence"]["comparison_kind"],
+        "byte_for_byte"
+    );
+    assert_eq!(report["version_relation"]["kind"], "version");
+    assert_eq!(report["version_relation"]["evidence"]["older_version"], 1);
+    assert_eq!(report["version_relation"]["evidence"]["newer_version"], 2);
+    assert_eq!(report["cleanup_inbox"]["evaluation_complete"], true);
+    assert_eq!(report["cleanup_inbox"]["action_authorized"], false);
+    let cleanup_kinds = report["cleanup_inbox"]["items"]
+        .as_array()
+        .expect("cleanup items should be an array")
+        .iter()
+        .map(|item| item["source_kind"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(cleanup_kinds.contains(&"exact_duplicate"));
+    assert!(cleanup_kinds.contains(&"version"));
+    assert_eq!(
+        report["cleanup_preview"]["operation"],
+        "system_trash_preview"
+    );
+    assert_eq!(report["cleanup_preview"]["state"], "previewed");
+    assert_eq!(
+        report["cleanup_preview"]["policy"]["confirmation_required"],
+        true
+    );
+    assert_eq!(
+        report["cleanup_preview"]["policy"]["action_authorized"],
+        false
+    );
+    assert_eq!(
+        report["cleanup_preview"]["policy"]["execution_available"],
+        false
+    );
+    assert_eq!(report["safety"]["source_files_unchanged"], true);
+    assert_eq!(report["safety"]["organization_actions_performed"], false);
+    assert_eq!(report["safety"]["cleanup_action_authorized"], false);
+    assert_eq!(report["safety"]["optional_ocr_used"], false);
+
+    let readme_path = workspace_path.join("authorized-files/DeskGraph-Launch-Lab/README.md");
+    let duplicate_left = workspace_path.join("authorized-files/Smart-Inbox/launch-brief-copy-a.md");
+    let duplicate_right =
+        workspace_path.join("authorized-files/Smart-Inbox/launch-brief-copy-b.md");
+    let readme_before = std::fs::read(&readme_path).expect("demo README should exist");
+    let left_before = std::fs::read(&duplicate_left).expect("left duplicate should exist");
+    let right_before = std::fs::read(&duplicate_right).expect("right duplicate should exist");
+    assert_eq!(left_before, right_before);
+
+    let database_path = workspace_path.join("deskgraph-demo.sqlite3");
+    let database = ManifestDatabase::open(&database_path).expect("demo database should reopen");
+    let stats = database.stats().expect("demo manifest stats should load");
+    assert_eq!(stats.completed_scan_count, 1);
+    assert_eq!(stats.file_count, 7);
+    assert_eq!(
+        database
+            .extraction_stats()
+            .expect("demo extraction stats should load")
+            .extracted_file_count,
+        2
+    );
+    drop(database);
+
+    let second = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
+        .args(["fixture", "demo", "--path", workspace_arg])
+        .output()
+        .expect("second fixture command should start");
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("demo_fixture_path_already_exists"));
+    assert_eq!(
+        std::fs::read(&readme_path).expect("README should remain readable"),
+        readme_before
+    );
+    assert_eq!(
+        std::fs::read(&duplicate_left).expect("left duplicate should remain readable"),
+        left_before
+    );
+    assert_eq!(
+        std::fs::read(&duplicate_right).expect("right duplicate should remain readable"),
+        right_before
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(workspace_arg));
+    assert!(
+        stderr
+            .lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+    );
+}
+
+#[test]
 fn extraction_command_emits_counts_without_paths_or_content() {
     let directory = tempfile::tempdir().expect("fixture root should exist");
     let database_path = directory.path().join("manifest.sqlite3");

@@ -1,3 +1,5 @@
+mod demo;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -186,7 +188,7 @@ enum Command {
         #[command(subcommand)]
         command: CleanupCommand,
     },
-    /// Generate a bounded synthetic metadata-scan fixture.
+    /// Generate bounded, non-overwriting local fixtures.
     Fixture {
         #[command(subcommand)]
         command: FixtureCommand,
@@ -584,6 +586,13 @@ enum ExtractCommand {
 
 #[derive(Debug, Subcommand)]
 enum FixtureCommand {
+    /// Create and verify a judge-reproducible bilingual demo through real local backends.
+    Demo {
+        /// New workspace path. The command refuses to overwrite any existing entry.
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Generate a large metadata-only benchmark fixture.
     Generate {
         #[arg(long)]
         path: PathBuf,
@@ -1155,6 +1164,10 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             }
         },
         Command::Fixture { command } => match command {
+            FixtureCommand::Demo { path } => {
+                let report = demo::run_demo_fixture(&path)?;
+                emit_json(&report, "demo_fixture_verified")
+            }
             FixtureCommand::Generate {
                 path,
                 files,
