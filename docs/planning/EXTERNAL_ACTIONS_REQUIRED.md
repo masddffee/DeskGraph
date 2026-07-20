@@ -4,6 +4,33 @@ Last reviewed: 2026-07-20
 
 No external step should block safe local implementation. Do not add real credentials to the repository.
 
+## OpenAI Build Week submission (deadline-critical)
+
+Current state: the authenticated Devpost account is registered for OpenAI Build Week and owns
+project draft `1343809`, currently named `Untitled` in `submission_pre_draft`. The submission
+deadline is 2026-07-22 00:00 UTC (2026-07-22 08:00 Asia/Taipei). Local implementation and all
+submission copy may continue without external mutation.
+
+Required owner-approved actions after the integrated golden path passes:
+
+1. Obtain the `/feedback` Session ID for the Codex task where most core functionality was built.
+2. Re-authenticate the intended GitHub account, create the public Apache-2.0 repository and approve
+   the first push, or share the private repository with `testing@devpost.com` and
+   `build-week-event@openai.com`.
+3. Record a narrated demo under three minutes only after the real product flow passes. The public
+   YouTube video must show the project working and explain how both Codex and GPT-5.6 were used.
+4. Confirm submitter type and country of residence; select `Apps for Your Life` unless the final
+   demonstrated audience changes materially.
+5. Review the prepared name, tagline, write-up, repository URL, judge instructions, video URL and
+   session ID, then explicitly authorize updating and submitting Devpost project `1343809`.
+6. Validate the public URLs and final Devpost state before 2026-07-22 08:00 Asia/Taipei. Devpost
+   changes cannot be made after the submission period except when the organizer explicitly allows
+   a narrow correction.
+
+Do not claim production v0.1, vector/hybrid search, executable system-trash cleanup, Undo,
+installers, signing, notarization or cross-platform runtime in the hackathon entry unless those
+gates independently pass before submission.
+
 ## GitHub repository and CI (needed to close M0 remote evidence)
 
 Current state: local `main` exists with logical M0 commits, but there is no remote. `gh auth status` still reports the configured `masddffee` token as invalid, so Issues, remote CI, branch protection, and Releases cannot be verified or changed.

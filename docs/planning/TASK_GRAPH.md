@@ -2,6 +2,67 @@
 
 Last updated: 2026-07-20
 
+## OpenAI Build Week 48-hour delivery graph
+
+This is a time-boxed submission path, not a replacement for the production v0.1 graph below.
+The submission deadline is 2026-07-22 00:00 UTC (2026-07-22 08:00 Asia/Taipei).
+All DeskGraph commits begin inside the competition submission period, so the repository history is
+the evidence for work created with Codex and GPT-5.6.
+
+```text
+H0 Freeze truthful judge story and acceptance gates
+├── H1 Real sample workspace + deterministic backend smoke
+├── H2 Desktop judge journey + four-locale product copy
+└── H3 README + Devpost copy + three-minute narrated demo script
+    └── H4 Integrated format/lint/typecheck/test/build + live golden-path rehearsal
+        └── H5 Video/repository URL/session ID/Devpost fields
+            └── H6 Owner-approved push, public YouTube upload and final submission
+```
+
+### Hackathon critical path
+
+1. **H0 — story:** submit to **Apps for Your Life** as “Graphify your computer without
+   uploading it.” Demonstrate one coherent flow: authorize a synthetic local workspace, scan it,
+   extract bounded local text, search it with explanations, review Project/duplicate/version/
+   screenshot evidence, and create a non-executable Cleanup Preview. Show read-only MCP as the
+   agent boundary. Do not claim vector search, executable cleanup, Undo, installers or complete
+   cross-platform runtime.
+2. **H1 + H2 + H3 — parallel build:** the sample/smoke, Desktop journey and submission package
+   use separate file ownership and may proceed together. Every visible result must come from the
+   real Rust/SQLite path; no screenshot, fixture or UI may imply a capability that is unavailable.
+3. **H4 — merge gate:** run Rust format/Clippy/workspace tests and TypeScript format/lint/
+   typecheck/tests/build, then rehearse the sample through the packaged or development Desktop.
+4. **H5 — submission gate:** record a public, narrated video under three minutes that covers the
+   product plus how Codex and GPT-5.6 were used; include the repository URL, setup/sample-data
+   instructions and the `/feedback` session ID.
+5. **H6 — external action:** pushing a public repository, uploading to YouTube and submitting the
+   Devpost entry require explicit owner approval. Preserve a safety margin before the deadline.
+
+### Hackathon acceptance criteria
+
+- A judge can reproduce the bounded local workflow from a fresh clone with documented commands
+  and generated synthetic data; no private user data is required.
+- The Desktop first-run journey communicates the problem, local-only boundary and next action in
+  English, Traditional Chinese, Simplified Chinese and Japanese.
+- The demo never changes or deletes a source file. Rename and Cleanup stay Preview-only.
+- The README distinguishes verified local behavior from production v0.1 roadmap claims and
+  documents how Codex/GPT-5.6 accelerated the work.
+- All local quality gates pass from the exact submitted commit and the working tree is clean.
+- Required external URLs and `/feedback` session ID are present before final submission.
+
+### 48-hour ownership and model budget
+
+| Workstream | Dependency | Agent budget | Merge gate |
+| --- | --- | --- | --- |
+| H1 sample + backend smoke | H0 | Frontier coding model, high reasoning because it crosses Rust/SQLite safety contracts | Scoped Rust format, Clippy and tests |
+| H2 Desktop journey | H0 | Balanced coding model, high reasoning for four-locale UX/state integrity | Desktop format, lint, typecheck, tests and build |
+| H3 submission package | H0 | Balanced model, medium reasoning; source-backed writing only | Claim audit against implementation status and rules |
+| H4 integration/rehearsal | H1-H3 | Primary agent; strongest final reviewer after merge | Full repository gates and real local smoke |
+| H5/H6 external delivery | H4 | Owner plus primary agent | Public URL/video/session ID validation and explicit approval |
+
+Rollback is concern-based: revert only the failing sample, UI or documentation commit. The
+production graph and safety invariants remain authoritative throughout the sprint.
+
 ## Dependency graph
 
 ```text
