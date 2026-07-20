@@ -461,6 +461,46 @@ export const ja = {
       stopped: 'エラーにより停止',
     },
   },
+  hardExclusion: {
+    kicker: '対象範囲のプライバシー',
+    heading: 'ハード除外',
+    description:
+      'ハード除外はローカルのアクセスと索引を拒否します。検索結果を隠すだけではありません。',
+    scopeLabel: '許可済みルート',
+    chooseScope: '許可済みルートを選択',
+    loading: '現在のポリシーを読み込み中…',
+    policyRevision: (revision) => `ポリシー改訂 ${revision}`,
+    addFolders: 'フォルダーを追加…',
+    addFiles: 'ファイルを追加…',
+    noExclusions: 'このルートにハード除外はありません。',
+    currentExclusions: '現在のハード除外',
+    removalUnavailable: 'このリリーススライスでは、ハード除外の解除は利用できません。',
+    previewHeading: 'ハード除外を確認',
+    previewNotice:
+      'DeskGraph は影響するローカル索引データを消去します。元ファイルを移動または削除しません。',
+    previewEmpty: 'ネイティブ選択をキャンセルしました。ポリシーは変更されていません。',
+    notConfirmable:
+      '現在のファイル操作または復元可能なジャーナル作業が完了していないため、この除外は確定できません。元ファイルは変更されていません。',
+    item: {
+      willAdd: '除外予定',
+      alreadyExcluded: 'すでに除外済み',
+      coveredByParent: '選択したフォルダーに含まれます',
+      file: 'ファイル',
+      folder: 'フォルダー',
+    },
+    impact: (locations, content, graph, candidates, jobs, actions) =>
+      `ローカルで ${locations} 件の場所、${content} 件の内容／OCR チャンク、${graph} 件のグラフ事実、${candidates} 件の派生候補、${jobs} 件の保留ジョブ、この変更を妨げる ${actions} 件の操作安全記録に影響します。`,
+    confirm: '除外を確定してローカル索引を消去',
+    confirming: 'プライバシー消去を確定中…',
+    cancel: 'プレビューをキャンセル',
+    cancelled: 'プレビューをキャンセルしました。ポリシーは変更されていません。',
+    committed: (count) =>
+      `${count} 件のハード除外を保存し、影響するローカル索引データを消去しました。`,
+    refreshFailed: (count) =>
+      `${count} 件のハード除外を保存してローカルデータを消去しましたが、再読み込みに失敗しました。`,
+    error: 'ハード除外は確定されませんでした。ローカルのプライバシー消去完了とは表示しません。',
+    sourceSafe: '元ファイルを移動、変更、削除しません。',
+  },
   footer: {
     version: (version) => `DeskGraph ${version}`,
     description: 'メタデータ + 制限付きローカルテキスト · アップロードなし · ファイル操作なし',

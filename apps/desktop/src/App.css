@@ -1413,6 +1413,62 @@ input:focus-visible {
   font-size: 0.84rem;
 }
 
+.hard-exclusion {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 1.4rem;
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  padding-top: 1.4rem;
+}
+
+.hard-exclusion .panel-heading {
+  margin-bottom: 0;
+}
+.settings-policy-revision {
+  color: #69766e;
+  font-size: 0.84rem;
+  margin: 0;
+}
+.settings-policy-limitation {
+  color: #69766e;
+  font-size: 0.84rem;
+  margin: 0;
+}
+.hard-exclusion-list {
+  display: grid;
+  gap: 0.5rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.hard-exclusion-list li {
+  display: grid;
+  gap: 0.25rem;
+  border: 1px solid rgba(27, 59, 40, 0.12);
+  border-radius: 0.65rem;
+  padding: 0.65rem 0.75rem;
+}
+.hard-exclusion-list span {
+  color: #69766e;
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+.hard-exclusion-list code {
+  overflow-wrap: anywhere;
+}
+.hard-exclusion-preview {
+  display: grid;
+  gap: 0.7rem;
+  border: 1px solid rgba(27, 59, 40, 0.2);
+  border-radius: 0.85rem;
+  padding: 1rem;
+  background: #f4f7f1;
+}
+.hard-exclusion-preview h4,
+.hard-exclusion-preview p {
+  margin: 0;
+}
+
 .state-card {
   justify-content: flex-start;
   min-height: 11rem;

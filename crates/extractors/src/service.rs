@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
     ContentChunkProvenanceWrite, ContentChunkWrite, DatabaseError, ExtractableFile,
-    ImageMetadataWrite, ManifestDatabase,
+    ImageMetadataWrite, ManifestDatabase, ScopeExclusionMatcher, ScopeRevisionBinding,
 };
 use deskgraph_domain::{
     ExtractionJobProgress, ExtractionOperation, ExtractionStats, ExtractionStatus, ImageMetadata,
@@ -55,6 +55,7 @@ pub enum ExtractionServiceError {
     OcrCapacityBusy,
     OcrCancellationMonitorFailed,
     InvalidSystemTime,
+    ScopePolicyChanged,
     Extraction(ExtractionError),
 }
 
@@ -79,6 +80,7 @@ impl ExtractionServiceError {
             Self::OcrCapacityBusy => "extraction_ocr_capacity_busy",
             Self::OcrCancellationMonitorFailed => "extraction_ocr_cancel_monitor_failed",
             Self::InvalidSystemTime => "system_time_invalid",
+            Self::ScopePolicyChanged => "scope_policy_changed",
             Self::Extraction(error) => error.code(),
         }
     }
@@ -126,9 +128,14 @@ pub fn create_extraction_job_at(
     node_id: i64,
 ) -> Result<ExtractionJobProgress, ExtractionServiceError> {
     let mut database = ManifestDatabase::open(database_path)?;
-    database
-        .create_extraction_job(scope_id, node_id)
-        .map_err(Into::into)
+    let (binding, matcher) = bind_current_extraction_policy(&database, scope_id)?;
+    let source = database.extractable_file(scope_id, node_id)?;
+    ensure_extraction_source_not_excluded(&matcher, &source)?;
+    let job = database
+        .create_extraction_job_with_policy(binding, node_id)
+        .map_err(ExtractionServiceError::from)?;
+    assert_extraction_policy_current(&database, binding)?;
+    Ok(job)
 }
 
 pub fn create_screenshot_ocr_job_at(
@@ -137,7 +144,9 @@ pub fn create_screenshot_ocr_job_at(
     node_id: i64,
 ) -> Result<ExtractionJobProgress, ExtractionServiceError> {
     let mut database = ManifestDatabase::open(database_path)?;
+    let (binding, matcher) = bind_current_extraction_policy(&database, scope_id)?;
     let source = database.extractable_file(scope_id, node_id)?;
+    ensure_extraction_source_not_excluded(&matcher, &source)?;
     let (mut file, media_kind) = validate_source(&database, &source)?;
     if !matches!(
         media_kind,
@@ -174,9 +183,11 @@ pub fn create_screenshot_ocr_job_at(
         limits,
     )?;
     validate_open_file(&file, &source)?;
-    database
-        .low_level_insert_screenshot_ocr_job_after_core_validation(&source)
-        .map_err(Into::into)
+    let job = database
+        .low_level_insert_screenshot_ocr_job_with_policy_after_core_validation(binding, &source)
+        .map_err(ExtractionServiceError::from)?;
+    assert_extraction_policy_current(&database, binding)?;
+    Ok(job)
 }
 
 pub fn extraction_job_at(
@@ -233,6 +244,8 @@ pub fn resume_extraction_job_at(
         return Err(DatabaseError::InvalidExtractionJobState.into());
     }
     let source = database.extractable_file_for_job(job_id)?;
+    let (_, matcher) = bind_current_extraction_policy(&database, source.scope_id)?;
+    ensure_extraction_source_not_excluded(&matcher, &source)?;
     validate_source(&database, &source)?;
     database.resume_extraction_job(job_id).map_err(Into::into)
 }
@@ -256,8 +269,12 @@ fn run_extraction_job_with_ocr_provider_at(
     if current.is_terminal() || current.status == ExtractionStatus::Interrupted {
         return Ok(current);
     }
+    let (policy_binding, matcher) = bind_current_extraction_policy(&database, current.scope_id)?;
+    let source = database.extractable_file_for_job(job_id)?;
+    ensure_extraction_source_not_excluded(&matcher, &source)?;
     let runner_token = runner_token()?;
     database.claim_extraction_job(job_id, &runner_token, RUNNER_LEASE_MS)?;
+    assert_extraction_policy_current(&database, policy_binding)?;
     let started = Instant::now();
     let attempt = extract_claimed_job(
         &database,
@@ -347,6 +364,17 @@ fn run_extraction_job_with_ocr_provider_at(
                 pixel_width: metadata.pixel_width,
                 pixel_height: metadata.pixel_height,
             });
+            if let Err(error) = assert_extraction_policy_current(&database, policy_binding) {
+                return fail_extraction_for_policy_change(
+                    &mut database,
+                    job_id,
+                    &runner_token,
+                    provider_id,
+                    provider_version,
+                    elapsed_ms,
+                    error,
+                );
+            }
             match database.complete_extraction_job_with_image_metadata(
                 job_id,
                 &runner_token,
@@ -430,6 +458,64 @@ fn run_extraction_job_with_ocr_provider_at(
                 .map_err(Into::into)
         }
     }
+}
+
+fn bind_current_extraction_policy(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<(ScopeRevisionBinding, ScopeExclusionMatcher), ExtractionServiceError> {
+    let binding = database.bind_core_scope_policy_revision(scope_id)?;
+    let matcher = database.scope_exclusion_matcher(scope_id)?;
+    if matcher.revision != binding.revision
+        || !database.is_core_scope_policy_binding_current(binding)?
+    {
+        return Err(ExtractionServiceError::ScopePolicyChanged);
+    }
+    Ok((binding, matcher))
+}
+
+fn assert_extraction_policy_current(
+    database: &ManifestDatabase,
+    binding: ScopeRevisionBinding,
+) -> Result<(), ExtractionServiceError> {
+    if database.is_core_scope_policy_binding_current(binding)? {
+        Ok(())
+    } else {
+        Err(ExtractionServiceError::ScopePolicyChanged)
+    }
+}
+
+fn ensure_extraction_source_not_excluded(
+    matcher: &ScopeExclusionMatcher,
+    source: &ExtractableFile,
+) -> Result<(), ExtractionServiceError> {
+    if matcher.is_excluded_path_key(&source.path_key)
+        || matcher.is_excluded_identity(&source.identity_kind, &source.identity_key)
+    {
+        Err(ExtractionServiceError::ScopePolicyChanged)
+    } else {
+        Ok(())
+    }
+}
+
+fn fail_extraction_for_policy_change(
+    database: &mut ManifestDatabase,
+    job_id: i64,
+    runner_token: &str,
+    provider_id: &str,
+    provider_version: &str,
+    elapsed_ms: u64,
+    error: ExtractionServiceError,
+) -> Result<ExtractionJobProgress, ExtractionServiceError> {
+    let _ = database.fail_extraction_job(
+        job_id,
+        runner_token,
+        provider_id,
+        provider_version,
+        error.code(),
+        elapsed_ms,
+    );
+    Err(error)
 }
 
 fn extract_claimed_job(
@@ -853,9 +939,14 @@ impl CancellationSignal for DatabaseCancellation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deskgraph_database::{LexicalCandidateSource, LexicalSearchFilters, LexicalSearchSource};
+    use deskgraph_database::{
+        LexicalCandidateSource, LexicalSearchFilters, LexicalSearchSource, ScopeExclusionWrite,
+    };
     use deskgraph_domain::{ExtractionOperation, ExtractionStatus};
-    use deskgraph_scanner::{authorize_scope, comparison_key, scan_scope};
+    use deskgraph_scanner::{
+        ScopeExclusionSelection, authorize_scope_with_access_grant, comparison_key,
+        prepare_scope_exclusion_batch, scan_scope,
+    };
     use lopdf::content::{Content, Operation};
     use lopdf::{Document, Object, Stream, dictionary};
     use std::io::{Cursor, Write};
@@ -1120,7 +1211,13 @@ mod tests {
         let file_path = scope_path.join(file_name);
         fs::write(&file_path, contents).expect("fixture should write");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
-        let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_access_grant(
+            &mut database,
+            &scope_path,
+            std::env::consts::OS,
+            b"test-access-grant",
+        )
+        .expect("scope should authorize with an active test grant");
         scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_file = fs::canonicalize(&file_path).expect("file should canonicalize");
         let node_id = database
@@ -1257,6 +1354,124 @@ mod tests {
         let stats = extraction_stats_at(&fixture.database_path).expect("stats should load");
         assert_eq!(stats.extracted_file_count, 1);
         assert_eq!(stats.active_chunk_count, completed.chunk_count);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_exclusion_identity_blocks_surviving_hardlink_rescan_extraction_and_search() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let scope_path = directory.path().join("authorized");
+        let private_path = scope_path.join("private/secret.txt");
+        let public_hardlink = scope_path.join("public-hardlink.txt");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        fs::create_dir(&scope_path).expect("scope should create");
+        fs::write(&public_hardlink, b"durableidentitysecret must disappear")
+            .expect("initial public source should create");
+
+        let mut database = ManifestDatabase::open(&database_path).expect("database should open");
+        let scope = authorize_scope_with_access_grant(
+            &mut database,
+            &scope_path,
+            std::env::consts::OS,
+            b"test-access-grant",
+        )
+        .expect("scope should authorize");
+        scan_scope(&mut database, scope.id).expect("initial scan should publish the public source");
+        let public_key = comparison_key(
+            &fs::canonicalize(&public_hardlink).expect("public hardlink should canonicalize"),
+        );
+        let node_id = database
+            .node_id_for_path_key(scope.id, &public_key)
+            .expect("public lookup should pass")
+            .expect("public hardlink should initially publish");
+        drop(database);
+
+        let job = create_extraction_job_at(&database_path, scope.id, node_id)
+            .expect("initial extraction should queue");
+        run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
+            .expect("initial extraction should complete");
+        let mut database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        assert_eq!(
+            database
+                .lexical_search_candidates(
+                    "\"durableidentitysecret\"",
+                    LexicalSearchFilters {
+                        scope_id: Some(scope.id),
+                        source: LexicalSearchSource::ExtractedText,
+                        extension: None,
+                        modified_since_unix_ns: None,
+                        modified_before_unix_ns: None,
+                    },
+                    10,
+                )
+                .expect("initial search should run")
+                .len(),
+            1
+        );
+
+        fs::create_dir_all(private_path.parent().expect("private parent"))
+            .expect("private directory should create after the manifest snapshot");
+        fs::hard_link(&public_hardlink, &private_path)
+            .expect("unscanned private hardlink should create");
+
+        let prepared = prepare_scope_exclusion_batch(
+            &database,
+            scope.id,
+            &[ScopeExclusionSelection {
+                requested_path: &private_path,
+            }],
+        )
+        .expect("private alias should prepare");
+        let exclusion = prepared.exclusions.first().expect("one exclusion");
+        let write = ScopeExclusionWrite {
+            kind: exclusion.kind,
+            path_raw: &exclusion.path_raw,
+            path_key: &exclusion.path_key,
+            display_path: &exclusion.display_path,
+            identity_kind: &exclusion.identity_kind,
+            identity_key: &exclusion.identity_key,
+        };
+        let binding = database
+            .bind_scope_policy_revision(scope.id)
+            .expect("policy should bind");
+        database
+            .apply_scope_exclusion_batch(binding, &[write], 1)
+            .expect("exclusion and purge should commit");
+        assert!(
+            public_hardlink.exists(),
+            "privacy purge must not mutate source files"
+        );
+
+        scan_scope(&mut database, scope.id).expect("rescan should safely withhold both aliases");
+        assert_eq!(
+            database
+                .node_id_for_path_key(scope.id, &public_key)
+                .expect("post-rescan lookup should pass"),
+            None,
+            "surviving hardlink identity must not republish a manifest location"
+        );
+        assert!(
+            database
+                .lexical_search_candidates(
+                    "\"durableidentitysecret\"",
+                    LexicalSearchFilters {
+                        scope_id: Some(scope.id),
+                        source: LexicalSearchSource::All,
+                        extension: None,
+                        modified_since_unix_ns: None,
+                        modified_before_unix_ns: None,
+                    },
+                    10,
+                )
+                .expect("post-exclusion search should run")
+                .is_empty(),
+            "excluded inode content must not become searchable again"
+        );
+        drop(database);
+        assert!(
+            create_extraction_job_at(&database_path, scope.id, node_id).is_err(),
+            "excluded inode must not regain an extraction entry point"
+        );
     }
 
     #[test]

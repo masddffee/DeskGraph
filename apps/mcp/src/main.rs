@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use deskgraph_database::{DatabaseError, ManifestReadDatabase};
+use deskgraph_database::{DatabaseError, ManifestReadDatabase, ScopePolicyBinding};
 use deskgraph_domain::{SearchMatchedField, SearchSourceFilter};
 use deskgraph_retrieval::{SearchError, SearchRequest, search_read_only};
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
@@ -145,8 +145,18 @@ impl DeskGraphMcp {
             modified_before_unix_seconds: arguments.modified_before_unix_seconds,
             limit: Some(arguments.limit),
         };
-        let search = match self.database.lock() {
-            Ok(database) => search_read_only(&database, request),
+        let (binding, search) = match self.database.lock() {
+            Ok(database) => {
+                let binding = match database.bind_scope_policy_revision(arguments.scope_id) {
+                    Ok(binding) => match database.is_scope_policy_binding_current(binding) {
+                        Ok(true) => binding,
+                        Ok(false) => return tool_error("scope_policy_changed"),
+                        Err(error) => return tool_error(mcp_policy_error_code(&error)),
+                    },
+                    Err(error) => return tool_error(mcp_policy_error_code(&error)),
+                };
+                (binding, search_read_only(&database, request))
+            }
             Err(_) => {
                 audit_failure(arguments.scope_id, "mcp_search_failed");
                 return tool_error("mcp_search_failed");
@@ -170,6 +180,10 @@ impl DeskGraphMcp {
             search.results,
             arguments.include_snippet,
         );
+        if !mcp_scope_policy_is_current(&self.database, binding) {
+            audit_rejection(arguments.scope_id, "scope_policy_changed");
+            return tool_error("scope_policy_changed");
+        }
         let result_count = response.result_count;
         let payload = match serde_json::to_string(&response) {
             Ok(payload) if payload.len() <= TOOL_PAYLOAD_BYTES => payload,
@@ -178,6 +192,10 @@ impl DeskGraphMcp {
                 return tool_error("mcp_response_limit_exceeded");
             }
         };
+        if !mcp_scope_policy_is_current(&self.database, binding) {
+            audit_rejection(arguments.scope_id, "scope_policy_changed");
+            return tool_error("scope_policy_changed");
+        }
         tracing::info!(
             target: "deskgraph_mcp",
             event = "mcp_tool_call",
@@ -407,9 +425,30 @@ fn mcp_search_error_code(error: &SearchError) -> &'static str {
         | SearchError::ExtensionInvalid
         | SearchError::ModifiedRangeInvalid
         | SearchError::LimitOutOfRange => "mcp_search_request_invalid",
+        SearchError::ScopePolicyChanged => "scope_policy_changed",
         SearchError::Database(DatabaseError::ReadOnlyQueryTimeout) => "mcp_search_timeout",
         SearchError::Database(_) => "mcp_search_failed",
     }
+}
+
+fn mcp_policy_error_code(error: &DatabaseError) -> &'static str {
+    match error {
+        DatabaseError::ScopeNotFound
+        | DatabaseError::ScopeAccessGrantNotActive
+        | DatabaseError::ScanJobIncomplete => "mcp_scope_not_authorized",
+        _ => "mcp_search_failed",
+    }
+}
+
+fn mcp_scope_policy_is_current(
+    database: &Arc<Mutex<ManifestReadDatabase>>,
+    binding: ScopePolicyBinding,
+) -> bool {
+    database
+        .lock()
+        .ok()
+        .and_then(|database| database.is_scope_policy_binding_current(binding).ok())
+        .unwrap_or(false)
 }
 
 fn tool_error(code: &'static str) -> CallToolResult {

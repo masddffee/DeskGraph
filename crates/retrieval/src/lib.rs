@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use deskgraph_database::{
     DatabaseError, LexicalCandidateSource, LexicalSearchCandidate, LexicalSearchFilters,
-    LexicalSearchSource, ManifestDatabase, ManifestReadDatabase,
+    LexicalSearchSource, ManifestDatabase, ManifestReadDatabase, ScopeExclusionMatcher,
+    ScopePolicyBinding,
 };
 pub use deskgraph_domain::SearchSourceFilter;
 use deskgraph_domain::{
@@ -39,6 +40,7 @@ pub enum SearchError {
     ExtensionInvalid,
     ModifiedRangeInvalid,
     LimitOutOfRange,
+    ScopePolicyChanged,
     Database(DatabaseError),
 }
 
@@ -53,6 +55,7 @@ impl SearchError {
             Self::ExtensionInvalid => "search_extension_invalid",
             Self::ModifiedRangeInvalid => "search_modified_range_invalid",
             Self::LimitOutOfRange => "search_limit_out_of_range",
+            Self::ScopePolicyChanged => "scope_policy_changed",
             Self::Database(error) => error.code(),
         }
     }
@@ -155,6 +158,21 @@ trait LexicalSearchStore {
         filters: LexicalSearchFilters<'_>,
         per_source_candidate_limit: u32,
     ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError>;
+
+    fn bind_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopePolicyBinding, DatabaseError>;
+
+    fn is_scope_policy_binding_current(
+        &self,
+        binding: ScopePolicyBinding,
+    ) -> Result<bool, DatabaseError>;
+
+    fn scope_exclusion_matcher(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeExclusionMatcher, DatabaseError>;
 }
 
 impl LexicalSearchStore for ManifestDatabase {
@@ -166,6 +184,27 @@ impl LexicalSearchStore for ManifestDatabase {
     ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
         self.lexical_search_candidates(match_query, filters, per_source_candidate_limit)
     }
+
+    fn bind_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopePolicyBinding, DatabaseError> {
+        ManifestDatabase::bind_scope_policy_revision(self, scope_id)
+    }
+
+    fn is_scope_policy_binding_current(
+        &self,
+        binding: ScopePolicyBinding,
+    ) -> Result<bool, DatabaseError> {
+        ManifestDatabase::is_scope_policy_binding_current(self, binding)
+    }
+
+    fn scope_exclusion_matcher(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeExclusionMatcher, DatabaseError> {
+        ManifestDatabase::scope_exclusion_matcher(self, scope_id)
+    }
 }
 
 impl LexicalSearchStore for ManifestReadDatabase {
@@ -176,6 +215,27 @@ impl LexicalSearchStore for ManifestReadDatabase {
         per_source_candidate_limit: u32,
     ) -> Result<Vec<LexicalSearchCandidate>, DatabaseError> {
         self.lexical_search_candidates(match_query, filters, per_source_candidate_limit)
+    }
+
+    fn bind_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopePolicyBinding, DatabaseError> {
+        ManifestReadDatabase::bind_scope_policy_revision(self, scope_id)
+    }
+
+    fn is_scope_policy_binding_current(
+        &self,
+        binding: ScopePolicyBinding,
+    ) -> Result<bool, DatabaseError> {
+        ManifestReadDatabase::is_scope_policy_binding_current(self, binding)
+    }
+
+    fn scope_exclusion_matcher(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeExclusionMatcher, DatabaseError> {
+        ManifestReadDatabase::scope_exclusion_matcher(self, scope_id)
     }
 }
 
@@ -190,6 +250,15 @@ fn search_with(
     if limit == 0 || limit > MAX_RESULT_LIMIT {
         return Err(SearchError::LimitOutOfRange);
     }
+    let binding = filters
+        .scope_id
+        .map(|scope_id| database.bind_scope_policy_revision(scope_id))
+        .transpose()?;
+    if let Some(binding) = binding
+        && !database.is_scope_policy_binding_current(binding)?
+    {
+        return Err(SearchError::ScopePolicyChanged);
+    }
     let per_source_candidate_limit = limit.saturating_mul(2).min(MAX_CANDIDATES_PER_SOURCE);
     let match_query = quote_fts_phrase(&normalized_query);
     let candidates = database.candidates(
@@ -197,7 +266,42 @@ fn search_with(
         filters.database_filters(),
         per_source_candidate_limit,
     )?;
+    let mut evidence = HashMap::<i64, (ScopePolicyBinding, ScopeExclusionMatcher)>::new();
+    for candidate in &candidates {
+        let (candidate_binding, matcher) = match evidence.get(&candidate.scope_id) {
+            Some(binding) => binding,
+            None => {
+                let binding = database.bind_scope_policy_revision(candidate.scope_id)?;
+                let matcher = database.scope_exclusion_matcher(candidate.scope_id)?;
+                if matcher.revision != binding.revision
+                    || !database.is_scope_policy_binding_current(binding)?
+                {
+                    return Err(SearchError::ScopePolicyChanged);
+                }
+                evidence.insert(candidate.scope_id, (binding, matcher));
+                evidence
+                    .get(&candidate.scope_id)
+                    .expect("policy evidence was inserted")
+            }
+        };
+        if candidate.policy_revision != candidate_binding.revision
+            || matcher.is_excluded_path_key(&candidate.path_key)
+            || matcher.is_excluded_identity(&candidate.identity_kind, &candidate.identity_key)
+        {
+            return Err(SearchError::ScopePolicyChanged);
+        }
+    }
     let results = rank_candidates(&normalized_query, candidates, limit);
+    if let Some(binding) = binding
+        && !database.is_scope_policy_binding_current(binding)?
+    {
+        return Err(SearchError::ScopePolicyChanged);
+    }
+    for (binding, _) in evidence.values() {
+        if !database.is_scope_policy_binding_current(*binding)? {
+            return Err(SearchError::ScopePolicyChanged);
+        }
+    }
     let result_count = u64::try_from(results.len()).map_err(|_| SearchError::LimitOutOfRange)?;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -412,9 +516,13 @@ mod tests {
         LexicalSearchCandidate {
             source,
             scope_id: 1,
+            policy_revision: 1,
             node_id,
             location_id: node_id,
             display_path: path.to_string(),
+            path_key: path.to_string(),
+            identity_kind: "test_identity".to_string(),
+            identity_key: vec![b'f', u8::try_from(node_id).unwrap_or_default()],
             snippet: snippet.map(str::to_string),
         }
     }

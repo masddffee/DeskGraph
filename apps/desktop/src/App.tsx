@@ -36,6 +36,13 @@ import {
   resumeManifestScan,
   runManifestScan,
   selectAndAuthorizeScopes,
+  confirmHardExclusionPreview,
+  discardHardExclusionPreview,
+  loadCoveragePolicyDetail,
+  selectHardExclusionsPreview,
+  type CoveragePolicyDetail,
+  type HardExclusionEntryKind,
+  type HardExclusionPreview,
   type AuthorizedScope,
   type ManifestStats,
   type ScanJobProgress,
@@ -180,6 +187,20 @@ type ProjectReviewState =
   | { kind: 'detail'; detail: ProjectCandidateDetail; decisionError: boolean }
   | { kind: 'saving'; detail: ProjectCandidateDetail; decision: ProjectDecisionKind }
   | { kind: 'error' };
+type HardExclusionState =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'ready'; detail: CoveragePolicyDetail }
+  | { kind: 'preview'; detail: CoveragePolicyDetail; preview: HardExclusionPreview }
+  | { kind: 'confirming'; detail: CoveragePolicyDetail; preview: HardExclusionPreview }
+  | {
+      kind: 'success';
+      detail: CoveragePolicyDetail;
+      message: 'committed' | 'refreshFailed';
+      count: number;
+    }
+  | { kind: 'cancelled'; detail: CoveragePolicyDetail; source: 'picker' | 'preview' }
+  | { kind: 'error'; detail?: CoveragePolicyDetail };
 type AppView = 'home' | 'search' | 'projects' | 'inbox' | 'history' | 'settings';
 
 const APP_VIEWS: readonly AppView[] = [
@@ -488,6 +509,10 @@ export default function App() {
   const [projectReviewState, setProjectReviewState] = useState<ProjectReviewState>({
     kind: 'idle',
   });
+  const [hardExclusionScopeId, setHardExclusionScopeId] = useState<number | null>(null);
+  const [hardExclusionState, setHardExclusionState] = useState<HardExclusionState>({
+    kind: 'idle',
+  });
   const [activeView, setActiveView] = useState<AppView>('home');
   const ocrRequestInFlight = useRef(new Set<string>());
   const viewHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -500,6 +525,10 @@ export default function App() {
   const projectScopeIdRef = useRef<number | null>(null);
   const projectReviewTriggerRef = useRef<HTMLButtonElement | null>(null);
   const projectReviewHeadingRef = useRef<HTMLHeadingElement>(null);
+  const hardExclusionGenerationRef = useRef(0);
+  const searchGenerationRef = useRef(0);
+  const ocrGenerationRef = useRef(0);
+  const renameGenerationRef = useRef(0);
   const runningJobIds =
     state.kind === 'ready'
       ? state.jobs.filter((job) => job.status === 'running').map((job) => job.job_id)
@@ -511,6 +540,8 @@ export default function App() {
   const dashboardReady = state.kind === 'ready';
   const catalog = getCatalog(locale);
   const activeViewCopy = catalog.navigation.views[activeView];
+  const hardExclusionDetail =
+    'detail' in hardExclusionState ? hardExclusionState.detail : undefined;
 
   useEffect(() => {
     const metadata = getLocalizedMetadata(locale);
@@ -550,8 +581,136 @@ export default function App() {
   function showView(nextView: AppView) {
     if (nextView !== 'inbox') invalidateCleanupReview();
     if (nextView !== 'projects') invalidateProjectReview();
+    if (nextView !== 'settings') {
+      invalidateHardExclusion();
+      setHardExclusionScopeId(null);
+    }
     setActiveView(nextView);
     window.requestAnimationFrame(() => viewHeadingRef.current?.focus());
+  }
+
+  function invalidateHardExclusion() {
+    hardExclusionGenerationRef.current += 1;
+    setHardExclusionState({ kind: 'idle' });
+  }
+
+  function clearPurgedTransientState() {
+    hardExclusionGenerationRef.current += 1;
+    searchGenerationRef.current += 1;
+    ocrGenerationRef.current += 1;
+    renameGenerationRef.current += 1;
+    setSearchQuery('');
+    setSearchScopeId(null);
+    setSearchSource('all');
+    setSearchExtension('');
+    setSearchModifiedSince('');
+    setSearchModifiedBefore('');
+    setSearchState({ kind: 'idle' });
+    setOcrAction({ kind: 'idle' });
+    setRenameScopeId(null);
+    setRenameSourcePath('');
+    setRenameNewName('');
+    setRenameState({ kind: 'idle' });
+    setCleanupScopeId(null);
+    setCleanupInboxState({ kind: 'idle' });
+    invalidateCleanupReview();
+    projectScopeIdRef.current = null;
+    setProjectScopeId(null);
+    setProjectDiscoveryState({ kind: 'idle' });
+    setProjectReadinessState('idle');
+    invalidateProjectReview();
+  }
+
+  async function chooseHardExclusionScope(scopeId: number | null) {
+    invalidateHardExclusion();
+    setHardExclusionScopeId(scopeId);
+    if (scopeId === null) return;
+    const generation = hardExclusionGenerationRef.current + 1;
+    hardExclusionGenerationRef.current = generation;
+    setHardExclusionState({ kind: 'loading' });
+    try {
+      const detail = await loadCoveragePolicyDetail(scopeId);
+      if (hardExclusionGenerationRef.current !== generation) return;
+      setHardExclusionState({ kind: 'ready', detail });
+    } catch {
+      if (hardExclusionGenerationRef.current === generation)
+        setHardExclusionState({ kind: 'error' });
+    }
+  }
+
+  async function createHardExclusionPreview(entryKind: HardExclusionEntryKind) {
+    if (hardExclusionScopeId === null || !('detail' in hardExclusionState)) return;
+    const detail = hardExclusionState.detail;
+    if (!detail) return;
+    const generation = hardExclusionGenerationRef.current + 1;
+    hardExclusionGenerationRef.current = generation;
+    setHardExclusionState({ kind: 'loading' });
+    try {
+      const preview = await selectHardExclusionsPreview(hardExclusionScopeId, entryKind);
+      if (hardExclusionGenerationRef.current !== generation) return;
+      if (preview === null) {
+        setHardExclusionState({ kind: 'cancelled', detail, source: 'picker' });
+        return;
+      }
+      setHardExclusionState({ kind: 'preview', detail, preview });
+    } catch {
+      if (hardExclusionGenerationRef.current === generation)
+        setHardExclusionState({ kind: 'error', detail });
+    }
+  }
+
+  async function cancelHardExclusionPreview() {
+    if (hardExclusionState.kind !== 'preview') return;
+    const { preview } = hardExclusionState;
+    const generation = hardExclusionGenerationRef.current + 1;
+    hardExclusionGenerationRef.current = generation;
+    setHardExclusionState({ kind: 'loading' });
+    try {
+      await discardHardExclusionPreview(preview.preview_id);
+      if (hardExclusionGenerationRef.current === generation) {
+        setHardExclusionState({
+          kind: 'cancelled',
+          detail: hardExclusionState.detail,
+          source: 'preview',
+        });
+      }
+    } catch {
+      if (hardExclusionGenerationRef.current === generation)
+        setHardExclusionState({ kind: 'error', detail: hardExclusionState.detail });
+    }
+  }
+
+  async function confirmHardExclusion() {
+    if (hardExclusionState.kind !== 'preview') return;
+    const { detail, preview } = hardExclusionState;
+    const generation = hardExclusionGenerationRef.current + 1;
+    hardExclusionGenerationRef.current = generation;
+    setHardExclusionState({ kind: 'confirming', detail, preview });
+    try {
+      const commit = await confirmHardExclusionPreview(preview.preview_id);
+      if (hardExclusionGenerationRef.current !== generation) return;
+      clearPurgedTransientState();
+      const updatedDetail = await loadCoveragePolicyDetail(commit.scope_id).catch(() => detail);
+      try {
+        await refreshManifest();
+        setHardExclusionState({
+          kind: 'success',
+          detail: updatedDetail,
+          message: 'committed',
+          count: commit.exclusions,
+        });
+      } catch {
+        setHardExclusionState({
+          kind: 'success',
+          detail: updatedDetail,
+          message: 'refreshFailed',
+          count: commit.exclusions,
+        });
+      }
+    } catch {
+      if (hardExclusionGenerationRef.current === generation)
+        setHardExclusionState({ kind: 'error', detail });
+    }
   }
 
   function invalidateCleanupReview(returnFocus = false) {
@@ -901,8 +1060,11 @@ export default function App() {
   }
 
   async function submitSearch() {
+    const generation = searchGenerationRef.current + 1;
+    searchGenerationRef.current = generation;
     const query = searchQuery.trim();
     if ([...query].length < 3) {
+      if (searchGenerationRef.current !== generation) return;
       setSearchState({
         kind: 'error',
         message: 'query',
@@ -911,6 +1073,7 @@ export default function App() {
     }
     const extension = searchExtension.trim();
     if (extension && !/^\.?[a-z0-9]{1,16}$/i.test(extension)) {
+      if (searchGenerationRef.current !== generation) return;
       setSearchState({
         kind: 'error',
         message: 'extension',
@@ -926,12 +1089,14 @@ export default function App() {
         modifiedBeforeUnixSeconds !== null &&
         modifiedSinceUnixSeconds >= modifiedBeforeUnixSeconds)
     ) {
+      if (searchGenerationRef.current !== generation) return;
       setSearchState({
         kind: 'error',
         message: 'dateRange',
       });
       return;
     }
+    if (searchGenerationRef.current !== generation) return;
     setSearchState({ kind: 'working' });
     try {
       const response = await searchLocal(query, {
@@ -941,6 +1106,7 @@ export default function App() {
         modifiedSinceUnixSeconds,
         modifiedBeforeUnixSeconds,
       });
+      if (searchGenerationRef.current !== generation) return;
       setSearchState({ kind: 'ready', response });
       const ocrJobs = await Promise.all(
         response.results
@@ -953,6 +1119,7 @@ export default function App() {
             }
           }),
       );
+      if (searchGenerationRef.current !== generation) return;
       setState((current) => {
         if (current.kind !== 'ready') return current;
         return {
@@ -963,6 +1130,7 @@ export default function App() {
         };
       });
     } catch {
+      if (searchGenerationRef.current !== generation) return;
       setSearchState({
         kind: 'error',
         message: 'request',
@@ -970,15 +1138,21 @@ export default function App() {
     }
   }
 
-  async function runScreenshotOcr(job: ExtractionJobProgress) {
+  async function runScreenshotOcr(
+    job: ExtractionJobProgress,
+    generation = ocrGenerationRef.current,
+  ) {
+    if (ocrGenerationRef.current !== generation) return;
     setOcrAction({ kind: 'working', scopeId: job.scope_id, nodeId: job.node_id });
     try {
       const progress = await runScreenshotOcrJob(job.job_id);
+      if (ocrGenerationRef.current !== generation) return;
       updateExtractionJob(progress);
-      setOcrFeedbackFromProgress(progress);
+      setOcrFeedbackFromProgress(progress, generation);
       await refreshManifest().catch(() => undefined);
     } catch (error) {
       await refreshManifest().catch(() => undefined);
+      if (ocrGenerationRef.current !== generation) return;
       if (isScreenshotOcrCapacityBusy(error)) {
         setOcrAction({
           kind: 'error',
@@ -997,7 +1171,11 @@ export default function App() {
     }
   }
 
-  function setOcrFeedbackFromProgress(progress: ExtractionJobProgress) {
+  function setOcrFeedbackFromProgress(
+    progress: ExtractionJobProgress,
+    generation = ocrGenerationRef.current,
+  ) {
+    if (ocrGenerationRef.current !== generation) return;
     if (progress.status === 'completed') {
       setOcrAction({
         kind: 'success',
@@ -1038,14 +1216,17 @@ export default function App() {
   async function startScreenshotOcr(result: SearchResult) {
     const requestKey = `${result.scope_id}:${result.node_id}`;
     if (activeExtractionJobIds.length > 0 || ocrRequestInFlight.current.size > 0) return;
+    const generation = ocrGenerationRef.current;
     ocrRequestInFlight.current.add(requestKey);
     setOcrAction({ kind: 'working', scopeId: result.scope_id, nodeId: result.node_id });
     try {
       const job = await createScreenshotOcrJob(result.scope_id, result.node_id);
+      if (ocrGenerationRef.current !== generation) return;
       updateExtractionJob(job);
-      await runScreenshotOcr(job);
+      await runScreenshotOcr(job, generation);
     } catch {
       await refreshManifest().catch(() => undefined);
+      if (ocrGenerationRef.current !== generation) return;
       setOcrAction({
         kind: 'error',
         scopeId: result.scope_id,
@@ -1060,14 +1241,17 @@ export default function App() {
   async function resumeScreenshotOcr(job: ExtractionJobProgress) {
     const requestKey = `${job.scope_id}:${job.node_id}`;
     if (activeExtractionJobIds.length > 0 || ocrRequestInFlight.current.size > 0) return;
+    const generation = ocrGenerationRef.current;
     ocrRequestInFlight.current.add(requestKey);
     setOcrAction({ kind: 'working', scopeId: job.scope_id, nodeId: job.node_id });
     try {
       const queued = await resumeScreenshotOcrJob(job.job_id);
+      if (ocrGenerationRef.current !== generation) return;
       updateExtractionJob(queued);
-      await runScreenshotOcr(queued);
+      await runScreenshotOcr(queued, generation);
     } catch {
       await refreshManifest().catch(() => undefined);
+      if (ocrGenerationRef.current !== generation) return;
       setOcrAction({
         kind: 'error',
         scopeId: job.scope_id,
@@ -1082,34 +1266,39 @@ export default function App() {
   async function retryQueuedScreenshotOcr(job: ExtractionJobProgress) {
     const requestKey = `${job.scope_id}:${job.node_id}`;
     if (ocrRequestInFlight.current.size > 0) return;
+    const generation = ocrGenerationRef.current;
     ocrRequestInFlight.current.add(requestKey);
     try {
-      await runScreenshotOcr(job);
+      await runScreenshotOcr(job, generation);
     } finally {
       ocrRequestInFlight.current.delete(requestKey);
     }
   }
 
   async function cancelScreenshotOcr(job: ExtractionJobProgress) {
+    const generation = ocrGenerationRef.current;
     try {
       const progress = await cancelScreenshotOcrJob(job.job_id);
+      if (ocrGenerationRef.current !== generation) return;
       updateExtractionJob(progress);
       if (progress.status === 'cancelled') {
-        setOcrFeedbackFromProgress(progress);
+        setOcrFeedbackFromProgress(progress, generation);
         await refreshManifest().catch(() => undefined);
       }
     } catch {
       try {
         const progress = await loadScreenshotOcrJobStatus(job.job_id);
+        if (ocrGenerationRef.current !== generation) return;
         updateExtractionJob(progress);
         if (progress.status !== 'queued' && progress.status !== 'running') {
-          setOcrFeedbackFromProgress(progress);
+          setOcrFeedbackFromProgress(progress, generation);
           await refreshManifest().catch(() => undefined);
           return;
         }
       } catch {
         // Fall through to a path-free generic error.
       }
+      if (ocrGenerationRef.current !== generation) return;
       setOcrAction({
         kind: 'error',
         scopeId: job.scope_id,
@@ -1120,6 +1309,8 @@ export default function App() {
   }
 
   async function submitRenamePreview() {
+    const generation = renameGenerationRef.current + 1;
+    renameGenerationRef.current = generation;
     const sourcePath = renameSourcePath.trim();
     if (renameScopeId === null) {
       setRenameState({ kind: 'error', message: 'chooseFolder' });
@@ -1132,13 +1323,16 @@ export default function App() {
       });
       return;
     }
+    if (renameGenerationRef.current !== generation) return;
     setRenameState({ kind: 'working' });
     try {
       const preview = await createRenamePreview(renameScopeId, sourcePath, renameNewName);
       const actionPlans = await loadRecentActionPlans();
+      if (renameGenerationRef.current !== generation) return;
       setState((current) => (current.kind === 'ready' ? { ...current, actionPlans } : current));
       setRenameState({ kind: 'ready', preview });
     } catch {
+      if (renameGenerationRef.current !== generation) return;
       setRenameState({
         kind: 'error',
         message: 'denied',
@@ -2643,6 +2837,172 @@ export default function App() {
                     {catalog.navigation.noNetwork}
                   </li>
                 </ul>
+                <section className="hard-exclusion" aria-labelledby="hard-exclusion-title">
+                  <div className="panel-heading panel-heading--wrap">
+                    <div>
+                      <p className="panel-kicker">{catalog.hardExclusion.kicker}</p>
+                      <h3 id="hard-exclusion-title">{catalog.hardExclusion.heading}</h3>
+                      <p>{catalog.hardExclusion.description}</p>
+                    </div>
+                  </div>
+                  <label htmlFor="hard-exclusion-scope">{catalog.hardExclusion.scopeLabel}</label>
+                  <div className="scope-form-row">
+                    <select
+                      id="hard-exclusion-scope"
+                      value={hardExclusionScopeId ?? ''}
+                      onChange={(event) =>
+                        void chooseHardExclusionScope(
+                          event.target.value ? Number(event.target.value) : null,
+                        )
+                      }
+                      disabled={
+                        state.scopes.length === 0 || hardExclusionState.kind === 'confirming'
+                      }
+                    >
+                      <option value="">{catalog.hardExclusion.chooseScope}</option>
+                      {state.scopes.map((scope) => (
+                        <option key={scope.id} value={scope.id}>
+                          {catalog.scope.label(scope.id)} · {scope.display_path}
+                        </option>
+                      ))}
+                    </select>
+                    {hardExclusionDetail &&
+                    hardExclusionState.kind !== 'preview' &&
+                    hardExclusionState.kind !== 'confirming' ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => void createHardExclusionPreview('folder')}
+                        >
+                          {catalog.hardExclusion.addFolders}
+                        </button>
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          onClick={() => void createHardExclusionPreview('file')}
+                        >
+                          {catalog.hardExclusion.addFiles}
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                  {hardExclusionState.kind === 'loading' ? (
+                    <p role="status">{catalog.hardExclusion.loading}</p>
+                  ) : null}
+                  {hardExclusionDetail ? (
+                    <>
+                      <p className="settings-policy-revision">
+                        {catalog.hardExclusion.policyRevision(hardExclusionDetail.policy_revision)}
+                      </p>
+                      <strong>{catalog.hardExclusion.currentExclusions}</strong>
+                      {hardExclusionDetail.exclusions.length === 0 ? (
+                        <p>{catalog.hardExclusion.noExclusions}</p>
+                      ) : (
+                        <ul className="hard-exclusion-list">
+                          {hardExclusionDetail.exclusions.map((item) => (
+                            <li key={item.id}>
+                              <span>
+                                {item.entry_kind === 'folder'
+                                  ? catalog.hardExclusion.item.folder
+                                  : catalog.hardExclusion.item.file}
+                              </span>
+                              <code>{item.display_path}</code>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      <p className="settings-policy-limitation">
+                        {catalog.hardExclusion.removalUnavailable}
+                      </p>
+                    </>
+                  ) : null}
+                  {hardExclusionState.kind === 'preview' ||
+                  hardExclusionState.kind === 'confirming' ? (
+                    <section
+                      className="hard-exclusion-preview"
+                      aria-labelledby="hard-exclusion-preview-title"
+                    >
+                      <div aria-live="polite">
+                        {hardExclusionState.kind === 'confirming' ? (
+                          <p>{catalog.hardExclusion.confirming}</p>
+                        ) : null}
+                      </div>
+                      <h4 id="hard-exclusion-preview-title">
+                        {catalog.hardExclusion.previewHeading}
+                      </h4>
+                      <p>{catalog.hardExclusion.previewNotice}</p>
+                      <p>{catalog.hardExclusion.sourceSafe}</p>
+                      <ul className="hard-exclusion-list">
+                        {hardExclusionState.preview.items.map((item, index) => (
+                          <li key={`${item.display_path}-${index}`}>
+                            <span>
+                              {item.entry_kind === 'folder'
+                                ? catalog.hardExclusion.item.folder
+                                : catalog.hardExclusion.item.file}{' '}
+                              ·{' '}
+                              {item.disposition === 'will_add'
+                                ? catalog.hardExclusion.item.willAdd
+                                : item.disposition === 'already_excluded'
+                                  ? catalog.hardExclusion.item.alreadyExcluded
+                                  : catalog.hardExclusion.item.coveredByParent}
+                            </span>
+                            <code>{item.display_path}</code>
+                          </li>
+                        ))}
+                      </ul>
+                      <p>
+                        {catalog.hardExclusion.impact(
+                          hardExclusionState.preview.impact.location_count,
+                          hardExclusionState.preview.impact.content_chunk_count,
+                          hardExclusionState.preview.impact.graph_fact_count,
+                          hardExclusionState.preview.impact.derived_candidate_count,
+                          hardExclusionState.preview.impact.pending_job_count,
+                          hardExclusionState.preview.impact.blocking_action_count,
+                        )}
+                      </p>
+                      {hardExclusionState.kind === 'preview' ? (
+                        <>
+                          <div className="scope-form-row">
+                            <button
+                              type="button"
+                              disabled={!hardExclusionState.preview.confirmable}
+                              onClick={() => void confirmHardExclusion()}
+                            >
+                              {catalog.hardExclusion.confirm}
+                            </button>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={() => void cancelHardExclusionPreview()}
+                            >
+                              {catalog.hardExclusion.cancel}
+                            </button>
+                          </div>
+                          {!hardExclusionState.preview.confirmable ? (
+                            <p>{catalog.hardExclusion.notConfirmable}</p>
+                          ) : null}
+                        </>
+                      ) : null}
+                    </section>
+                  ) : null}
+                  {hardExclusionState.kind === 'cancelled' ? (
+                    <p role="status">
+                      {hardExclusionState.source === 'picker'
+                        ? catalog.hardExclusion.previewEmpty
+                        : catalog.hardExclusion.cancelled}
+                    </p>
+                  ) : null}
+                  {hardExclusionState.kind === 'success' ? (
+                    <p role="status">
+                      {hardExclusionState.message === 'committed'
+                        ? catalog.hardExclusion.committed(hardExclusionState.count)
+                        : catalog.hardExclusion.refreshFailed(hardExclusionState.count)}
+                    </p>
+                  ) : null}
+                  {hardExclusionState.kind === 'error' ? (
+                    <p role="alert">{catalog.hardExclusion.error}</p>
+                  ) : null}
+                </section>
               </section>
             ) : null}
           </div>

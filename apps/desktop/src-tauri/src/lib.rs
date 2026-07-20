@@ -1,16 +1,19 @@
 mod scope_access;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, MutexGuard, TryLockError,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use deskgraph_database::{CleanupActionSelection, ManifestDatabase};
+use deskgraph_database::{
+    CleanupActionSelection, ManifestDatabase, ScopeExclusionImpactPreview, ScopeExclusionKind,
+    ScopeExclusionWrite,
+};
 use deskgraph_domain::{
     ActionPlanPreview, ActionPlanSummary, AuthorizedScope, CleanupActionPlanPreview,
     CleanupSourceDetail, ExtractionJobProgress, ExtractionOperation, ExtractionStats, HealthReport,
@@ -33,9 +36,9 @@ use deskgraph_projects::{
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 use deskgraph_scanner::{
-    CoverageRootAuthorizationRequest, MAX_COVERAGE_ROOTS_PER_SELECTION,
+    CoverageRootAuthorizationRequest, MAX_COVERAGE_ROOTS_PER_SELECTION, ScopeExclusionSelection,
     authorize_coverage_roots_with_access_grants, comparison_key, create_scan_job, pause_scan_job,
-    resume_scan_job, run_scan_job_batch, validated_scope_root,
+    prepare_scope_exclusion_batch, resume_scan_job, run_scan_job_batch, validated_scope_root,
 };
 #[cfg(test)]
 use deskgraph_scanner::{
@@ -50,7 +53,7 @@ use deskgraph_watcher::{
     recent_watch_events_at as read_recent_watch_events_at,
 };
 use scope_access::{ActiveScopeAccess, prepare_selected_scope, restore_scope_access};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tracing::{error, info};
@@ -62,6 +65,9 @@ const WATCH_GATE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const FOREGROUND_SCAN_BATCH_SIZE: usize = 256;
 const WATCH_ADAPTER_NATIVE: &str = "native_with_periodic_reconciliation";
 const WATCH_ADAPTER_PERIODIC_ONLY: &str = "periodic_reconciliation_only";
+const MAX_PENDING_HARD_EXCLUSION_PREVIEWS: usize = 16;
+const HARD_EXCLUSION_PREVIEW_TTL_MS: i64 = 5 * 60 * 1_000;
+static HARD_EXCLUSION_PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct ManifestState {
     database_path: PathBuf,
@@ -71,6 +77,94 @@ struct ManifestState {
     watch_wake: SyncSender<()>,
     watch_thread: Mutex<Option<JoinHandle<()>>>,
     scope_accesses: Arc<Mutex<HashMap<i64, ActiveScopeAccess>>>,
+    hard_exclusion_previews: Mutex<HardExclusionPreviewRegistry>,
+}
+
+/// This is deliberately the only IPC-selectable kind. The WebView chooses a
+/// native picker mode, never a filesystem path; the scanner still validates
+/// the actual selected entry before it can reach the database.
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum HardExclusionEntryKind {
+    File,
+    Folder,
+}
+
+#[derive(Serialize)]
+struct CoveragePolicyDetailResponse {
+    api_version: &'static str,
+    scope_id: i64,
+    root_display_path: String,
+    policy_revision: i64,
+    exclusions: Vec<CoveragePolicyExclusionResponse>,
+}
+
+#[derive(Serialize)]
+struct CoveragePolicyExclusionResponse {
+    id: i64,
+    scope_id: i64,
+    display_path: String,
+    entry_kind: &'static str,
+    created_at_unix_ms: i64,
+}
+
+#[derive(Serialize)]
+struct HardExclusionPreviewResponse {
+    api_version: &'static str,
+    preview_id: String,
+    scope_id: i64,
+    base_policy_revision: i64,
+    expires_at_unix_ms: i64,
+    items: Vec<HardExclusionPreviewItemResponse>,
+    impact: HardExclusionImpactResponse,
+    confirmable: bool,
+    source_files_will_change: bool,
+}
+
+#[derive(Serialize)]
+struct HardExclusionPreviewItemResponse {
+    display_path: String,
+    entry_kind: &'static str,
+    disposition: &'static str,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct HardExclusionImpactResponse {
+    location_count: u64,
+    content_chunk_count: u64,
+    graph_fact_count: u64,
+    derived_candidate_count: u64,
+    pending_job_count: u64,
+    blocking_action_count: u64,
+}
+
+#[derive(Serialize)]
+struct HardExclusionCommitResponse {
+    api_version: &'static str,
+    scope_id: i64,
+    policy_revision: i64,
+    exclusions: u64,
+    purge: HardExclusionImpactResponse,
+    source_files_changed: bool,
+    automatic_scans_started: u64,
+    automatic_extractions_started: u64,
+}
+
+/// Path- and identity-bearing picker state never crosses IPC or ordinary
+/// logging. It exists only until a one-time Settings confirmation.
+struct PendingHardExclusionPreview {
+    scope_id: i64,
+    base_policy_revision: i64,
+    expires_at_unix_ms: i64,
+    expires_at: Instant,
+    entry_kind: HardExclusionEntryKind,
+    prepared: deskgraph_scanner::PreparedScopeExclusionBatch,
+}
+
+#[derive(Default)]
+struct HardExclusionPreviewRegistry {
+    entries: HashMap<String, PendingHardExclusionPreview>,
+    insertion_order: VecDeque<String>,
 }
 
 impl Drop for ManifestState {
@@ -160,6 +254,112 @@ fn lock_scope_accesses(
         .scope_accesses
         .lock()
         .map_err(|_| "scope_access_registry_poisoned".to_string())
+}
+
+fn lock_hard_exclusion_previews(
+    state: &ManifestState,
+) -> Result<MutexGuard<'_, HardExclusionPreviewRegistry>, String> {
+    state
+        .hard_exclusion_previews
+        .lock()
+        .map_err(|_| "hard_exclusion_preview_registry_poisoned".to_string())
+}
+
+fn hard_exclusion_now_unix_ms() -> Result<i64, String> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "hard_exclusion_clock_unavailable".to_string())?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| "hard_exclusion_clock_unavailable".to_string())
+}
+
+fn hard_exclusion_preview_id(now_unix_ms: i64) -> String {
+    let sequence = HARD_EXCLUSION_PREVIEW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    // This lookup token is opaque to the WebView and excludes path/identity
+    // data. It is deliberately not an authorization credential: confirmation
+    // consumes it once and still revalidates the active grant, policy revision,
+    // selected source identity/kind, and database transaction fence.
+    format!("hep-{:x}-{:x}", now_unix_ms, sequence)
+}
+
+impl HardExclusionPreviewRegistry {
+    fn discard_expired_at(&mut self, now: Instant) {
+        self.entries.retain(|_, preview| preview.expires_at > now);
+        self.insertion_order
+            .retain(|preview_id| self.entries.contains_key(preview_id));
+    }
+
+    fn insert_at(&mut self, preview: PendingHardExclusionPreview, now: Instant) -> String {
+        self.discard_expired_at(now);
+        while self.entries.len() >= MAX_PENDING_HARD_EXCLUSION_PREVIEWS {
+            let Some(expired_or_oldest) = self.insertion_order.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&expired_or_oldest);
+        }
+        let preview_id = hard_exclusion_preview_id(preview.expires_at_unix_ms);
+        self.insertion_order.push_back(preview_id.clone());
+        self.entries.insert(preview_id.clone(), preview);
+        preview_id
+    }
+
+    /// Confirmation consumes state before revalidation or database work. A
+    /// retry can therefore never turn a previously approved picker result into
+    /// a reusable filesystem capability.
+    fn take_for_confirmation_at(
+        &mut self,
+        preview_id: &str,
+        now: Instant,
+    ) -> Result<PendingHardExclusionPreview, &'static str> {
+        let preview = self
+            .entries
+            .remove(preview_id)
+            .ok_or("hard_exclusion_preview_not_found")?;
+        self.insertion_order.retain(|id| id != preview_id);
+        if preview.expires_at <= now {
+            return Err("hard_exclusion_preview_expired");
+        }
+        Ok(preview)
+    }
+
+    fn discard(&mut self, preview_id: &str) {
+        self.entries.remove(preview_id);
+        self.insertion_order.retain(|id| id != preview_id);
+    }
+}
+
+fn scope_exclusion_kind_name(kind: ScopeExclusionKind) -> &'static str {
+    match kind {
+        ScopeExclusionKind::File => "file",
+        ScopeExclusionKind::Folder => "folder",
+    }
+}
+
+fn map_hard_exclusion_impact(
+    impact: ScopeExclusionImpactPreview,
+) -> Result<HardExclusionImpactResponse, String> {
+    // Relations are derived candidates rather than graph facts. Action and
+    // Cleanup records are plans, likewise not candidates. Action safety
+    // records that cannot be removed under ADR-033 are reported separately.
+    let graph_fact_count = impact.edge_count;
+    let derived_candidate_count = [
+        impact.project_count,
+        impact.relation_count,
+        impact.screenshot_group_count,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, value| total.checked_add(value))
+    .ok_or("hard_exclusion_impact_out_of_range")?;
+    Ok(HardExclusionImpactResponse {
+        // Conservative location count also covers same-scope hard-link
+        // withholding; reporting only direct rows would understate the purge.
+        location_count: impact.conservative_location_count,
+        content_chunk_count: impact.content_chunk_count,
+        graph_fact_count,
+        derived_candidate_count,
+        pending_job_count: impact.pending_job_count,
+        blocking_action_count: impact.blocking_action_count,
+    })
 }
 
 fn require_active_scope(state: &ManifestState, scope_id: i64) -> Result<(), String> {
@@ -270,6 +470,7 @@ fn start_manifest_state_with_accesses(
         watch_wake,
         watch_thread: Mutex::new(watch_thread),
         scope_accesses,
+        hard_exclusion_previews: Mutex::new(HardExclusionPreviewRegistry::default()),
     }
 }
 
@@ -545,6 +746,290 @@ fn authorized_scopes(state: State<'_, ManifestState>) -> Result<Vec<AuthorizedSc
                 .collect()
         })
         .map_err(str::to_string)
+}
+
+/// Settings-only coverage inspection. It deliberately returns the current
+/// root, durable revision, and explicit exclusions, but accepts no path from
+/// the WebView.
+#[tauri::command]
+fn coverage_policy_detail(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+) -> Result<CoveragePolicyDetailResponse, String> {
+    require_active_scope(&state, scope_id)?;
+    let _database_guard = lock_database(&state)?;
+    let database = ManifestDatabase::open(&state.database_path).map_err(|error| error.code())?;
+    let binding = database
+        .bind_scope_policy_revision(scope_id)
+        .map_err(|error| error.code())?;
+    let scope = database
+        .scope_record(scope_id)
+        .map_err(|error| error.code())?;
+    let exclusions = database
+        .scope_exclusions(scope_id)
+        .map_err(|error| error.code())?
+        .into_iter()
+        .map(|exclusion| CoveragePolicyExclusionResponse {
+            id: exclusion.id,
+            scope_id: exclusion.scope_id,
+            display_path: exclusion.display_path,
+            entry_kind: scope_exclusion_kind_name(exclusion.kind),
+            created_at_unix_ms: exclusion.created_at_unix_ms,
+        })
+        .collect();
+    Ok(CoveragePolicyDetailResponse {
+        api_version: "deskgraph.coverage-policy.v1",
+        scope_id,
+        root_display_path: scope.display_path,
+        policy_revision: binding.revision,
+        exclusions,
+    })
+}
+
+/// Opens a native multi-file or multi-folder picker. The selected paths remain
+/// in this process, are revalidated by the scanner, and are never command
+/// arguments or response identifiers.
+#[tauri::command]
+async fn select_hard_exclusions_preview(
+    app: AppHandle,
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    entry_kind: HardExclusionEntryKind,
+) -> Result<Option<HardExclusionPreviewResponse>, String> {
+    require_active_scope(&state, scope_id)?;
+    let selected = match entry_kind {
+        HardExclusionEntryKind::File => app.dialog().file().blocking_pick_files(),
+        HardExclusionEntryKind::Folder => app.dialog().file().blocking_pick_folders(),
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let selected_paths = selected
+        .into_iter()
+        .map(|entry| {
+            entry
+                .into_path()
+                .map_err(|_| "hard_exclusion_selection_invalid".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    select_hard_exclusions_preview_from_native_paths(&state, scope_id, entry_kind, &selected_paths)
+        .map(Some)
+}
+
+fn select_hard_exclusions_preview_from_native_paths(
+    state: &ManifestState,
+    scope_id: i64,
+    entry_kind: HardExclusionEntryKind,
+    selected_paths: &[PathBuf],
+) -> Result<HardExclusionPreviewResponse, String> {
+    require_active_scope(state, scope_id)?;
+    let now_unix_ms = hard_exclusion_now_unix_ms()?;
+    let expires_at_unix_ms = now_unix_ms
+        .checked_add(HARD_EXCLUSION_PREVIEW_TTL_MS)
+        .ok_or("hard_exclusion_clock_unavailable")?;
+    let expires_at = Instant::now()
+        .checked_add(Duration::from_millis(HARD_EXCLUSION_PREVIEW_TTL_MS as u64))
+        .ok_or("hard_exclusion_clock_unavailable")?;
+    let _database_guard = lock_database(state)?;
+    let mut database =
+        ManifestDatabase::open(&state.database_path).map_err(|error| error.code())?;
+    let binding = database
+        .bind_scope_policy_revision(scope_id)
+        .map_err(|error| error.code())?;
+    let selections = selected_paths
+        .iter()
+        .map(|path| ScopeExclusionSelection {
+            requested_path: path.as_path(),
+        })
+        .collect::<Vec<_>>();
+    let prepared = prepare_scope_exclusion_batch(&database, scope_id, &selections)
+        .map_err(|error| error.code().to_string())?;
+    if prepared
+        .exclusions
+        .iter()
+        .any(|exclusion| !hard_exclusion_kind_matches(entry_kind, exclusion.kind))
+    {
+        return Err("hard_exclusion_selection_kind_changed".to_string());
+    }
+    let writes = prepared
+        .exclusions
+        .iter()
+        .map(|exclusion| ScopeExclusionWrite {
+            kind: exclusion.kind,
+            path_raw: &exclusion.path_raw,
+            path_key: &exclusion.path_key,
+            display_path: &exclusion.display_path,
+            identity_kind: &exclusion.identity_kind,
+            identity_key: &exclusion.identity_key,
+        })
+        .collect::<Vec<_>>();
+    let impact = database
+        .preview_scope_exclusion_batch(binding, &writes)
+        .map_err(|error| error.code().to_string())?;
+    let impact = map_hard_exclusion_impact(impact)?;
+    let confirmable = impact.blocking_action_count == 0;
+    let items = prepared
+        .exclusions
+        .iter()
+        .map(|exclusion| HardExclusionPreviewItemResponse {
+            display_path: exclusion.display_path.clone(),
+            entry_kind: scope_exclusion_kind_name(exclusion.kind),
+            disposition: "will_add",
+        })
+        .collect();
+    let pending = PendingHardExclusionPreview {
+        scope_id,
+        base_policy_revision: binding.revision,
+        expires_at_unix_ms,
+        expires_at,
+        entry_kind,
+        prepared,
+    };
+    let preview_id = lock_hard_exclusion_previews(state)?.insert_at(pending, Instant::now());
+    Ok(HardExclusionPreviewResponse {
+        api_version: "deskgraph.hard-exclusion-preview.v1",
+        preview_id,
+        scope_id,
+        base_policy_revision: binding.revision,
+        expires_at_unix_ms,
+        items,
+        impact,
+        confirmable,
+        source_files_will_change: false,
+    })
+}
+
+#[tauri::command]
+fn confirm_hard_exclusion_preview(
+    state: State<'_, ManifestState>,
+    preview_id: String,
+) -> Result<HardExclusionCommitResponse, String> {
+    confirm_hard_exclusion_preview_for_state(&state, preview_id)
+}
+
+fn confirm_hard_exclusion_preview_for_state(
+    state: &ManifestState,
+    preview_id: String,
+) -> Result<HardExclusionCommitResponse, String> {
+    if preview_id.is_empty() || preview_id.len() > 128 {
+        return Err("hard_exclusion_preview_not_found".to_string());
+    }
+    let now_unix_ms = hard_exclusion_now_unix_ms()?;
+    let pending = lock_hard_exclusion_previews(state)?
+        .take_for_confirmation_at(&preview_id, Instant::now())
+        .map_err(str::to_string)?;
+    require_active_scope(state, pending.scope_id)?;
+    let _database_guard = lock_database(state)?;
+    let mut database =
+        ManifestDatabase::open(&state.database_path).map_err(|error| error.code())?;
+    let binding = database
+        .bind_scope_policy_revision(pending.scope_id)
+        .map_err(|error| error.code())?;
+    if binding.revision != pending.base_policy_revision {
+        return Err("scope_policy_changed".to_string());
+    }
+    let selections = pending
+        .prepared
+        .exclusions
+        .iter()
+        .map(|exclusion| ScopeExclusionSelection {
+            requested_path: exclusion.resolved_path.as_path(),
+        })
+        .collect::<Vec<_>>();
+    let revalidated = prepare_scope_exclusion_batch(&database, pending.scope_id, &selections)
+        .map_err(|error| error.code().to_string())?;
+    if revalidated.exclusions.len() != pending.prepared.exclusions.len()
+        || revalidated
+            .exclusions
+            .iter()
+            .zip(&pending.prepared.exclusions)
+            .any(|(current, expected)| !same_prepared_hard_exclusion(current, expected))
+        || revalidated
+            .exclusions
+            .iter()
+            .any(|exclusion| !hard_exclusion_kind_matches(pending.entry_kind, exclusion.kind))
+    {
+        return Err("hard_exclusion_selection_changed".to_string());
+    }
+    let writes = revalidated
+        .exclusions
+        .iter()
+        .map(|exclusion| ScopeExclusionWrite {
+            kind: exclusion.kind,
+            path_raw: &exclusion.path_raw,
+            path_key: &exclusion.path_key,
+            display_path: &exclusion.display_path,
+            identity_kind: &exclusion.identity_kind,
+            identity_key: &exclusion.identity_key,
+        })
+        .collect::<Vec<_>>();
+    // `apply_scope_exclusion_batch` repeats policy binding and blocker checks
+    // inside its BEGIN IMMEDIATE transaction; this is the authoritative race
+    // fence, not the advisory preview above.
+    let applied = database
+        .apply_scope_exclusion_batch(binding, &writes, now_unix_ms)
+        .map_err(|error| error.code().to_string())?;
+    let purge = map_hard_exclusion_impact(applied.purged)?;
+    let response = HardExclusionCommitResponse {
+        api_version: "deskgraph.hard-exclusion-commit.v1",
+        scope_id: applied.policy.scope_id,
+        policy_revision: applied.policy.revision,
+        exclusions: applied.receipt.exclusions_added,
+        purge,
+        source_files_changed: false,
+        automatic_scans_started: 0,
+        automatic_extractions_started: 0,
+    };
+    drop(_database_guard);
+    // Do not wake the ordinary Watch coordinator here: its wake signal can
+    // enter a general reconciliation cycle, which would contradict this IPC
+    // contract's explicit zero automatic scans/extractions. The committed
+    // policy revision is already a durable fail-closed fence; Watch observes
+    // it on its normal cycle without treating this policy change as a scan.
+    info!(
+        event = "hard_exclusion_policy_applied",
+        scope_id = response.scope_id,
+        policy_revision = response.policy_revision,
+        exclusion_count = response.exclusions,
+        source_files_changed = false,
+        automatic_scans_started = 0_u64,
+        automatic_extractions_started = 0_u64
+    );
+    Ok(response)
+}
+
+#[tauri::command]
+fn discard_hard_exclusion_preview(
+    state: State<'_, ManifestState>,
+    preview_id: String,
+) -> Result<(), String> {
+    if preview_id.len() <= 128 {
+        lock_hard_exclusion_previews(&state)?.discard(&preview_id);
+    }
+    Ok(())
+}
+
+fn hard_exclusion_kind_matches(
+    entry_kind: HardExclusionEntryKind,
+    prepared_kind: ScopeExclusionKind,
+) -> bool {
+    matches!(
+        (entry_kind, prepared_kind),
+        (HardExclusionEntryKind::File, ScopeExclusionKind::File)
+            | (HardExclusionEntryKind::Folder, ScopeExclusionKind::Folder)
+    )
+}
+
+fn same_prepared_hard_exclusion(
+    current: &deskgraph_scanner::PreparedScopeExclusion,
+    expected: &deskgraph_scanner::PreparedScopeExclusion,
+) -> bool {
+    current.resolved_path == expected.resolved_path
+        && current.path_raw == expected.path_raw
+        && current.path_key == expected.path_key
+        && current.kind == expected.kind
+        && current.identity_kind == expected.identity_kind
+        && current.identity_key == expected.identity_key
 }
 
 #[tauri::command]
@@ -1539,7 +2024,11 @@ pub fn run() {
             health,
             manifest_status,
             authorized_scopes,
+            coverage_policy_detail,
             select_and_authorize_scopes,
+            select_hard_exclusions_preview,
+            confirm_hard_exclusion_preview,
+            discard_hard_exclusion_preview,
             create_manifest_scan,
             run_manifest_scan,
             scan_job_status,
@@ -2769,8 +3258,13 @@ mod tests {
         std::fs::write(&source_path, private_text).expect("file should create");
 
         initialize_manifest(&database_path).expect("manifest should initialize");
-        let scope =
-            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &scope_path,
+            std::env::consts::OS,
+            b"search-helper-test-grant",
+        )
+        .expect("scope should authorize with an active grant");
         let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
         run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
         let database = ManifestDatabase::open(&database_path).expect("database should open");
@@ -2826,8 +3320,13 @@ mod tests {
         std::fs::create_dir(&scope_path).expect("scope should create");
         std::fs::write(&source_path, "private action text").expect("file should create");
         initialize_manifest(&database_path).expect("manifest should initialize");
-        let scope =
-            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &scope_path,
+            std::env::consts::OS,
+            b"rename-preview-helper-test-grant",
+        )
+        .expect("scope should authorize with an active grant");
         let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
         run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
 
@@ -2887,5 +3386,209 @@ mod tests {
         assert!(!payload.contains("private-watch.md"));
         assert!(!payload.contains("private watch text"));
         assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
+    }
+
+    fn pending_hard_exclusion_preview(
+        expires_at_unix_ms: i64,
+        expires_at: Instant,
+    ) -> PendingHardExclusionPreview {
+        PendingHardExclusionPreview {
+            scope_id: 1,
+            base_policy_revision: 1,
+            expires_at_unix_ms,
+            expires_at,
+            entry_kind: HardExclusionEntryKind::File,
+            prepared: deskgraph_scanner::PreparedScopeExclusionBatch {
+                scope_id: 1,
+                exclusions: vec![deskgraph_scanner::PreparedScopeExclusion {
+                    resolved_path: PathBuf::from("/native-only-picker-state"),
+                    display_path: "/native-only-picker-state".to_string(),
+                    path_raw: b"/native-only-picker-state".to_vec(),
+                    path_key: "/native-only-picker-state".to_string(),
+                    kind: ScopeExclusionKind::File,
+                    identity_kind: "test".to_string(),
+                    identity_key: b"identity".to_vec(),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn hard_exclusion_preview_registry_is_bounded_expiring_and_one_time() {
+        let now = Instant::now();
+        let display_expiry = 10_001_i64;
+        let mut registry = HardExclusionPreviewRegistry::default();
+        let preview_id = registry.insert_at(
+            pending_hard_exclusion_preview(display_expiry, now + Duration::from_millis(1)),
+            now,
+        );
+        assert!(registry.take_for_confirmation_at(&preview_id, now).is_ok());
+        assert_eq!(
+            registry
+                .take_for_confirmation_at(&preview_id, now)
+                .err()
+                .expect("a confirmation must consume the preview"),
+            "hard_exclusion_preview_not_found"
+        );
+
+        let expired_id =
+            registry.insert_at(pending_hard_exclusion_preview(display_expiry, now), now);
+        assert_eq!(
+            registry
+                .take_for_confirmation_at(&expired_id, now)
+                .err()
+                .expect("expired preview must not be confirmable"),
+            "hard_exclusion_preview_expired"
+        );
+
+        let first_id = registry.insert_at(
+            pending_hard_exclusion_preview(display_expiry, now + Duration::from_secs(1)),
+            now,
+        );
+        for offset in 1..=MAX_PENDING_HARD_EXCLUSION_PREVIEWS {
+            registry.insert_at(
+                pending_hard_exclusion_preview(
+                    display_expiry + offset as i64,
+                    now + Duration::from_secs(1 + offset as u64),
+                ),
+                now,
+            );
+        }
+        assert_eq!(registry.entries.len(), MAX_PENDING_HARD_EXCLUSION_PREVIEWS);
+        assert_eq!(
+            registry
+                .take_for_confirmation_at(&first_id, now)
+                .err()
+                .expect("oldest preview must be evicted at the fixed bound"),
+            "hard_exclusion_preview_not_found"
+        );
+
+        registry.discard("unknown-preview");
+        let discard_id = registry.insert_at(
+            pending_hard_exclusion_preview(display_expiry, now + Duration::from_secs(2)),
+            now,
+        );
+        registry.discard(&discard_id);
+        registry.discard(&discard_id);
+        assert!(
+            !registry.entries.contains_key(&discard_id),
+            "discard must remain idempotent after a preview is gone"
+        );
+    }
+
+    #[test]
+    fn hard_exclusion_commit_serializes_without_native_picker_paths() {
+        let source_marker = "native-picker-path-must-not-cross-ipc";
+        let commit = HardExclusionCommitResponse {
+            api_version: "deskgraph.hard-exclusion-commit.v1",
+            scope_id: 7,
+            policy_revision: 3,
+            exclusions: 1,
+            purge: HardExclusionImpactResponse {
+                location_count: 2,
+                content_chunk_count: 3,
+                graph_fact_count: 4,
+                derived_candidate_count: 5,
+                pending_job_count: 6,
+                blocking_action_count: 0,
+            },
+            source_files_changed: false,
+            automatic_scans_started: 0,
+            automatic_extractions_started: 0,
+        };
+        let payload = serde_json::to_string(&commit).expect("commit response should serialize");
+        assert!(payload.contains("deskgraph.hard-exclusion-commit.v1"));
+        assert!(!payload.contains(source_marker));
+        assert!(!payload.contains("native-only-picker-state"));
+        assert!(!payload.contains("identity"));
+    }
+
+    #[test]
+    fn hard_exclusion_impact_keeps_facts_candidates_and_plans_distinct() {
+        let response = map_hard_exclusion_impact(ScopeExclusionImpactPreview {
+            edge_count: 2,
+            project_count: 3,
+            relation_count: 5,
+            screenshot_group_count: 7,
+            action_plan_count: 11,
+            cleanup_action_plan_count: 13,
+            blocking_action_count: 17,
+            ..ScopeExclusionImpactPreview::default()
+        })
+        .expect("bounded impact should map");
+
+        assert_eq!(response.graph_fact_count, 2);
+        assert_eq!(response.derived_candidate_count, 15);
+        assert_eq!(response.blocking_action_count, 17);
+    }
+
+    #[test]
+    fn live_hard_exclusion_purges_derived_data_without_changing_the_source() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-coverage");
+        let excluded_folder = scope_path.join("excluded-folder");
+        let source_path = excluded_folder.join("private-derived.md");
+        std::fs::create_dir_all(&excluded_folder).expect("fixture folder should create");
+        std::fs::write(&source_path, "source must remain on disk")
+            .expect("fixture file should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+
+        let prepared_access = prepare_selected_scope(&scope_path).expect("scope should prepare");
+        let requests = [CoverageRootAuthorizationRequest {
+            requested_path: &prepared_access.resolved_path,
+            grant_platform: prepared_access.platform,
+            opaque_grant: &prepared_access.opaque_grant,
+        }];
+        let scopes = authorize_coverage_roots_with_access_grants_at(&database_path, &requests)
+            .expect("scope and grant should persist");
+        let scope = scopes
+            .into_iter()
+            .next()
+            .expect("one scope should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared_access.access);
+        let state = start_manifest_state_with_accesses(database_path.clone(), accesses);
+
+        let preview = select_hard_exclusions_preview_from_native_paths(
+            &state,
+            scope.id,
+            HardExclusionEntryKind::Folder,
+            std::slice::from_ref(&excluded_folder),
+        )
+        .expect("native selection should prepare a hard-exclusion preview");
+        assert!(preview.confirmable);
+        assert!(!preview.source_files_will_change);
+        let commit = confirm_hard_exclusion_preview_for_state(&state, preview.preview_id)
+            .expect("confirmed policy should apply atomically");
+        assert_eq!(commit.exclusions, 1);
+        assert!(!commit.source_files_changed);
+        assert_eq!(commit.automatic_scans_started, 0);
+        assert_eq!(commit.automatic_extractions_started, 0);
+        assert!(
+            source_path.exists(),
+            "a policy purge must never remove the source file"
+        );
+
+        let database = ManifestDatabase::open(&database_path).expect("database should open");
+        assert_eq!(
+            database
+                .scope_exclusions(scope.id)
+                .expect("exclusions should load")
+                .len(),
+            1
+        );
+        let source_key = comparison_key(
+            &std::fs::canonicalize(&source_path).expect("source should canonicalize after purge"),
+        );
+        assert!(
+            database
+                .node_id_for_path_key(scope.id, &source_key)
+                .expect("node lookup should succeed")
+                .is_none(),
+            "derived manifest data below an exclusion must be purged"
+        );
     }
 }

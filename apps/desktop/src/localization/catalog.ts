@@ -333,6 +333,47 @@ export type Catalog = {
       stopped: string;
     };
   };
+  hardExclusion: {
+    kicker: string;
+    heading: string;
+    description: string;
+    scopeLabel: string;
+    chooseScope: string;
+    loading: string;
+    policyRevision: (revision: number) => string;
+    addFolders: string;
+    addFiles: string;
+    noExclusions: string;
+    currentExclusions: string;
+    removalUnavailable: string;
+    previewHeading: string;
+    previewNotice: string;
+    previewEmpty: string;
+    notConfirmable: string;
+    item: {
+      willAdd: string;
+      alreadyExcluded: string;
+      coveredByParent: string;
+      file: string;
+      folder: string;
+    };
+    impact: (
+      locations: number,
+      content: number,
+      graph: number,
+      candidates: number,
+      jobs: number,
+      actions: number,
+    ) => string;
+    confirm: string;
+    confirming: string;
+    cancel: string;
+    cancelled: string;
+    committed: (count: number) => string;
+    refreshFailed: (count: number) => string;
+    error: string;
+    sourceSafe: string;
+  };
   footer: { version: (version: string) => string; description: string };
 };
 

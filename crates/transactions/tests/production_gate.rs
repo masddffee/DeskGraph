@@ -34,6 +34,13 @@ fn production_action_apis_fail_closed_before_database_or_filesystem_side_effects
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
     let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
     scan_scope(&mut database, scope.id).expect("scope should scan");
+    database
+        .upsert_scope_access_grant(
+            scope.id,
+            std::env::consts::OS,
+            b"production-gate-active-grant",
+        )
+        .expect("scope should retain an active runtime grant");
     drop(database);
 
     let preview = create_rename_preview_at(&database_path, scope.id, &source_path, "Final.txt")

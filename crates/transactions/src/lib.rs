@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use deskgraph_database::{
     ActionCommandWrite, ActionExecutionPlan, ActionExecutionSourceRecord, ActionJournalAppend,
     ActionPlanWrite, ActionSourceRecord, CleanupActionPlanWrite, CleanupActionSelection,
-    CleanupKeeperBindingWrite, DatabaseError, ManifestDatabase,
+    CleanupKeeperBindingWrite, DatabaseError, ManifestDatabase, ScopeExclusionMatcher,
+    ScopePolicyBinding,
 };
 use deskgraph_domain::{
     ActionCommandKind, ActionExecutionRecord, ActionExecutionStrategy, ActionJournalEventKind,
@@ -67,6 +68,7 @@ pub enum TransactionError {
     ExecutionStrategyUnsupported,
     ExecutionPathInvalid,
     ActionNeedsAttention,
+    ScopePolicyChanged,
     Binding(ActionBindingError),
     Platform(PlatformRenameError),
 }
@@ -99,6 +101,7 @@ impl TransactionError {
             Self::ExecutionStrategyUnsupported => "action_execution_strategy_unsupported",
             Self::ExecutionPathInvalid => "action_execution_path_invalid",
             Self::ActionNeedsAttention => "action_needs_attention",
+            Self::ScopePolicyChanged => "scope_policy_changed",
             Self::Binding(error) => error.code(),
             Self::Platform(error) => error.code(),
         }
@@ -182,10 +185,12 @@ pub fn create_rename_preview(
     source_path: &Path,
     new_name: &str,
 ) -> Result<ActionPlanPreview, TransactionError> {
+    let (policy_binding, exclusion_matcher) = bind_transaction_scope_policy(database, scope_id)?;
     validate_portable_name(new_name)?;
     if !source_path.is_absolute() {
         return Err(TransactionError::SourcePathMustBeAbsolute);
     }
+    ensure_transaction_path_not_excluded(&exclusion_matcher, source_path)?;
     let canonical_root = validated_scope_root(database, scope_id)?;
     let source_link_metadata = fs::symlink_metadata(source_path).map_err(map_source_error)?;
     if is_symlink_or_reparse_point(&source_link_metadata) {
@@ -198,6 +203,7 @@ pub fn create_rename_preview(
     if canonical_source == canonical_root || !canonical_source.starts_with(&canonical_root) {
         return Err(TransactionError::SourceOutsideScope);
     }
+    ensure_transaction_path_not_excluded(&exclusion_matcher, &canonical_source)?;
     if canonical_source.file_name() == Some(OsStr::new(new_name)) {
         return Err(TransactionError::RenameNoOp);
     }
@@ -221,12 +227,14 @@ pub fn create_rename_preview(
     if canonical_parent != parent || !canonical_parent.starts_with(&canonical_root) {
         return Err(TransactionError::DestinationOutsideScope);
     }
+    ensure_transaction_path_not_excluded(&exclusion_matcher, &canonical_parent)?;
     let destination = canonical_parent.join(new_name);
     if destination.parent() != Some(canonical_parent.as_path())
         || !destination.starts_with(&canonical_root)
     {
         return Err(TransactionError::DestinationOutsideScope);
     }
+    ensure_transaction_path_not_excluded(&exclusion_matcher, &destination)?;
     let execution_strategy = destination_strategy(&canonical_source, &destination, source)?;
     let live = create_preview_live_binding(
         &canonical_root,
@@ -236,30 +244,35 @@ pub fn create_rename_preview(
         execution_strategy,
     )?;
 
-    database
-        .create_rename_action_plan(ActionPlanWrite {
-            scope_id,
-            node_id: source.node_id,
-            source_location_id: source.location_id,
-            source_path_raw: &path_to_raw(&canonical_source),
-            source_path_key: &comparison_key(&canonical_source),
-            source_display_path: &canonical_source.to_string_lossy(),
-            destination_path_raw: &path_to_raw(&destination),
-            destination_path_key: &comparison_key(&destination),
-            destination_display_path: &destination.to_string_lossy(),
-            source_identity_kind: &source.identity_kind,
-            source_identity_key: &source.identity_key,
-            source_size_bytes: source.size_bytes,
-            source_modified_unix_ns: source.modified_unix_ns,
-            source_sha256: &live.source_sha256,
-            source_hash_bytes: live.source_hash_bytes,
-            scope_root_identity_kind: &live.scope_root_identity_kind,
-            scope_root_identity_key: &live.scope_root_identity_key,
-            parent_identity_kind: &live.parent_identity_kind,
-            parent_identity_key: &live.parent_identity_key,
-            execution_strategy,
-        })
-        .map_err(Into::into)
+    let preview = database
+        .create_rename_action_plan_with_policy(
+            policy_binding,
+            ActionPlanWrite {
+                scope_id,
+                node_id: source.node_id,
+                source_location_id: source.location_id,
+                source_path_raw: &path_to_raw(&canonical_source),
+                source_path_key: &comparison_key(&canonical_source),
+                source_display_path: &canonical_source.to_string_lossy(),
+                destination_path_raw: &path_to_raw(&destination),
+                destination_path_key: &comparison_key(&destination),
+                destination_display_path: &destination.to_string_lossy(),
+                source_identity_kind: &source.identity_kind,
+                source_identity_key: &source.identity_key,
+                source_size_bytes: source.size_bytes,
+                source_modified_unix_ns: source.modified_unix_ns,
+                source_sha256: &live.source_sha256,
+                source_hash_bytes: live.source_hash_bytes,
+                scope_root_identity_kind: &live.scope_root_identity_kind,
+                scope_root_identity_key: &live.scope_root_identity_key,
+                parent_identity_kind: &live.parent_identity_kind,
+                parent_identity_key: &live.parent_identity_key,
+                execution_strategy,
+            },
+        )
+        .map_err(TransactionError::from)?;
+    assert_transaction_scope_policy_current(database, policy_binding)?;
+    Ok(preview)
 }
 
 pub fn create_cleanup_preview_at(
@@ -277,6 +290,8 @@ pub fn create_cleanup_preview(
     database: &mut ManifestDatabase,
     selection: CleanupActionSelection,
 ) -> Result<CleanupActionPlanPreview, TransactionError> {
+    let (policy_binding, exclusion_matcher) =
+        bind_transaction_scope_policy(database, selection.scope_id)?;
     let (execution_source, keeper_execution_source) = database.cleanup_action_sources(selection)?;
     let source = &execution_source.source;
     let canonical_root = validated_scope_root(database, selection.scope_id)?;
@@ -285,6 +300,7 @@ pub fn create_cleanup_preview(
     if !source_path.is_absolute() {
         return Err(TransactionError::SourcePathMustBeAbsolute);
     }
+    ensure_transaction_path_not_excluded(&exclusion_matcher, &source_path)?;
     let source_link_metadata = fs::symlink_metadata(&source_path).map_err(map_source_error)?;
     if is_symlink_or_reparse_point(&source_link_metadata) {
         return Err(TransactionError::SourceSymlinkOrReparseDenied);
@@ -296,13 +312,14 @@ pub fn create_cleanup_preview(
     if canonical_source == canonical_root || !canonical_source.starts_with(&canonical_root) {
         return Err(TransactionError::SourceOutsideScope);
     }
+    ensure_transaction_path_not_excluded(&exclusion_matcher, &canonical_source)?;
     if comparison_key(&canonical_source) != source.path_key {
         return Err(TransactionError::SourceSymlinkOrReparseDenied);
     }
     validate_source_snapshot(&canonical_source, source, &source_link_metadata)?;
     let keeper_path = keeper_execution_source
         .as_ref()
-        .map(|keeper| cleanup_peer_path(&canonical_root, &keeper.source))
+        .map(|keeper| cleanup_peer_path(&canonical_root, &exclusion_matcher, &keeper.source))
         .transpose()?;
     let binding = create_cleanup_live_binding(
         &canonical_root,
@@ -312,42 +329,82 @@ pub fn create_cleanup_preview(
         keeper_execution_source.as_ref(),
         selection.source_kind,
     )?;
-    database
-        .create_cleanup_action_plan(CleanupActionPlanWrite {
-            selection,
-            target_location_id: source.location_id,
-            target_identity_kind: &source.identity_kind,
-            target_identity_key: &source.identity_key,
-            target_size_bytes: source.size_bytes,
-            target_modified_unix_ns: source.modified_unix_ns,
-            target_sha256: &binding.target.source_sha256,
-            target_hash_bytes: binding.target.source_hash_bytes,
-            keeper: keeper_execution_source
-                .as_ref()
-                .zip(binding.keeper.as_ref())
-                .map(|(keeper, binding)| CleanupKeeperBindingWrite {
-                    location_id: keeper.source.location_id,
-                    identity_kind: &keeper.source.identity_kind,
-                    identity_key: &keeper.source.identity_key,
-                    size_bytes: keeper.source.size_bytes,
-                    modified_unix_ns: keeper.source.modified_unix_ns,
-                    sha256: &binding.source_sha256,
-                    hash_bytes: binding.source_hash_bytes,
-                    scope_root_node_id: keeper.scope_root_node_id,
-                    scope_root_identity_kind: &binding.scope_root_identity_kind,
-                    scope_root_identity_key: &binding.scope_root_identity_key,
-                    parent_node_id: keeper.parent_node_id,
-                    parent_identity_kind: &binding.parent_identity_kind,
-                    parent_identity_key: &binding.parent_identity_key,
-                }),
-            scope_root_node_id: execution_source.scope_root_node_id,
-            scope_root_identity_kind: &binding.target.scope_root_identity_kind,
-            scope_root_identity_key: &binding.target.scope_root_identity_key,
-            parent_node_id: execution_source.parent_node_id,
-            parent_identity_kind: &binding.target.parent_identity_kind,
-            parent_identity_key: &binding.target.parent_identity_key,
-        })
-        .map_err(Into::into)
+    let preview = database
+        .create_cleanup_action_plan_with_policy(
+            policy_binding,
+            CleanupActionPlanWrite {
+                selection,
+                target_location_id: source.location_id,
+                target_identity_kind: &source.identity_kind,
+                target_identity_key: &source.identity_key,
+                target_size_bytes: source.size_bytes,
+                target_modified_unix_ns: source.modified_unix_ns,
+                target_sha256: &binding.target.source_sha256,
+                target_hash_bytes: binding.target.source_hash_bytes,
+                keeper: keeper_execution_source
+                    .as_ref()
+                    .zip(binding.keeper.as_ref())
+                    .map(|(keeper, binding)| CleanupKeeperBindingWrite {
+                        location_id: keeper.source.location_id,
+                        identity_kind: &keeper.source.identity_kind,
+                        identity_key: &keeper.source.identity_key,
+                        size_bytes: keeper.source.size_bytes,
+                        modified_unix_ns: keeper.source.modified_unix_ns,
+                        sha256: &binding.source_sha256,
+                        hash_bytes: binding.source_hash_bytes,
+                        scope_root_node_id: keeper.scope_root_node_id,
+                        scope_root_identity_kind: &binding.scope_root_identity_kind,
+                        scope_root_identity_key: &binding.scope_root_identity_key,
+                        parent_node_id: keeper.parent_node_id,
+                        parent_identity_kind: &binding.parent_identity_kind,
+                        parent_identity_key: &binding.parent_identity_key,
+                    }),
+                scope_root_node_id: execution_source.scope_root_node_id,
+                scope_root_identity_kind: &binding.target.scope_root_identity_kind,
+                scope_root_identity_key: &binding.target.scope_root_identity_key,
+                parent_node_id: execution_source.parent_node_id,
+                parent_identity_kind: &binding.target.parent_identity_kind,
+                parent_identity_key: &binding.target.parent_identity_key,
+            },
+        )
+        .map_err(TransactionError::from)?;
+    assert_transaction_scope_policy_current(database, policy_binding)?;
+    Ok(preview)
+}
+
+fn bind_transaction_scope_policy(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<(ScopePolicyBinding, ScopeExclusionMatcher), TransactionError> {
+    let binding = database.bind_scope_policy_revision(scope_id)?;
+    let matcher = database.scope_exclusion_matcher(scope_id)?;
+    if matcher.revision == binding.revision && database.is_scope_policy_binding_current(binding)? {
+        Ok((binding, matcher))
+    } else {
+        Err(TransactionError::ScopePolicyChanged)
+    }
+}
+
+fn ensure_transaction_path_not_excluded(
+    matcher: &ScopeExclusionMatcher,
+    path: &Path,
+) -> Result<(), TransactionError> {
+    if matcher.is_excluded_path_key(&comparison_key(path)) {
+        Err(TransactionError::ScopePolicyChanged)
+    } else {
+        Ok(())
+    }
+}
+
+fn assert_transaction_scope_policy_current(
+    database: &ManifestDatabase,
+    binding: ScopePolicyBinding,
+) -> Result<(), TransactionError> {
+    if database.is_scope_policy_binding_current(binding)? {
+        Ok(())
+    } else {
+        Err(TransactionError::ScopePolicyChanged)
+    }
 }
 
 pub fn action_plan_at(
@@ -1054,6 +1111,7 @@ fn create_preview_live_binding(
 
 fn cleanup_peer_path(
     canonical_root: &Path,
+    exclusion_matcher: &ScopeExclusionMatcher,
     source: &ActionSourceRecord,
 ) -> Result<PathBuf, TransactionError> {
     let path =
@@ -1061,6 +1119,7 @@ fn cleanup_peer_path(
     if !path.is_absolute() {
         return Err(TransactionError::SourcePathMustBeAbsolute);
     }
+    ensure_transaction_path_not_excluded(exclusion_matcher, &path)?;
     let link_metadata = fs::symlink_metadata(&path).map_err(map_source_error)?;
     if is_symlink_or_reparse_point(&link_metadata) {
         return Err(TransactionError::SourceSymlinkOrReparseDenied);
@@ -1072,6 +1131,7 @@ fn cleanup_peer_path(
     if canonical == canonical_root || !canonical.starts_with(canonical_root) {
         return Err(TransactionError::SourceOutsideScope);
     }
+    ensure_transaction_path_not_excluded(exclusion_matcher, &canonical)?;
     if comparison_key(&canonical) != source.path_key {
         return Err(TransactionError::SourceSymlinkOrReparseDenied);
     }
@@ -1562,11 +1622,14 @@ fn map_source_error(_error: std::io::Error) -> TransactionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deskgraph_database::ScopeExclusionWrite;
     use deskgraph_domain::{
         ActionJournalEventKind, ActionOperation, ActionPlanState, ActionPolicyDecision,
         CleanupActionOperation, CleanupActionPlanState, SmartCleanupSourceKind,
     };
-    use deskgraph_scanner::{authorize_scope, scan_scope};
+    use deskgraph_scanner::{
+        ScopeExclusionSelection, authorize_scope, prepare_scope_exclusion_batch, scan_scope,
+    };
     use std::fs::OpenOptions;
     use std::path::PathBuf;
 
@@ -1589,6 +1652,9 @@ mod tests {
             let mut database =
                 ManifestDatabase::open(&database_path).expect("database should initialize");
             let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+            database
+                .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-active-grant")
+                .expect("test grant should activate");
             scan_scope(&mut database, scope.id).expect("scope should scan");
             drop(database);
             Self {
@@ -1599,6 +1665,66 @@ mod tests {
                 scope_id: scope.id,
             }
         }
+    }
+
+    fn exclude_path(database: &mut ManifestDatabase, scope_id: i64, path: &Path) {
+        let prepared = prepare_scope_exclusion_batch(
+            database,
+            scope_id,
+            &[ScopeExclusionSelection {
+                requested_path: path,
+            }],
+        )
+        .expect("strict fixture exclusion should prepare");
+        let writes = prepared
+            .exclusions
+            .iter()
+            .map(|exclusion| ScopeExclusionWrite {
+                kind: exclusion.kind,
+                path_raw: &exclusion.path_raw,
+                path_key: &exclusion.path_key,
+                display_path: &exclusion.display_path,
+                identity_kind: &exclusion.identity_kind,
+                identity_key: &exclusion.identity_key,
+            })
+            .collect::<Vec<_>>();
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("active fixture scope should bind");
+        database
+            .apply_scope_exclusion_batch(binding, &writes, 1)
+            .expect("fixture exclusion should commit");
+    }
+
+    #[test]
+    fn rename_preview_rejects_an_excluded_destination_without_persisting_a_plan() {
+        let fixture = Fixture::new();
+        let destination = fixture.scope_path.join("Renamed.txt");
+        fs::write(&destination, "excluded destination fixture")
+            .expect("destination fixture should write");
+        let mut database =
+            ManifestDatabase::open(&fixture.database_path).expect("database should reopen");
+        scan_scope(&mut database, fixture.scope_id).expect("rescan should include destination");
+        exclude_path(&mut database, fixture.scope_id, &destination);
+        drop(database);
+
+        let error = create_rename_preview_at(
+            &fixture.database_path,
+            fixture.scope_id,
+            &fixture.source_path,
+            "Renamed.txt",
+        )
+        .expect_err("excluded destination must fail closed");
+        assert_eq!(error.code(), "scope_policy_changed");
+        let database =
+            ManifestDatabase::open(&fixture.database_path).expect("database should reopen");
+        assert!(
+            database
+                .recent_action_plans()
+                .expect("plans should load")
+                .is_empty(),
+            "a denied destination must not create an action plan"
+        );
     }
 
     struct CleanupFixture {
@@ -1636,8 +1762,11 @@ mod tests {
             let target = database
                 .action_source_for_path_key(scope.id, &comparison_key(&canonical_target))
                 .expect("target should load");
+            let binding = database
+                .bind_scope_policy_revision(scope.id)
+                .expect("active fixture scope should bind");
             let candidate = database
-                .record_exact_duplicate_candidate(&keeper, &target)
+                .record_exact_duplicate_candidate_with_policy(binding, &keeper, &target)
                 .expect("fresh evidence should persist");
             let inbox_item = database
                 .smart_cleanup_relation_item(
@@ -1698,6 +1827,31 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_preview_rejects_an_excluded_keeper_without_persisting_a_plan() {
+        let fixture = CleanupFixture::new();
+        let mut database =
+            ManifestDatabase::open(&fixture.database_path).expect("database should reopen");
+        exclude_path(
+            &mut database,
+            fixture.selection.scope_id,
+            &fixture.keeper_path,
+        );
+        drop(database);
+
+        let error = create_cleanup_preview_at(&fixture.database_path, fixture.selection)
+            .expect_err("excluded keeper must fail closed");
+        assert!(
+            matches!(
+                error.code(),
+                "scope_policy_changed" | "cleanup_action_source_not_current"
+            ),
+            "privacy purge or the runtime guard must deny an excluded keeper"
+        );
+        assert!(fixture.target_path.exists());
+        assert!(fixture.keeper_path.exists());
+    }
+
+    #[test]
     fn cleanup_preview_rejects_same_size_and_mtime_keeper_content_change() {
         let fixture = CleanupFixture::new();
         let original_metadata =
@@ -1740,8 +1894,11 @@ mod tests {
         let (left, right) = database
             .exact_duplicate_sources(fixture.selection.source_id)
             .expect("relation sources should load");
+        let binding = database
+            .bind_scope_policy_revision(left.scope_id)
+            .expect("active fixture scope should bind");
         let refreshed = database
-            .record_exact_duplicate_candidate(&left, &right)
+            .record_exact_duplicate_candidate_with_policy(binding, &left, &right)
             .expect("refresh should append a new observation");
         let refreshed_item = database
             .smart_cleanup_relation_item(

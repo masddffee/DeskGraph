@@ -4,7 +4,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use deskgraph_database::{ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase};
+use deskgraph_database::{
+    ActionSourceRecord, DatabaseError, FolderProfileFacts, ManifestDatabase, ScopeExclusionMatcher,
+    ScopePolicyBinding,
+};
 use deskgraph_domain::{
     CleanupSourceDetail, CleanupSourceDetailMember, CleanupSourceMemberRole,
     CleanupSourceSelectionRule, FileRelationCandidate, FileRelationCandidateState,
@@ -57,6 +60,7 @@ pub enum ProjectError {
     VersionExtensionMismatch,
     VersionNumberEqual,
     CleanupSourceMemberLimitExceeded,
+    ScopePolicyChanged,
 }
 
 impl ProjectError {
@@ -89,6 +93,7 @@ impl ProjectError {
             Self::VersionExtensionMismatch => "file_version_extension_mismatch",
             Self::VersionNumberEqual => "file_version_number_equal",
             Self::CleanupSourceMemberLimitExceeded => "cleanup_source_member_limit_exceeded",
+            Self::ScopePolicyChanged => "scope_policy_changed",
         }
     }
 }
@@ -133,7 +138,11 @@ pub fn folder_profile(
     scope_id: i64,
     folder_node_id: i64,
 ) -> Result<FolderProfile, ProjectError> {
-    folder_profile_with_limit(database, scope_id, folder_node_id, DEFAULT_ENTRY_LIMIT)
+    let binding = bind_project_scope_policy(database, scope_id)?;
+    let profile =
+        folder_profile_with_limit(database, scope_id, folder_node_id, DEFAULT_ENTRY_LIMIT)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(profile)
 }
 
 pub fn propose_project_at(
@@ -150,8 +159,11 @@ pub fn propose_project(
     scope_id: i64,
     root_folder_node_id: i64,
 ) -> Result<ProjectCandidate, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     require_current_project_scope(database, scope_id)?;
-    record_current_project_suggestion(database, scope_id, root_folder_node_id)
+    let candidate = record_current_project_suggestion(database, scope_id, root_folder_node_id)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 fn record_current_project_suggestion(
@@ -159,12 +171,13 @@ fn record_current_project_suggestion(
     scope_id: i64,
     root_folder_node_id: i64,
 ) -> Result<ProjectCandidate, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     let profile = folder_profile(database, scope_id, root_folder_node_id)?;
     let suggestion = profile
         .project_suggestion
         .ok_or(ProjectError::SuggestionUnavailable)?;
     database
-        .record_project_candidate(scope_id, root_folder_node_id, &suggestion)
+        .record_project_candidate_with_policy(binding, root_folder_node_id, &suggestion)
         .map_err(Into::into)
 }
 
@@ -210,13 +223,14 @@ pub fn discover_projects(
     database: &mut ManifestDatabase,
     scope_id: i64,
 ) -> Result<ProjectDiscovery, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     let roots = database.project_discovery_roots(scope_id, MAX_PROJECT_DISCOVERY_ROOTS)?;
     let mut candidates = Vec::with_capacity(roots.root_folder_node_ids.len());
     for root_folder_node_id in roots.root_folder_node_ids {
         let candidate = record_current_project_suggestion(database, scope_id, root_folder_node_id)?;
         candidates.push(project_candidate_summary(candidate));
     }
-    Ok(ProjectDiscovery {
+    let discovery = ProjectDiscovery {
         api_version: ProjectDiscovery::API_VERSION,
         scope_id,
         evaluated_root_count: u32::try_from(candidates.len())
@@ -226,7 +240,9 @@ pub fn discover_projects(
         candidates,
         automatic_membership_created: false,
         file_actions_available: false,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(discovery)
 }
 
 /// Re-derives current marker evidence before exposing one explicitly selected
@@ -245,6 +261,7 @@ pub fn project_candidate_detail(
     scope_id: i64,
     project_id: i64,
 ) -> Result<ProjectCandidateDetail, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     require_current_project_scope(database, scope_id)?;
     let current = database.project_candidate(project_id)?;
     if current.scope_id != scope_id {
@@ -254,14 +271,16 @@ pub fn project_candidate_detail(
     }
     let candidate =
         record_current_project_suggestion(database, scope_id, current.root_folder_node_id)?;
-    Ok(ProjectCandidateDetail {
+    let detail = ProjectCandidateDetail {
         api_version: ProjectCandidateDetail::API_VERSION,
         candidate,
         user_requested_path: true,
         current_evidence: true,
         automatic_membership_created: false,
         file_actions_available: false,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(detail)
 }
 
 /// Appends one user correction only after the same current marker evidence used
@@ -283,15 +302,22 @@ pub fn decide_current_project_candidate(
     decision: ProjectDecisionKind,
 ) -> Result<ProjectCandidateDetail, ProjectError> {
     let detail = project_candidate_detail(database, scope_id, project_id)?;
-    let candidate = database.decide_project_candidate(detail.candidate.project_id, decision)?;
-    Ok(ProjectCandidateDetail {
+    let binding = bind_project_scope_policy(database, scope_id)?;
+    let candidate = database.decide_project_candidate_with_policy(
+        binding,
+        detail.candidate.project_id,
+        decision,
+    )?;
+    let result = ProjectCandidateDetail {
         api_version: ProjectCandidateDetail::API_VERSION,
         candidate,
         user_requested_path: true,
         current_evidence: true,
         automatic_membership_created: false,
         file_actions_available: false,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(result)
 }
 
 fn require_current_project_scope(
@@ -307,6 +333,48 @@ fn require_current_project_scope(
         return Err(ProjectError::Database(DatabaseError::ScanJobIncomplete));
     }
     Ok(())
+}
+
+fn bind_project_scope_policy(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<ScopePolicyBinding, ProjectError> {
+    Ok(bind_project_scope_policy_with_matcher(database, scope_id)?.0)
+}
+
+fn bind_project_scope_policy_with_matcher(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<(ScopePolicyBinding, ScopeExclusionMatcher), ProjectError> {
+    let binding = database.bind_scope_policy_revision(scope_id)?;
+    let matcher = database.scope_exclusion_matcher(scope_id)?;
+    if matcher.revision == binding.revision && database.is_scope_policy_binding_current(binding)? {
+        Ok((binding, matcher))
+    } else {
+        Err(ProjectError::ScopePolicyChanged)
+    }
+}
+
+fn ensure_project_path_not_excluded(
+    matcher: &ScopeExclusionMatcher,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    if matcher.is_excluded_path_key(&comparison_key(path)) {
+        Err(ProjectError::ScopePolicyChanged)
+    } else {
+        Ok(())
+    }
+}
+
+fn assert_project_scope_policy_current(
+    database: &ManifestDatabase,
+    binding: ScopePolicyBinding,
+) -> Result<(), ProjectError> {
+    if database.is_scope_policy_binding_current(binding)? {
+        Ok(())
+    } else {
+        Err(ProjectError::ScopePolicyChanged)
+    }
 }
 
 fn project_candidate_summary(candidate: ProjectCandidate) -> ProjectCandidateSummary {
@@ -340,10 +408,13 @@ pub fn check_exact_duplicate(
     left_path: &Path,
     right_path: &Path,
 ) -> Result<FileRelationCandidate, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     let canonical_root = validated_scope_root(database, scope_id)?;
     let left = open_relation_source(database, scope_id, &canonical_root, left_path, None)?;
     let right = open_relation_source(database, scope_id, &canonical_root, right_path, None)?;
-    compare_and_record(database, left, right)
+    let candidate = compare_and_record(database, left, right)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 pub fn verify_exact_duplicate_at(
@@ -359,6 +430,7 @@ pub fn verify_exact_duplicate(
     relation_id: i64,
 ) -> Result<FileRelationCandidate, ProjectError> {
     let (left_snapshot, right_snapshot) = database.exact_duplicate_sources(relation_id)?;
+    let binding = bind_project_scope_policy(database, left_snapshot.scope_id)?;
     let canonical_root = validated_scope_root(database, left_snapshot.scope_id)?;
     let left_path = path_from_raw(&left_snapshot.path_raw)
         .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
@@ -378,7 +450,9 @@ pub fn verify_exact_duplicate(
         &right_path,
         Some(right_snapshot.node_id),
     )?;
-    compare_and_record(database, left, right)
+    let candidate = compare_and_record(database, left, right)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 pub fn decide_exact_duplicate_at(
@@ -395,10 +469,13 @@ pub fn decide_exact_duplicate(
     relation_id: i64,
     decision: FileRelationDecisionKind,
 ) -> Result<FileRelationCandidate, ProjectError> {
-    verify_exact_duplicate(database, relation_id)?;
-    database
-        .decide_file_relation_candidate(relation_id, decision)
-        .map_err(Into::into)
+    let verified = verify_exact_duplicate(database, relation_id)?;
+    let binding = bind_project_scope_policy(database, verified.left.scope_id)?;
+    let candidate = database
+        .decide_file_relation_candidate_with_policy(binding, relation_id, decision)
+        .map_err(ProjectError::from)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 pub fn recent_file_relation_candidates_at(
@@ -425,10 +502,13 @@ pub fn suggest_file_version(
     first_path: &Path,
     second_path: &Path,
 ) -> Result<FileVersionCandidate, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     let canonical_root = validated_scope_root(database, scope_id)?;
     let first = open_relation_source(database, scope_id, &canonical_root, first_path, None)?;
     let second = open_relation_source(database, scope_id, &canonical_root, second_path, None)?;
-    analyze_and_record_file_version(database, first, second)
+    let candidate = analyze_and_record_file_version(database, first, second)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 pub fn verify_file_version_at(
@@ -444,6 +524,7 @@ pub fn verify_file_version(
     relation_id: i64,
 ) -> Result<FileVersionCandidate, ProjectError> {
     let (first_snapshot, second_snapshot) = database.file_version_sources(relation_id)?;
+    let binding = bind_project_scope_policy(database, first_snapshot.scope_id)?;
     let canonical_root = validated_scope_root(database, first_snapshot.scope_id)?;
     let first_path = path_from_raw(&first_snapshot.path_raw)
         .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
@@ -463,7 +544,9 @@ pub fn verify_file_version(
         &second_path,
         Some(second_snapshot.node_id),
     )?;
-    analyze_and_record_file_version(database, first, second)
+    let candidate = analyze_and_record_file_version(database, first, second)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 pub fn decide_file_version_at(
@@ -480,10 +563,13 @@ pub fn decide_file_version(
     relation_id: i64,
     decision: FileRelationDecisionKind,
 ) -> Result<FileVersionCandidate, ProjectError> {
-    verify_file_version(database, relation_id)?;
-    database
-        .decide_file_version_candidate(relation_id, decision)
-        .map_err(Into::into)
+    let verified = verify_file_version(database, relation_id)?;
+    let binding = bind_project_scope_policy(database, verified.older.scope_id)?;
+    let candidate = database
+        .decide_file_version_candidate_with_policy(binding, relation_id, decision)
+        .map_err(ProjectError::from)?;
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(candidate)
 }
 
 pub fn suggest_screenshot_groups_at(
@@ -498,9 +584,10 @@ pub fn suggest_screenshot_groups(
     database: &mut ManifestDatabase,
     scope_id: i64,
 ) -> Result<ScreenshotGroupDiscovery, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     let (evaluated_image_count, groups) =
-        database.discover_screenshot_group_candidates(scope_id)?;
-    Ok(ScreenshotGroupDiscovery {
+        database.discover_screenshot_group_candidates_with_policy(binding)?;
+    let discovery = ScreenshotGroupDiscovery {
         api_version: ScreenshotGroupDiscovery::API_VERSION,
         scope_id,
         evaluated_image_count,
@@ -508,16 +595,20 @@ pub fn suggest_screenshot_groups(
         bounded_image_limit: MAX_SCREENSHOT_GROUP_IMAGES,
         bounded_group_limit: MAX_SCREENSHOT_GROUPS,
         bounded_members_per_group: MAX_SCREENSHOT_GROUP_MEMBERS,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(discovery)
 }
 
 pub fn screenshot_group_at(
     database_path: &Path,
     group_id: i64,
 ) -> Result<ScreenshotGroupCandidate, ProjectError> {
-    ManifestDatabase::open(database_path)?
-        .screenshot_group_candidate(group_id)
-        .map_err(Into::into)
+    let database = ManifestDatabase::open(database_path)?;
+    let candidate = database.screenshot_group_candidate(group_id)?;
+    let binding = bind_project_scope_policy(&database, candidate.scope_id)?;
+    assert_project_scope_policy_current(&database, binding)?;
+    Ok(candidate)
 }
 
 pub fn recent_screenshot_groups_at(
@@ -540,9 +631,7 @@ pub fn refresh_smart_cleanup_inbox(
     database: &mut ManifestDatabase,
     scope_id: i64,
 ) -> Result<SmartCleanupInbox, ProjectError> {
-    if !database.scope_has_active_access_grant(scope_id)? {
-        return Err(DatabaseError::ScopeAccessGrantNotActive.into());
-    }
+    let binding = bind_project_scope_policy(database, scope_id)?;
     let (references, mut evaluation_complete) =
         database.smart_cleanup_source_references(scope_id, MAX_SMART_CLEANUP_SOURCES)?;
     let evaluated_source_count =
@@ -554,9 +643,7 @@ pub fn refresh_smart_cleanup_inbox(
         if reference.state != FileRelationCandidateState::Suggested {
             continue;
         }
-        if !database.scope_has_active_access_grant(scope_id)? {
-            return Err(DatabaseError::ScopeAccessGrantNotActive.into());
-        }
+        assert_project_scope_policy_current(database, binding)?;
         let result = match reference.kind {
             SmartCleanupSourceKind::ExactDuplicate => {
                 let candidate = verify_exact_duplicate(database, reference.source_id);
@@ -604,7 +691,7 @@ pub fn refresh_smart_cleanup_inbox(
             .then_with(|| right.observed_at_unix_ms.cmp(&left.observed_at_unix_ms))
             .then_with(|| left.source_id.cmp(&right.source_id))
     });
-    Ok(SmartCleanupInbox {
+    let inbox = SmartCleanupInbox {
         api_version: SmartCleanupInbox::API_VERSION,
         scope_id,
         items,
@@ -613,7 +700,9 @@ pub fn refresh_smart_cleanup_inbox(
         bounded_source_limit: MAX_SMART_CLEANUP_SOURCES,
         evaluation_complete,
         action_authorized: false,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(inbox)
 }
 
 pub fn cleanup_source_detail_at(
@@ -640,6 +729,7 @@ pub fn cleanup_source_detail(
     source_id: i64,
     source_observation_id: i64,
 ) -> Result<CleanupSourceDetail, ProjectError> {
+    let binding = bind_project_scope_policy(database, scope_id)?;
     database.validate_cleanup_source_observation(
         scope_id,
         source_kind,
@@ -730,7 +820,7 @@ pub fn cleanup_source_detail(
     if members.is_empty() || members.len() > CleanupSourceDetail::MAX_MEMBERS {
         return Err(ProjectError::CleanupSourceMemberLimitExceeded);
     }
-    Ok(CleanupSourceDetail {
+    let detail = CleanupSourceDetail {
         api_version: CleanupSourceDetail::API_VERSION,
         scope_id,
         source_kind,
@@ -742,7 +832,9 @@ pub fn cleanup_source_detail(
         user_requested_paths: true,
         action_authorized: false,
         execution_available: false,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(detail)
 }
 
 fn validate_cleanup_detail_item(
@@ -801,9 +893,11 @@ fn open_relation_source(
     requested_path: &Path,
     expected_node_id: Option<i64>,
 ) -> Result<OpenRelationSource, ProjectError> {
+    let (binding, exclusion_matcher) = bind_project_scope_policy_with_matcher(database, scope_id)?;
     if !requested_path.is_absolute() {
         return Err(ProjectError::RelationPathMustBeAbsolute);
     }
+    ensure_project_path_not_excluded(&exclusion_matcher, requested_path)?;
     let link_metadata = fs::symlink_metadata(requested_path)
         .map_err(|_| ProjectError::RelationSourceUnavailable)?;
     if is_symlink_or_reparse_point(&link_metadata) {
@@ -817,6 +911,7 @@ fn open_relation_source(
     if canonical_path == canonical_root || !canonical_path.starts_with(canonical_root) {
         return Err(ProjectError::RelationSourceOutsideScope);
     }
+    ensure_project_path_not_excluded(&exclusion_matcher, &canonical_path)?;
     if comparison_key(requested_path) != comparison_key(&canonical_path) {
         return Err(ProjectError::RelationSourceSymlinkOrReparseDenied);
     }
@@ -836,11 +931,13 @@ fn open_relation_source(
         .metadata()
         .map_err(|_| ProjectError::RelationSourceOpenFailed)?;
     validate_open_snapshot(&file, &canonical_path, &snapshot, &open_metadata)?;
-    Ok(OpenRelationSource {
+    let source = OpenRelationSource {
         path: canonical_path,
         snapshot,
         file,
-    })
+    };
+    assert_project_scope_policy_current(database, binding)?;
+    Ok(source)
 }
 
 fn compare_and_record(
@@ -848,6 +945,7 @@ fn compare_and_record(
     mut left: OpenRelationSource,
     mut right: OpenRelationSource,
 ) -> Result<FileRelationCandidate, ProjectError> {
+    let binding = bind_project_scope_policy(database, left.snapshot.scope_id)?;
     if left.snapshot.node_id == right.snapshot.node_id
         || (left.snapshot.identity_kind == right.snapshot.identity_kind
             && left.snapshot.identity_key == right.snapshot.identity_key)
@@ -874,7 +972,7 @@ fn compare_and_record(
         (&right.snapshot, &left.snapshot)
     };
     database
-        .record_exact_duplicate_candidate(left_snapshot, right_snapshot)
+        .record_exact_duplicate_candidate_with_policy(binding, left_snapshot, right_snapshot)
         .map_err(Into::into)
 }
 
@@ -883,6 +981,7 @@ fn analyze_and_record_file_version(
     first: OpenRelationSource,
     second: OpenRelationSource,
 ) -> Result<FileVersionCandidate, ProjectError> {
+    let binding = bind_project_scope_policy(database, first.snapshot.scope_id)?;
     if first.snapshot.node_id == second.snapshot.node_id
         || (first.snapshot.identity_kind == second.snapshot.identity_kind
             && first.snapshot.identity_key == second.snapshot.identity_key)
@@ -912,7 +1011,7 @@ fn analyze_and_record_file_version(
     }
     revalidate_open_relation_sources(database, &first, &second)?;
     database
-        .record_file_version_candidate(&first.snapshot, &second.snapshot)
+        .record_file_version_candidate_with_policy(binding, &first.snapshot, &second.snapshot)
         .map_err(Into::into)
 }
 
@@ -1230,6 +1329,9 @@ mod tests {
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
         scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
         let canonical_root = std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
         let root_node_id = database
             .node_id_for_path_key(scope.id, &comparison_key(&canonical_root))
@@ -1262,10 +1364,18 @@ mod tests {
         .expect("candidate should persist");
         assert_eq!(proposed.state, ProjectCandidateState::Suggested);
         assert!(proposed.latest_decision.is_none());
+        let binding = fixture
+            .database
+            .bind_scope_policy_revision(fixture.scope_id)
+            .expect("active fixture scope should bind");
 
         let rejected = fixture
             .database
-            .decide_project_candidate(proposed.project_id, ProjectDecisionKind::Rejected)
+            .decide_project_candidate_with_policy(
+                binding,
+                proposed.project_id,
+                ProjectDecisionKind::Rejected,
+            )
             .expect("candidate should reject");
         assert_eq!(rejected.state, ProjectCandidateState::Rejected);
         assert_eq!(
@@ -1287,7 +1397,11 @@ mod tests {
 
         let accepted = fixture
             .database
-            .decide_project_candidate(proposed.project_id, ProjectDecisionKind::Accepted)
+            .decide_project_candidate_with_policy(
+                binding,
+                proposed.project_id,
+                ProjectDecisionKind::Accepted,
+            )
             .expect("user should be able to correct the rejection");
         assert_eq!(accepted.state, ProjectCandidateState::Accepted);
         assert_eq!(
@@ -1299,7 +1413,11 @@ mod tests {
         );
         let idempotent = fixture
             .database
-            .decide_project_candidate(proposed.project_id, ProjectDecisionKind::Accepted)
+            .decide_project_candidate_with_policy(
+                binding,
+                proposed.project_id,
+                ProjectDecisionKind::Accepted,
+            )
             .expect("repeated decision should be idempotent");
         assert_eq!(idempotent.latest_decision, accepted.latest_decision);
 
@@ -1495,6 +1613,9 @@ mod tests {
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
         scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
         let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
         let canonical_right =
             std::fs::canonicalize(&right_path).expect("right should canonicalize");
@@ -1613,6 +1734,9 @@ mod tests {
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
         scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
         let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
         let canonical_right =
             std::fs::canonicalize(&right_path).expect("right should canonicalize");
@@ -1707,6 +1831,9 @@ mod tests {
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
         scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
         let canonical_first =
             std::fs::canonicalize(&first_path).expect("first should canonicalize");
         let canonical_second =
@@ -1825,6 +1952,9 @@ mod tests {
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
         scan_scope(&mut database, scope.id).expect("scope should scan");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
+            .expect("active grant should persist");
         let canonical_empty_left =
             std::fs::canonicalize(&empty_left).expect("empty left should canonicalize");
         let canonical_empty_right =

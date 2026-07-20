@@ -9,6 +9,13 @@ import {
   RUN_SCAN_COMMAND,
   SCAN_JOB_STATUS_COMMAND,
   SELECT_AND_AUTHORIZE_SCOPES_COMMAND,
+  CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND,
+  COVERAGE_POLICY_DETAIL_COMMAND,
+  DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND,
+  SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND,
+  confirmHardExclusionPreview,
+  discardHardExclusionPreview,
+  loadCoveragePolicyDetail,
   createManifestScan,
   loadRecentScanJobs,
   loadScanJobStatus,
@@ -18,13 +25,62 @@ import {
   parseSelectedAuthorizedScopes,
   parseScanJobProgress,
   parseScanJobs,
+  parseCoveragePolicyDetail,
+  parseHardExclusionCommit,
+  parseHardExclusionPreview,
   pauseManifestScan,
   resumeManifestScan,
   runManifestScan,
   selectAndAuthorizeScopes,
+  selectHardExclusionsPreview,
   type ManifestStats,
   type ScanJobProgress,
 } from './manifest';
+
+const policyDetail = {
+  api_version: 'deskgraph.coverage-policy.v1',
+  scope_id: 4,
+  root_display_path: '/explicit',
+  policy_revision: 2,
+  exclusions: [
+    {
+      id: 9,
+      scope_id: 4,
+      display_path: '/explicit/private',
+      entry_kind: 'folder',
+      created_at_unix_ms: 4,
+    },
+  ],
+} as const;
+const purge = {
+  location_count: 1,
+  content_chunk_count: 2,
+  graph_fact_count: 3,
+  derived_candidate_count: 4,
+  pending_job_count: 5,
+  blocking_action_count: 6,
+} as const;
+const exclusionPreview = {
+  api_version: 'deskgraph.hard-exclusion-preview.v1',
+  preview_id: 'opaque-preview',
+  scope_id: 4,
+  base_policy_revision: 2,
+  expires_at_unix_ms: 99,
+  items: [{ display_path: '/explicit/private', entry_kind: 'folder', disposition: 'will_add' }],
+  impact: purge,
+  confirmable: true,
+  source_files_will_change: false,
+} as const;
+const exclusionCommit = {
+  api_version: 'deskgraph.hard-exclusion-commit.v1',
+  scope_id: 4,
+  policy_revision: 3,
+  exclusions: 1,
+  purge,
+  source_files_changed: false,
+  automatic_scans_started: 0,
+  automatic_extractions_started: 0,
+} as const;
 
 const stats: ManifestStats = {
   api_version: 'deskgraph.manifest.v1',
@@ -158,5 +214,71 @@ describe('manifest contract', () => {
       { id: 2, display_path: '/new', created_at_unix_ms: 2 },
       { id: 4, display_path: '/reauthorized', created_at_unix_ms: 1 },
     ]);
+  });
+
+  it('accepts only exact hard-exclusion policy, preview, and commit payloads', () => {
+    expect(parseCoveragePolicyDetail(policyDetail)).toEqual(policyDetail);
+    expect(parseHardExclusionPreview(null)).toBeNull();
+    expect(parseHardExclusionPreview(exclusionPreview)).toEqual(exclusionPreview);
+    expect(parseHardExclusionCommit(exclusionCommit)).toEqual(exclusionCommit);
+    expect(() =>
+      parseCoveragePolicyDetail({ ...policyDetail, path: '/must-not-arrive' }),
+    ).toThrow();
+    expect(() =>
+      parseHardExclusionPreview({ ...exclusionPreview, source_files_will_change: true }),
+    ).toThrow();
+    expect(() =>
+      parseHardExclusionPreview({
+        ...exclusionPreview,
+        items: [{ ...exclusionPreview.items[0], disposition: 'unknown' }],
+      }),
+    ).toThrow();
+    expect(() => parseCoveragePolicyDetail({ ...policyDetail, policy_revision: 0 })).toThrow();
+    expect(() =>
+      parseHardExclusionPreview({ ...exclusionPreview, base_policy_revision: 0 }),
+    ).toThrow();
+    expect(() =>
+      parseHardExclusionPreview({ ...exclusionPreview, preview_id: ' '.repeat(129) }),
+    ).toThrow();
+    expect(() =>
+      parseHardExclusionPreview({ ...exclusionPreview, items: [], confirmable: true }),
+    ).toThrow();
+    expect(() =>
+      parseHardExclusionCommit({ ...exclusionCommit, automatic_scans_started: 1 }),
+    ).toThrow();
+    expect(() => parseHardExclusionCommit({ ...exclusionCommit, policy_revision: 0 })).toThrow();
+    expect(() => parseHardExclusionCommit({ ...exclusionCommit, exclusions: 0 })).toThrow();
+  });
+
+  it('uses native selection and opaque preview IDs without forwarding a WebView path', async () => {
+    const invokeCommand = vi.fn().mockImplementation((command: string) => {
+      if (command === COVERAGE_POLICY_DETAIL_COMMAND) return Promise.resolve(policyDetail);
+      if (command === SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND)
+        return Promise.resolve(exclusionPreview);
+      if (command === CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND)
+        return Promise.resolve(exclusionCommit);
+      return Promise.resolve(undefined);
+    });
+    await expect(loadCoveragePolicyDetail(4, invokeCommand)).resolves.toEqual(policyDetail);
+    await expect(selectHardExclusionsPreview(4, 'folder', invokeCommand)).resolves.toEqual(
+      exclusionPreview,
+    );
+    await expect(confirmHardExclusionPreview('opaque-preview', invokeCommand)).resolves.toEqual(
+      exclusionCommit,
+    );
+    await discardHardExclusionPreview('opaque-preview', invokeCommand);
+    expect(invokeCommand).toHaveBeenNthCalledWith(1, COVERAGE_POLICY_DETAIL_COMMAND, {
+      scopeId: 4,
+    });
+    expect(invokeCommand).toHaveBeenNthCalledWith(2, SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND, {
+      scopeId: 4,
+      entryKind: 'folder',
+    });
+    expect(invokeCommand).toHaveBeenNthCalledWith(3, CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND, {
+      previewId: 'opaque-preview',
+    });
+    expect(invokeCommand).toHaveBeenNthCalledWith(4, DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND, {
+      previewId: 'opaque-preview',
+    });
   });
 });

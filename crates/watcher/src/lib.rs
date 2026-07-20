@@ -11,8 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
-    DatabaseError, ManifestDatabase, QueuedPath, WatchFileDeltaWrite, WatchObservationWrite,
-    WatchReconciliationKind, WatchSnapshot, WatchSnapshotKind,
+    DatabaseError, ManifestDatabase, QueuedPath, ScopeExclusionMatcher, ScopeRevisionBinding,
+    WatchFileDeltaWrite, WatchObservationWrite, WatchReconciliationKind, WatchSnapshot,
+    WatchSnapshotKind,
 };
 use deskgraph_domain::{ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus};
 use deskgraph_identity::{
@@ -649,6 +650,7 @@ pub enum WatcherError {
     InvalidPollingPolicy,
     InvalidRuntimeCount,
     InvalidTimestamp,
+    ScopePolicyChanged,
     ObservedPathMustBeAbsolute,
     ObservedPathOutsideScope,
     ObservedPathDecodeFailed,
@@ -667,6 +669,7 @@ impl WatcherError {
             Self::InvalidPollingPolicy => "watch_polling_policy_invalid",
             Self::InvalidRuntimeCount => "watch_runtime_count_out_of_range",
             Self::InvalidTimestamp => "watch_timestamp_invalid",
+            Self::ScopePolicyChanged => "scope_policy_changed",
             Self::ObservedPathMustBeAbsolute => "watch_path_must_be_absolute",
             Self::ObservedPathOutsideScope => "watch_path_outside_scope",
             Self::ObservedPathDecodeFailed => "watch_path_decode_failed",
@@ -724,6 +727,42 @@ struct ValidatedHint {
     snapshot: WatchSnapshot,
 }
 
+fn bind_current_watch_policy(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<(ScopeRevisionBinding, ScopeExclusionMatcher), WatcherError> {
+    let binding = database.bind_core_scope_policy_revision(scope_id)?;
+    let matcher = database.scope_exclusion_matcher(scope_id)?;
+    if matcher.revision != binding.revision
+        || !database.is_core_scope_policy_binding_current(binding)?
+    {
+        return Err(WatcherError::ScopePolicyChanged);
+    }
+    Ok((binding, matcher))
+}
+
+fn assert_watch_policy_current(
+    database: &ManifestDatabase,
+    binding: ScopeRevisionBinding,
+) -> Result<(), WatcherError> {
+    if database.is_core_scope_policy_binding_current(binding)? {
+        Ok(())
+    } else {
+        Err(WatcherError::ScopePolicyChanged)
+    }
+}
+
+fn ensure_watch_hint_not_excluded(
+    matcher: &ScopeExclusionMatcher,
+    hint: &ValidatedHint,
+) -> Result<(), WatcherError> {
+    if matcher.is_excluded_path_key(&hint.path_key) {
+        Err(WatcherError::ScopePolicyChanged)
+    } else {
+        Ok(())
+    }
+}
+
 enum EvaluatedHint {
     Track(ValidatedHint),
     Ignore(ValidatedHint, WatchEventReason),
@@ -767,37 +806,54 @@ pub fn observe_watch_path_at_time(
     policy: WatchPolicy,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
+    let (binding, matcher) = bind_current_watch_policy(database, scope_id)?;
     if !database.scope_has_completed_scan(scope_id)? {
         return Err(DatabaseError::WatchScopeInitialScanRequired.into());
     }
     let stable_after = stable_after(now_unix_ms, policy)?;
     match evaluate_hint(database, scope_id, observed_path)? {
-        EvaluatedHint::Track(hint) => database
-            .record_watch_observation_at(WatchObservationWrite {
-                scope_id,
-                path_raw: &hint.path_raw,
-                path_key: &hint.path_key,
-                snapshot: &hint.snapshot,
-                stable_after_unix_ms: stable_after,
-                ignored_reason: None,
-                observed_at_unix_ms: now_unix_ms,
-                reconciliation_kind: reconciliation_kind_for_snapshot(&hint.snapshot),
-            })
-            .map(|event| event.progress)
-            .map_err(Into::into),
-        EvaluatedHint::Ignore(hint, reason) => database
-            .record_watch_observation_at(WatchObservationWrite {
-                scope_id,
-                path_raw: &hint.path_raw,
-                path_key: &hint.path_key,
-                snapshot: &hint.snapshot,
-                stable_after_unix_ms: now_unix_ms,
-                ignored_reason: Some(reason),
-                observed_at_unix_ms: now_unix_ms,
-                reconciliation_kind: WatchReconciliationKind::FullScope,
-            })
-            .map(|event| event.progress)
-            .map_err(Into::into),
+        EvaluatedHint::Track(hint) => {
+            ensure_watch_hint_not_excluded(&matcher, &hint)?;
+            assert_watch_policy_current(database, binding)?;
+            let progress = database
+                .record_watch_observation_with_policy_at(
+                    binding,
+                    WatchObservationWrite {
+                        scope_id,
+                        path_raw: &hint.path_raw,
+                        path_key: &hint.path_key,
+                        snapshot: &hint.snapshot,
+                        stable_after_unix_ms: stable_after,
+                        ignored_reason: None,
+                        observed_at_unix_ms: now_unix_ms,
+                        reconciliation_kind: reconciliation_kind_for_snapshot(&hint.snapshot),
+                    },
+                )
+                .map(|event| event.progress)?;
+            assert_watch_policy_current(database, binding)?;
+            Ok(progress)
+        }
+        EvaluatedHint::Ignore(hint, reason) => {
+            ensure_watch_hint_not_excluded(&matcher, &hint)?;
+            assert_watch_policy_current(database, binding)?;
+            let progress = database
+                .record_watch_observation_with_policy_at(
+                    binding,
+                    WatchObservationWrite {
+                        scope_id,
+                        path_raw: &hint.path_raw,
+                        path_key: &hint.path_key,
+                        snapshot: &hint.snapshot,
+                        stable_after_unix_ms: now_unix_ms,
+                        ignored_reason: Some(reason),
+                        observed_at_unix_ms: now_unix_ms,
+                        reconciliation_kind: WatchReconciliationKind::FullScope,
+                    },
+                )
+                .map(|event| event.progress)?;
+            assert_watch_policy_current(database, binding)?;
+            Ok(progress)
+        }
     }
 }
 
@@ -859,6 +915,11 @@ fn force_scope_metadata_reconciliation_at_time(
         return Err(WatcherError::InvalidTimestamp);
     }
     let event = database.watch_event(event_id)?;
+    let (policy_binding, matcher) = bind_current_watch_policy(database, event.progress.scope_id)?;
+    if matcher.is_excluded_path_key(&event.path_key) {
+        return Err(WatcherError::ScopePolicyChanged);
+    }
+    assert_watch_policy_current(database, policy_binding)?;
     if event.progress.is_terminal() {
         return Ok(event.progress);
     }
@@ -899,6 +960,11 @@ fn advance_watch_event_with_mode(
         return Err(WatcherError::InvalidTimestamp);
     }
     let event = database.watch_event(event_id)?;
+    let (policy_binding, matcher) = bind_current_watch_policy(database, event.progress.scope_id)?;
+    if matcher.is_excluded_path_key(&event.path_key) {
+        return Err(WatcherError::ScopePolicyChanged);
+    }
+    assert_watch_policy_current(database, policy_binding)?;
     if event.progress.is_terminal() {
         return Ok(event.progress);
     }
@@ -947,6 +1013,8 @@ fn advance_watch_event_with_mode(
         }
         EvaluatedHint::Track(hint) => hint,
     };
+    ensure_watch_hint_not_excluded(&matcher, &hint)?;
+    assert_watch_policy_current(database, policy_binding)?;
     if hint.path_key != event.path_key || hint.snapshot != event.snapshot {
         return record_changed_snapshot(
             database,
@@ -1136,19 +1204,25 @@ fn record_changed_snapshot(
     policy: WatchPolicy,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
-    database
-        .record_watch_observation_at(WatchObservationWrite {
-            scope_id,
-            path_raw: &hint.path_raw,
-            path_key: &hint.path_key,
-            snapshot: &hint.snapshot,
-            stable_after_unix_ms: stable_after(now_unix_ms, policy)?,
-            ignored_reason: None,
-            observed_at_unix_ms: now_unix_ms,
-            reconciliation_kind: reconciliation_kind_for_snapshot(&hint.snapshot),
-        })
-        .map(|event| event.progress)
-        .map_err(Into::into)
+    let (binding, matcher) = bind_current_watch_policy(database, scope_id)?;
+    ensure_watch_hint_not_excluded(&matcher, hint)?;
+    let progress = database
+        .record_watch_observation_with_policy_at(
+            binding,
+            WatchObservationWrite {
+                scope_id,
+                path_raw: &hint.path_raw,
+                path_key: &hint.path_key,
+                snapshot: &hint.snapshot,
+                stable_after_unix_ms: stable_after(now_unix_ms, policy)?,
+                ignored_reason: None,
+                observed_at_unix_ms: now_unix_ms,
+                reconciliation_kind: reconciliation_kind_for_snapshot(&hint.snapshot),
+            },
+        )
+        .map(|event| event.progress)?;
+    assert_watch_policy_current(database, binding)?;
+    Ok(progress)
 }
 
 fn reconciliation_kind_for_snapshot(snapshot: &WatchSnapshot) -> WatchReconciliationKind {
@@ -1565,7 +1639,8 @@ fn unix_ms() -> Result<i64, WatcherError> {
 mod tests {
     use super::*;
     use deskgraph_scanner::{
-        authorize_scope, create_scan_job, run_scan_job_to_terminal, scan_scope,
+        authorize_scope, authorize_scope_with_access_grant, create_scan_job,
+        run_scan_job_to_terminal, scan_scope,
     };
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -1573,7 +1648,13 @@ mod tests {
     fn setup() -> (tempfile::TempDir, ManifestDatabase, i64) {
         let directory = tempfile::tempdir().expect("fixture root should exist");
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
-        let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
+        let scope = authorize_scope_with_access_grant(
+            &mut database,
+            directory.path(),
+            std::env::consts::OS,
+            b"watch-test-grant",
+        )
+        .expect("scope should authorize with an active test grant");
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         (directory, database, scope.id)
     }

@@ -9,6 +9,10 @@ export const SCAN_JOB_STATUS_COMMAND = 'scan_job_status';
 export const RECENT_SCAN_JOBS_COMMAND = 'recent_scan_jobs';
 export const PAUSE_SCAN_COMMAND = 'pause_manifest_scan';
 export const RESUME_SCAN_COMMAND = 'resume_manifest_scan';
+export const COVERAGE_POLICY_DETAIL_COMMAND = 'coverage_policy_detail';
+export const SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND = 'select_hard_exclusions_preview';
+export const CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND = 'confirm_hard_exclusion_preview';
+export const DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND = 'discard_hard_exclusion_preview';
 
 export interface ManifestStats {
   api_version: 'deskgraph.manifest.v1';
@@ -45,6 +49,55 @@ export interface ScanJobProgress {
   pause_requested: boolean;
 }
 
+export type HardExclusionEntryKind = 'file' | 'folder';
+export interface HardExclusionItem {
+  display_path: string;
+  entry_kind: HardExclusionEntryKind;
+  disposition: 'will_add' | 'already_excluded' | 'covered_by_selected_parent';
+}
+export interface HardExclusionImpact {
+  location_count: number;
+  content_chunk_count: number;
+  graph_fact_count: number;
+  derived_candidate_count: number;
+  pending_job_count: number;
+  blocking_action_count: number;
+}
+export interface CoveragePolicyDetail {
+  api_version: 'deskgraph.coverage-policy.v1';
+  scope_id: number;
+  root_display_path: string;
+  policy_revision: number;
+  exclusions: readonly {
+    id: number;
+    scope_id: number;
+    display_path: string;
+    entry_kind: HardExclusionEntryKind;
+    created_at_unix_ms: number;
+  }[];
+}
+export interface HardExclusionPreview {
+  api_version: 'deskgraph.hard-exclusion-preview.v1';
+  preview_id: string;
+  scope_id: number;
+  base_policy_revision: number;
+  expires_at_unix_ms: number;
+  items: readonly HardExclusionItem[];
+  impact: HardExclusionImpact;
+  confirmable: boolean;
+  source_files_will_change: false;
+}
+export interface HardExclusionCommit {
+  api_version: 'deskgraph.hard-exclusion-commit.v1';
+  scope_id: number;
+  policy_revision: number;
+  exclusions: number;
+  purge: HardExclusionImpact;
+  source_files_changed: false;
+  automatic_scans_started: 0;
+  automatic_extractions_started: 0;
+}
+
 type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -53,6 +106,161 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isPositiveId(value: unknown): value is number {
+  return isCount(value) && value > 0;
+}
+
+function isPositiveRevision(value: unknown): value is number {
+  return isPositiveId(value);
+}
+
+function isDisplayPath(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isEntryKind(value: unknown): value is HardExclusionEntryKind {
+  return value === 'file' || value === 'folder';
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return (
+    actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index])
+  );
+}
+
+function parseHardExclusionImpact(value: unknown): HardExclusionImpact {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'location_count',
+      'content_chunk_count',
+      'graph_fact_count',
+      'derived_candidate_count',
+      'pending_job_count',
+      'blocking_action_count',
+    ]) ||
+    !Object.values(value).every(isCount)
+  )
+    throw new Error('Invalid hard exclusion impact response');
+  return value as unknown as HardExclusionImpact;
+}
+
+function parseHardExclusionItem(value: unknown): HardExclusionItem {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ['display_path', 'entry_kind', 'disposition']) ||
+    !isDisplayPath(value.display_path) ||
+    !isEntryKind(value.entry_kind) ||
+    (value.disposition !== 'will_add' &&
+      value.disposition !== 'already_excluded' &&
+      value.disposition !== 'covered_by_selected_parent')
+  )
+    throw new Error('Invalid hard exclusion item response');
+  return value as unknown as HardExclusionItem;
+}
+
+export function parseCoveragePolicyDetail(value: unknown): CoveragePolicyDetail {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'api_version',
+      'scope_id',
+      'root_display_path',
+      'policy_revision',
+      'exclusions',
+    ]) ||
+    value.api_version !== 'deskgraph.coverage-policy.v1' ||
+    !isPositiveId(value.scope_id) ||
+    !isDisplayPath(value.root_display_path) ||
+    !isPositiveRevision(value.policy_revision) ||
+    !Array.isArray(value.exclusions)
+  ) {
+    throw new Error('Invalid coverage policy detail response');
+  }
+  for (const exclusion of value.exclusions) {
+    if (
+      !isRecord(exclusion) ||
+      !hasExactKeys(exclusion, [
+        'id',
+        'scope_id',
+        'display_path',
+        'entry_kind',
+        'created_at_unix_ms',
+      ]) ||
+      !isPositiveId(exclusion.id) ||
+      exclusion.scope_id !== value.scope_id ||
+      !isDisplayPath(exclusion.display_path) ||
+      !isEntryKind(exclusion.entry_kind) ||
+      !isCount(exclusion.created_at_unix_ms)
+    ) {
+      throw new Error('Invalid coverage policy detail response');
+    }
+  }
+  return value as unknown as CoveragePolicyDetail;
+}
+
+export function parseHardExclusionPreview(value: unknown): HardExclusionPreview | null {
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'api_version',
+      'preview_id',
+      'scope_id',
+      'base_policy_revision',
+      'expires_at_unix_ms',
+      'items',
+      'impact',
+      'confirmable',
+      'source_files_will_change',
+    ]) ||
+    value.api_version !== 'deskgraph.hard-exclusion-preview.v1' ||
+    typeof value.preview_id !== 'string' ||
+    value.preview_id.trim().length === 0 ||
+    value.preview_id.length > 128 ||
+    !isPositiveId(value.scope_id) ||
+    !isPositiveRevision(value.base_policy_revision) ||
+    !isCount(value.expires_at_unix_ms) ||
+    !Array.isArray(value.items) ||
+    typeof value.confirmable !== 'boolean' ||
+    value.source_files_will_change !== false
+  )
+    throw new Error('Invalid hard exclusion preview response');
+  value.items.forEach(parseHardExclusionItem);
+  if (value.confirmable && value.items.length === 0)
+    throw new Error('Invalid hard exclusion preview response');
+  parseHardExclusionImpact(value.impact);
+  return value as unknown as HardExclusionPreview;
+}
+
+export function parseHardExclusionCommit(value: unknown): HardExclusionCommit {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'api_version',
+      'scope_id',
+      'policy_revision',
+      'exclusions',
+      'purge',
+      'source_files_changed',
+      'automatic_scans_started',
+      'automatic_extractions_started',
+    ]) ||
+    value.api_version !== 'deskgraph.hard-exclusion-commit.v1' ||
+    !isPositiveId(value.scope_id) ||
+    !isPositiveRevision(value.policy_revision) ||
+    !isPositiveId(value.exclusions) ||
+    value.source_files_changed !== false ||
+    value.automatic_scans_started !== 0 ||
+    value.automatic_extractions_started !== 0
+  ) {
+    throw new Error('Invalid hard exclusion commit response');
+  }
+  parseHardExclusionImpact(value.purge);
+  return value as unknown as HardExclusionCommit;
 }
 
 export function parseManifestStats(value: unknown): ManifestStats {
@@ -216,4 +424,40 @@ export async function resumeManifestScan(
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
 ): Promise<ScanJobProgress> {
   return parseScanJobProgress(await invokeCommand(RESUME_SCAN_COMMAND, { jobId }));
+}
+
+export async function loadCoveragePolicyDetail(
+  scopeId: number,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<CoveragePolicyDetail> {
+  return parseCoveragePolicyDetail(
+    await invokeCommand(COVERAGE_POLICY_DETAIL_COMMAND, { scopeId }),
+  );
+}
+
+/** Native selection only: paths are never sent from the WebView. */
+export async function selectHardExclusionsPreview(
+  scopeId: number,
+  entryKind: HardExclusionEntryKind,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<HardExclusionPreview | null> {
+  return parseHardExclusionPreview(
+    await invokeCommand(SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND, { scopeId, entryKind }),
+  );
+}
+
+export async function confirmHardExclusionPreview(
+  previewId: string,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<HardExclusionCommit> {
+  return parseHardExclusionCommit(
+    await invokeCommand(CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND, { previewId }),
+  );
+}
+
+export async function discardHardExclusionPreview(
+  previewId: string,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<void> {
+  await invokeCommand(DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND, { previewId });
 }

@@ -446,6 +446,46 @@ export const en = {
       stopped: 'Stopped with an error',
     },
   },
+  hardExclusion: {
+    kicker: 'Coverage privacy',
+    heading: 'Hard exclusions',
+    description:
+      'Hard exclusions deny local access and indexing; they are not just hidden search results.',
+    scopeLabel: 'Authorized root',
+    chooseScope: 'Choose an authorized root',
+    loading: 'Loading current policy…',
+    policyRevision: (revision) => `Policy revision ${revision}`,
+    addFolders: 'Add folders…',
+    addFiles: 'Add files…',
+    noExclusions: 'No hard exclusions in this root.',
+    currentExclusions: 'Current hard exclusions',
+    removalUnavailable: 'Removing a hard exclusion is not available in this release slice.',
+    previewHeading: 'Review hard exclusion',
+    previewNotice:
+      'DeskGraph will clear affected local index data. It will not move or delete source files.',
+    previewEmpty: 'The picker was cancelled; no policy change was made.',
+    notConfirmable:
+      'This exclusion cannot be confirmed until current file operations or recoverable journal work finish. Source files have not changed.',
+    item: {
+      willAdd: 'Will exclude',
+      alreadyExcluded: 'Already excluded',
+      coveredByParent: 'Covered by selected folder',
+      file: 'File',
+      folder: 'Folder',
+    },
+    impact: (locations, content, graph, candidates, jobs, actions) =>
+      `${locations} locations, ${content} content/OCR chunks, ${graph} graph facts, ${candidates} derived candidates, ${jobs} pending jobs, and ${actions} action safety records that block this change are affected locally.`,
+    confirm: 'Confirm exclusion and clear local index',
+    confirming: 'Confirming privacy purge…',
+    cancel: 'Cancel preview',
+    cancelled: 'Preview cancelled; no policy change was made.',
+    committed: (count) =>
+      `${count} hard exclusion${count === 1 ? '' : 's'} saved and affected local index data cleared.`,
+    refreshFailed: (count) =>
+      `${count} hard exclusion${count === 1 ? '' : 's'} saved and local data cleared, but refresh failed.`,
+    error: 'Hard exclusion was not confirmed. No local privacy purge is reported.',
+    sourceSafe: 'Source files will not be moved, changed, or deleted.',
+  },
   footer: {
     version: (version) => `DeskGraph ${version}`,
     description: 'Metadata + bounded local text · No uploads · No file operations',

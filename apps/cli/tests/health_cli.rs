@@ -4,7 +4,7 @@ use deskgraph_database::{ContentChunkProvenanceWrite, ContentChunkWrite, Manifes
 use deskgraph_extractors::{
     ExtractionLimits, create_extraction_job_at, create_screenshot_ocr_job_at, run_extraction_job_at,
 };
-use deskgraph_scanner::{authorize_scope, scan_scope};
+use deskgraph_scanner::{authorize_scope, authorize_scope_with_access_grant, scan_scope};
 
 #[test]
 fn health_command_emits_privacy_safe_json() {
@@ -52,6 +52,125 @@ fn incomplete_command_fails_with_usage_without_a_stack_trace() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Usage:"));
     assert!(!stderr.contains("panicked"));
+}
+
+#[test]
+fn scope_add_child_process_creates_a_path_free_active_grant_for_scan_and_search() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("manifest.sqlite3");
+    let scope_path = directory.path().join("explicit-cli-consent");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let source_path = scope_path.join("receipt-e2e-metadata.md");
+    let private_contents = "this local content must never enter command diagnostics";
+    std::fs::write(&source_path, private_contents).expect("fixture should write");
+
+    let binary = env!("CARGO_BIN_EXE_deskgraph");
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let scope_arg = scope_path.to_str().expect("scope path should be UTF-8");
+
+    let initialized = Command::new(binary)
+        .args(["manifest", "init", "--database", database_arg])
+        .output()
+        .expect("manifest init should start");
+    assert!(initialized.status.success());
+
+    let added = Command::new(binary)
+        .args([
+            "scope",
+            "add",
+            "--database",
+            database_arg,
+            "--path",
+            scope_arg,
+        ])
+        .output()
+        .expect("scope add should start");
+    assert!(added.status.success());
+    let added_scope: serde_json::Value =
+        serde_json::from_slice(&added.stdout).expect("scope add should emit JSON");
+    let scope_id = added_scope["id"]
+        .as_i64()
+        .expect("scope add should return an ID");
+
+    let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+    let grant = database
+        .active_scope_grant(scope_id)
+        .expect("CLI scope add should atomically persist an active grant");
+    assert_eq!(grant.platform, std::env::consts::OS);
+    assert!(
+        grant
+            .opaque_grant
+            .starts_with(b"deskgraph-cli-explicit-consent-v1")
+    );
+    let canonical_scope = std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
+    assert!(
+        !grant
+            .opaque_grant
+            .windows(canonical_scope.as_os_str().as_encoded_bytes().len())
+            .any(|window| window == canonical_scope.as_os_str().as_encoded_bytes()),
+        "the receipt must not contain path bytes"
+    );
+    assert!(
+        !grant
+            .opaque_grant
+            .windows(private_contents.len())
+            .any(|window| window == private_contents.as_bytes())
+    );
+    drop(database);
+
+    let scope_id_arg = scope_id.to_string();
+    let scanned = Command::new(binary)
+        .args([
+            "scan",
+            "start",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+        ])
+        .output()
+        .expect("scan start should start");
+    assert!(scanned.status.success());
+
+    let searched = Command::new(binary)
+        .args([
+            "search",
+            "--database",
+            database_arg,
+            "--query",
+            "receipt-e2e-metadata",
+            "--scope",
+            &scope_id_arg,
+            "--source",
+            "metadata",
+        ])
+        .output()
+        .expect("search should start");
+    assert!(searched.status.success());
+    let response: serde_json::Value =
+        serde_json::from_slice(&searched.stdout).expect("search should emit JSON");
+    assert_eq!(response["result_count"], 1);
+
+    for output in [&initialized, &added, &scanned, &searched] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains(private_contents));
+        assert!(!stderr.contains(scope_arg));
+        assert!(!stderr.contains("deskgraph-cli-explicit-consent-v1"));
+        assert!(
+            stderr
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
+    }
+    let add_stdout = String::from_utf8_lossy(&added.stdout);
+    let scan_stdout = String::from_utf8_lossy(&scanned.stdout);
+    let search_stdout = String::from_utf8_lossy(&searched.stdout);
+    for output in [&add_stdout, &scan_stdout, &search_stdout] {
+        assert!(!output.contains(private_contents));
+        assert!(!output.contains("deskgraph-cli-explicit-consent-v1"));
+    }
 }
 
 #[test]
@@ -633,7 +752,13 @@ fn search_command_returns_requested_local_context_without_logging_it() {
     let private_text = "confidentially searchable context stays local";
     std::fs::write(&source_path, private_text).expect("fixture should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"cli-search-test-grant",
+    )
+    .expect("scope should authorize with an active test grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     let node_id = database
         .node_id_for_path_key(
@@ -775,7 +900,13 @@ fn folder_profile_returns_explainable_local_facts_without_logging_paths() {
     std::fs::write(&marker_path, "[package]").expect("marker should write");
     std::fs::write(&private_source, "pub fn private_graph() {}").expect("source should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"cli-folder-profile-test-grant",
+    )
+    .expect("scope should authorize with an active test grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
@@ -1075,7 +1206,13 @@ fn exact_duplicate_relation_is_explicit_revalidated_and_path_free_in_logs() {
     std::fs::write(&left_path, private_content).expect("left should write");
     std::fs::write(&right_path, private_content).expect("right should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"cli-duplicate-test-grant",
+    )
+    .expect("scope should authorize with an active test grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
@@ -1302,7 +1439,13 @@ fn file_version_relation_is_directional_revalidated_and_path_free_in_history() {
     std::fs::write(&older_path, older_content).expect("older should write");
     std::fs::write(&newer_path, newer_content).expect("newer should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"cli-version-test-grant",
+    )
+    .expect("scope should authorize with an active test grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
@@ -1498,7 +1641,13 @@ fn rename_preview_returns_explicit_paths_without_logging_or_changing_files() {
     let destination_path = scope_path.join("private-final.txt");
     std::fs::write(&source_path, "private local action fixture").expect("fixture should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"cli-rename-preview-test-grant",
+    )
+    .expect("scope should authorize with an active test grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 

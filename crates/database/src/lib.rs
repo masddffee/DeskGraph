@@ -150,6 +150,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "coverage_root_overlap_guard",
         sql: include_str!("../../../migrations/0023_coverage_root_overlap_guard.sql"),
     },
+    Migration {
+        version: 24,
+        name: "scope_exclusions_and_privacy_purge",
+        sql: include_str!("../../../migrations/0024_scope_exclusions_and_privacy_purge.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -165,6 +170,10 @@ const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_MATCH_BYTES: usize = 1024;
 const MAX_SEARCH_CANDIDATES_PER_SOURCE: u32 = 100;
 const MAX_WATCH_PATH_BYTES: usize = 64 * 1024;
+const MAX_SCOPE_EXCLUSION_PATH_BYTES: usize = 64 * 1024;
+const MAX_SCOPE_EXCLUSION_BATCH: usize = 128;
+const MAX_SCOPE_EXCLUSION_IDENTITY_KIND_BYTES: usize = 128;
+const MAX_SCOPE_EXCLUSION_IDENTITY_KEY_BYTES: usize = 1024;
 const MAX_ACTION_PATH_BYTES: usize = 64 * 1024;
 const MAX_FOLDER_PROFILE_ENTRIES: u64 = 100_000;
 const MAX_FILE_RELATION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
@@ -178,6 +187,1009 @@ struct Migration {
     version: i64,
     name: &'static str,
     sql: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct ScopeExclusionValidationContext {
+    scope_id: i64,
+    root_path_key: String,
+    revision: i64,
+    separator: char,
+    platform: String,
+}
+
+fn stable_scope_exclusion_identity_is_valid(
+    platform: &str,
+    kind: ScopeExclusionKind,
+    identity_kind: &str,
+    identity_key: &[u8],
+) -> bool {
+    let expected_key_len = match platform {
+        "macos" | "linux" if identity_kind == "unix_device_inode" => 17,
+        "windows" if identity_kind == "windows_volume_file_index" => 13,
+        _ => return false,
+    };
+    let expected_kind_byte = match kind {
+        ScopeExclusionKind::File => b'f',
+        ScopeExclusionKind::Folder => b'd',
+    };
+    identity_kind.len() <= MAX_SCOPE_EXCLUSION_IDENTITY_KIND_BYTES
+        && identity_key.len() == expected_key_len
+        && identity_key.len() <= MAX_SCOPE_EXCLUSION_IDENTITY_KEY_BYTES
+        && identity_key.first() == Some(&expected_kind_byte)
+}
+
+fn platform_separator(platform: &str) -> Result<char, DatabaseError> {
+    match platform {
+        "windows" => Ok('\\'),
+        "macos" | "linux" => Ok('/'),
+        _ => Err(DatabaseError::InvalidStoredValue),
+    }
+}
+
+fn canonical_descendant_of(path_key: &str, ancestor_key: &str, separator: char) -> bool {
+    path_key.len() > ancestor_key.len()
+        && path_key.starts_with(ancestor_key)
+        && (ancestor_key.ends_with(separator)
+            || path_key.as_bytes().get(ancestor_key.len()) == Some(&(separator as u8)))
+}
+
+fn scope_path_key_is_excluded(
+    connection: &Connection,
+    scope_id: i64,
+    path_key: &str,
+) -> Result<bool, DatabaseError> {
+    let excluded: i64 = connection.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM scope_exclusions x \
+             JOIN authorized_scopes s ON s.id=x.scope_id \
+             WHERE x.scope_id=?1 AND ( \
+                 x.path_key=?2 OR (x.kind='folder' \
+                   AND length(?2)>length(x.path_key) \
+                   AND substr(?2,1,length(x.path_key))=x.path_key \
+                   AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END \
+                        OR substr(?2,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) \
+                 OR EXISTS(SELECT 1 FROM locations l JOIN nodes n ON n.id=l.node_id \
+                    WHERE l.scope_id=?1 AND l.path_key=?2 AND l.present=1 \
+                      AND n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key)))",
+        params![scope_id, path_key],
+        |row| row.get(0),
+    )?;
+    Ok(excluded != 0)
+}
+
+fn scope_identity_is_excluded(
+    connection: &Connection,
+    scope_id: i64,
+    identity_kind: &str,
+    identity_key: &[u8],
+) -> Result<bool, DatabaseError> {
+    if identity_kind.is_empty() || identity_key.is_empty() {
+        return Err(DatabaseError::InvalidStoredValue);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scope_exclusions \
+         WHERE scope_id=?1 AND identity_kind=?2 AND identity_key=?3)",
+        params![scope_id, identity_kind, identity_key],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn assert_scope_identity_allowed(
+    connection: &Connection,
+    scope_id: i64,
+    identity_kind: &str,
+    identity_key: &[u8],
+) -> Result<(), DatabaseError> {
+    if scope_identity_is_excluded(connection, scope_id, identity_kind, identity_key)? {
+        Err(DatabaseError::ScopePolicyRevisionStale)
+    } else {
+        Ok(())
+    }
+}
+
+fn assert_scope_path_key_allowed(
+    connection: &Connection,
+    scope_id: i64,
+    path_key: &str,
+) -> Result<(), DatabaseError> {
+    if scope_path_key_is_excluded(connection, scope_id, path_key)? {
+        Err(DatabaseError::ScopePolicyRevisionStale)
+    } else {
+        Ok(())
+    }
+}
+
+fn current_scope_policy_revision_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+) -> Result<i64, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT policy_revision FROM authorized_scopes WHERE id = ?1",
+            [scope_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScopeNotFound)
+}
+
+fn scope_policy_binding_is_current(
+    connection: &Connection,
+    binding: ScopePolicyBinding,
+) -> Result<bool, DatabaseError> {
+    if binding.scope_id <= 0 || binding.revision <= 0 {
+        return Ok(false);
+    }
+    let current = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM authorized_scopes s \
+         JOIN scope_access_grants g ON g.scope_id = s.id AND g.state = 'active' \
+         WHERE s.id = ?1 AND s.policy_revision = ?2 \
+           AND s.platform = ?3 AND g.platform = ?3)",
+        params![binding.scope_id, binding.revision, std::env::consts::OS],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(current != 0)
+}
+
+fn core_scope_policy_binding_is_current(
+    connection: &Connection,
+    binding: ScopeRevisionBinding,
+) -> Result<bool, DatabaseError> {
+    if binding.scope_id <= 0 || binding.revision <= 0 {
+        return Ok(false);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM authorized_scopes WHERE id=?1 AND policy_revision=?2)",
+        params![binding.scope_id, binding.revision],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn assert_scope_revision_binding_in_transaction(
+    transaction: &Transaction<'_>,
+    binding: ScopeRevisionBinding,
+) -> Result<(), DatabaseError> {
+    if binding.scope_id <= 0 || binding.revision <= 0 {
+        return Err(DatabaseError::ScopePolicyRevisionStale);
+    }
+    let revision = transaction
+        .query_row(
+            "SELECT policy_revision FROM authorized_scopes WHERE id = ?1",
+            [binding.scope_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScopeNotFound)?;
+    if revision != binding.revision {
+        return Err(DatabaseError::ScopePolicyRevisionStale);
+    }
+    Ok(())
+}
+
+fn scope_exclusion_matcher_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+) -> Result<ScopeExclusionMatcher, DatabaseError> {
+    let (revision, platform): (i64, String) = connection
+        .query_row(
+            "SELECT policy_revision, platform FROM authorized_scopes WHERE id = ?1",
+            [scope_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScopeNotFound)?;
+    let mut statement = connection.prepare(
+        "SELECT path_key, kind, identity_kind, identity_key \
+         FROM scope_exclusions WHERE scope_id = ?1 ORDER BY id",
+    )?;
+    let rows = statement.query_map([scope_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+        ))
+    })?;
+    let mut exclusions = Vec::new();
+    let mut excluded_identities = Vec::new();
+    for row in rows {
+        let (path_key, kind, identity_kind, identity_key) = row?;
+        let kind = ScopeExclusionKind::from_db(&kind)?;
+        if !stable_scope_exclusion_identity_is_valid(&platform, kind, &identity_kind, &identity_key)
+        {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        exclusions.push((path_key, kind));
+        excluded_identities.push((identity_kind, identity_key));
+    }
+    Ok(ScopeExclusionMatcher {
+        scope_id,
+        revision,
+        exclusions,
+        excluded_identities,
+        separator: platform_separator(&platform)?,
+    })
+}
+
+fn assert_scope_policy_binding_in_transaction(
+    transaction: &Transaction<'_>,
+    binding: ScopePolicyBinding,
+) -> Result<(), DatabaseError> {
+    if binding.scope_id <= 0 || binding.revision <= 0 {
+        return Err(DatabaseError::ScopePolicyRevisionStale);
+    }
+    let state = transaction
+        .query_row(
+            "SELECT s.policy_revision, g.state \
+             FROM authorized_scopes s \
+             LEFT JOIN scope_access_grants g \
+               ON g.scope_id = s.id AND g.platform = s.platform \
+              AND s.platform = ?2 AND g.platform = ?2 \
+             WHERE s.id = ?1",
+            params![binding.scope_id, std::env::consts::OS],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScopeNotFound)?;
+    if state.0 != binding.revision {
+        return Err(DatabaseError::ScopePolicyRevisionStale);
+    }
+    if state.1.as_deref() != Some("active") {
+        return Err(DatabaseError::ScopeAccessGrantNotActive);
+    }
+    Ok(())
+}
+
+fn scan_job_revision_binding(
+    transaction: &Transaction<'_>,
+    job_id: i64,
+) -> Result<ScopeRevisionBinding, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT scope_id, policy_revision FROM scan_jobs WHERE id=?1",
+            [job_id],
+            |row| {
+                Ok(ScopeRevisionBinding {
+                    scope_id: row.get(0)?,
+                    revision: row.get(1)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScanJobNotFound)
+}
+
+fn extraction_job_revision_binding(
+    transaction: &Transaction<'_>,
+    job_id: i64,
+) -> Result<ScopeRevisionBinding, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT scope_id, policy_revision FROM extraction_jobs WHERE id=?1",
+            [job_id],
+            |row| {
+                Ok(ScopeRevisionBinding {
+                    scope_id: row.get(0)?,
+                    revision: row.get(1)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ExtractionJobNotFound)
+}
+
+fn scope_exclusion_validation_context(
+    connection: &Connection,
+    scope_id: i64,
+) -> Result<ScopeExclusionValidationContext, DatabaseError> {
+    let (root_path_key, platform, revision) = connection
+        .query_row(
+            "SELECT path_key, platform, policy_revision FROM authorized_scopes WHERE id = ?1",
+            [scope_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ScopeNotFound)?;
+    Ok(ScopeExclusionValidationContext {
+        scope_id,
+        root_path_key,
+        separator: platform_separator(&platform)?,
+        platform,
+        revision,
+    })
+}
+
+fn validate_scope_exclusion_batch(
+    connection: &Connection,
+    scope: &ScopeExclusionValidationContext,
+    writes: &[ScopeExclusionWrite<'_>],
+) -> Result<(), DatabaseError> {
+    if writes.is_empty() || writes.len() > MAX_SCOPE_EXCLUSION_BATCH {
+        return Err(DatabaseError::ScopeExclusionInputInvalid);
+    }
+    let existing = {
+        let mut statement = connection.prepare(
+            "SELECT path_key, kind, identity_kind, identity_key \
+             FROM scope_exclusions WHERE scope_id = ?1 ORDER BY id",
+        )?;
+        statement
+            .query_map([scope.scope_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut seen = HashSet::with_capacity(writes.len());
+    for write in writes {
+        if write.path_raw.is_empty()
+            || write.path_raw.len() > MAX_SCOPE_EXCLUSION_PATH_BYTES
+            || write.path_key.is_empty()
+            || write.path_key.len() > MAX_SCOPE_EXCLUSION_PATH_BYTES
+            || write.display_path.is_empty()
+            || write.display_path.len() > MAX_SCOPE_EXCLUSION_PATH_BYTES
+            || !seen.insert(write.path_key)
+            || !canonical_descendant_of(write.path_key, &scope.root_path_key, scope.separator)
+            || !stable_scope_exclusion_identity_is_valid(
+                &scope.platform,
+                write.kind,
+                write.identity_kind,
+                write.identity_key,
+            )
+        {
+            return Err(DatabaseError::ScopeExclusionInputInvalid);
+        }
+        let decoded =
+            path_from_raw(write.path_raw).map_err(|_| DatabaseError::ScopeExclusionInputInvalid)?;
+        if comparison_key(&decoded) != write.path_key {
+            return Err(DatabaseError::ScopeExclusionInputInvalid);
+        }
+        for (existing_key, existing_kind, existing_identity_kind, existing_identity_key) in
+            &existing
+        {
+            let existing_kind = ScopeExclusionKind::from_db(existing_kind)?;
+            if !stable_scope_exclusion_identity_is_valid(
+                &scope.platform,
+                existing_kind,
+                existing_identity_kind,
+                existing_identity_key,
+            ) {
+                return Err(DatabaseError::InvalidStoredValue);
+            }
+            if write.path_key == existing_key
+                || (write.identity_kind == existing_identity_kind
+                    && write.identity_key == existing_identity_key)
+                || (existing_kind == ScopeExclusionKind::Folder
+                    && canonical_descendant_of(write.path_key, existing_key, scope.separator))
+                || (write.kind == ScopeExclusionKind::Folder
+                    && canonical_descendant_of(existing_key, write.path_key, scope.separator))
+            {
+                return Err(DatabaseError::ScopeExclusionInputInvalid);
+            }
+        }
+    }
+    for (index, left) in writes.iter().enumerate() {
+        for right in writes.iter().skip(index + 1) {
+            if (left.identity_kind == right.identity_kind
+                && left.identity_key == right.identity_key)
+                || (left.kind == ScopeExclusionKind::Folder
+                    && canonical_descendant_of(right.path_key, left.path_key, scope.separator))
+                || (right.kind == ScopeExclusionKind::Folder
+                    && canonical_descendant_of(left.path_key, right.path_key, scope.separator))
+            {
+                return Err(DatabaseError::ScopeExclusionInputInvalid);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scope_exclusions_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+) -> Result<Vec<ScopeExclusionRecord>, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT id, scope_id, kind, path_raw, path_key, display_path, \
+                policy_revision, created_at_unix_ms \
+         FROM scope_exclusions WHERE scope_id = ?1 ORDER BY id",
+    )?;
+    let rows = statement.query_map([scope_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let row = row?;
+        Ok(ScopeExclusionRecord {
+            id: row.0,
+            scope_id: row.1,
+            kind: ScopeExclusionKind::from_db(&row.2)?,
+            path_raw: row.3,
+            path_key: row.4,
+            display_path: row.5,
+            policy_revision: row.6,
+            created_at_unix_ms: row.7,
+        })
+    })
+    .collect()
+}
+
+fn begin_privacy_purge_capability(
+    transaction: &Transaction<'_>,
+    scope_id: i64,
+    from_revision: i64,
+    to_revision: i64,
+    now_unix_ms: i64,
+) -> Result<Vec<u8>, DatabaseError> {
+    transaction.execute(
+        "INSERT INTO privacy_purge_capabilities( \
+             nonce, scope_id, from_revision, to_revision, created_at_unix_ms \
+         ) VALUES (randomblob(32), ?1, ?2, ?3, ?4)",
+        params![scope_id, from_revision, to_revision, now_unix_ms],
+    )?;
+    transaction
+        .query_row(
+            "SELECT nonce FROM privacy_purge_capabilities WHERE scope_id = ?1",
+            [scope_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn insert_privacy_targets_for_writes(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope: &ScopeExclusionValidationContext,
+    writes: &[ScopeExclusionWrite<'_>],
+) -> Result<(), DatabaseError> {
+    for write in writes {
+        transaction.execute(
+            "INSERT OR IGNORE INTO privacy_purge_location_targets(nonce, location_id, node_id, direct_match) \
+             SELECT ?1, id, node_id, 1 FROM locations \
+             WHERE scope_id = ?2 AND (path_key = ?3 OR ( \
+                 ?4 = 'folder' AND length(path_key) > length(?3) \
+                 AND substr(path_key, 1, length(?3)) = ?3 \
+                 AND (substr(?3, -1, 1) = ?5 \
+                      OR substr(path_key, length(?3) + 1, 1) = ?5)))",
+            params![
+                nonce,
+                scope.scope_id,
+                write.path_key,
+                write.kind.as_str(),
+                scope.separator.to_string(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO privacy_purge_location_targets(nonce, location_id, node_id, direct_match) \
+             SELECT ?1, l.id, l.node_id, 0 FROM locations l \
+             JOIN nodes n ON n.id=l.node_id \
+             WHERE l.scope_id=?2 AND n.identity_kind=?3 AND n.identity_key=?4",
+            params![nonce, scope.scope_id, write.identity_kind, write.identity_key],
+        )?;
+    }
+    close_privacy_targets_over_same_scope_hardlinks(transaction, nonce, scope.scope_id)?;
+    for write in writes {
+        transaction.execute(
+            "INSERT OR IGNORE INTO privacy_purge_action_plan_targets(nonce, plan_id) \
+             SELECT ?1, id FROM action_plans WHERE scope_id=?2 AND (source_path_key=?3 OR destination_path_key=?3 OR (?4='folder' AND ((length(source_path_key)>length(?3) AND substr(source_path_key,1,length(?3))=?3 AND (substr(?3,-1,1)=?5 OR substr(source_path_key,length(?3)+1,1)=?5)) OR (length(destination_path_key)>length(?3) AND substr(destination_path_key,1,length(?3))=?3 AND (substr(?3,-1,1)=?5 OR substr(destination_path_key,length(?3)+1,1)=?5)))))",
+            params![nonce,scope.scope_id,write.path_key,write.kind.as_str(),scope.separator.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_all_privacy_targets(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope: &ScopeExclusionValidationContext,
+) -> Result<(), DatabaseError> {
+    let separator = scope.separator.to_string();
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_location_targets(nonce, location_id, node_id, direct_match) \
+         SELECT ?1, l.id, l.node_id, CASE WHEN EXISTS( \
+             SELECT 1 FROM scope_exclusions e WHERE e.scope_id=l.scope_id AND (l.path_key=e.path_key OR (e.kind='folder' \
+                 AND length(l.path_key)>length(e.path_key) AND substr(l.path_key,1,length(e.path_key))=e.path_key \
+                 AND (substr(e.path_key,-1,1)=?3 OR substr(l.path_key,length(e.path_key)+1,1)=?3)))) THEN 1 ELSE 0 END \
+         FROM locations l JOIN nodes n ON n.id=l.node_id \
+         WHERE l.scope_id = ?2 AND EXISTS( \
+             SELECT 1 FROM scope_exclusions e WHERE e.scope_id = l.scope_id \
+               AND (l.path_key = e.path_key OR (e.kind = 'folder' \
+                    AND length(l.path_key) > length(e.path_key) \
+                    AND substr(l.path_key, 1, length(e.path_key)) = e.path_key \
+                    AND (substr(e.path_key, -1, 1) = ?3 \
+                         OR substr(l.path_key, length(e.path_key) + 1, 1) = ?3)) \
+                   OR (n.identity_kind=e.identity_kind AND n.identity_key=e.identity_key)))",
+        params![nonce, scope.scope_id, separator],
+    )?;
+    close_privacy_targets_over_same_scope_hardlinks(transaction, nonce, scope.scope_id)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_action_plan_targets(nonce, plan_id) \
+         SELECT ?1, p.id FROM action_plans p WHERE p.scope_id=?2 AND EXISTS(SELECT 1 FROM scope_exclusions e WHERE e.scope_id=p.scope_id AND (p.source_path_key=e.path_key OR p.destination_path_key=e.path_key OR (e.kind='folder' AND ((length(p.source_path_key)>length(e.path_key) AND substr(p.source_path_key,1,length(e.path_key))=e.path_key AND (substr(e.path_key,-1,1)=?3 OR substr(p.source_path_key,length(e.path_key)+1,1)=?3)) OR (length(p.destination_path_key)>length(e.path_key) AND substr(p.destination_path_key,1,length(e.path_key))=e.path_key AND (substr(e.path_key,-1,1)=?3 OR substr(p.destination_path_key,length(e.path_key)+1,1)=?3))))))",
+        params![nonce,scope.scope_id,separator],
+    )?;
+    Ok(())
+}
+
+fn close_privacy_targets_over_same_scope_hardlinks(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_node_targets(nonce, node_id) \
+         SELECT ?1, node_id FROM privacy_purge_location_targets WHERE nonce = ?1",
+        [nonce],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_location_targets(nonce, location_id, node_id, direct_match) \
+         SELECT ?1, l.id, l.node_id, 0 FROM locations l \
+         JOIN privacy_purge_node_targets n ON n.nonce = ?1 AND n.node_id = l.node_id \
+         WHERE l.scope_id = ?2",
+        params![nonce, scope_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_project_targets(nonce, project_id) \
+         SELECT ?1, p.id FROM projects p WHERE p.scope_id=?2 AND ( \
+             EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=p.root_folder_node_id) \
+             OR EXISTS(SELECT 1 FROM edges e JOIN privacy_purge_node_targets n ON n.nonce=?1 AND n.node_id=e.source_node_id WHERE e.scope_id=p.scope_id AND e.kind='located_in' AND e.active=1 AND e.target_node_id=p.root_folder_node_id))",
+        params![nonce,scope_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_action_plan_targets(nonce, plan_id) \
+         SELECT ?1, p.id FROM action_plans p JOIN privacy_purge_node_targets n ON n.nonce=?1 AND n.node_id=p.node_id WHERE p.scope_id=?2",
+        params![nonce,scope_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_relation_targets(nonce, relation_id) \
+         SELECT ?1, r.id FROM file_relation_candidates r WHERE r.scope_id=?2 AND ( \
+             EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=r.left_node_id) \
+             OR EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=r.right_node_id))",
+        params![nonce, scope_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_screenshot_group_targets(nonce, group_id) \
+         SELECT DISTINCT ?1, g.id FROM screenshot_group_candidates g \
+         JOIN screenshot_group_observations o ON o.group_id=g.id \
+         JOIN screenshot_group_members m ON m.observation_id=o.id \
+         JOIN privacy_purge_node_targets n ON n.nonce=?1 AND n.node_id=m.node_id \
+         WHERE g.scope_id=?2",
+        params![nonce, scope_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_cleanup_action_plan_targets(nonce, plan_id) \
+         SELECT ?1, p.id FROM cleanup_action_plans p WHERE p.scope_id=?2 AND ( \
+             EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=p.target_node_id) \
+             OR EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=p.keeper_node_id) \
+             OR (p.source_kind='screenshot_review_group' AND EXISTS( \
+                 SELECT 1 FROM privacy_purge_screenshot_group_targets g \
+                 WHERE g.nonce=?1 AND g.group_id=p.source_id)))",
+        params![nonce, scope_id],
+    )?;
+    Ok(())
+}
+
+fn count_query(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<u64, DatabaseError> {
+    let count = transaction.query_row(sql, params![nonce, scope_id], |row| row.get::<_, i64>(0))?;
+    u64::try_from(count).map_err(|_| DatabaseError::InvalidCount)
+}
+
+fn privacy_purge_impact(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<ScopeExclusionImpactPreview, DatabaseError> {
+    let direct_locations = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_location_targets WHERE nonce = ?1 AND direct_match = 1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let locations = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_location_targets WHERE nonce = ?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let nodes = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_node_targets WHERE nonce = ?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let extraction_jobs = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM extraction_jobs j JOIN privacy_purge_node_targets n ON n.nonce = ?1 AND n.node_id = j.node_id WHERE j.scope_id = ?2",
+        nonce,
+        scope_id,
+    )?;
+    let content_chunks = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM content_chunks c JOIN privacy_purge_node_targets n ON n.nonce = ?1 AND n.node_id = c.node_id WHERE c.scope_id = ?2",
+        nonce,
+        scope_id,
+    )?;
+    let image_metadata = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM image_metadata i JOIN privacy_purge_node_targets n ON n.nonce = ?1 AND n.node_id = i.node_id WHERE i.scope_id = ?2",
+        nonce,
+        scope_id,
+    )?;
+    let edges = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM edges e WHERE e.scope_id = ?2 AND (EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce = ?1 AND n.node_id = e.source_node_id) OR EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce = ?1 AND n.node_id = e.target_node_id))",
+        nonce,
+        scope_id,
+    )?;
+    let projects = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_project_targets WHERE nonce=?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let relations = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_relation_targets WHERE nonce=?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let groups = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_screenshot_group_targets WHERE nonce=?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let actions = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let cleanup = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_cleanup_action_plan_targets WHERE nonce=?1 AND ?2=?2",
+        nonce,
+        scope_id,
+    )?;
+    let watches = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM watch_events w WHERE w.scope_id = ?2 AND (w.status IN ('stabilizing','reconciling') OR EXISTS(SELECT 1 FROM scope_exclusions e WHERE e.scope_id = w.scope_id AND (w.path_key = e.path_key OR (e.kind = 'folder' AND length(w.path_key) > length(e.path_key) AND substr(w.path_key,1,length(e.path_key)) = e.path_key AND (substr(e.path_key,-1,1) = CASE WHEN (SELECT platform FROM authorized_scopes WHERE id=?2)='windows' THEN char(92) ELSE '/' END OR substr(w.path_key,length(e.path_key)+1,1) = CASE WHEN (SELECT platform FROM authorized_scopes WHERE id=?2)='windows' THEN char(92) ELSE '/' END)))))",
+        nonce,
+        scope_id,
+    )?;
+    let pending = count_query(
+        transaction,
+        "SELECT (SELECT COUNT(*) FROM scan_jobs WHERE scope_id = ?2 AND status IN ('running','interrupted')) + (SELECT COUNT(*) FROM extraction_jobs WHERE scope_id = ?2 AND status IN ('queued','running','interrupted')) + (SELECT COUNT(*) FROM watch_events WHERE scope_id = ?2 AND status IN ('stabilizing','reconciling'))",
+        nonce,
+        scope_id,
+    )?;
+    let scan_jobs = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM scan_jobs WHERE scope_id = ?2 AND status IN ('running','interrupted')",
+        nonce,
+        scope_id,
+    )?;
+    let blocking_actions = privacy_purge_blocking_action_count(transaction, nonce, scope_id)?;
+    Ok(ScopeExclusionImpactPreview {
+        direct_location_count: direct_locations,
+        conservative_location_count: locations,
+        conservative_node_count: nodes,
+        scan_job_count: scan_jobs,
+        extraction_job_count: extraction_jobs,
+        watch_event_count: watches,
+        content_chunk_count: content_chunks,
+        image_metadata_count: image_metadata,
+        edge_count: edges,
+        project_count: projects,
+        relation_count: relations,
+        screenshot_group_count: groups,
+        action_plan_count: actions,
+        cleanup_action_plan_count: cleanup,
+        blocking_action_count: blocking_actions,
+        pending_job_count: pending,
+    })
+}
+
+fn ensure_privacy_purge_actions_are_safe(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<(), DatabaseError> {
+    let blocked = privacy_purge_blocking_action_count(transaction, nonce, scope_id)?;
+    if blocked != 0 {
+        return Err(DatabaseError::ScopePrivacyPurgeBlocked);
+    }
+    Ok(())
+}
+
+/// Only a pristine sequence-one preview may be removed by ADR-033's bounded
+/// privacy exception. Any later command/event, including a transition that
+/// reduces back to Previewed, is an executable-action safety receipt and blocks
+/// the purge. Missing or corrupt journal history also fails closed.
+fn privacy_purge_blocking_action_count(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<u64, DatabaseError> {
+    count_query(
+        transaction,
+        "SELECT COUNT(*) FROM privacy_purge_action_plan_targets t \
+         WHERE t.nonce=?1 AND ?2=?2 AND NOT EXISTS( \
+             SELECT 1 FROM action_journal_events e \
+             WHERE e.plan_id=t.plan_id \
+               AND e.sequence=(SELECT MAX(latest.sequence) FROM action_journal_events latest WHERE latest.plan_id=t.plan_id) \
+               AND e.sequence=1 AND e.event_kind='preview_created')",
+        nonce,
+        scope_id,
+    )
+}
+
+fn execute_counted(
+    transaction: &Transaction<'_>,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+    total: &mut u64,
+) -> Result<(), DatabaseError> {
+    let changed = transaction.execute(sql, parameters)?;
+    *total = total
+        .checked_add(u64::try_from(changed).map_err(|_| DatabaseError::InvalidCount)?)
+        .ok_or(DatabaseError::InvalidCount)?;
+    Ok(())
+}
+
+fn execute_privacy_purge(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+    new_revision: i64,
+) -> Result<u64, DatabaseError> {
+    let mut total = 0_u64;
+
+    // Only a pristine sequence-one preview reaches this point. Any later
+    // executable-action safety record was rejected before the purge begins.
+    execute_counted(
+        transaction,
+        "DELETE FROM action_executor_leases WHERE plan_id IN (SELECT plan_id FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM action_execution_bindings WHERE plan_id IN (SELECT plan_id FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM action_journal_events WHERE plan_id IN (SELECT plan_id FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM action_command_requests WHERE plan_id IN (SELECT plan_id FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM action_plan_events WHERE plan_id IN (SELECT plan_id FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM action_plans WHERE id IN (SELECT plan_id FROM privacy_purge_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    execute_counted(
+        transaction,
+        "DELETE FROM cleanup_action_journal_events WHERE plan_id IN (SELECT plan_id FROM privacy_purge_cleanup_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM cleanup_action_plans WHERE id IN (SELECT plan_id FROM privacy_purge_cleanup_action_plan_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    execute_counted(
+        transaction,
+        "DELETE FROM screenshot_group_members WHERE observation_id IN (SELECT o.id FROM screenshot_group_observations o JOIN privacy_purge_screenshot_group_targets t ON t.nonce=?1 AND t.group_id=o.group_id WHERE ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM screenshot_group_observations WHERE group_id IN (SELECT group_id FROM privacy_purge_screenshot_group_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM screenshot_group_candidates WHERE id IN (SELECT group_id FROM privacy_purge_screenshot_group_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    execute_counted(
+        transaction,
+        "DELETE FROM project_suggestion_signals WHERE suggestion_id IN (SELECT s.id FROM project_suggestions s JOIN privacy_purge_project_targets t ON t.nonce=?1 AND t.project_id=s.project_id WHERE ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM project_feedback_events WHERE project_id IN (SELECT project_id FROM privacy_purge_project_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM project_suggestions WHERE project_id IN (SELECT project_id FROM privacy_purge_project_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM projects WHERE id IN (SELECT project_id FROM privacy_purge_project_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    execute_counted(
+        transaction,
+        "DELETE FROM file_version_feedback_events WHERE relation_id IN (SELECT relation_id FROM privacy_purge_relation_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM file_relation_feedback_events WHERE relation_id IN (SELECT relation_id FROM privacy_purge_relation_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM file_version_observations WHERE relation_id IN (SELECT relation_id FROM privacy_purge_relation_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM file_relation_observations WHERE relation_id IN (SELECT relation_id FROM privacy_purge_relation_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM file_relation_candidates WHERE id IN (SELECT relation_id FROM privacy_purge_relation_targets WHERE nonce=?1 AND ?2=?2)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    execute_counted(
+        transaction,
+        "UPDATE extraction_jobs SET status='cancelled', cancel_requested=1, runner_token=NULL, lease_expires_at_unix_ms=NULL, finished_at_unix_ms=COALESCE(finished_at_unix_ms,updated_at_unix_ms) WHERE scope_id=?2 AND policy_revision < ?3 AND status IN ('queued','running','interrupted') AND NOT EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=extraction_jobs.node_id)",
+        params![nonce, scope_id, new_revision],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM content_chunks WHERE scope_id=?2 AND EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=content_chunks.node_id)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM image_metadata WHERE scope_id=?2 AND EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=image_metadata.node_id)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM extraction_jobs WHERE scope_id=?2 AND EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=extraction_jobs.node_id)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    // Every running unit was bound to the previous revision. It cannot publish.
+    execute_counted(
+        transaction,
+        "UPDATE scan_jobs SET status='failed', control_state='ready', pause_requested=0, runner_token=NULL, lease_expires_at_unix_ms=NULL, finished_at_unix_ms=COALESCE(finished_at_unix_ms,updated_at_unix_ms) WHERE scope_id=?1 AND policy_revision < ?2 AND status IN ('running','interrupted')",
+        params![scope_id, new_revision],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_queue WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1 AND policy_revision < ?2)",
+        params![scope_id, new_revision],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_staged_observations WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1 AND policy_revision < ?2)",
+        params![scope_id, new_revision],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_staged_issues WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1 AND policy_revision < ?2)",
+        params![scope_id, new_revision],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_issues WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1) AND path_key IS NOT NULL AND EXISTS(SELECT 1 FROM scope_exclusions e WHERE e.scope_id=?1 AND (scan_issues.path_key=e.path_key OR (e.kind='folder' AND length(scan_issues.path_key)>length(e.path_key) AND substr(scan_issues.path_key,1,length(e.path_key))=e.path_key AND (substr(e.path_key,-1,1)=CASE WHEN (SELECT platform FROM authorized_scopes WHERE id=?1)='windows' THEN char(92) ELSE '/' END OR substr(scan_issues.path_key,length(e.path_key)+1,1)=CASE WHEN (SELECT platform FROM authorized_scopes WHERE id=?1)='windows' THEN char(92) ELSE '/' END))))",
+        [scope_id],
+        &mut total,
+    )?;
+
+    execute_counted(
+        transaction,
+        "DELETE FROM watch_events WHERE scope_id=?2 AND (status IN ('stabilizing','reconciling') OR EXISTS(SELECT 1 FROM scope_exclusions e WHERE e.scope_id=?2 AND (watch_events.path_key=e.path_key OR (e.kind='folder' AND length(watch_events.path_key)>length(e.path_key) AND substr(watch_events.path_key,1,length(e.path_key))=e.path_key AND (substr(e.path_key,-1,1)=CASE WHEN (SELECT platform FROM authorized_scopes WHERE id=?2)='windows' THEN char(92) ELSE '/' END OR substr(watch_events.path_key,length(e.path_key)+1,1)=CASE WHEN (SELECT platform FROM authorized_scopes WHERE id=?2)='windows' THEN char(92) ELSE '/' END)))))",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM edges WHERE scope_id=?2 AND (EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=edges.source_node_id) OR EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=edges.target_node_id))",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM locations WHERE scope_id=?2 AND EXISTS(SELECT 1 FROM privacy_purge_location_targets t WHERE t.nonce=?1 AND t.location_id=locations.id)",
+        params![nonce, scope_id],
+        &mut total,
+    )?;
+
+    // Node identity is global. Cross-scope hardlinks retain their source node;
+    // only identities with no remaining location or derived reference are freed.
+    execute_counted(
+        transaction,
+        "DELETE FROM files WHERE EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=files.node_id) AND NOT EXISTS(SELECT 1 FROM locations l WHERE l.node_id=files.node_id)",
+        [nonce],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM folders WHERE EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=folders.node_id) AND NOT EXISTS(SELECT 1 FROM locations l WHERE l.node_id=folders.node_id)",
+        [nonce],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM nodes WHERE EXISTS(SELECT 1 FROM privacy_purge_node_targets n WHERE n.nonce=?1 AND n.node_id=nodes.id) AND NOT EXISTS(SELECT 1 FROM locations l WHERE l.node_id=nodes.id) AND NOT EXISTS(SELECT 1 FROM edges e WHERE e.source_node_id=nodes.id OR e.target_node_id=nodes.id)",
+        [nonce],
+        &mut total,
+    )?;
+    Ok(total)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,6 +1243,201 @@ pub struct ScopeRecord {
     pub path_key: String,
     pub display_path: String,
     pub platform: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopePolicyRevision {
+    pub scope_id: i64,
+    pub revision: i64,
+}
+
+/// A revision-only snapshot for explicitly authorized core scan/extraction work.
+/// This never proves that a durable OS access grant exists or is active.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopeRevisionBinding {
+    pub scope_id: i64,
+    pub revision: i64,
+}
+
+/// An active-grant policy snapshot. Path-bearing packaged/query/action work must
+/// present this binding; the database rechecks both revision and durable active
+/// grant in the same transaction that commits the mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopePolicyBinding {
+    pub scope_id: i64,
+    pub revision: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScopeExclusionKind {
+    File,
+    Folder,
+}
+
+impl ScopeExclusionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Folder => "folder",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "file" => Ok(Self::File),
+            "folder" => Ok(Self::Folder),
+            _ => Err(DatabaseError::InvalidStoredValue),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeExclusionRecord {
+    pub id: i64,
+    pub scope_id: i64,
+    pub kind: ScopeExclusionKind,
+    pub path_raw: Vec<u8>,
+    pub path_key: String,
+    pub display_path: String,
+    pub policy_revision: i64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ScopeExclusionWrite<'a> {
+    pub kind: ScopeExclusionKind,
+    pub path_raw: &'a [u8],
+    /// Canonical `deskgraph_identity::comparison_key`, never a display path.
+    pub path_key: &'a str,
+    pub display_path: &'a str,
+    /// Canonical stable filesystem identity. `path_fallback` is never accepted.
+    pub identity_kind: &'a str,
+    pub identity_key: &'a [u8],
+}
+
+impl fmt::Debug for ScopeExclusionWrite<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopeExclusionWrite")
+            .field("kind", &self.kind)
+            .field("path_raw_len", &self.path_raw.len())
+            .field("path_key_len", &self.path_key.len())
+            .field("display_path_len", &self.display_path.len())
+            .field("identity_kind_len", &self.identity_kind.len())
+            .field("identity_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Canonical component-boundary matcher for one immutable policy snapshot.
+/// It never performs a raw string-prefix authorization decision.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ScopeExclusionMatcher {
+    pub scope_id: i64,
+    pub revision: i64,
+    exclusions: Vec<(String, ScopeExclusionKind)>,
+    excluded_identities: Vec<(String, Vec<u8>)>,
+    separator: char,
+}
+
+impl fmt::Debug for ScopeExclusionMatcher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopeExclusionMatcher")
+            .field("scope_id", &self.scope_id)
+            .field("revision", &self.revision)
+            .field("path_exclusion_count", &self.exclusions.len())
+            .field("identity_exclusion_count", &self.excluded_identities.len())
+            .finish()
+    }
+}
+
+impl ScopeExclusionMatcher {
+    pub fn is_excluded_path_key(&self, canonical_path_key: &str) -> bool {
+        self.exclusions.iter().any(|(excluded, kind)| {
+            canonical_path_key == excluded
+                || (*kind == ScopeExclusionKind::Folder
+                    && canonical_descendant_of(canonical_path_key, excluded, self.separator))
+        })
+    }
+
+    pub fn is_excluded_identity(&self, identity_kind: &str, identity_key: &[u8]) -> bool {
+        if identity_kind.is_empty() || identity_key.is_empty() {
+            return !self.excluded_identities.is_empty();
+        }
+        self.excluded_identities
+            .iter()
+            .any(|(excluded_kind, excluded_key)| {
+                identity_kind == excluded_kind && identity_key == excluded_key
+            })
+    }
+
+    pub fn requires_stable_identity(&self) -> bool {
+        !self.excluded_identities.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ScopeExclusionImpactPreview {
+    pub direct_location_count: u64,
+    pub conservative_location_count: u64,
+    pub conservative_node_count: u64,
+    pub scan_job_count: u64,
+    pub extraction_job_count: u64,
+    pub watch_event_count: u64,
+    pub content_chunk_count: u64,
+    pub image_metadata_count: u64,
+    pub edge_count: u64,
+    pub project_count: u64,
+    pub relation_count: u64,
+    pub screenshot_group_count: u64,
+    pub action_plan_count: u64,
+    pub cleanup_action_plan_count: u64,
+    pub blocking_action_count: u64,
+    pub pending_job_count: u64,
+}
+
+impl ScopeExclusionImpactPreview {
+    pub fn total_purge_rows(self) -> Result<u64, DatabaseError> {
+        [
+            self.conservative_location_count,
+            self.scan_job_count,
+            self.extraction_job_count,
+            self.watch_event_count,
+            self.content_chunk_count,
+            self.image_metadata_count,
+            self.edge_count,
+            self.project_count,
+            self.relation_count,
+            self.screenshot_group_count,
+            self.action_plan_count,
+            self.cleanup_action_plan_count,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |sum, value| sum.checked_add(value))
+        .ok_or(DatabaseError::InvalidCount)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrivacyPurgeReceipt {
+    pub id: i64,
+    pub scope_id: i64,
+    pub from_revision: i64,
+    pub to_revision: i64,
+    pub exclusions_added: u64,
+    pub affected_location_count: u64,
+    pub affected_node_count: u64,
+    pub purged_row_count: u64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScopeExclusionApplyResult {
+    pub policy: ScopePolicyRevision,
+    pub receipt: PrivacyPurgeReceipt,
+    pub purged: ScopeExclusionImpactPreview,
+    pub exclusions: Vec<ScopeExclusionRecord>,
 }
 
 /// The durable lifecycle state of a platform-owned scope access grant.
@@ -776,14 +1983,36 @@ pub struct LexicalSearchFilters<'a> {
     pub modified_before_unix_ns: Option<i64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct LexicalSearchCandidate {
     pub source: LexicalCandidateSource,
     pub scope_id: i64,
+    pub policy_revision: i64,
     pub node_id: i64,
     pub location_id: i64,
+    pub path_key: String,
     pub display_path: String,
+    pub identity_kind: String,
+    pub identity_key: Vec<u8>,
     pub snippet: Option<String>,
+}
+
+impl fmt::Debug for LexicalSearchCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LexicalSearchCandidate")
+            .field("source", &self.source)
+            .field("scope_id", &self.scope_id)
+            .field("policy_revision", &self.policy_revision)
+            .field("node_id", &self.node_id)
+            .field("location_id", &self.location_id)
+            .field("path_key", &"<redacted>")
+            .field("display_path", &"<redacted>")
+            .field("identity_kind_len", &self.identity_kind.len())
+            .field("identity_key", &"<redacted>")
+            .field("snippet", &self.snippet.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -799,6 +2028,9 @@ pub enum DatabaseError {
     ScopeAccessGrantNotFound,
     ScopeAccessGrantNotActive,
     ScopeAccessGrantInputInvalid,
+    ScopeExclusionInputInvalid,
+    ScopePolicyRevisionStale,
+    ScopePrivacyPurgeBlocked,
     ScanJobNotFound,
     ScanJobAlreadyActive,
     ScanJobBusy,
@@ -870,6 +2102,9 @@ impl DatabaseError {
             Self::ScopeAccessGrantNotFound => "scope_access_grant_not_found",
             Self::ScopeAccessGrantNotActive => "scope_access_grant_not_active",
             Self::ScopeAccessGrantInputInvalid => "scope_access_grant_input_invalid",
+            Self::ScopeExclusionInputInvalid => "scope_exclusion_input_invalid",
+            Self::ScopePolicyRevisionStale => "scope_policy_revision_stale",
+            Self::ScopePrivacyPurgeBlocked => "scope_privacy_purge_blocked",
             Self::ScanJobNotFound => "scan_job_not_found",
             Self::ScanJobAlreadyActive => "scan_job_already_active",
             Self::ScanJobBusy => "scan_job_busy",
@@ -1006,6 +2241,47 @@ impl ManifestReadDatabase {
 
     pub fn ensure_scope_queryable(&self, scope_id: i64) -> Result<(), DatabaseError> {
         ensure_scope_queryable(&self.connection, scope_id)
+    }
+
+    pub fn bind_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopePolicyBinding, DatabaseError> {
+        let revision = current_scope_policy_revision_from_connection(&self.connection, scope_id)?;
+        ensure_scope_access_permitted(&self.connection, scope_id)?;
+        Ok(ScopePolicyBinding { scope_id, revision })
+    }
+
+    /// Revision-only binding for the explicitly authorized core CLI scan and
+    /// extraction pipeline. Desktop, MCP, Search and privacy changes must use
+    /// `bind_scope_policy_revision`, which additionally requires an active OS grant.
+    pub fn bind_core_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeRevisionBinding, DatabaseError> {
+        let revision = current_scope_policy_revision_from_connection(&self.connection, scope_id)?;
+        Ok(ScopeRevisionBinding { scope_id, revision })
+    }
+
+    pub fn is_core_scope_policy_binding_current(
+        &self,
+        binding: ScopeRevisionBinding,
+    ) -> Result<bool, DatabaseError> {
+        core_scope_policy_binding_is_current(&self.connection, binding)
+    }
+
+    pub fn is_scope_policy_binding_current(
+        &self,
+        binding: ScopePolicyBinding,
+    ) -> Result<bool, DatabaseError> {
+        scope_policy_binding_is_current(&self.connection, binding)
+    }
+
+    pub fn scope_exclusion_matcher(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeExclusionMatcher, DatabaseError> {
+        scope_exclusion_matcher_from_connection(&self.connection, scope_id)
     }
 
     pub fn lexical_search_candidates(
@@ -1259,10 +2535,12 @@ impl ManifestDatabase {
                 "SELECT scope.path_raw, scope.path_key, scope.platform \
                  FROM authorized_scopes scope \
                  JOIN scope_access_grants grant \
-                   ON grant.scope_id = scope.id AND grant.state = 'active' \
+                   ON grant.scope_id = scope.id AND grant.platform = scope.platform \
+                  AND grant.state = 'active' \
+                 WHERE scope.platform = ?1 AND grant.platform = ?1 \
                  ORDER BY scope.id",
             )?;
-            let rows = statement.query_map([], |row| {
+            let rows = statement.query_map([std::env::consts::OS], |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
@@ -1379,10 +2657,12 @@ impl ManifestDatabase {
             "SELECT scope.id, scope.path_raw, scope.path_key, scope.display_path, scope.platform \
              FROM authorized_scopes scope \
              JOIN scope_access_grants grant \
-               ON grant.scope_id = scope.id AND grant.state = 'active' \
+               ON grant.scope_id = scope.id AND grant.platform = scope.platform \
+              AND grant.state = 'active' \
+             WHERE scope.platform = ?1 AND grant.platform = ?1 \
              ORDER BY scope.id",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([std::env::consts::OS], |row| {
             Ok(ScopeRecord {
                 id: row.get(0)?,
                 path_raw: row.get(1)?,
@@ -1412,6 +2692,205 @@ impl ManifestDatabase {
             )
             .optional()?
             .ok_or(DatabaseError::ScopeNotFound)
+    }
+
+    pub fn current_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopePolicyRevision, DatabaseError> {
+        let revision = self
+            .connection
+            .query_row(
+                "SELECT policy_revision FROM authorized_scopes WHERE id = ?1",
+                [scope_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::ScopeNotFound)?;
+        Ok(ScopePolicyRevision { scope_id, revision })
+    }
+
+    pub fn bind_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopePolicyBinding, DatabaseError> {
+        let revision = current_scope_policy_revision_from_connection(&self.connection, scope_id)?;
+        ensure_scope_access_permitted(&self.connection, scope_id)?;
+        Ok(ScopePolicyBinding { scope_id, revision })
+    }
+
+    /// Revision-only binding for core CLI scan/extraction work. Packaged and
+    /// query surfaces must use the active-grant `bind_scope_policy_revision`.
+    pub fn bind_core_scope_policy_revision(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeRevisionBinding, DatabaseError> {
+        let revision = current_scope_policy_revision_from_connection(&self.connection, scope_id)?;
+        Ok(ScopeRevisionBinding { scope_id, revision })
+    }
+
+    pub fn is_core_scope_policy_binding_current(
+        &self,
+        binding: ScopeRevisionBinding,
+    ) -> Result<bool, DatabaseError> {
+        core_scope_policy_binding_is_current(&self.connection, binding)
+    }
+
+    pub fn is_scope_policy_binding_current(
+        &self,
+        binding: ScopePolicyBinding,
+    ) -> Result<bool, DatabaseError> {
+        scope_policy_binding_is_current(&self.connection, binding)
+    }
+
+    pub fn scope_exclusion_matcher(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeExclusionMatcher, DatabaseError> {
+        scope_exclusion_matcher_from_connection(&self.connection, scope_id)
+    }
+
+    pub fn scope_exclusions(
+        &self,
+        scope_id: i64,
+    ) -> Result<Vec<ScopeExclusionRecord>, DatabaseError> {
+        self.current_scope_policy_revision(scope_id)?;
+        scope_exclusions_from_connection(&self.connection, scope_id)
+    }
+
+    pub fn preview_scope_exclusion_batch(
+        &mut self,
+        binding: ScopePolicyBinding,
+        writes: &[ScopeExclusionWrite<'_>],
+    ) -> Result<ScopeExclusionImpactPreview, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        assert_scope_policy_binding_in_transaction(&transaction, binding)?;
+        let scope = scope_exclusion_validation_context(&transaction, binding.scope_id)?;
+        validate_scope_exclusion_batch(&transaction, &scope, writes)?;
+        let next_revision = scope
+            .revision
+            .checked_add(1)
+            .ok_or(DatabaseError::InvalidCount)?;
+        let nonce = begin_privacy_purge_capability(
+            &transaction,
+            binding.scope_id,
+            scope.revision,
+            next_revision,
+            0,
+        )?;
+        insert_privacy_targets_for_writes(&transaction, &nonce, &scope, writes)?;
+        let impact = privacy_purge_impact(&transaction, &nonce, binding.scope_id)?;
+        transaction.rollback()?;
+        Ok(impact)
+    }
+
+    pub fn apply_scope_exclusion_batch(
+        &mut self,
+        binding: ScopePolicyBinding,
+        writes: &[ScopeExclusionWrite<'_>],
+        now_unix_ms: i64,
+    ) -> Result<ScopeExclusionApplyResult, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::InvalidTimestamp);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_scope_policy_binding_in_transaction(&transaction, binding)?;
+        let scope = scope_exclusion_validation_context(&transaction, binding.scope_id)?;
+        validate_scope_exclusion_batch(&transaction, &scope, writes)?;
+        let next_revision = binding
+            .revision
+            .checked_add(1)
+            .ok_or(DatabaseError::InvalidCount)?;
+        let nonce = begin_privacy_purge_capability(
+            &transaction,
+            binding.scope_id,
+            binding.revision,
+            next_revision,
+            now_unix_ms,
+        )?;
+        let changed = transaction.execute(
+            "UPDATE authorized_scopes SET policy_revision = ?3 \
+             WHERE id = ?1 AND policy_revision = ?2",
+            params![binding.scope_id, binding.revision, next_revision],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
+        for write in writes {
+            transaction.execute(
+                "INSERT INTO scope_exclusions( \
+                     scope_id, kind, path_raw, path_key, display_path, identity_kind, identity_key, \
+                     policy_revision, created_at_unix_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    binding.scope_id,
+                    write.kind.as_str(),
+                    write.path_raw,
+                    write.path_key,
+                    write.display_path,
+                    write.identity_kind,
+                    write.identity_key,
+                    next_revision,
+                    now_unix_ms,
+                ],
+            )?;
+        }
+        insert_all_privacy_targets(&transaction, &nonce, &scope)?;
+        let impact = privacy_purge_impact(&transaction, &nonce, binding.scope_id)?;
+        ensure_privacy_purge_actions_are_safe(&transaction, &nonce, binding.scope_id)?;
+        let purged_row_count =
+            execute_privacy_purge(&transaction, &nonce, binding.scope_id, next_revision)?;
+        transaction.execute(
+            "INSERT INTO privacy_purge_receipts( \
+                 scope_id, from_revision, to_revision, exclusions_added, \
+                 affected_location_count, affected_node_count, purged_row_count, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                binding.scope_id,
+                binding.revision,
+                next_revision,
+                to_i64(u64::try_from(writes.len()).map_err(|_| DatabaseError::InvalidCount)?)?,
+                to_i64(impact.conservative_location_count)?,
+                to_i64(impact.conservative_node_count)?,
+                to_i64(purged_row_count)?,
+                now_unix_ms,
+            ],
+        )?;
+        let receipt_id = transaction.last_insert_rowid();
+        let exclusions = scope_exclusions_from_connection(&transaction, binding.scope_id)?;
+        let consumed = transaction.execute(
+            "DELETE FROM privacy_purge_capabilities WHERE nonce = ?1 AND scope_id = ?2",
+            params![nonce, binding.scope_id],
+        )?;
+        if consumed != 1 {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        transaction.commit()?;
+        let receipt = PrivacyPurgeReceipt {
+            id: receipt_id,
+            scope_id: binding.scope_id,
+            from_revision: binding.revision,
+            to_revision: next_revision,
+            exclusions_added: u64::try_from(writes.len())
+                .map_err(|_| DatabaseError::InvalidCount)?,
+            affected_location_count: impact.conservative_location_count,
+            affected_node_count: impact.conservative_node_count,
+            purged_row_count,
+            created_at_unix_ms: now_unix_ms,
+        };
+        Ok(ScopeExclusionApplyResult {
+            policy: ScopePolicyRevision {
+                scope_id: binding.scope_id,
+                revision: next_revision,
+            },
+            receipt,
+            purged: impact,
+            exclusions,
+        })
     }
 
     /// Stores or replaces a platform-owned grant for an existing scope.
@@ -1507,9 +2986,11 @@ impl ManifestDatabase {
             "SELECT grant.scope_id FROM scope_access_grants grant \
              JOIN authorized_scopes scope \
                ON scope.id = grant.scope_id AND scope.platform = grant.platform \
-             WHERE grant.state = 'active' ORDER BY grant.scope_id ASC",
+             WHERE grant.state = 'active' \
+               AND scope.platform = ?1 AND grant.platform = ?1 \
+             ORDER BY grant.scope_id ASC",
         )?;
-        let scope_ids = statement.query_map([], |row| row.get(0))?;
+        let scope_ids = statement.query_map([std::env::consts::OS], |row| row.get(0))?;
         scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1517,10 +2998,14 @@ impl ManifestDatabase {
     /// revoked, or reauthorization-required record is never returned as a
     /// usable capability.
     pub fn active_scope_grant(&self, scope_id: i64) -> Result<ScopeAccessGrant, DatabaseError> {
+        let scope = self.scope_record(scope_id)?;
         let grant = self
             .scope_access_grant(scope_id)?
             .ok_or(DatabaseError::ScopeAccessGrantNotFound)?;
-        if grant.state != ScopeAccessGrantState::Active {
+        if grant.state != ScopeAccessGrantState::Active
+            || scope.platform != std::env::consts::OS
+            || grant.platform != std::env::consts::OS
+        {
             return Err(DatabaseError::ScopeAccessGrantNotActive);
         }
         Ok(grant)
@@ -1535,9 +3020,11 @@ impl ManifestDatabase {
              FROM scope_access_grants grant \
              JOIN authorized_scopes scope \
                ON scope.id = grant.scope_id AND scope.platform = grant.platform \
-             WHERE grant.state = 'active' ORDER BY grant.scope_id ASC",
+             WHERE grant.state = 'active' \
+               AND scope.platform = ?1 AND grant.platform = ?1 \
+             ORDER BY grant.scope_id ASC",
         )?;
-        let grants = statement.query_map([], scope_access_grant_from_row)?;
+        let grants = statement.query_map([std::env::consts::OS], scope_access_grant_from_row)?;
         grants.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -1550,8 +3037,9 @@ impl ManifestDatabase {
                      JOIN authorized_scopes scope \
                        ON scope.id = grant.scope_id AND scope.platform = grant.platform \
                      WHERE grant.scope_id = ?1 AND grant.state = 'active' \
+                       AND scope.platform = ?2 AND grant.platform = ?2 \
                  )",
-                [scope_id],
+                params![scope_id, std::env::consts::OS],
                 |row| row.get::<_, i64>(0).map(|value| value == 1),
             )
             .map_err(Into::into)
@@ -1585,13 +3073,24 @@ impl ManifestDatabase {
         Ok(())
     }
 
-    pub fn create_scan_job(&self, scope_id: i64) -> Result<i64, DatabaseError> {
-        self.scope_record(scope_id)?;
-        self.connection.execute(
-            "INSERT INTO scan_jobs(scope_id, status, started_at_unix_ms) VALUES (?1, 'running', ?2)",
-            params![scope_id, unix_ms()?],
+    pub fn create_scan_job_with_policy(
+        &self,
+        binding: ScopeRevisionBinding,
+    ) -> Result<i64, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        assert_scope_revision_binding_in_transaction(&transaction, binding)?;
+        transaction.execute(
+            "INSERT INTO scan_jobs(scope_id, status, started_at_unix_ms, policy_revision) \
+             VALUES (?1, 'running', ?2, ?3)",
+            params![binding.scope_id, unix_ms()?, binding.revision],
         )?;
+        transaction.commit()?;
         Ok(self.connection.last_insert_rowid())
+    }
+
+    #[cfg(test)]
+    pub fn create_scan_job(&self, scope_id: i64) -> Result<i64, DatabaseError> {
+        self.create_scan_job_with_policy(test_revision_binding(self, scope_id)?)
     }
 
     pub fn fail_scan(&self, job_id: i64, issue_count: u64) -> Result<(), DatabaseError> {
@@ -1673,16 +3172,28 @@ impl ManifestDatabase {
         })
     }
 
+    pub fn create_resumable_scan_job_with_policy(
+        &mut self,
+        binding: ScopeRevisionBinding,
+        root: &QueuedPath,
+    ) -> Result<ScanJobProgress, DatabaseError> {
+        let now = unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        assert_scope_revision_binding_in_transaction(&transaction, binding)?;
+        assert_scope_path_key_allowed(&transaction, binding.scope_id, &root.path_key)?;
+        let job_id = insert_resumable_scan_job(&transaction, binding, root, now)?;
+        transaction.commit()?;
+        self.scan_job(job_id)
+    }
+
+    #[cfg(test)]
     pub fn create_resumable_scan_job(
         &mut self,
         scope_id: i64,
         root: &QueuedPath,
     ) -> Result<ScanJobProgress, DatabaseError> {
-        let now = unix_ms()?;
-        let transaction = self.connection.transaction()?;
-        let job_id = insert_resumable_scan_job(&transaction, scope_id, root, now)?;
-        transaction.commit()?;
-        self.scan_job(job_id)
+        let binding = test_revision_binding(self, scope_id)?;
+        self.create_resumable_scan_job_with_policy(binding, root)
     }
 
     pub fn scan_job(&self, job_id: i64) -> Result<ScanJobProgress, DatabaseError> {
@@ -1708,22 +3219,20 @@ impl ManifestDatabase {
         jobs.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    pub fn record_watch_observation_at(
+    pub fn record_watch_observation_with_policy_at(
         &mut self,
+        binding: ScopeRevisionBinding,
         observation: WatchObservationWrite<'_>,
     ) -> Result<WatchEventRecord, DatabaseError> {
         validate_watch_observation(&observation)?;
+        if binding.scope_id != observation.scope_id {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let scope_exists: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM authorized_scopes WHERE id = ?1",
-            [observation.scope_id],
-            |row| row.get(0),
-        )?;
-        if scope_exists != 1 {
-            return Err(DatabaseError::ScopeNotFound);
-        }
+        assert_scope_revision_binding_in_transaction(&transaction, binding)?;
+        assert_scope_path_key_allowed(&transaction, observation.scope_id, observation.path_key)?;
         let completed_scan_exists: i64 = transaction.query_row(
             "SELECT EXISTS( \
                 SELECT 1 FROM scan_jobs \
@@ -1862,6 +3371,15 @@ impl ManifestDatabase {
         self.watch_event(event_id)
     }
 
+    #[cfg(test)]
+    pub fn record_watch_observation_at(
+        &mut self,
+        observation: WatchObservationWrite<'_>,
+    ) -> Result<WatchEventRecord, DatabaseError> {
+        let binding = test_revision_binding(self, observation.scope_id)?;
+        self.record_watch_observation_with_policy_at(binding, observation)
+    }
+
     pub fn watch_event(&self, event_id: i64) -> Result<WatchEventRecord, DatabaseError> {
         self.connection
             .query_row(
@@ -1946,14 +3464,15 @@ impl ManifestDatabase {
                ON grant.scope_id = authorized_scopes.id \
               AND grant.platform = authorized_scopes.platform \
               AND grant.state = 'active' \
-             WHERE EXISTS ( \
+             WHERE authorized_scopes.platform = ?1 AND grant.platform = ?1 \
+               AND EXISTS ( \
                 SELECT 1 FROM scan_jobs \
                 WHERE scan_jobs.scope_id = authorized_scopes.id \
                     AND scan_jobs.status = 'completed' \
              ) \
              ORDER BY authorized_scopes.id ASC",
         )?;
-        let scope_ids = statement.query_map([], |row| row.get(0))?;
+        let scope_ids = statement.query_map([std::env::consts::OS], |row| row.get(0))?;
         scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -2263,6 +3782,22 @@ impl ManifestDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let policy_revision = transaction
+            .query_row(
+                "SELECT policy_revision FROM watch_events WHERE id=?1 AND scope_id=?2",
+                params![binding.event_id, binding.scope_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::WatchEventNotFound)?;
+        assert_scope_revision_binding_in_transaction(
+            &transaction,
+            ScopeRevisionBinding {
+                scope_id: binding.scope_id,
+                revision: policy_revision,
+            },
+        )?;
+        assert_scope_path_key_allowed(&transaction, binding.scope_id, &binding.path_key)?;
         let event_changed = transaction.execute(
             "UPDATE watch_events SET status = 'completed', scan_job_id = NULL, reason = NULL, \
                 updated_at_unix_ms = ?2 \
@@ -2526,14 +4061,16 @@ impl ManifestDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (scope_id, status, stable_after): (i64, String, i64) = transaction
-            .query_row(
-                "SELECT scope_id, status, stable_after_unix_ms FROM watch_events WHERE id = ?1",
-                [event_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?
-            .ok_or(DatabaseError::WatchEventNotFound)?;
+        let (scope_id, policy_revision, status, stable_after): (i64, i64, String, i64) =
+            transaction
+                .query_row(
+                    "SELECT scope_id, policy_revision, status, stable_after_unix_ms \
+                 FROM watch_events WHERE id = ?1",
+                    [event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?
+                .ok_or(DatabaseError::WatchEventNotFound)?;
         let authorized_root = transaction
             .query_row(
                 "SELECT path_raw, path_key FROM authorized_scopes WHERE id = ?1",
@@ -2560,7 +4097,22 @@ impl ManifestDatabase {
         {
             return Err(DatabaseError::InvalidWatchEventState);
         }
-        let scan_job_id = insert_resumable_scan_job(&transaction, scope_id, root, now_unix_ms)?;
+        assert_scope_revision_binding_in_transaction(
+            &transaction,
+            ScopeRevisionBinding {
+                scope_id,
+                revision: policy_revision,
+            },
+        )?;
+        let scan_job_id = insert_resumable_scan_job(
+            &transaction,
+            ScopeRevisionBinding {
+                scope_id,
+                revision: policy_revision,
+            },
+            root,
+            now_unix_ms,
+        )?;
         let changed = transaction.execute(
             "UPDATE watch_events SET status = 'reconciling', scan_job_id = ?2, reason = NULL, \
                 updated_at_unix_ms = ?3 WHERE id = ?1 AND status = 'stabilizing'",
@@ -2785,9 +4337,16 @@ impl ManifestDatabase {
             .checked_add(lease_ms)
             .ok_or(DatabaseError::InvalidTimestamp)?;
         let transaction = self.connection.transaction()?;
+        let policy_binding = scan_job_revision_binding(&transaction, job_id)?;
+        assert_scope_revision_binding_in_transaction(&transaction, policy_binding)?;
         ensure_owned_runner(&transaction, job_id, runner_token, now)?;
 
         if let Some(observation) = observation {
+            assert_scope_path_key_allowed(
+                &transaction,
+                policy_binding.scope_id,
+                &observation.path_key,
+            )?;
             transaction.execute(
                 "INSERT INTO scan_staged_observations( \
                     scan_id, kind, identity_kind, identity_key, parent_identity_key, path_raw, \
@@ -2815,6 +4374,7 @@ impl ManifestDatabase {
         }
 
         for child in children {
+            assert_scope_path_key_allowed(&transaction, policy_binding.scope_id, &child.path_key)?;
             transaction.execute(
                 "INSERT INTO scan_queue( \
                     scan_id, path_raw, path_key, parent_identity_key, is_root, state \
@@ -2888,6 +4448,8 @@ impl ManifestDatabase {
     ) -> Result<ScanJobProgress, DatabaseError> {
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        let policy_binding = scan_job_revision_binding(&transaction, job_id)?;
+        assert_scope_revision_binding_in_transaction(&transaction, policy_binding)?;
         ensure_owned_runner(&transaction, job_id, runner_token, now)?;
         transaction.execute(
             "UPDATE scan_jobs SET \
@@ -3002,6 +4564,13 @@ impl ManifestDatabase {
             observations
         };
         for observation in &observations {
+            assert_scope_path_key_allowed(&transaction, scope_id, &observation.path_key)?;
+            assert_scope_identity_allowed(
+                &transaction,
+                scope_id,
+                &observation.identity_kind,
+                &observation.identity_key,
+            )?;
             upsert_observation(&transaction, scope_id, job_id, observation, now)?;
         }
         transaction.execute(
@@ -3141,12 +4710,35 @@ impl ManifestDatabase {
             .ok_or(DatabaseError::ExtractableFileNotFound)
     }
 
+    pub fn create_extraction_job_with_policy(
+        &mut self,
+        binding: ScopeRevisionBinding,
+        node_id: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.create_extraction_job_for_operation(binding, node_id, ExtractionOperation::Content)
+    }
+
+    #[cfg(test)]
     pub fn create_extraction_job(
         &mut self,
         scope_id: i64,
         node_id: i64,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
-        self.create_extraction_job_for_operation(scope_id, node_id, ExtractionOperation::Content)
+        let binding = test_revision_binding(self, scope_id)?;
+        self.create_extraction_job_with_policy(binding, node_id)
+    }
+
+    #[cfg(test)]
+    fn create_screenshot_ocr_job_with_policy(
+        &mut self,
+        binding: ScopeRevisionBinding,
+        node_id: i64,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.create_extraction_job_for_operation(
+            binding,
+            node_id,
+            ExtractionOperation::ScreenshotOcr,
+        )
     }
 
     #[cfg(test)]
@@ -3155,11 +4747,8 @@ impl ManifestDatabase {
         scope_id: i64,
         node_id: i64,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
-        self.create_extraction_job_for_operation(
-            scope_id,
-            node_id,
-            ExtractionOperation::ScreenshotOcr,
-        )
+        let binding = test_revision_binding(self, scope_id)?;
+        self.create_screenshot_ocr_job_with_policy(binding, node_id)
     }
 
     /// Low-level storage compare-and-insert used only after the extraction core
@@ -3170,30 +4759,56 @@ impl ManifestDatabase {
     /// and it is not a filesystem or image-validation entry point. Workspace
     /// callers must use `deskgraph_extractors::create_screenshot_ocr_job_at`.
     #[doc(hidden)]
+    pub fn low_level_insert_screenshot_ocr_job_with_policy_after_core_validation(
+        &mut self,
+        binding: ScopeRevisionBinding,
+        source: &ExtractableFile,
+    ) -> Result<ExtractionJobProgress, DatabaseError> {
+        self.create_extraction_job_for_current_source(
+            binding,
+            source,
+            ExtractionOperation::ScreenshotOcr,
+        )
+    }
+
+    #[cfg(test)]
     pub fn low_level_insert_screenshot_ocr_job_after_core_validation(
         &mut self,
         source: &ExtractableFile,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
-        self.create_extraction_job_for_current_source(source, ExtractionOperation::ScreenshotOcr)
+        let binding = test_revision_binding(self, source.scope_id)?;
+        self.low_level_insert_screenshot_ocr_job_with_policy_after_core_validation(binding, source)
     }
 
     fn create_extraction_job_for_operation(
         &mut self,
-        scope_id: i64,
+        binding: ScopeRevisionBinding,
         node_id: i64,
         operation: ExtractionOperation,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
-        let source = self.extractable_file(scope_id, node_id)?;
-        self.create_extraction_job_for_current_source(&source, operation)
+        let source = self.extractable_file(binding.scope_id, node_id)?;
+        self.create_extraction_job_for_current_source(binding, &source, operation)
     }
 
     fn create_extraction_job_for_current_source(
         &mut self,
+        binding: ScopeRevisionBinding,
         source: &ExtractableFile,
         operation: ExtractionOperation,
     ) -> Result<ExtractionJobProgress, DatabaseError> {
+        if source.scope_id != binding.scope_id {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        assert_scope_revision_binding_in_transaction(&transaction, binding)?;
+        assert_scope_path_key_allowed(&transaction, source.scope_id, &source.path_key)?;
+        assert_scope_identity_allowed(
+            &transaction,
+            source.scope_id,
+            &source.identity_kind,
+            &source.identity_key,
+        )?;
         let current: i64 = transaction.query_row(
             "SELECT COUNT(*) \
              FROM locations l \
@@ -3231,8 +4846,8 @@ impl ManifestDatabase {
         transaction.execute(
             "INSERT INTO extraction_jobs( \
                 scope_id, node_id, location_id, status, source_size_bytes, source_modified_unix_ns, \
-                created_at_unix_ms, updated_at_unix_ms, operation \
-             ) VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?6, ?7)",
+                created_at_unix_ms, updated_at_unix_ms, operation, policy_revision \
+             ) VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?6, ?7, ?8)",
             params![
                 source.scope_id,
                 source.node_id,
@@ -3241,6 +4856,7 @@ impl ManifestDatabase {
                 source.modified_unix_ns,
                 now,
                 operation.as_str(),
+                binding.revision,
             ],
         )?;
         let job_id = transaction.last_insert_rowid();
@@ -3538,6 +5154,8 @@ impl ManifestDatabase {
         }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        let policy_binding = extraction_job_revision_binding(&transaction, job_id)?;
+        assert_scope_revision_binding_in_transaction(&transaction, policy_binding)?;
         ensure_extraction_runner(&transaction, job_id, runner_token, now)?;
         let (
             scope_id,
@@ -3606,18 +5224,19 @@ impl ManifestDatabase {
         {
             return Err(DatabaseError::ExtractionOutputInvalid);
         }
-        let current_source: Option<(i64, Option<i64>)> = transaction
+        let current_source: Option<(i64, Option<i64>, String)> = transaction
             .query_row(
-                "SELECT f.size_bytes, f.modified_unix_ns \
+                "SELECT f.size_bytes, f.modified_unix_ns, l.path_key \
                  FROM locations l JOIN files f ON f.node_id = l.node_id \
                  WHERE l.id = ?1 AND l.node_id = ?2 AND l.present = 1",
                 params![location_id, node_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((current_size, current_modified)) = current_source else {
+        let Some((current_size, current_modified, current_path_key)) = current_source else {
             return Err(DatabaseError::ExtractionOutputInvalid);
         };
+        assert_scope_path_key_allowed(&transaction, scope_id, &current_path_key)?;
         if u64::try_from(current_size).map_err(|_| DatabaseError::InvalidStoredValue)?
             != source_size_bytes
             || current_modified != source_modified_unix_ns
@@ -4012,40 +5631,50 @@ impl ManifestDatabase {
     ) -> Result<ExtractionStats, DatabaseError> {
         Ok(ExtractionStats {
             api_version: ExtractionStats::API_VERSION,
-            active_chunk_count: count(
+            active_chunk_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM content_chunks chunk \
                  JOIN scope_access_grants grant ON grant.scope_id = chunk.scope_id \
-                 WHERE chunk.active = 1 AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE chunk.active = 1 AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            extracted_file_count: count(
+            extracted_file_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM ( \
                     SELECT chunk.node_id FROM content_chunks chunk \
                     JOIN scope_access_grants grant ON grant.scope_id = chunk.scope_id \
-                    WHERE chunk.active = 1 AND grant.state = 'active' \
+                    JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                    WHERE chunk.active = 1 AND grant.state = 'active' AND scope.platform = ?1 AND grant.platform = ?1 \
                     UNION SELECT metadata.node_id FROM image_metadata metadata \
                     JOIN scope_access_grants grant ON grant.scope_id = metadata.scope_id \
-                    WHERE metadata.active = 1 AND grant.state = 'active' \
+                    JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                    WHERE metadata.active = 1 AND grant.state = 'active' AND scope.platform = ?1 AND grant.platform = ?1 \
                  )",
             )?,
-            completed_job_count: count(
+            completed_job_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM extraction_jobs job \
                  JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
-                 WHERE job.status = 'completed' AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE job.status = 'completed' AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            failed_job_count: count(
+            failed_job_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM extraction_jobs job \
                  JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
-                 WHERE job.status = 'failed' AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE job.status = 'failed' AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            cancelled_job_count: count(
+            cancelled_job_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM extraction_jobs job \
                  JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
-                 WHERE job.status = 'cancelled' AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE job.status = 'cancelled' AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
         })
     }
@@ -4131,48 +5760,62 @@ impl ManifestDatabase {
         Ok(ManifestStats {
             api_version: ManifestStats::API_VERSION,
             database_ready: true,
-            authorized_scope_count: count(
+            authorized_scope_count: count_with_host_platform(
                 &self.connection,
-                "SELECT COUNT(*) FROM scope_access_grants WHERE state = 'active'",
+                "SELECT COUNT(*) FROM scope_access_grants grant \
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE grant.state = 'active' AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            node_count: count(
+            node_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(DISTINCT location.node_id) FROM locations location \
                  JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
-                 WHERE location.present = 1 AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE location.present = 1 AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            file_count: count(
+            file_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(DISTINCT file.node_id) FROM files file \
                  JOIN locations location ON location.node_id = file.node_id \
                  JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
-                 WHERE location.present = 1 AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE location.present = 1 AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            folder_count: count(
+            folder_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(DISTINCT folder.node_id) FROM folders folder \
                  JOIN locations location ON location.node_id = folder.node_id \
                  JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
-                 WHERE location.present = 1 AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE location.present = 1 AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            active_location_count: count(
+            active_location_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM locations location \
                  JOIN scope_access_grants grant ON grant.scope_id = location.scope_id \
-                 WHERE location.present = 1 AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE location.present = 1 AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
-            issue_count: count(
+            issue_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COALESCE(job.issue_count, 0) FROM scan_jobs job \
                  JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
                  WHERE job.status = 'completed' AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1 \
                  ORDER BY job.id DESC LIMIT 1",
             )?,
-            completed_scan_count: count(
+            completed_scan_count: count_with_host_platform(
                 &self.connection,
                 "SELECT COUNT(*) FROM scan_jobs job \
                  JOIN scope_access_grants grant ON grant.scope_id = job.scope_id \
-                 WHERE job.status = 'completed' AND grant.state = 'active'",
+                 JOIN authorized_scopes scope ON scope.id = grant.scope_id AND scope.platform = grant.platform \
+                 WHERE job.status = 'completed' AND grant.state = 'active' \
+                   AND scope.platform = ?1 AND grant.platform = ?1",
             )?,
         })
     }
@@ -4426,12 +6069,13 @@ impl ManifestDatabase {
         })
     }
 
-    pub fn record_project_candidate(
+    pub fn record_project_candidate_with_policy(
         &mut self,
-        scope_id: i64,
+        policy_binding: ScopePolicyBinding,
         root_folder_node_id: i64,
         suggestion: &ProjectSuggestion,
     ) -> Result<ProjectCandidate, DatabaseError> {
+        let scope_id = policy_binding.scope_id;
         validate_project_suggestion(scope_id, root_folder_node_id, suggestion)?;
         let current_facts =
             self.folder_profile_facts(scope_id, root_folder_node_id, MAX_FOLDER_PROFILE_ENTRIES)?;
@@ -4447,17 +6091,50 @@ impl ManifestDatabase {
         }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
-        let root_is_current = transaction.query_row(
-            "SELECT EXISTS( \
-                 SELECT 1 FROM locations l \
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
+        let root_path_key = transaction
+            .query_row(
+                "SELECT l.path_key FROM locations l \
                  JOIN nodes n ON n.id = l.node_id AND n.kind = 'folder' \
                  WHERE l.scope_id = ?1 AND l.node_id = ?2 AND l.present = 1 \
-             )",
-            params![scope_id, root_folder_node_id],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        if !root_is_current {
+                 ORDER BY l.id LIMIT 1",
+                params![scope_id, root_folder_node_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(root_path_key) = root_path_key else {
             return Err(DatabaseError::ProjectCandidateRootNotCurrent);
+        };
+        assert_scope_path_key_allowed(&transaction, scope_id, &root_path_key)?;
+        let current_marker_kinds = {
+            let mut statement = transaction.prepare(
+                "SELECT n.kind, l.path_key, l.display_path FROM edges e \
+                 JOIN nodes n ON n.id=e.source_node_id \
+                 JOIN locations l ON l.scope_id=e.scope_id AND l.node_id=n.id AND l.present=1 \
+                 WHERE e.scope_id=?1 AND e.target_node_id=?2 \
+                   AND e.kind='located_in' AND e.active=1 \
+                 ORDER BY l.id",
+            )?;
+            let rows = statement.query_map(params![scope_id, root_folder_node_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut kinds = std::collections::BTreeSet::new();
+            for row in rows {
+                let (kind, path_key, display_path) = row?;
+                let kind = NodeKind::from_db(&kind)?;
+                if let Some(marker) = project_marker(Path::new(&display_path), kind) {
+                    assert_scope_path_key_allowed(&transaction, scope_id, &path_key)?;
+                    kinds.insert(marker);
+                }
+            }
+            kinds.into_iter().collect::<Vec<_>>()
+        };
+        if current_marker_kinds != suggested_kinds {
+            return Err(DatabaseError::ProjectCandidateInputInvalid);
         }
         transaction.execute(
             "INSERT OR IGNORE INTO projects( \
@@ -4519,6 +6196,17 @@ impl ManifestDatabase {
         }
         transaction.commit()?;
         self.project_candidate(project_id)
+    }
+
+    #[cfg(test)]
+    pub fn record_project_candidate(
+        &mut self,
+        scope_id: i64,
+        root_folder_node_id: i64,
+        suggestion: &ProjectSuggestion,
+    ) -> Result<ProjectCandidate, DatabaseError> {
+        let binding = test_active_binding(self, scope_id)?;
+        self.record_project_candidate_with_policy(binding, root_folder_node_id, suggestion)
     }
 
     pub fn project_candidate(&self, project_id: i64) -> Result<ProjectCandidate, DatabaseError> {
@@ -4676,8 +6364,9 @@ impl ManifestDatabase {
         })
     }
 
-    pub fn decide_project_candidate(
+    pub fn decide_project_candidate_with_policy(
         &mut self,
+        policy_binding: ScopePolicyBinding,
         project_id: i64,
         decision: ProjectDecisionKind,
     ) -> Result<ProjectCandidate, DatabaseError> {
@@ -4686,9 +6375,10 @@ impl ManifestDatabase {
         }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
         let project_exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-            [project_id],
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1 AND scope_id = ?2)",
+            params![project_id, policy_binding.scope_id],
             |row| row.get::<_, i64>(0),
         )? != 0;
         if !project_exists {
@@ -4741,6 +6431,21 @@ impl ManifestDatabase {
         self.project_candidate(project_id)
     }
 
+    #[cfg(test)]
+    pub fn decide_project_candidate(
+        &mut self,
+        project_id: i64,
+        decision: ProjectDecisionKind,
+    ) -> Result<ProjectCandidate, DatabaseError> {
+        let scope_id: i64 = self.connection.query_row(
+            "SELECT scope_id FROM projects WHERE id=?1",
+            [project_id],
+            |row| row.get(0),
+        )?;
+        let binding = test_active_binding(self, scope_id)?;
+        self.decide_project_candidate_with_policy(binding, project_id, decision)
+    }
+
     pub fn recent_project_candidates(&self) -> Result<Vec<ProjectCandidateSummary>, DatabaseError> {
         let project_ids = {
             let mut statement = self.connection.prepare(
@@ -4776,14 +6481,21 @@ impl ManifestDatabase {
             .collect()
     }
 
-    pub fn record_exact_duplicate_candidate(
+    pub fn record_exact_duplicate_candidate_with_policy(
         &mut self,
+        policy_binding: ScopePolicyBinding,
         left: &ActionSourceRecord,
         right: &ActionSourceRecord,
     ) -> Result<FileRelationCandidate, DatabaseError> {
         validate_exact_duplicate_sources(left, right)?;
+        if policy_binding.scope_id != left.scope_id {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
         let observed_at = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
+        assert_scope_path_key_allowed(&transaction, left.scope_id, &left.path_key)?;
+        assert_scope_path_key_allowed(&transaction, right.scope_id, &right.path_key)?;
         if !relation_snapshot_matches(&transaction, left)?
             || !relation_snapshot_matches(&transaction, right)?
         {
@@ -4833,12 +6545,26 @@ impl ManifestDatabase {
         self.file_relation_candidate(relation_id)
     }
 
-    pub fn record_file_version_candidate(
+    #[cfg(test)]
+    pub fn record_exact_duplicate_candidate(
         &mut self,
+        left: &ActionSourceRecord,
+        right: &ActionSourceRecord,
+    ) -> Result<FileRelationCandidate, DatabaseError> {
+        let binding = test_active_binding(self, left.scope_id)?;
+        self.record_exact_duplicate_candidate_with_policy(binding, left, right)
+    }
+
+    pub fn record_file_version_candidate_with_policy(
+        &mut self,
+        policy_binding: ScopePolicyBinding,
         first: &ActionSourceRecord,
         second: &ActionSourceRecord,
     ) -> Result<FileVersionCandidate, DatabaseError> {
         validate_file_relation_sources(first, second)?;
+        if policy_binding.scope_id != first.scope_id {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
         let first_name = explicit_version_name_from_source(first)?;
         let second_name = explicit_version_name_from_source(second)?;
         if first_name.base_key != second_name.base_key
@@ -4859,6 +6585,9 @@ impl ManifestDatabase {
         };
         let observed_at = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
+        assert_scope_path_key_allowed(&transaction, first.scope_id, &first.path_key)?;
+        assert_scope_path_key_allowed(&transaction, second.scope_id, &second.path_key)?;
         if !relation_snapshot_matches(&transaction, first)?
             || !relation_snapshot_matches(&transaction, second)?
         {
@@ -4913,6 +6642,16 @@ impl ManifestDatabase {
         )?;
         transaction.commit()?;
         self.file_version_candidate(relation_id)
+    }
+
+    #[cfg(test)]
+    pub fn record_file_version_candidate(
+        &mut self,
+        first: &ActionSourceRecord,
+        second: &ActionSourceRecord,
+    ) -> Result<FileVersionCandidate, DatabaseError> {
+        let binding = test_active_binding(self, first.scope_id)?;
+        self.record_file_version_candidate_with_policy(binding, first, second)
     }
 
     fn file_version_candidate(
@@ -5317,8 +7056,9 @@ impl ManifestDatabase {
         })
     }
 
-    pub fn decide_file_relation_candidate(
+    pub fn decide_file_relation_candidate_with_policy(
         &mut self,
+        policy_binding: ScopePolicyBinding,
         relation_id: i64,
         decision: FileRelationDecisionKind,
     ) -> Result<FileRelationCandidate, DatabaseError> {
@@ -5327,9 +7067,10 @@ impl ManifestDatabase {
         }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
         let relation_exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM file_relation_candidates WHERE id = ?1)",
-            [relation_id],
+            "SELECT EXISTS(SELECT 1 FROM file_relation_candidates WHERE id = ?1 AND scope_id = ?2)",
+            params![relation_id, policy_binding.scope_id],
             |row| row.get::<_, i64>(0),
         )? != 0;
         if !relation_exists {
@@ -5396,8 +7137,24 @@ impl ManifestDatabase {
         self.file_relation_candidate(relation_id)
     }
 
-    pub fn decide_file_version_candidate(
+    #[cfg(test)]
+    pub fn decide_file_relation_candidate(
         &mut self,
+        relation_id: i64,
+        decision: FileRelationDecisionKind,
+    ) -> Result<FileRelationCandidate, DatabaseError> {
+        let scope_id: i64 = self.connection.query_row(
+            "SELECT scope_id FROM file_relation_candidates WHERE id=?1",
+            [relation_id],
+            |row| row.get(0),
+        )?;
+        let binding = test_active_binding(self, scope_id)?;
+        self.decide_file_relation_candidate_with_policy(binding, relation_id, decision)
+    }
+
+    pub fn decide_file_version_candidate_with_policy(
+        &mut self,
+        policy_binding: ScopePolicyBinding,
         relation_id: i64,
         decision: FileRelationDecisionKind,
     ) -> Result<FileVersionCandidate, DatabaseError> {
@@ -5406,6 +7163,15 @@ impl ManifestDatabase {
         }
         let now = unix_ms()?;
         let transaction = self.connection.transaction()?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
+        let relation_matches_scope: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_relation_candidates WHERE id=?1 AND scope_id=?2)",
+            params![relation_id, policy_binding.scope_id],
+            |row| row.get(0),
+        )?;
+        if relation_matches_scope != 1 {
+            return Err(DatabaseError::FileRelationCandidateNotFound);
+        }
         Self::file_version_candidate_from_connection(&transaction, relation_id)?;
         let current_observation_id = transaction.query_row(
             "SELECT id FROM file_version_observations WHERE relation_id = ?1 \
@@ -5451,6 +7217,21 @@ impl ManifestDatabase {
         )?;
         transaction.commit()?;
         self.file_version_candidate(relation_id)
+    }
+
+    #[cfg(test)]
+    pub fn decide_file_version_candidate(
+        &mut self,
+        relation_id: i64,
+        decision: FileRelationDecisionKind,
+    ) -> Result<FileVersionCandidate, DatabaseError> {
+        let scope_id: i64 = self.connection.query_row(
+            "SELECT scope_id FROM file_relation_candidates WHERE id=?1",
+            [relation_id],
+            |row| row.get(0),
+        )?;
+        let binding = test_active_binding(self, scope_id)?;
+        self.decide_file_version_candidate_with_policy(binding, relation_id, decision)
     }
 
     pub fn recent_file_relation_candidates(
@@ -5857,21 +7638,22 @@ impl ManifestDatabase {
         screenshot_group_sources_from_connection(&self.connection, scope_id)
     }
 
-    pub fn discover_screenshot_group_candidates(
+    pub fn discover_screenshot_group_candidates_with_policy(
         &mut self,
-        scope_id: i64,
+        policy_binding: ScopePolicyBinding,
     ) -> Result<(u32, Vec<ScreenshotGroupCandidate>), DatabaseError> {
-        self.discover_screenshot_group_candidates_with_hook(scope_id, || Ok(()))
+        self.discover_screenshot_group_candidates_with_policy_and_hook(policy_binding, || Ok(()))
     }
 
-    fn discover_screenshot_group_candidates_with_hook<F>(
+    fn discover_screenshot_group_candidates_with_policy_and_hook<F>(
         &mut self,
-        scope_id: i64,
+        policy_binding: ScopePolicyBinding,
         after_source_snapshot: F,
     ) -> Result<(u32, Vec<ScreenshotGroupCandidate>), DatabaseError>
     where
         F: FnOnce() -> Result<(), DatabaseError>,
     {
+        let scope_id = policy_binding.scope_id;
         if scope_id <= 0 {
             return Err(DatabaseError::ScreenshotGroupCandidateInputInvalid);
         }
@@ -5879,6 +7661,7 @@ impl ManifestDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
         ensure_scope_queryable(&transaction, scope_id)?;
         ensure_scope_access_permitted(&transaction, scope_id)?;
         let sources = screenshot_group_sources_from_connection(&transaction, scope_id)?;
@@ -5993,6 +7776,28 @@ impl ManifestDatabase {
             .map(|group_id| self.screenshot_group_candidate(group_id))
             .collect::<Result<Vec<_>, _>>()?;
         Ok((evaluated_image_count, candidates))
+    }
+
+    #[cfg(test)]
+    pub fn discover_screenshot_group_candidates(
+        &mut self,
+        scope_id: i64,
+    ) -> Result<(u32, Vec<ScreenshotGroupCandidate>), DatabaseError> {
+        let binding = self.bind_scope_policy_revision(scope_id)?;
+        self.discover_screenshot_group_candidates_with_policy(binding)
+    }
+
+    #[cfg(test)]
+    fn discover_screenshot_group_candidates_with_hook<F>(
+        &mut self,
+        scope_id: i64,
+        hook: F,
+    ) -> Result<(u32, Vec<ScreenshotGroupCandidate>), DatabaseError>
+    where
+        F: FnOnce() -> Result<(), DatabaseError>,
+    {
+        let binding = self.bind_scope_policy_revision(scope_id)?;
+        self.discover_screenshot_group_candidates_with_policy_and_hook(binding, hook)
     }
 
     pub fn screenshot_group_candidate(
@@ -6470,17 +8275,24 @@ impl ManifestDatabase {
         action_plan_base_from_connection(&self.connection, plan_id)
     }
 
-    pub fn create_rename_action_plan(
+    pub fn create_rename_action_plan_with_policy(
         &mut self,
+        policy_binding: ScopePolicyBinding,
         plan: ActionPlanWrite<'_>,
     ) -> Result<ActionPlanPreview, DatabaseError> {
         validate_action_plan_write(&plan)?;
+        if policy_binding.scope_id != plan.scope_id {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
         let source_size = to_i64(plan.source_size_bytes)?;
         let created_at = unix_ms()?;
         let execution_strategy = action_execution_strategy_str(plan.execution_strategy);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
+        assert_scope_path_key_allowed(&transaction, plan.scope_id, plan.source_path_key)?;
+        assert_scope_path_key_allowed(&transaction, plan.scope_id, plan.destination_path_key)?;
         let snapshot_matches: i64 = transaction.query_row(
             "SELECT COUNT(*) \
              FROM locations l \
@@ -6507,17 +8319,17 @@ impl ManifestDatabase {
         if snapshot_matches != 1 {
             return Err(DatabaseError::ActionSourceSnapshotChanged);
         }
-        let binding = preview_execution_binding(&transaction, &plan)?;
+        let execution_binding = preview_execution_binding(&transaction, &plan)?;
         transaction.execute(
             "INSERT INTO action_plans( \
                 api_version, policy_version, operation, execution_strategy, scope_id, node_id, \
                 source_location_id, source_path_raw, source_path_key, source_display_path, \
                 destination_path_raw, destination_path_key, destination_display_path, \
                 source_identity_kind, source_identity_key, source_size_bytes, \
-                source_modified_unix_ns, created_at_unix_ms \
+                source_modified_unix_ns, created_at_unix_ms, policy_revision \
              ) VALUES ( \
                 'deskgraph.action-plan.v1', 'deskgraph.action-policy.v1', 'rename', ?1, ?2, ?3, \
-                ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15 \
+                ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16 \
              )",
             params![
                 execution_strategy,
@@ -6535,6 +8347,7 @@ impl ManifestDatabase {
                 source_size,
                 plan.source_modified_unix_ns,
                 created_at,
+                policy_binding.revision,
             ],
         )?;
         let plan_id = transaction.last_insert_rowid();
@@ -6556,12 +8369,12 @@ impl ManifestDatabase {
                 plan_id,
                 to_i64(plan.source_hash_bytes)?,
                 plan.source_sha256,
-                binding.scope_root_node_id,
-                binding.scope_root_identity_kind,
-                binding.scope_root_identity_key,
-                binding.parent_node_id,
-                binding.parent_identity_kind,
-                binding.parent_identity_key,
+                execution_binding.scope_root_node_id,
+                execution_binding.scope_root_identity_kind,
+                execution_binding.scope_root_identity_key,
+                execution_binding.parent_node_id,
+                execution_binding.parent_identity_kind,
+                execution_binding.parent_identity_key,
                 created_at,
             ],
         )?;
@@ -6569,13 +8382,26 @@ impl ManifestDatabase {
         self.action_plan(plan_id)
     }
 
+    #[cfg(test)]
+    pub fn create_rename_action_plan(
+        &mut self,
+        plan: ActionPlanWrite<'_>,
+    ) -> Result<ActionPlanPreview, DatabaseError> {
+        let binding = test_active_binding(self, plan.scope_id)?;
+        self.create_rename_action_plan_with_policy(binding, plan)
+    }
+
     /// Persists one immutable, path-free System Trash preview. This method has
     /// no confirmation, command, execute, recovery, Trash, or Undo companion.
-    pub fn create_cleanup_action_plan(
+    pub fn create_cleanup_action_plan_with_policy(
         &mut self,
+        policy_binding: ScopePolicyBinding,
         plan: CleanupActionPlanWrite<'_>,
     ) -> Result<CleanupActionPlanPreview, DatabaseError> {
         validate_cleanup_action_plan_write(&plan)?;
+        if policy_binding.scope_id != plan.selection.scope_id {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
         let target_size = to_i64(plan.target_size_bytes)?;
         let keeper_size = plan
             .keeper
@@ -6589,6 +8415,7 @@ impl ManifestDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_scope_policy_binding_in_transaction(&transaction, policy_binding)?;
         let expected = cleanup_selection_snapshot(&transaction, &plan.selection)?;
         if expected.location_id != plan.target_location_id
             || expected.size_bytes != plan.target_size_bytes
@@ -6603,6 +8430,11 @@ impl ManifestDatabase {
             plan.target_location_id,
             plan.target_size_bytes,
             plan.target_modified_unix_ns,
+        )?;
+        assert_scope_path_key_allowed(
+            &transaction,
+            plan.selection.scope_id,
+            &current.source.path_key,
         )?;
         if current.source.identity_kind != plan.target_identity_kind
             || current.source.identity_key != plan.target_identity_key
@@ -6634,6 +8466,11 @@ impl ManifestDatabase {
                     keeper.size_bytes,
                     keeper.modified_unix_ns,
                 )?;
+                assert_scope_path_key_allowed(
+                    &transaction,
+                    plan.selection.scope_id,
+                    &current_keeper.source.path_key,
+                )?;
                 if current_keeper.source.identity_kind != keeper.identity_kind
                     || current_keeper.source.identity_key != keeper.identity_key
                     || current_keeper.scope_root_node_id != keeper.scope_root_node_id
@@ -6661,12 +8498,13 @@ impl ManifestDatabase {
                  target_size_bytes, target_modified_unix_ns, target_sha256, target_hash_bytes, \
                  scope_root_node_id, scope_root_identity_kind, scope_root_identity_key, \
                  parent_node_id, parent_identity_kind, parent_identity_key, \
-                 confirmation_required, action_authorized, execution_available, created_at_unix_ms \
+                 confirmation_required, action_authorized, execution_available, created_at_unix_ms, \
+                 policy_revision \
              ) VALUES ( \
                  'deskgraph.cleanup-action-plan.v1', 'deskgraph.cleanup-action-policy.v1', \
                  'system_trash_preview', 'previewed', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                  ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, \
-                 ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, 1, 0, 0, ?33 \
+                 ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, 1, 0, 0, ?33, ?34 \
              )",
             params![
                 plan.selection.scope_id,
@@ -6702,6 +8540,7 @@ impl ManifestDatabase {
                 plan.parent_identity_kind,
                 plan.parent_identity_key,
                 created_at,
+                policy_binding.revision,
             ],
         )?;
         let plan_id = transaction.last_insert_rowid();
@@ -6713,6 +8552,15 @@ impl ManifestDatabase {
         )?;
         transaction.commit()?;
         self.cleanup_action_plan(plan_id)
+    }
+
+    #[cfg(test)]
+    pub fn create_cleanup_action_plan(
+        &mut self,
+        plan: CleanupActionPlanWrite<'_>,
+    ) -> Result<CleanupActionPlanPreview, DatabaseError> {
+        let binding = test_active_binding(self, plan.selection.scope_id)?;
+        self.create_cleanup_action_plan_with_policy(binding, plan)
     }
 
     pub fn cleanup_action_plan(
@@ -9014,12 +10862,15 @@ fn insert_watch_event(
     size_bytes: Option<i64>,
     reconciliation_kind: WatchReconciliationKind,
 ) -> Result<i64, DatabaseError> {
+    let policy_revision =
+        current_scope_policy_revision_from_connection(transaction, observation.scope_id)?;
     transaction.execute(
         "INSERT INTO watch_events( \
             scope_id, status, path_raw, path_key, observed_kind, observed_size_bytes, \
             observed_modified_unix_ns, observed_identity_key, observation_count, \
-            stable_after_unix_ms, reason, reconciliation_kind, created_at_unix_ms, updated_at_unix_ms \
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12)",
+            stable_after_unix_ms, reason, reconciliation_kind, created_at_unix_ms, updated_at_unix_ms, \
+            policy_revision \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13)",
         params![
             observation.scope_id,
             status,
@@ -9033,6 +10884,7 @@ fn insert_watch_event(
             reason,
             reconciliation_kind.as_str(),
             observation.observed_at_unix_ms,
+            policy_revision,
         ],
     )?;
     Ok(transaction.last_insert_rowid())
@@ -9065,14 +10917,15 @@ fn active_granted_watchable_scope_ids_in_transaction(
            ON grant.scope_id = authorized_scopes.id \
           AND grant.platform = authorized_scopes.platform \
           AND grant.state = 'active' \
-         WHERE EXISTS ( \
+         WHERE authorized_scopes.platform = ?1 AND grant.platform = ?1 \
+           AND EXISTS ( \
             SELECT 1 FROM scan_jobs \
             WHERE scan_jobs.scope_id = authorized_scopes.id \
                 AND scan_jobs.status = 'completed' \
          ) \
          ORDER BY authorized_scopes.id ASC",
     )?;
-    let scope_ids = statement.query_map([], |row| row.get(0))?;
+    let scope_ids = statement.query_map([std::env::consts::OS], |row| row.get(0))?;
     scope_ids.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -9162,21 +11015,13 @@ fn request_scope_full_reconciliation_in_transaction(
 
 fn insert_resumable_scan_job(
     transaction: &Transaction<'_>,
-    scope_id: i64,
+    binding: ScopeRevisionBinding,
     root: &QueuedPath,
     now: i64,
 ) -> Result<i64, DatabaseError> {
-    let scope_exists: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM authorized_scopes WHERE id = ?1",
-        [scope_id],
-        |row| row.get(0),
-    )?;
-    if scope_exists != 1 {
-        return Err(DatabaseError::ScopeNotFound);
-    }
     let active_jobs: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM scan_jobs WHERE scope_id = ?1 AND status IN ('running', 'interrupted')",
-        [scope_id],
+        [binding.scope_id],
         |row| row.get(0),
     )?;
     if active_jobs != 0 {
@@ -9185,9 +11030,9 @@ fn insert_resumable_scan_job(
     transaction.execute(
         "INSERT INTO scan_jobs( \
             scope_id, status, control_state, queued_entries, processed_entries, \
-            started_at_unix_ms, updated_at_unix_ms \
-         ) VALUES (?1, 'running', 'ready', 1, 0, ?2, ?2)",
-        params![scope_id, now],
+            started_at_unix_ms, updated_at_unix_ms, policy_revision \
+         ) VALUES (?1, 'running', 'ready', 1, 0, ?2, ?2, ?3)",
+        params![binding.scope_id, now, binding.revision],
     )?;
     let job_id = transaction.last_insert_rowid();
     transaction.execute(
@@ -9493,8 +11338,9 @@ fn ensure_scope_access_permitted(
              FROM authorized_scopes scope \
              LEFT JOIN scope_access_grants grant \
                ON grant.scope_id = scope.id AND grant.platform = scope.platform \
+              AND scope.platform = ?2 AND grant.platform = ?2 \
              WHERE scope.id = ?1",
-            [scope_id],
+            params![scope_id, std::env::consts::OS],
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
@@ -9519,6 +11365,7 @@ fn screenshot_group_sources_from_connection(
                 COUNT(chunk.id), MIN(chunk.provider_id), MIN(chunk.provider_version), \
                 MAX(chunk.provider_id), MAX(chunk.provider_version) \
          FROM image_metadata im \
+         JOIN authorized_scopes scope ON scope.id = im.scope_id \
          JOIN extraction_jobs image_job \
            ON image_job.id = im.extraction_job_id AND image_job.status = 'completed' \
          JOIN locations location \
@@ -9540,6 +11387,16 @@ fn screenshot_group_sources_from_connection(
           AND chunk.source_size_bytes = f.size_bytes \
           AND chunk.source_modified_unix_ns IS f.modified_unix_ns \
          WHERE im.scope_id = ?1 AND im.active = 1 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM scope_exclusions exclusion \
+               WHERE exclusion.scope_id = location.scope_id \
+                 AND (location.path_key = exclusion.path_key OR ( \
+                     exclusion.kind = 'folder' \
+                     AND length(location.path_key) > length(exclusion.path_key) \
+                     AND substr(location.path_key, 1, length(exclusion.path_key)) = exclusion.path_key \
+                     AND (substr(exclusion.path_key, -1, 1) = CASE WHEN scope.platform='windows' THEN char(92) ELSE '/' END \
+                          OR substr(location.path_key, length(exclusion.path_key) + 1, 1) = CASE WHEN scope.platform='windows' THEN char(92) ELSE '/' END))) \
+           ) \
            AND im.source_size_bytes = f.size_bytes \
            AND im.source_modified_unix_ns IS f.modified_unix_ns \
            AND im.format IN ('png', 'jpeg', 'webp') \
@@ -9943,15 +11800,21 @@ fn lexical_search_candidates_from_connection(
 
     if filters.source != LexicalSearchSource::ExtractedText {
         let mut metadata_statement = connection.prepare(
-            "SELECT l.scope_id, l.node_id, l.id, l.display_path \
+            "SELECT l.scope_id, s.policy_revision, l.node_id, l.id, l.path_key, l.display_path, \
+                    n.identity_kind, n.identity_key \
              FROM location_search_fts \
              JOIN locations l ON l.id = location_search_fts.rowid \
+             JOIN nodes n ON n.id = l.node_id \
+             JOIN authorized_scopes s ON s.id = l.scope_id \
+             JOIN scope_access_grants g ON g.scope_id = s.id AND g.platform = s.platform AND g.state = 'active' \
              LEFT JOIN files f ON f.node_id = l.node_id \
              WHERE location_search_fts MATCH ?1 AND l.present = 1 \
                AND (?2 IS NULL OR l.scope_id = ?2) \
                AND (?3 IS NULL OR (f.node_id IS NOT NULL AND substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3)) \
                AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
                AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+               AND s.platform = ?7 AND g.platform = ?7 \
+               AND NOT EXISTS (SELECT 1 FROM scope_exclusions x WHERE x.scope_id=l.scope_id AND (l.path_key=x.path_key OR (x.kind='folder' AND length(l.path_key)>length(x.path_key) AND substr(l.path_key,1,length(x.path_key))=x.path_key AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END OR substr(l.path_key,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) OR (n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key))) \
              ORDER BY location_search_fts.rank, l.id \
              LIMIT ?6",
         )?;
@@ -9962,15 +11825,20 @@ fn lexical_search_candidates_from_connection(
                 filters.extension,
                 filters.modified_since_unix_ns,
                 filters.modified_before_unix_ns,
-                limit
+                limit,
+                std::env::consts::OS,
             ],
             |row| {
                 Ok(LexicalSearchCandidate {
                     source: LexicalCandidateSource::MetadataPath,
                     scope_id: row.get(0)?,
-                    node_id: row.get(1)?,
-                    location_id: row.get(2)?,
-                    display_path: row.get(3)?,
+                    policy_revision: row.get(1)?,
+                    node_id: row.get(2)?,
+                    location_id: row.get(3)?,
+                    path_key: row.get(4)?,
+                    display_path: row.get(5)?,
+                    identity_kind: row.get(6)?,
+                    identity_key: row.get(7)?,
                     snippet: None,
                 })
             },
@@ -9982,12 +11850,15 @@ fn lexical_search_candidates_from_connection(
 
     if filters.source != LexicalSearchSource::MetadataPath {
         let mut content_statement = connection.prepare(
-            "SELECT c.scope_id, c.node_id, c.location_id, l.display_path, \
-                    snippet(content_search_fts, 0, '[', ']', '…', 24) \
+            "SELECT c.scope_id, s.policy_revision, c.node_id, c.location_id, l.path_key, l.display_path, \
+                    n.identity_kind, n.identity_key, snippet(content_search_fts, 0, '[', ']', '…', 24) \
              FROM content_search_fts \
              JOIN content_chunks c ON c.id = content_search_fts.rowid \
              JOIN locations l ON l.id = c.location_id \
                 AND l.node_id = c.node_id AND l.scope_id = c.scope_id \
+             JOIN nodes n ON n.id = c.node_id \
+             JOIN authorized_scopes s ON s.id = c.scope_id \
+             JOIN scope_access_grants g ON g.scope_id = s.id AND g.platform = s.platform AND g.state = 'active' \
              JOIN extraction_jobs e ON e.id = c.extraction_job_id \
                 AND e.scope_id = c.scope_id AND e.node_id = c.node_id \
                 AND e.location_id = c.location_id AND e.status = 'completed' \
@@ -9997,6 +11868,8 @@ fn lexical_search_candidates_from_connection(
                AND (?3 IS NULL OR substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3) \
                AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
                AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+               AND s.platform = ?7 AND g.platform = ?7 \
+               AND NOT EXISTS (SELECT 1 FROM scope_exclusions x WHERE x.scope_id=l.scope_id AND (l.path_key=x.path_key OR (x.kind='folder' AND length(l.path_key)>length(x.path_key) AND substr(l.path_key,1,length(x.path_key))=x.path_key AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END OR substr(l.path_key,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) OR (n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key))) \
              ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
              LIMIT ?6",
         )?;
@@ -10007,16 +11880,21 @@ fn lexical_search_candidates_from_connection(
                 filters.extension,
                 filters.modified_since_unix_ns,
                 filters.modified_before_unix_ns,
-                limit
+                limit,
+                std::env::consts::OS,
             ],
             |row| {
                 Ok(LexicalSearchCandidate {
                     source: LexicalCandidateSource::ExtractedText,
                     scope_id: row.get(0)?,
-                    node_id: row.get(1)?,
-                    location_id: row.get(2)?,
-                    display_path: row.get(3)?,
-                    snippet: Some(row.get(4)?),
+                    policy_revision: row.get(1)?,
+                    node_id: row.get(2)?,
+                    location_id: row.get(3)?,
+                    path_key: row.get(4)?,
+                    display_path: row.get(5)?,
+                    identity_kind: row.get(6)?,
+                    identity_key: row.get(7)?,
+                    snippet: Some(row.get(8)?),
                 })
             },
         )?;
@@ -10112,6 +11990,13 @@ fn count(connection: &Connection, sql: &str) -> Result<u64, DatabaseError> {
     u64::try_from(result.unwrap_or(0)).map_err(|_| DatabaseError::InvalidCount)
 }
 
+fn count_with_host_platform(connection: &Connection, sql: &str) -> Result<u64, DatabaseError> {
+    let result = connection
+        .query_row(sql, [std::env::consts::OS], |row| row.get::<_, i64>(0))
+        .optional()?;
+    u64::try_from(result.unwrap_or(0)).map_err(|_| DatabaseError::InvalidCount)
+}
+
 fn to_i64(value: u64) -> Result<i64, DatabaseError> {
     i64::try_from(value).map_err(|_| DatabaseError::InvalidCount)
 }
@@ -10178,8 +12063,45 @@ fn migration_checksum(sql: &str) -> String {
 }
 
 #[cfg(test)]
+fn test_revision_binding(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<ScopeRevisionBinding, DatabaseError> {
+    let revision = current_scope_policy_revision_from_connection(&database.connection, scope_id)?;
+    Ok(ScopeRevisionBinding { scope_id, revision })
+}
+
+#[cfg(test)]
+fn test_active_binding(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<ScopePolicyBinding, DatabaseError> {
+    if !database.scope_has_active_access_grant(scope_id)? {
+        let mut platform: String = database.connection.query_row(
+            "SELECT platform FROM authorized_scopes WHERE id=?1",
+            [scope_id],
+            |row| row.get(0),
+        )?;
+        if !matches!(platform.as_str(), "macos" | "linux" | "windows") {
+            platform = "macos".to_string();
+            database.connection.execute(
+                "UPDATE authorized_scopes SET platform=?2 WHERE id=?1",
+                params![scope_id, platform],
+            )?;
+        }
+        database.upsert_scope_access_grant(scope_id, &platform, b"database-unit-test-grant")?;
+    }
+    database.bind_scope_policy_revision(scope_id)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_EXCLUDED_FILE_IDENTITY: &[u8] = b"f0000000000000000";
+    const TEST_EXCLUDED_FILE_IDENTITY_2: &[u8] = b"f0000000000000001";
+    const TEST_EXCLUDED_FOLDER_IDENTITY: &[u8] = b"d0000000000000000";
+    const TEST_EXCLUDED_IDENTITY_KIND: &str = "unix_device_inode";
 
     fn lexical_filters(scope_id: Option<i64>) -> LexicalSearchFilters<'static> {
         LexicalSearchFilters {
@@ -10189,6 +12111,61 @@ mod tests {
             modified_since_unix_ns: None,
             modified_before_unix_ns: None,
         }
+    }
+
+    fn apply_migrations_before_scope_exclusions(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations ( \
+                     version INTEGER PRIMARY KEY, \
+                     name TEXT NOT NULL, \
+                     checksum TEXT NOT NULL, \
+                     applied_at_unix_ms INTEGER NOT NULL \
+                 );",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..23] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("historical migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("historical migration should register");
+        }
+    }
+
+    fn foreign_platform() -> &'static str {
+        match std::env::consts::OS {
+            "windows" => "macos",
+            _ => "windows",
+        }
+    }
+
+    fn clone_table_row_without_id(
+        connection: &Connection,
+        table: &str,
+        source_id: i64,
+    ) -> rusqlite::Result<usize> {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|column| column != "id")
+            .collect::<Vec<_>>()
+            .join(",");
+        connection.execute(
+            &format!("INSERT INTO {table}({columns}) SELECT {columns} FROM {table} WHERE id=?1"),
+            [source_id],
+        )
     }
 
     fn resumable_setup() -> (ManifestDatabase, i64, QueuedPath) {
@@ -11560,6 +13537,101 @@ mod tests {
             .expect("preview and binding should persist")
     }
 
+    fn assert_action_safety_record_blocks_privacy_purge(
+        database: &mut ManifestDatabase,
+        scope_id: i64,
+        plan_id: i64,
+    ) {
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("active policy binding should load");
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::File,
+            path_raw: b"/scope/renamed.txt",
+            path_key: "/scope/renamed.txt",
+            display_path: "/scope/renamed.txt",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FILE_IDENTITY,
+        };
+        let event_count_before: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM action_journal_events WHERE plan_id=?1",
+                [plan_id],
+                |row| row.get(0),
+            )
+            .expect("journal count should load");
+        let location_count_before: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("location count should load");
+        let preview = database
+            .preview_scope_exclusion_batch(binding, &[write])
+            .expect("impact preview should remain available");
+        assert_eq!(preview.action_plan_count, 1);
+        assert_eq!(preview.blocking_action_count, 1);
+        assert!(matches!(
+            database.apply_scope_exclusion_batch(binding, &[write], 10),
+            Err(DatabaseError::ScopePrivacyPurgeBlocked)
+        ));
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .expect("revision should load")
+                .revision,
+            1
+        );
+        assert!(database.scope_exclusions(scope_id).unwrap().is_empty());
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM action_plans WHERE id=?1",
+                    [plan_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM action_journal_events WHERE plan_id=?1",
+                    [plan_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            event_count_before
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                    [scope_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            location_count_before
+        );
+        for table in ["privacy_purge_receipts", "privacy_purge_capabilities"] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                database
+                    .connection
+                    .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table} must roll back"
+            );
+        }
+    }
+
     fn acquire_test_executor_lease(database: &mut ManifestDatabase, plan_id: i64) {
         database
             .acquire_action_executor_lease(plan_id, "test_executor_0001", 60_000)
@@ -12010,6 +14082,172 @@ mod tests {
     }
 
     #[test]
+    fn scope_exclusion_migration_upgrades_an_empty_pre_0024_database() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("pre-scope-exclusions-empty.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        apply_migrations_before_scope_exclusions(&connection);
+        drop(connection);
+
+        let database = ManifestDatabase::open(&path).expect("0024 migration should apply");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=24 AND name='scope_exclusions_and_privacy_purge'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("0024 registry row should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM pragma_table_info('authorized_scopes') WHERE name='policy_revision') \
+                          + (SELECT COUNT(*) FROM pragma_table_info('scan_jobs') WHERE name='policy_revision') \
+                          + (SELECT COUNT(*) FROM pragma_table_info('extraction_jobs') WHERE name='policy_revision') \
+                          + (SELECT COUNT(*) FROM pragma_table_info('watch_events') WHERE name='policy_revision') \
+                          + (SELECT COUNT(*) FROM pragma_table_info('action_plans') WHERE name='policy_revision') \
+                          + (SELECT COUNT(*) FROM pragma_table_info('cleanup_action_plans') WHERE name='policy_revision')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("revision columns should load"),
+            6
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ( \
+                         'scope_exclusions','privacy_purge_capabilities','privacy_purge_location_targets', \
+                         'privacy_purge_node_targets','privacy_purge_project_targets', \
+                         'privacy_purge_action_plan_targets','privacy_purge_relation_targets', \
+                         'privacy_purge_screenshot_group_targets', \
+                         'privacy_purge_cleanup_action_plan_targets','privacy_purge_receipts')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("privacy tables should load"),
+            10
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM pragma_table_info('scope_exclusions') \
+                             WHERE name IN ('identity_kind','identity_key')) \
+                          + (SELECT COUNT(*) FROM sqlite_schema \
+                             WHERE type='index' AND name='scope_exclusions_scope_identity_idx')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("durable exclusion identity schema should load"),
+            3
+        );
+    }
+
+    #[test]
+    fn scope_exclusion_migration_backfills_every_pre_0024_policy_owner() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory
+            .path()
+            .join("pre-scope-exclusions-populated.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        apply_migrations_before_scope_exclusions(&connection);
+        connection
+            .execute(
+                "INSERT INTO authorized_scopes(id,path_raw,path_key,display_path,platform,created_at_unix_ms) \
+                 VALUES(1,X'2F73636F7065','/scope','/scope',?1,0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy scope should persist");
+        connection
+            .execute(
+                "INSERT INTO scope_access_grants(scope_id,platform,opaque_grant,state,updated_at_unix_ms) \
+                 VALUES(1,?1,X'6772616E74','active',0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy active grant should persist");
+        connection
+            .execute_batch(
+                "INSERT INTO scan_jobs(id,scope_id,status,started_at_unix_ms,finished_at_unix_ms) \
+                     VALUES(1,1,'completed',0,1); \
+                 INSERT INTO nodes(id,kind,identity_kind,identity_key,created_at_unix_ms,updated_at_unix_ms) VALUES \
+                     (1,'folder','test',X'01',0,0),(2,'file','test',X'02',0,0); \
+                 INSERT INTO folders(node_id) VALUES(1); \
+                 INSERT INTO files(node_id,size_bytes,modified_unix_ns,link_count) VALUES(2,4,1,1); \
+                 INSERT INTO locations(id,scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id) VALUES \
+                     (1,1,1,X'2F73636F7065','/scope','/scope',1,1), \
+                     (2,1,2,X'2F73636F70652F66696C652E747874','/scope/file.txt','/scope/file.txt',1,1); \
+                 INSERT INTO edges(scope_id,source_node_id,target_node_id,kind,active,last_seen_scan_id) \
+                     VALUES(1,2,1,'located_in',1,1); \
+                 INSERT INTO extraction_jobs(id,scope_id,node_id,location_id,status,source_size_bytes,created_at_unix_ms,updated_at_unix_ms) \
+                     VALUES(1,1,2,2,'completed',4,0,1); \
+                 INSERT INTO watch_events(id,scope_id,status,path_raw,path_key,observed_kind,observed_size_bytes, \
+                     observed_modified_unix_ns,observed_identity_key,observation_count,stable_after_unix_ms,created_at_unix_ms,updated_at_unix_ms) \
+                     VALUES(1,1,'completed',X'2F73636F70652F66696C652E747874','/scope/file.txt','file',4,1,X'02',1,1,0,1); \
+                 INSERT INTO action_plans(id,api_version,policy_version,operation,execution_strategy,scope_id,node_id, \
+                     source_location_id,source_path_raw,source_path_key,source_display_path,destination_path_raw, \
+                     destination_path_key,destination_display_path,source_identity_kind,source_identity_key, \
+                     source_size_bytes,source_modified_unix_ns,created_at_unix_ms) \
+                     VALUES(1,'deskgraph.action-plan.v1','deskgraph.action-policy.v1','rename','direct',1,2,2, \
+                     X'2F73636F70652F66696C652E747874','/scope/file.txt','/scope/file.txt', \
+                     X'2F73636F70652F72656E616D65642E747874','/scope/renamed.txt','/scope/renamed.txt','test',X'02',4,1,0); \
+                 INSERT INTO action_journal_events(api_version,plan_id,sequence,event_kind,command_request_id,created_at_unix_ms) \
+                     VALUES('deskgraph.action-journal.v1',1,1,'preview_created',NULL,0); \
+                 INSERT INTO cleanup_action_plans(id,api_version,policy_version,operation,state,scope_id,source_kind, \
+                     source_id,source_observation_id,target_node_id,target_location_id,target_identity_kind,target_identity_key, \
+                     target_size_bytes,target_modified_unix_ns,target_sha256,target_hash_bytes,scope_root_node_id, \
+                     scope_root_identity_kind,scope_root_identity_key,parent_node_id,parent_identity_kind,parent_identity_key, \
+                     confirmation_required,action_authorized,execution_available,created_at_unix_ms) \
+                     VALUES(1,'deskgraph.cleanup-action-plan.v1','deskgraph.cleanup-action-policy.v1','system_trash_preview', \
+                     'previewed',1,'screenshot_review_group',1,1,2,2,'test',X'02',4,1,zeroblob(32),4,1, \
+                     'test',X'01',1,'test',X'01',1,0,0,0); \
+                 INSERT INTO cleanup_action_journal_events(api_version,plan_id,sequence,event_kind,created_at_unix_ms) \
+                     VALUES('deskgraph.cleanup-action-journal.v1',1,1,'preview_created',0);",
+            )
+            .expect("legacy policy-owned rows should persist");
+        drop(connection);
+
+        let database = ManifestDatabase::open(&path).expect("0024 migration should backfill");
+        for table in [
+            "authorized_scopes",
+            "scan_jobs",
+            "extraction_jobs",
+            "watch_events",
+            "action_plans",
+            "cleanup_action_plans",
+        ] {
+            let sql = format!("SELECT policy_revision FROM {table} WHERE id=1");
+            assert_eq!(
+                database
+                    .connection
+                    .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                    .expect("backfilled revision should load"),
+                1,
+                "{table} must be bound to the pre-upgrade scope revision"
+            );
+        }
+        assert!(
+            database
+                .scope_exclusions(1)
+                .expect("new exclusion table should load")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("PRAGMA foreign_key_check", [], |_| Ok(1_i64))
+                .optional()
+                .expect("foreign key check should run"),
+            None
+        );
+    }
+
+    #[test]
     fn scope_access_grant_migration_preserves_legacy_scopes_as_reauthorization_required() {
         let directory = tempfile::tempdir().expect("tempdir should exist");
         let path = directory.path().join("pre-scope-access-grants.sqlite3");
@@ -12157,7 +14395,12 @@ mod tests {
                 .into_iter()
                 .map(|scope| scope.id)
                 .collect::<Vec<_>>(),
-            vec![1, 3, 4, 6]
+            match std::env::consts::OS {
+                "macos" => vec![1, 3],
+                "linux" => vec![4],
+                "windows" => vec![6],
+                _ => Vec::new(),
+            }
         );
         assert!(
             database
@@ -12279,6 +14522,29 @@ mod tests {
         assert!(output.contains("opaque_grant_len: 25"));
         assert!(!output.contains("private-capability-marker"));
         assert!(!output.contains("opaque_grant: ["));
+    }
+
+    #[test]
+    fn lexical_candidate_debug_output_redacts_local_context() {
+        let candidate = LexicalSearchCandidate {
+            source: LexicalCandidateSource::ExtractedText,
+            scope_id: 7,
+            policy_revision: 3,
+            node_id: 11,
+            location_id: 13,
+            path_key: "/private/context.md".to_string(),
+            display_path: "/Private/Context.md".to_string(),
+            identity_kind: "unix_device_inode".to_string(),
+            identity_key: b"private-identity".to_vec(),
+            snippet: Some("private extracted text".to_string()),
+        };
+
+        let output = format!("{candidate:?}");
+        assert!(!output.contains("/private/context.md"));
+        assert!(!output.contains("/Private/Context.md"));
+        assert!(!output.contains("private-identity"));
+        assert!(!output.contains("private extracted text"));
+        assert!(output.contains("<redacted>"));
     }
 
     #[test]
@@ -12793,7 +15059,8 @@ mod tests {
         );
         assert_eq!(
             database
-                .active_scope_grant(existing.id)
+                .scope_access_grant(existing.id)
+                .expect("stored grant should remain readable")
                 .expect("existing grant should remain unchanged")
                 .opaque_grant,
             b"existing-windows-grant"
@@ -12884,11 +15151,14 @@ mod tests {
             .join("manifest.sqlite3");
         let writer = ManifestDatabase::open(&path).expect("fixture should initialize");
         let scope = writer
-            .add_scope(b"/scope", "/scope", "/scope", "test")
+            .add_scope(b"/scope", "/scope", "/scope", "macos")
             .expect("scope should persist");
         let unscanned_scope = writer
-            .add_scope(b"/unscanned", "/unscanned", "/unscanned", "test")
+            .add_scope(b"/unscanned", "/unscanned", "/unscanned", "macos")
             .expect("unscanned scope should persist");
+        writer
+            .upsert_scope_access_grant(scope.id, "macos", b"read-only-test-grant")
+            .expect("queryable scope grant should persist");
         writer
             .connection
             .execute(
@@ -13103,7 +15373,7 @@ mod tests {
         }
         connection
             .execute_batch(
-                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'test', 0); \
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0); \
                  INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0); \
                  INSERT INTO files VALUES (1, 4, 1, 1); \
@@ -13128,7 +15398,17 @@ mod tests {
         assert_eq!(
             upgraded
                 .lexical_search_candidates("保留t", lexical_filters(Some(1)), 10)
-                .expect("legacy FTS row should remain searchable")
+                .expect("legacy FTS query should fail closed before reauthorization")
+                .len(),
+            0
+        );
+        upgraded
+            .upsert_scope_access_grant(1, "macos", b"migration-test-grant")
+            .expect("legacy scope should be explicitly reauthorized");
+        assert_eq!(
+            upgraded
+                .lexical_search_candidates("保留t", lexical_filters(Some(1)), 10)
+                .expect("legacy FTS row should remain searchable after reauthorization")
                 .len(),
             1
         );
@@ -13169,7 +15449,7 @@ mod tests {
         }
         connection
             .execute_batch(
-                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'test', 0); \
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0); \
                  INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0); \
                  INSERT INTO files VALUES (1, 4, 1, 1); \
@@ -13198,7 +15478,17 @@ mod tests {
         assert_eq!(
             upgraded
                 .lexical_search_candidates("保留l", lexical_filters(Some(1)), 10)
-                .expect("legacy FTS row should remain searchable")
+                .expect("legacy FTS query should fail closed before reauthorization")
+                .len(),
+            0
+        );
+        upgraded
+            .upsert_scope_access_grant(1, "macos", b"migration-test-grant")
+            .expect("legacy scope should be explicitly reauthorized");
+        assert_eq!(
+            upgraded
+                .lexical_search_candidates("保留l", lexical_filters(Some(1)), 10)
+                .expect("legacy FTS row should remain searchable after reauthorization")
                 .len(),
             1
         );
@@ -13841,6 +16131,8 @@ mod tests {
     #[test]
     fn legacy_previews_without_a_v19_binding_are_non_executable() {
         let (mut database, scope_id, node_id, _) = extraction_setup();
+        test_active_binding(&database, scope_id)
+            .expect("historical action fixture scope should be active");
         database
             .connection
             .execute(
@@ -15405,7 +17697,7 @@ mod tests {
         }
         connection
             .execute_batch(
-                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'test', 0);\
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0);\
                  INSERT INTO scan_jobs(id, scope_id, status, started_at_unix_ms) VALUES (1, 1, 'completed', 0);\
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0);\
                  INSERT INTO files VALUES (1, 4, 1, 1);\
@@ -15452,7 +17744,14 @@ mod tests {
         );
         let candidates = database
             .lexical_search_candidates("\"legacy\"", lexical_filters(None), 10)
-            .expect("search migration should backfill existing content");
+            .expect("search must fail closed before legacy scope reauthorization");
+        assert!(candidates.is_empty());
+        database
+            .upsert_scope_access_grant(1, "macos", b"migration-test-grant")
+            .expect("legacy scope should be explicitly reauthorized");
+        let candidates = database
+            .lexical_search_candidates("\"legacy\"", lexical_filters(None), 10)
+            .expect("search migration should backfill existing content after reauthorization");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source, LexicalCandidateSource::ExtractedText);
     }
@@ -15460,6 +17759,7 @@ mod tests {
     #[test]
     fn trigram_search_indexes_multilingual_metadata_and_only_active_content() {
         let (mut database, scope_id, node_id, root) = extraction_setup();
+        test_active_binding(&database, scope_id).expect("search fixture scope should be active");
         database
             .connection
             .execute(
@@ -16074,7 +18374,9 @@ mod tests {
                 {
                     let source = fs::read_to_string(&path)?;
                     let matches = source
-                        .matches("low_level_insert_screenshot_ocr_job_after_core_validation")
+                        .matches(
+                            "low_level_insert_screenshot_ocr_job_with_policy_after_core_validation",
+                        )
                         .count();
                     for _ in 0..matches {
                         calls.push(
@@ -17059,5 +19361,1365 @@ mod tests {
         database
             .claim_extraction_job(job.job_id, "new-runner", 60_000)
             .expect("resumed job should claim");
+    }
+
+    #[test]
+    fn exclusion_preview_and_apply_require_active_grant_but_core_watch_remains_revision_only() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
+            .expect("scope should persist without a platform grant");
+        let core = database
+            .bind_core_scope_policy_revision(scope.id)
+            .expect("core revision should bind without a grant");
+        let scan_id = database
+            .create_scan_job_with_policy(core)
+            .expect("core scan should start without a grant");
+        database
+            .complete_scan(scan_id, scope.id, &[], &[], 0, 0)
+            .expect("core scan should complete without a grant");
+        let snapshot = WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(1),
+            modified_unix_ns: Some(1),
+            identity_key: Some(b"watch-no-grant".to_vec()),
+        };
+        database
+            .record_watch_observation_with_policy_at(
+                core,
+                WatchObservationWrite {
+                    scope_id: scope.id,
+                    path_raw: b"/scope/watch.txt",
+                    path_key: "/scope/watch.txt",
+                    snapshot: &snapshot,
+                    stable_after_unix_ms: 1,
+                    ignored_reason: None,
+                    reconciliation_kind: WatchReconciliationKind::FullScope,
+                    observed_at_unix_ms: 0,
+                },
+            )
+            .expect("core Watch should remain revision-only");
+
+        let active_binding = ScopePolicyBinding {
+            scope_id: scope.id,
+            revision: 1,
+        };
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: b"/scope/private",
+            path_key: "/scope/private",
+            display_path: "/scope/private",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+        };
+        assert!(matches!(
+            database.preview_scope_exclusion_batch(active_binding, &[write]),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(matches!(
+            database.apply_scope_exclusion_batch(active_binding, &[write], 1),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope.id)
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(database.scope_exclusions(scope.id).unwrap().is_empty());
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM privacy_purge_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn forged_foreign_platform_active_grant_fails_closed_every_packaged_boundary() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let execution_source = database
+            .action_execution_source_for_path_key(scope_id, "/scope/file.txt")
+            .expect("action source should load before grant validation");
+        let foreign = foreign_platform();
+        database
+            .connection
+            .execute(
+                "UPDATE authorized_scopes SET platform=?2 WHERE id=?1",
+                params![scope_id, foreign],
+            )
+            .expect("foreign scope fixture should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO scope_access_grants(scope_id,platform,opaque_grant,state,updated_at_unix_ms) \
+                 VALUES(?1,?2,X'666F72676564','active',0)",
+                params![scope_id, foreign],
+            )
+            .expect("forged foreign active row should persist");
+        let forged_binding = ScopePolicyBinding {
+            scope_id,
+            revision: 1,
+        };
+
+        assert!(matches!(
+            database.bind_scope_policy_revision(scope_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(
+            !database
+                .is_scope_policy_binding_current(forged_binding)
+                .expect("forged binding currentness should load")
+        );
+        assert!(
+            database
+                .is_core_scope_policy_binding_current(ScopeRevisionBinding {
+                    scope_id,
+                    revision: 1,
+                })
+                .expect("core binding currentness should remain revision-only")
+        );
+        assert!(!database.scope_has_active_access_grant(scope_id).unwrap());
+        assert!(database.active_scope_access_grant_ids().unwrap().is_empty());
+        assert!(database.list_active_scope_records().unwrap().is_empty());
+        assert!(database.list_active_scope_grants().unwrap().is_empty());
+        assert!(matches!(
+            database.active_scope_grant(scope_id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .lexical_search_candidates("file", lexical_filters(Some(scope_id)), 10)
+                .expect("search should fail closed as an empty result")
+                .is_empty()
+        );
+
+        let source = &execution_source.source;
+        let sha256 = [0x5a; 32];
+        let action = database.create_rename_action_plan_with_policy(
+            forged_binding,
+            ActionPlanWrite {
+                scope_id,
+                node_id,
+                source_location_id: source.location_id,
+                source_path_raw: &source.path_raw,
+                source_path_key: &source.path_key,
+                source_display_path: &source.display_path,
+                destination_path_raw: b"/scope/renamed.txt",
+                destination_path_key: "/scope/renamed.txt",
+                destination_display_path: "/scope/renamed.txt",
+                source_identity_kind: &source.identity_kind,
+                source_identity_key: &source.identity_key,
+                source_size_bytes: source.size_bytes,
+                source_modified_unix_ns: source.modified_unix_ns,
+                source_sha256: &sha256,
+                source_hash_bytes: source.size_bytes,
+                scope_root_identity_kind: &execution_source.scope_root_identity_kind,
+                scope_root_identity_key: &execution_source.scope_root_identity_key,
+                parent_identity_kind: &execution_source.parent_identity_kind,
+                parent_identity_key: &execution_source.parent_identity_key,
+                execution_strategy: ActionExecutionStrategy::Direct,
+            },
+        );
+        assert!(matches!(
+            action,
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: b"/scope/private",
+            path_key: "/scope/private",
+            display_path: "/scope/private",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+        };
+        assert!(matches!(
+            database.preview_scope_exclusion_batch(forged_binding, &[write]),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(matches!(
+            database.apply_scope_exclusion_batch(forged_binding, &[write], 1),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(database.scope_exclusions(scope_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_exclusion_binding_rolls_back_policy_data_receipt_and_capability() {
+        let (mut database, scope_id, _, _) = extraction_setup();
+        let binding = test_active_binding(&database, scope_id).expect("active binding should load");
+        let first = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: b"/scope/old-private",
+            path_key: "/scope/old-private",
+            display_path: "/scope/old-private",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+        };
+        database
+            .apply_scope_exclusion_batch(binding, &[first], 1)
+            .expect("first policy update should commit");
+        let location_count_before: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_target = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::File,
+            path_raw: b"/scope/file.txt",
+            path_key: "/scope/file.txt",
+            display_path: "/scope/file.txt",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FILE_IDENTITY,
+        };
+        assert!(matches!(
+            database.apply_scope_exclusion_batch(binding, &[stale_target], 2),
+            Err(DatabaseError::ScopePolicyRevisionStale)
+        ));
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(database.scope_exclusions(scope_id).unwrap().len(), 1);
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                    [scope_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            location_count_before
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM privacy_purge_receipts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_purge_capabilities",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn exclusion_identity_validation_and_corrupt_stored_identity_fail_closed() {
+        let (mut database, scope_id, _, _) = extraction_setup();
+        let binding = test_active_binding(&database, scope_id).expect("scope should bind");
+        let weak = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: b"/scope/private",
+            path_key: "/scope/private",
+            display_path: "/scope/private",
+            identity_kind: "path_fallback",
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+        };
+        assert!(matches!(
+            database.preview_scope_exclusion_batch(binding, &[weak]),
+            Err(DatabaseError::ScopeExclusionInputInvalid)
+        ));
+        let mismatched_kind = ScopeExclusionWrite {
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FILE_IDENTITY,
+            ..weak
+        };
+        assert!(matches!(
+            database.preview_scope_exclusion_batch(binding, &[mismatched_kind]),
+            Err(DatabaseError::ScopeExclusionInputInvalid)
+        ));
+
+        let valid = ScopeExclusionWrite {
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+            ..weak
+        };
+        database
+            .apply_scope_exclusion_batch(binding, &[valid], 2)
+            .expect("stable identity should persist");
+        let debug = format!("{valid:?}");
+        assert!(!debug.contains("d0000000000000000"));
+        database
+            .connection
+            .execute(
+                "UPDATE scope_exclusions SET identity_key=?2 WHERE scope_id=?1",
+                params![scope_id, TEST_EXCLUDED_FILE_IDENTITY],
+            )
+            .expect("corrupt pre-release fixture should persist within SQL checks");
+        assert!(matches!(
+            database.scope_exclusion_matcher(scope_id),
+            Err(DatabaseError::InvalidStoredValue)
+        ));
+    }
+
+    #[test]
+    fn privacy_purge_capability_is_next_revision_bound_immutable_and_rollback_clean() {
+        let (mut database, scope_id, _, _) = extraction_setup();
+        let binding = test_active_binding(&database, scope_id).expect("scope should activate");
+        let other = database
+            .add_scope(b"/other", "/other", "/other", std::env::consts::OS)
+            .expect("second scope should persist");
+        database
+            .upsert_scope_access_grant(other.id, std::env::consts::OS, b"other-grant")
+            .expect("second scope grant should persist");
+        let insert_exclusion = "INSERT INTO scope_exclusions( \
+             scope_id,kind,path_raw,path_key,display_path,identity_kind,identity_key,policy_revision,created_at_unix_ms) \
+             VALUES(?1,'folder',X'2F73636F70652F70726976617465','/scope/private','/scope/private', \
+                    'unix_device_inode',X'6430303030303030303030303030303030',2,1)";
+
+        assert!(
+            database
+                .connection
+                .execute(insert_exclusion, [scope_id])
+                .is_err()
+        );
+        assert!(database
+            .connection
+            .execute(
+                "INSERT INTO privacy_purge_capabilities(nonce,scope_id,from_revision,to_revision,created_at_unix_ms) \
+                 VALUES(zeroblob(32),?1,2,3,1)",
+                [scope_id],
+            )
+            .is_err());
+
+        {
+            let transaction = database
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO privacy_purge_capabilities(nonce,scope_id,from_revision,to_revision,created_at_unix_ms) \
+                 VALUES(zeroblob(32),?1,1,2,1)",
+                [scope_id],
+            ).unwrap();
+            assert!(transaction
+                .execute(
+                    "UPDATE privacy_purge_capabilities SET created_at_unix_ms=2 WHERE scope_id=?1",
+                    [scope_id],
+                )
+                .is_err());
+            assert!(transaction.execute(insert_exclusion, [scope_id]).is_err());
+            transaction.rollback().unwrap();
+        }
+        {
+            let transaction = database
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO privacy_purge_capabilities(nonce,scope_id,from_revision,to_revision,created_at_unix_ms) \
+                 VALUES(zeroblob(32),?1,1,2,1)",
+                [other.id],
+            ).unwrap();
+            transaction.execute(
+                "UPDATE authorized_scopes SET policy_revision=2 WHERE id=?1 AND policy_revision=1",
+                [scope_id],
+            ).unwrap();
+            assert!(transaction.execute(insert_exclusion, [scope_id]).is_err());
+            transaction.rollback().unwrap();
+        }
+        {
+            let transaction = database
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO privacy_purge_capabilities(nonce,scope_id,from_revision,to_revision,created_at_unix_ms) \
+                 VALUES(zeroblob(32),?1,1,2,1)",
+                [scope_id],
+            ).unwrap();
+            transaction.execute(
+                "UPDATE authorized_scopes SET policy_revision=2 WHERE id=?1 AND policy_revision=1",
+                [scope_id],
+            ).unwrap();
+            transaction.execute(insert_exclusion, [scope_id]).unwrap();
+            assert!(
+                transaction
+                    .execute(
+                        "DELETE FROM privacy_purge_capabilities WHERE scope_id=?1",
+                        [scope_id],
+                    )
+                    .is_err()
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .unwrap()
+                .revision,
+            1
+        );
+        assert!(database.scope_exclusions(scope_id).unwrap().is_empty());
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_purge_capabilities",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+
+        database
+            .apply_scope_exclusion_batch(
+                binding,
+                &[ScopeExclusionWrite {
+                    kind: ScopeExclusionKind::Folder,
+                    path_raw: b"/scope/private",
+                    path_key: "/scope/private",
+                    display_path: "/scope/private",
+                    identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+                    identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+                }],
+                2,
+            )
+            .expect("normal apply should create its receipt then consume the capability");
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_purge_receipts WHERE scope_id=?1",
+                    [scope_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_purge_capabilities",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn privacy_purge_target_capability_cannot_delete_a_non_target_action() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let first = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let second = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let transaction = database
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        transaction.execute(
+            "INSERT INTO privacy_purge_capabilities(nonce,scope_id,from_revision,to_revision,created_at_unix_ms) \
+             VALUES(zeroblob(32),?1,1,2,1)",
+            [scope_id],
+        ).unwrap();
+        transaction
+            .execute(
+                "UPDATE authorized_scopes SET policy_revision=2 WHERE id=?1 AND policy_revision=1",
+                [scope_id],
+            )
+            .unwrap();
+        transaction.execute(
+            "INSERT INTO privacy_purge_action_plan_targets(nonce,plan_id) VALUES(zeroblob(32),?1)",
+            [first.plan_id],
+        ).unwrap();
+        assert!(
+            transaction
+                .execute(
+                    "DELETE FROM action_journal_events WHERE plan_id=?1",
+                    [second.plan_id],
+                )
+                .is_err()
+        );
+        assert!(
+            transaction
+                .execute("DELETE FROM action_plans WHERE id=?1", [second.plan_id])
+                .is_err()
+        );
+        transaction.rollback().unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM action_plans WHERE id IN (?1,?2)",
+                    params![first.plan_id, second.plan_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn action_and_cleanup_plan_insert_triggers_reject_platform_mismatch() {
+        let (mut action_database, scope_id, node_id, _) = extraction_setup();
+        let action = create_bound_rename_preview(&mut action_database, scope_id, node_id);
+        action_database
+            .connection
+            .execute(
+                "UPDATE authorized_scopes SET platform=?2 WHERE id=?1",
+                params![scope_id, foreign_platform()],
+            )
+            .unwrap();
+        assert!(
+            clone_table_row_without_id(&action_database.connection, "action_plans", action.plan_id)
+                .is_err()
+        );
+
+        let (mut cleanup_database, selection, source, keeper) = cleanup_exact_duplicate_setup();
+        let sha256 = [9_u8; 32];
+        let cleanup = cleanup_database
+            .create_cleanup_action_plan(cleanup_exact_duplicate_plan_write(
+                selection, &source, &keeper, &sha256, &sha256,
+            ))
+            .expect("cleanup preview should persist before mismatch");
+        cleanup_database
+            .connection
+            .execute(
+                "UPDATE authorized_scopes SET platform=?2 WHERE id=?1",
+                params![selection.scope_id, foreign_platform()],
+            )
+            .unwrap();
+        assert!(
+            clone_table_row_without_id(
+                &cleanup_database.connection,
+                "cleanup_action_plans",
+                cleanup.plan_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_direct_scan_extraction_and_watch_inserts_and_updates_are_trigger_rejected() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let binding = test_active_binding(&database, scope_id).expect("active binding should load");
+        let location_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM locations WHERE scope_id=?1 AND node_id=?2",
+                params![scope_id, node_id],
+                |row| row.get(0),
+            )
+            .expect("location should load");
+        database
+            .connection
+            .execute(
+                "INSERT INTO extraction_jobs(scope_id,node_id,location_id,status,source_size_bytes, \
+                    created_at_unix_ms,updated_at_unix_ms,policy_revision) \
+                 VALUES(?1,?2,?3,'completed',4,0,1,1)",
+                params![scope_id, node_id, location_id],
+            )
+            .expect("old-revision extraction fixture should persist");
+        let extraction_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO watch_events(scope_id,status,path_raw,path_key,observed_kind,observed_size_bytes, \
+                    observed_modified_unix_ns,observed_identity_key,observation_count,stable_after_unix_ms, \
+                    created_at_unix_ms,updated_at_unix_ms,policy_revision) \
+                 VALUES(?1,'completed',X'2F73636F70652F66696C652E747874','/scope/file.txt','file',4,1, \
+                    X'7761746368',1,1,0,1,1)",
+                [scope_id],
+            )
+            .expect("old-revision watch fixture should persist");
+        let watch_id = database.connection.last_insert_rowid();
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM scan_jobs WHERE scope_id=?1 AND status='completed' ORDER BY id DESC LIMIT 1",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should load");
+
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: b"/scope/unused-private",
+            path_key: "/scope/unused-private",
+            display_path: "/scope/unused-private",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+        };
+        database
+            .apply_scope_exclusion_batch(binding, &[write], 2)
+            .expect("revision-only exclusion should commit");
+
+        for result in [
+            database.connection.execute(
+                "INSERT INTO scan_jobs(scope_id,status,started_at_unix_ms) VALUES(?1,'completed',2)",
+                [scope_id],
+            ),
+            database.connection.execute(
+                "UPDATE scan_jobs SET issue_count=issue_count+1 WHERE id=?1",
+                [scan_id],
+            ),
+            database.connection.execute(
+                "INSERT INTO extraction_jobs(scope_id,node_id,location_id,status,source_size_bytes,created_at_unix_ms,updated_at_unix_ms) \
+                 VALUES(?1,?2,?3,'failed',4,2,2)",
+                params![scope_id, node_id, location_id],
+            ),
+            database.connection.execute(
+                "UPDATE extraction_jobs SET error_code='stale-write' WHERE id=?1",
+                [extraction_id],
+            ),
+            database.connection.execute(
+                "INSERT INTO watch_events(scope_id,status,path_raw,path_key,observed_kind,observed_size_bytes, \
+                    observed_modified_unix_ns,observed_identity_key,observation_count,stable_after_unix_ms,created_at_unix_ms,updated_at_unix_ms) \
+                 VALUES(?1,'completed',X'2F73636F70652F6E65772E747874','/scope/new.txt','file',1,1,X'6E6577',1,2,2,2)",
+                [scope_id],
+            ),
+            database.connection.execute(
+                "UPDATE watch_events SET observation_count=observation_count+1 WHERE id=?1",
+                [watch_id],
+            ),
+        ] {
+            let error = result.expect_err("stale direct write must be rejected by a DB trigger");
+            assert!(
+                error.to_string().contains("scope_policy_revision_stale"),
+                "unexpected trigger error: {error}"
+            );
+        }
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT issue_count FROM scan_jobs WHERE id=?1",
+                    [scan_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT error_code FROM extraction_jobs WHERE id=?1",
+                    [extraction_id],
+                    |row| row.get::<_, Option<String>>(0)
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT observation_count FROM watch_events WHERE id=?1",
+                    [watch_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn hard_exclusion_keeps_allowed_sibling_metadata_and_content_searchable() {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/scope",
+                "/scope",
+                "/scope",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"sibling-search-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let scan_id = database
+            .create_scan_job_with_policy(
+                database.bind_core_scope_policy_revision(scope.id).unwrap(),
+            )
+            .expect("scan should start");
+        let root = observation("/scope", NodeKind::Folder, None);
+        let private = observation(
+            "/scope/private",
+            NodeKind::Folder,
+            Some(root.identity_key.clone()),
+        );
+        let secret = observation(
+            "/scope/private/secret.txt",
+            NodeKind::File,
+            Some(private.identity_key.clone()),
+        );
+        let allowed = observation(
+            "/scope/public-allowed.txt",
+            NodeKind::File,
+            Some(root.identity_key.clone()),
+        );
+        database
+            .complete_scan(
+                scan_id,
+                scope.id,
+                &[root, private, secret, allowed],
+                &[],
+                0,
+                0,
+            )
+            .expect("manifest should publish");
+        for (path, text) in [
+            ("/scope/private/secret.txt", "secret private body"),
+            ("/scope/public-allowed.txt", "allowed sibling body"),
+        ] {
+            let (node_id, location_id): (i64, i64) = database
+                .connection
+                .query_row(
+                    "SELECT node_id,id FROM locations WHERE scope_id=?1 AND path_key=?2",
+                    params![scope.id, path],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("file location should load");
+            database
+                .connection
+                .execute(
+                    "INSERT INTO extraction_jobs(scope_id,node_id,location_id,status,source_size_bytes, \
+                        created_at_unix_ms,finished_at_unix_ms,updated_at_unix_ms,policy_revision) \
+                     VALUES(?1,?2,?3,'completed',4,0,1,1,1)",
+                    params![scope.id, node_id, location_id],
+                )
+                .expect("content job should persist");
+            let extraction_id = database.connection.last_insert_rowid();
+            database
+                .connection
+                .execute(
+                    "INSERT INTO content_chunks(scope_id,node_id,location_id,extraction_job_id,ordinal,text, \
+                        provenance_kind,source_byte_start,source_byte_end,source_size_bytes,source_modified_unix_ns, \
+                        trust_class,provider_id,provider_version,active,created_at_unix_ms) \
+                     VALUES(?1,?2,?3,?4,0,?5,'byte_range',0,4,4,1,'untrusted_extracted_text','test','1',1,1)",
+                    params![scope.id, node_id, location_id, extraction_id, text],
+                )
+                .expect("content chunk should persist");
+        }
+
+        let binding = database.bind_scope_policy_revision(scope.id).unwrap();
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: b"/scope/private",
+            path_key: "/scope/private",
+            display_path: "/scope/private",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+        };
+        database
+            .apply_scope_exclusion_batch(binding, &[write], 2)
+            .expect("private subtree should purge");
+        let allowed_results = database
+            .lexical_search_candidates("allowed", lexical_filters(Some(scope.id)), 10)
+            .expect("allowed sibling should remain queryable");
+        assert_eq!(allowed_results.len(), 2);
+        assert!(
+            allowed_results
+                .iter()
+                .all(|candidate| candidate.path_key == "/scope/public-allowed.txt")
+        );
+        assert!(
+            allowed_results
+                .iter()
+                .any(|candidate| candidate.source == LexicalCandidateSource::MetadataPath)
+        );
+        assert!(
+            allowed_results
+                .iter()
+                .any(|candidate| candidate.source == LexicalCandidateSource::ExtractedText)
+        );
+        assert!(
+            database
+                .lexical_search_candidates("secret", lexical_filters(Some(scope.id)), 10)
+                .expect("excluded search should fail closed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn execute_requested_action_blocks_privacy_purge_with_full_rollback() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "purge_execute_requested",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("execute request should persist");
+        assert_action_safety_record_blocks_privacy_purge(&mut database, scope_id, preview.plan_id);
+    }
+
+    #[test]
+    fn execution_needs_attention_blocks_privacy_purge_with_full_rollback() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let execute = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "purge_execution_attention",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("execute request should persist");
+        acquire_test_executor_lease(&mut database, preview.plan_id);
+        let intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: execute.journal_sequence,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::DirectRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("direct intent should persist");
+        database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: intent.journal_sequence,
+                expected_state: ActionPlanState::DirectRenameIntent,
+                kind: ActionJournalEventKind::ExecutionNeedsAttention,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("execution attention receipt should persist");
+        assert_action_safety_record_blocks_privacy_purge(&mut database, scope_id, preview.plan_id);
+    }
+
+    #[test]
+    fn undo_needs_attention_blocks_privacy_purge_with_full_rollback() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let execute = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "purge_undo_execute",
+                kind: ActionCommandKind::Execute,
+                expected_sequence: 1,
+            })
+            .expect("execute request should persist");
+        acquire_test_executor_lease(&mut database, preview.plan_id);
+        let intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: execute.journal_sequence,
+                expected_state: ActionPlanState::ExecuteRequested,
+                kind: ActionJournalEventKind::DirectRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("direct intent should persist");
+        let executed = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: execute.command_request_id,
+                expected_sequence: intent.journal_sequence,
+                expected_state: ActionPlanState::DirectRenameIntent,
+                kind: ActionJournalEventKind::ExecutionCompleted,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("execution receipt should persist");
+        let undo = database
+            .start_action_command(ActionCommandWrite {
+                plan_id: preview.plan_id,
+                request_id: "purge_undo_attention",
+                kind: ActionCommandKind::Undo,
+                expected_sequence: executed.journal_sequence,
+            })
+            .expect("undo request should persist");
+        let undo_intent = database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: undo.command_request_id,
+                expected_sequence: undo.journal_sequence,
+                expected_state: ActionPlanState::UndoRequested,
+                kind: ActionJournalEventKind::UndoRenameIntent,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("undo intent should persist");
+        database
+            .append_action_journal_event(ActionJournalAppend {
+                plan_id: preview.plan_id,
+                command_request_id: undo.command_request_id,
+                expected_sequence: undo_intent.journal_sequence,
+                expected_state: ActionPlanState::UndoRenameIntent,
+                kind: ActionJournalEventKind::UndoNeedsAttention,
+                executor_lease_owner_token: "test_executor_0001",
+            })
+            .expect("undo attention receipt should persist");
+        assert_action_safety_record_blocks_privacy_purge(&mut database, scope_id, preview.plan_id);
+    }
+
+    #[test]
+    fn excluding_one_screenshot_member_closes_the_group_and_its_cleanup_source_only() {
+        let (mut database, scope_id, _) = screenshot_group_setup();
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id=?1 AND status='completed'",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        insert_screenshot_group_source(&database, scope_id, scan_id, 2, "1");
+        let candidate = database
+            .discover_screenshot_group_candidates(scope_id)
+            .expect("three-member screenshot group should persist")
+            .1
+            .remove(0);
+        assert_eq!(candidate.members.len(), 3);
+        let target = &candidate.members[1];
+        let (identity_kind, identity_key, size_bytes, modified_unix_ns): (
+            String,
+            Vec<u8>,
+            i64,
+            Option<i64>,
+        ) = database
+            .connection
+            .query_row(
+                "SELECT n.identity_kind,n.identity_key,f.size_bytes,f.modified_unix_ns \
+                 FROM nodes n JOIN files f ON f.node_id=n.id WHERE n.id=?1",
+                [target.node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        database.connection.execute(
+            "INSERT INTO cleanup_action_plans( \
+                 api_version,policy_version,operation,state,scope_id,source_kind,source_id,source_observation_id, \
+                 target_node_id,target_location_id,target_identity_kind,target_identity_key,target_size_bytes, \
+                 target_modified_unix_ns,target_sha256,target_hash_bytes,scope_root_node_id,scope_root_identity_kind, \
+                 scope_root_identity_key,parent_node_id,parent_identity_kind,parent_identity_key,confirmation_required, \
+                 action_authorized,execution_available,created_at_unix_ms,policy_revision \
+             ) VALUES('deskgraph.cleanup-action-plan.v1','deskgraph.cleanup-action-policy.v1', \
+                 'system_trash_preview','previewed',?1,'screenshot_review_group',?2,?3,?4,?5,?6,?7,?8,?9, \
+                 zeroblob(32),?8,?4,?6,?7,?4,?6,?7,1,0,0,1,1)",
+            params![
+                scope_id,
+                candidate.group_id,
+                candidate.evidence.observation_id,
+                target.node_id,
+                target.location_id,
+                identity_kind,
+                identity_key,
+                size_bytes,
+                modified_unix_ns,
+            ],
+        ).expect("screenshot cleanup preview should persist");
+        let cleanup_plan_id = database.connection.last_insert_rowid();
+        database.connection.execute(
+            "INSERT INTO cleanup_action_journal_events(api_version,plan_id,sequence,event_kind,created_at_unix_ms) \
+             VALUES('deskgraph.cleanup-action-journal.v1',?1,1,'preview_created',1)",
+            [cleanup_plan_id],
+        ).unwrap();
+
+        let binding = database.bind_scope_policy_revision(scope_id).unwrap();
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::File,
+            path_raw: b"/scope/screenshot-0.png",
+            path_key: "/scope/screenshot-0.png",
+            display_path: "/scope/screenshot-0.png",
+            identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+            identity_key: TEST_EXCLUDED_FILE_IDENTITY,
+        };
+        let impact = database
+            .preview_scope_exclusion_batch(binding, &[write])
+            .unwrap();
+        assert_eq!(impact.screenshot_group_count, 1);
+        assert_eq!(impact.cleanup_action_plan_count, 1);
+        database
+            .apply_scope_exclusion_batch(binding, &[write], 2)
+            .unwrap();
+
+        for table in [
+            "screenshot_group_members",
+            "screenshot_group_observations",
+            "screenshot_group_candidates",
+            "cleanup_action_journal_events",
+            "cleanup_action_plans",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                database
+                    .connection
+                    .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table} should be purged as one closed source"
+            );
+        }
+        assert_eq!(database.connection.query_row(
+            "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND path_key IN('/scope/screenshot-1.png','/scope/screenshot-2.png')",
+            [scope_id],
+            |row| row.get::<_,i64>(0),
+        ).unwrap(), 2);
+        assert_eq!(database.connection.query_row(
+            "SELECT COUNT(*) FROM content_chunks c JOIN locations l ON l.id=c.location_id \
+             WHERE l.scope_id=?1 AND l.path_key IN('/scope/screenshot-1.png','/scope/screenshot-2.png')",
+            [scope_id],
+            |row| row.get::<_,i64>(0),
+        ).unwrap(), 2);
+    }
+
+    #[test]
+    fn project_marker_and_action_destination_are_closed_over_privacy_targets() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let root_node_id = database
+            .node_id_for_path_key(scope_id, "/scope")
+            .expect("root lookup should pass")
+            .expect("root should exist");
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM scan_jobs WHERE scope_id=?1 AND status='completed' ORDER BY id DESC LIMIT 1",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should load");
+        database
+            .connection
+            .execute(
+                "INSERT INTO nodes(kind,identity_kind,identity_key,created_at_unix_ms,updated_at_unix_ms) \
+                 VALUES('file','test',X'70726F6A6563742D6D61726B6572',1,1)",
+                [],
+            )
+            .expect("project marker node should persist");
+        let marker_node_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO files(node_id,size_bytes,modified_unix_ns,link_count) VALUES(?1,4,1,1)",
+                [marker_node_id],
+            )
+            .expect("marker file facts should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations(scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id) \
+                 VALUES(?1,?2,X'2F73636F70652F436172676F2E746F6D6C','/scope/Cargo.toml','/scope/Cargo.toml',1,?3)",
+                params![scope_id, marker_node_id, scan_id],
+            )
+            .expect("marker location should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO edges(scope_id,source_node_id,target_node_id,kind,active,last_seen_scan_id) \
+                 VALUES(?1,?2,?3,'located_in',1,?4)",
+                params![scope_id, marker_node_id, root_node_id, scan_id],
+            )
+            .expect("marker topology should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO projects(api_version,scope_id,root_folder_node_id,created_at_unix_ms) \
+                 VALUES('deskgraph.project-candidate.v1',?1,?2,1)",
+                params![scope_id, root_node_id],
+            )
+            .expect("project should persist");
+        let project_id = database.connection.last_insert_rowid();
+
+        let binding = database.bind_scope_policy_revision(scope_id).unwrap();
+        let writes = [
+            ScopeExclusionWrite {
+                kind: ScopeExclusionKind::File,
+                path_raw: b"/scope/Cargo.toml",
+                path_key: "/scope/Cargo.toml",
+                display_path: "/scope/Cargo.toml",
+                identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+                identity_key: TEST_EXCLUDED_FILE_IDENTITY,
+            },
+            ScopeExclusionWrite {
+                kind: ScopeExclusionKind::File,
+                path_raw: b"/scope/renamed.txt",
+                path_key: "/scope/renamed.txt",
+                display_path: "/scope/renamed.txt",
+                identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+                identity_key: TEST_EXCLUDED_FILE_IDENTITY_2,
+            },
+        ];
+        let impact = database
+            .preview_scope_exclusion_batch(binding, &writes)
+            .expect("closure impact should preview");
+        assert_eq!(impact.project_count, 1);
+        assert_eq!(impact.action_plan_count, 1);
+        assert_eq!(impact.blocking_action_count, 0);
+        database
+            .apply_scope_exclusion_batch(binding, &writes, 10)
+            .expect("pristine preview and project marker should purge");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE id=?1",
+                    [project_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM action_plans WHERE id=?1",
+                    [preview.plan_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND path_key='/scope/file.txt'",
+                [scope_id],
+                |row| row.get::<_, i64>(0)
+            ).unwrap(),
+            1,
+            "destination-only closure must not purge the action source"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn hard_exclusion_purges_fts_and_same_scope_hardlinks_but_keeps_source_and_cross_scope_node() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let root = temp.path().join("scope");
+        let private = root.join("private");
+        std::fs::create_dir_all(&private).expect("private directory should create");
+        let source = private.join("secret.txt");
+        std::fs::write(&source, b"secret-source-bytes").expect("source should create");
+        let bytes_before = std::fs::read(&source).expect("source should read");
+        let modified_before = std::fs::metadata(&source)
+            .expect("metadata should load")
+            .modified()
+            .expect("mtime should load");
+        let root_key = comparison_key(&root);
+        let private_key = comparison_key(&private);
+        let source_key = comparison_key(&source);
+        let hardlink_key = comparison_key(&root.join("public-hardlink.txt"));
+
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                root.as_os_str().as_bytes(),
+                &root_key,
+                &root.to_string_lossy(),
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"scope-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope should persist");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("outside should create");
+        let outside_key = comparison_key(&outside);
+        let outside_scope = database
+            .add_scope_with_access_grant(
+                outside.as_os_str().as_bytes(),
+                &outside_key,
+                &outside.to_string_lossy(),
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"outside-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("outside scope should persist");
+        database.connection.execute(
+            "INSERT INTO scan_jobs(scope_id,status,started_at_unix_ms,finished_at_unix_ms,policy_revision) VALUES(?1,'completed',1,2,1)",
+            [scope.id],
+        ).expect("scope scan should insert");
+        let scan_id = database.connection.last_insert_rowid();
+        database.connection.execute(
+            "INSERT INTO scan_jobs(scope_id,status,started_at_unix_ms,finished_at_unix_ms,policy_revision) VALUES(?1,'completed',1,2,1)",
+            [outside_scope.id],
+        ).expect("outside scan should insert");
+        let outside_scan_id = database.connection.last_insert_rowid();
+        database.connection.execute(
+            "INSERT INTO nodes(kind,identity_kind,identity_key,created_at_unix_ms,updated_at_unix_ms) VALUES('file','unix-dev-inode',x'0102',1,1)",
+            [],
+        ).expect("node should insert");
+        let node_id = database.connection.last_insert_rowid();
+        database.connection.execute(
+            "INSERT INTO files(node_id,size_bytes,modified_unix_ns,link_count) VALUES(?1,19,1,3)",
+            [node_id],
+        ).expect("file should insert");
+        for (scope_id, job_id, raw, key, display) in [
+            (
+                scope.id,
+                scan_id,
+                source.as_os_str().as_bytes(),
+                source_key.as_str(),
+                source.to_string_lossy().into_owned(),
+            ),
+            (
+                scope.id,
+                scan_id,
+                root.join("public-hardlink.txt").as_os_str().as_bytes(),
+                hardlink_key.as_str(),
+                root.join("public-hardlink.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                outside_scope.id,
+                outside_scan_id,
+                outside.join("same-node.txt").as_os_str().as_bytes(),
+                comparison_key(&outside.join("same-node.txt")).as_str(),
+                outside.join("same-node.txt").to_string_lossy().into_owned(),
+            ),
+        ] {
+            database.connection.execute(
+                "INSERT INTO locations(scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id) VALUES(?1,?2,?3,?4,?5,1,?6)",
+                params![scope_id,node_id,raw,key,display,job_id],
+            ).expect("location should insert");
+        }
+        let source_location: i64 = database
+            .connection
+            .query_row(
+                "SELECT id FROM locations WHERE scope_id=?1 AND path_key=?2",
+                params![scope.id, source_key],
+                |row| row.get(0),
+            )
+            .expect("source location should load");
+        database.connection.execute(
+            "INSERT INTO extraction_jobs(scope_id,node_id,location_id,status,source_size_bytes,output_bytes,chunk_count,elapsed_ms,created_at_unix_ms,finished_at_unix_ms,updated_at_unix_ms,policy_revision,operation) VALUES(?1,?2,?3,'completed',19,19,1,1,1,2,2,1,'content')",
+            params![scope.id,node_id,source_location],
+        ).expect("extraction job should insert");
+        let extraction_id = database.connection.last_insert_rowid();
+        database.connection.execute(
+            "INSERT INTO content_chunks(scope_id,node_id,location_id,extraction_job_id,ordinal,text,provenance_kind,source_byte_start,source_byte_end,source_size_bytes,trust_class,provider_id,provider_version,active,created_at_unix_ms) VALUES(?1,?2,?3,?4,0,'secret searchable text','byte_range',0,19,19,'untrusted_extracted_text','test','1',1,2)",
+            params![scope.id,node_id,source_location,extraction_id],
+        ).expect("content should insert");
+
+        let private_metadata = std::fs::symlink_metadata(&private).expect("private metadata");
+        let private_identity =
+            platform_identity(&private, &private_metadata, IdentityNodeKind::Folder)
+                .expect("private folder must have stable identity");
+
+        let write = ScopeExclusionWrite {
+            kind: ScopeExclusionKind::Folder,
+            path_raw: private.as_os_str().as_bytes(),
+            path_key: &private_key,
+            display_path: &private.to_string_lossy(),
+            identity_kind: private_identity.kind,
+            identity_key: &private_identity.key,
+        };
+        let binding = database
+            .bind_scope_policy_revision(scope.id)
+            .expect("binding should load");
+        let preview = database
+            .preview_scope_exclusion_batch(binding, &[write])
+            .expect("preview should succeed");
+        assert_eq!(preview.direct_location_count, 1);
+        assert_eq!(preview.conservative_location_count, 2);
+        let result = database
+            .apply_scope_exclusion_batch(binding, &[write], 10)
+            .expect("privacy purge should commit");
+        assert_eq!(result.policy.revision, 2);
+        assert_eq!(result.exclusions.len(), 1);
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                    [scope.id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND node_id=?2",
+                    params![outside_scope.id, node_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM nodes WHERE id=?1", [node_id], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(database.connection.query_row("SELECT COUNT(*) FROM content_search_fts WHERE content_search_fts MATCH 'secret'", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+        assert_eq!(database.connection.query_row("SELECT COUNT(*) FROM location_search_fts WHERE location_search_fts MATCH 'secret'", [], |row| row.get::<_,i64>(0)).unwrap(), 0);
+        assert_eq!(
+            std::fs::read(&source).expect("source should remain"),
+            bytes_before
+        );
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().modified().unwrap(),
+            modified_before
+        );
+        assert!(matches!(
+            database.apply_scope_exclusion_batch(binding, &[write], 11),
+            Err(DatabaseError::ScopePolicyRevisionStale)
+        ));
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_purge_capabilities",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
     }
 }

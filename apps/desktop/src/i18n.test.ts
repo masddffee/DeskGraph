@@ -270,6 +270,55 @@ describe('i18n catalog and registry contract', () => {
     expect(appSource).toContain("if (nextView !== 'projects') invalidateProjectReview()");
   });
 
+  it('keeps hard exclusion as a Settings-only privacy purge, not search hiding, in every catalog', () => {
+    const phrases: Record<Locale, { deny: string; notHidden: string; sourceSafe: string }> = {
+      en: {
+        deny: 'deny local access and indexing',
+        notHidden: 'not just hidden search results',
+        sourceSafe: 'not move or delete source files',
+      },
+      'zh-TW': {
+        deny: '拒絕本機存取與索引',
+        notHidden: '不是只隱藏搜尋結果',
+        sourceSafe: '不會移動或刪除來源檔案',
+      },
+      'zh-CN': {
+        deny: '拒绝本机访问和索引',
+        notHidden: '不是只隐藏搜索结果',
+        sourceSafe: '不会移动或删除源文件',
+      },
+      ja: {
+        deny: 'ローカルのアクセスと索引を拒否',
+        notHidden: '検索結果を隠すだけではありません',
+        sourceSafe: '元ファイルを移動または削除しません',
+      },
+    };
+    for (const locale of LOCALES) {
+      const exclusion = catalogs[locale].hardExclusion;
+      expect(exclusion.description).toContain(phrases[locale].deny);
+      expect(exclusion.description).toContain(phrases[locale].notHidden);
+      expect(exclusion.previewNotice).toContain(phrases[locale].sourceSafe);
+      expect(exclusion.sourceSafe.length).toBeGreaterThan(0);
+      expect(exclusion.addFolders.length).toBeGreaterThan(0);
+      expect(exclusion.addFiles.length).toBeGreaterThan(0);
+      expect(exclusion.notConfirmable.length).toBeGreaterThan(20);
+      expect(exclusion.removalUnavailable).toBeTruthy();
+    }
+    expect(appSource).toContain('selectHardExclusionsPreview(hardExclusionScopeId, entryKind)');
+    expect(appSource).toContain('confirmHardExclusionPreview(preview.preview_id)');
+    expect(appSource).toContain('discardHardExclusionPreview(preview.preview_id)');
+    expect(appSource).toContain('clearPurgedTransientState()');
+    expect(appSource).toContain('hardExclusionGenerationRef.current !== generation');
+    expect(appSource).toContain('const searchGenerationRef = useRef(0)');
+    expect(appSource).toContain('searchGenerationRef.current += 1');
+    expect(appSource).toContain('searchGenerationRef.current !== generation');
+    expect(appSource).toContain('const ocrGenerationRef = useRef(0)');
+    expect(appSource).toContain('const renameGenerationRef = useRef(0)');
+    expect(appSource).toContain('scope.display_path');
+    expect(appSource).toContain('catalog.hardExclusion.notConfirmable');
+    expect(appSource).toContain('catalog.hardExclusion.removalUnavailable');
+  });
+
   it('keeps primary navigation complete and honest in every catalog', () => {
     const phrases: Record<
       Locale,

@@ -20,8 +20,8 @@ use deskgraph_projects::{
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
-    authorize_scope, comparison_key, create_scan_job, pause_scan_job, resume_scan_job,
-    run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
+    authorize_scope_with_access_grant, comparison_key, create_scan_job, pause_scan_job,
+    resume_scan_job, run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{action_plan_at, create_rename_preview_at, recent_action_plans_at};
@@ -31,6 +31,26 @@ use deskgraph_watcher::{
 };
 use serde::Serialize;
 use tracing::{error, info};
+
+/// A versioned receipt that records the user's explicit `scope add` consent.
+///
+/// This is deliberately path-free: the canonical root belongs only in the
+/// scope record, while this opaque value merely identifies the CLI consent
+/// mechanism that atomically activated the current-host grant. Never emit or
+/// log these bytes.
+const CLI_EXPLICIT_CONSENT_RECEIPT_V1: &[u8] = b"deskgraph-cli-explicit-consent-v1";
+
+fn authorize_scope_with_cli_consent(
+    database: &mut ManifestDatabase,
+    path: &Path,
+) -> Result<deskgraph_domain::AuthorizedScope, deskgraph_scanner::ScannerError> {
+    authorize_scope_with_access_grant(
+        database,
+        path,
+        std::env::consts::OS,
+        CLI_EXPLICIT_CONSENT_RECEIPT_V1,
+    )
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -616,8 +636,9 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
         },
         Command::Scope { command } => match command {
             ScopeCommand::Add { database, path } => {
-                let database = open_database(&database)?;
-                let scope = authorize_scope(&database, &path).map_err(|error| error.code())?;
+                let mut database = open_database(&database)?;
+                let scope = authorize_scope_with_cli_consent(&mut database, &path)
+                    .map_err(|error| error.code())?;
                 emit_json(&scope, "scope_authorized")
             }
             ScopeCommand::List { database } => {
@@ -1346,7 +1367,8 @@ mod tests {
         std::fs::write(scope_path.join("note.md"), "metadata fixture")
             .expect("fixture should write");
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
-        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
+            .expect("scope should authorize");
         let job = create_scan_job(&mut manifest, scope.id).expect("job should create");
         drop(manifest);
 
@@ -1398,7 +1420,8 @@ mod tests {
         std::fs::write(&source_path, "# DeskGraph\n本機 local-first context\n")
             .expect("fixture should write");
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
-        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
+            .expect("scope should authorize");
         scan_scope(&mut manifest, scope.id).expect("scope should scan");
         let node_id = manifest
             .node_id_for_path_key(
@@ -1444,7 +1467,8 @@ mod tests {
         png[20..24].copy_from_slice(&1080_u32.to_be_bytes());
         std::fs::write(&source_path, png).expect("image fixture should write");
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
-        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
+            .expect("scope should authorize");
         scan_scope(&mut manifest, scope.id).expect("scope should scan");
         let node_id = manifest
             .node_id_for_path_key(
@@ -1499,7 +1523,8 @@ mod tests {
         let source_path = scope_path.join("Screenshot.png");
         std::fs::write(&source_path, bounded_png_header(640, 480)).expect("fixture should write");
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
-        let scope = authorize_scope(&manifest, &scope_path).expect("scope should authorize");
+        let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
+            .expect("scope should authorize");
         scan_scope(&mut manifest, scope.id).expect("scope should scan");
         let node_id = manifest
             .node_id_for_path_key(

@@ -39,6 +39,13 @@ fn fixture_with_content() -> Fixture {
     let mut database = ManifestDatabase::open(&database_path).expect("manifest should initialize");
     let granted = authorize_scope(&database, &granted_root).expect("scope should authorize");
     let denied = authorize_scope(&database, &denied_root).expect("scope should authorize");
+    database
+        .upsert_scope_access_grant(
+            granted.id,
+            std::env::consts::OS,
+            b"mcp-integration-active-grant",
+        )
+        .expect("granted scope should have an active platform grant");
     scan_scope(&mut database, granted.id).expect("granted scope should scan");
     scan_scope(&mut database, denied.id).expect("denied scope should scan");
     let granted_node_id = database

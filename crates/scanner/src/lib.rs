@@ -1,12 +1,13 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, Metadata};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
     CoverageRootAccessGrantWrite, DatabaseError, ManifestDatabase, NodeKind, Observation,
     QueueEntry, QueuedPath, ScanIssue, ScopeAccessGrantState, ScopeAccessGrantWrite,
+    ScopeExclusionKind, ScopeExclusionMatcher, ScopeRevisionBinding,
 };
 use deskgraph_domain::{AuthorizedScope, ScanJobProgress, ScanReport, ScanStatus};
 pub use deskgraph_identity::comparison_key;
@@ -26,6 +27,15 @@ pub enum ScannerError {
     CoverageSetEmpty,
     CoverageSetTooLarge,
     CoverageRootOverlap,
+    ScopeExclusionSelectionEmpty,
+    ScopeExclusionSelectionTooLarge,
+    ScopeExclusionNotStrictDescendant,
+    ScopeExclusionSymlinkOrReparse,
+    ScopeExclusionHiddenOrTemporary,
+    ScopeExclusionUnsupportedKind,
+    ScopeExclusionIdentityUnavailable,
+    ScopeExclusionOverlap,
+    ScopePolicyChanged,
     ScanFailed,
     InvalidBatchSize,
     ScanNotCompleted,
@@ -43,6 +53,15 @@ impl ScannerError {
             Self::CoverageSetEmpty => "coverage_set_empty",
             Self::CoverageSetTooLarge => "coverage_set_too_large",
             Self::CoverageRootOverlap => "coverage_root_overlap",
+            Self::ScopeExclusionSelectionEmpty => "scope_exclusion_selection_empty",
+            Self::ScopeExclusionSelectionTooLarge => "scope_exclusion_selection_too_large",
+            Self::ScopeExclusionNotStrictDescendant => "scope_exclusion_not_strict_descendant",
+            Self::ScopeExclusionSymlinkOrReparse => "scope_exclusion_symlink_or_reparse_denied",
+            Self::ScopeExclusionHiddenOrTemporary => "scope_exclusion_hidden_or_temporary_denied",
+            Self::ScopeExclusionUnsupportedKind => "scope_exclusion_unsupported_kind",
+            Self::ScopeExclusionIdentityUnavailable => "scope_exclusion_identity_unavailable",
+            Self::ScopeExclusionOverlap => "scope_exclusion_overlap",
+            Self::ScopePolicyChanged => "scope_policy_changed",
             Self::ScanFailed => "metadata_scan_failed",
             Self::InvalidBatchSize => "scan_batch_size_out_of_range",
             Self::ScanNotCompleted => "scan_job_not_completed",
@@ -53,6 +72,10 @@ impl ScannerError {
 const DEFAULT_BATCH_SIZE: usize = 256;
 const MAX_BATCH_SIZE: usize = 10_000;
 pub const MAX_COVERAGE_ROOTS_PER_SELECTION: usize = 32;
+/// Bounded before any policy preview or apply. The caller must re-run this
+/// validation immediately before applying a preview because picker paths are
+/// untrusted hints, not a durable policy capability.
+pub const MAX_SCOPE_EXCLUSIONS_PER_SELECTION: usize = 64;
 const RUNNER_LEASE_MS: i64 = 30_000;
 
 /// One native-picker result in a user-confirmed coverage-set transaction.
@@ -62,6 +85,74 @@ pub struct CoverageRootAuthorizationRequest<'a> {
     pub requested_path: &'a Path,
     pub grant_platform: &'a str,
     pub opaque_grant: &'a [u8],
+}
+
+/// One native-picker result for a hard-exclusion policy change.
+///
+/// The path is intentionally borrowed and never retained by the prepared
+/// result's `Debug` implementation. It is only acceptable at the explicit
+/// local coverage/exclusion management boundary.
+#[derive(Clone, Copy)]
+pub struct ScopeExclusionSelection<'a> {
+    pub requested_path: &'a Path,
+}
+
+impl fmt::Debug for ScopeExclusionSelection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ScopeExclusionSelection { requested_path: <redacted> }")
+    }
+}
+
+/// Canonical, identity-bound data that can be passed to the database policy
+/// preview/apply APIs. Path-bearing fields are available only to the explicit
+/// local Settings preview and are redacted from diagnostics.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreparedScopeExclusion {
+    /// Canonical native path retained only by the backend while the explicit
+    /// Settings preview is pending. It preserves non-UTF-8 paths for the
+    /// mandatory revalidation at confirmation time.
+    pub resolved_path: PathBuf,
+    /// Canonical path for the explicit, in-memory Settings preview only. The
+    /// caller must never log or persist it outside the policy transaction.
+    pub display_path: String,
+    pub path_raw: Vec<u8>,
+    pub path_key: String,
+    pub kind: ScopeExclusionKind,
+    pub identity_kind: String,
+    pub identity_key: Vec<u8>,
+}
+
+impl fmt::Debug for PreparedScopeExclusion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedScopeExclusion")
+            .field("resolved_path", &"<redacted>")
+            .field("display_path", &"<redacted>")
+            .field("path_raw", &"<redacted>")
+            .field("path_key", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("identity_kind", &self.identity_kind)
+            .field("identity_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A complete, validated policy request for one authorized root. This is an
+/// input to a DB preview/apply transaction, never a persisted policy itself.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreparedScopeExclusionBatch {
+    pub scope_id: i64,
+    pub exclusions: Vec<PreparedScopeExclusion>,
+}
+
+impl fmt::Debug for PreparedScopeExclusionBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedScopeExclusionBatch")
+            .field("scope_id", &self.scope_id)
+            .field("exclusion_count", &self.exclusions.len())
+            .finish()
+    }
 }
 
 impl fmt::Display for ScannerError {
@@ -219,6 +310,112 @@ fn validated_requested_scope(requested_path: &Path) -> Result<std::path::PathBuf
     Ok(canonical)
 }
 
+/// Validates an explicit native-picker exclusion selection before it reaches a
+/// policy preview or apply transaction.
+///
+/// This deliberately performs no database write. A preview is advisory: the
+/// caller must invoke this again immediately before `apply_scope_exclusion_batch`
+/// so a changed path, symlink swap, or scope move cannot be committed from stale
+/// picker data.
+pub fn prepare_scope_exclusion_batch(
+    database: &ManifestDatabase,
+    scope_id: i64,
+    selections: &[ScopeExclusionSelection<'_>],
+) -> Result<PreparedScopeExclusionBatch, ScannerError> {
+    if selections.is_empty() {
+        return Err(ScannerError::ScopeExclusionSelectionEmpty);
+    }
+    if selections.len() > MAX_SCOPE_EXCLUSIONS_PER_SELECTION {
+        return Err(ScannerError::ScopeExclusionSelectionTooLarge);
+    }
+
+    let root = validated_scope_root(database, scope_id)?;
+    let mut canonical_selections = Vec::with_capacity(selections.len());
+    for selection in selections {
+        canonical_selections.push(prepare_scope_exclusion(&root, selection.requested_path)?);
+    }
+    for (index, selection) in canonical_selections.iter().enumerate() {
+        if canonical_selections
+            .iter()
+            .skip(index + 1)
+            .any(|other| coverage_roots_overlap(&selection.0, &other.0))
+        {
+            return Err(ScannerError::ScopeExclusionOverlap);
+        }
+    }
+
+    Ok(PreparedScopeExclusionBatch {
+        scope_id,
+        exclusions: canonical_selections
+            .into_iter()
+            .map(|(_, exclusion)| exclusion)
+            .collect(),
+    })
+}
+
+fn prepare_scope_exclusion(
+    root: &Path,
+    requested_path: &Path,
+) -> Result<(PathBuf, PreparedScopeExclusion), ScannerError> {
+    // Check the user-selected directory entry before canonicalization so a
+    // selected link cannot be converted into an apparently ordinary target.
+    let selected_metadata =
+        fs::symlink_metadata(requested_path).map_err(|_| ScannerError::CanonicalizationFailed)?;
+    if is_symlink_or_reparse_point(&selected_metadata) {
+        return Err(ScannerError::ScopeExclusionSymlinkOrReparse);
+    }
+    if has_hidden_or_system_attribute(&selected_metadata)
+        || is_hidden(requested_path.file_name())
+        || is_temporary_download_path(requested_path)
+    {
+        return Err(ScannerError::ScopeExclusionHiddenOrTemporary);
+    }
+
+    let canonical =
+        fs::canonicalize(requested_path).map_err(|_| ScannerError::CanonicalizationFailed)?;
+    if !is_strict_descendant(&canonical, root) {
+        return Err(ScannerError::ScopeExclusionNotStrictDescendant);
+    }
+    if is_protected_system_scope(&canonical) {
+        return Err(ScannerError::ProtectedSystemScope);
+    }
+    let metadata =
+        fs::symlink_metadata(&canonical).map_err(|_| ScannerError::CanonicalizationFailed)?;
+    if is_symlink_or_reparse_point(&metadata) {
+        return Err(ScannerError::ScopeExclusionSymlinkOrReparse);
+    }
+    let (kind, identity_kind) = if metadata.is_file() {
+        (ScopeExclusionKind::File, IdentityNodeKind::File)
+    } else if metadata.is_dir() {
+        (ScopeExclusionKind::Folder, IdentityNodeKind::Folder)
+    } else {
+        return Err(ScannerError::ScopeExclusionUnsupportedKind);
+    };
+    let identity = platform_identity(&canonical, &metadata, identity_kind)
+        .map_err(|_| ScannerError::ScopeExclusionIdentityUnavailable)?;
+    let path_key = comparison_key(&canonical);
+    Ok((
+        canonical.clone(),
+        PreparedScopeExclusion {
+            resolved_path: canonical.clone(),
+            display_path: canonical.to_string_lossy().into_owned(),
+            path_raw: path_to_raw(&canonical),
+            path_key,
+            kind,
+            identity_kind: identity.kind.to_string(),
+            identity_key: identity.key,
+        },
+    ))
+}
+
+fn is_strict_descendant(path: &Path, root: &Path) -> bool {
+    let path_key = comparison_key(path);
+    path.ancestors()
+        .skip(1)
+        .any(|ancestor| comparison_key(ancestor) == comparison_key(root))
+        && path_key != comparison_key(root)
+}
+
 pub fn scan_scope(
     database: &mut ManifestDatabase,
     scope_id: i64,
@@ -232,10 +429,11 @@ pub fn create_scan_job(
     database: &mut ManifestDatabase,
     scope_id: i64,
 ) -> Result<ScanJobProgress, ScannerError> {
+    let (binding, _) = bind_current_scope_policy(database, scope_id)?;
     let canonical_root = validated_scope_root(database, scope_id)?;
-    database
-        .create_resumable_scan_job(
-            scope_id,
+    let job = database
+        .create_resumable_scan_job_with_policy(
+            binding,
             &QueuedPath {
                 path_raw: path_to_raw(&canonical_root),
                 path_key: comparison_key(&canonical_root),
@@ -243,7 +441,9 @@ pub fn create_scan_job(
                 is_root: true,
             },
         )
-        .map_err(Into::into)
+        .map_err(ScannerError::from)?;
+    assert_scope_policy_current(database, binding)?;
+    Ok(job)
 }
 
 pub fn run_scan_job_batch(
@@ -260,14 +460,17 @@ pub fn run_scan_job_batch(
     {
         return Ok(current);
     }
+    let (binding, matcher) = bind_current_scope_policy(database, current.scope_id)?;
     let canonical_root = validated_scope_root(database, current.scope_id)?;
     let runner_token = runner_token()?;
     database.claim_scan_job(job_id, &runner_token, RUNNER_LEASE_MS)?;
+    assert_scope_policy_current(database, binding)?;
     let batch_started = Instant::now();
 
     for _ in 0..batch_size {
         let progress = database.scan_job(job_id)?;
         if progress.pause_requested {
+            assert_scope_policy_current(database, binding)?;
             persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
             return database
                 .release_scan_job(job_id, &runner_token)
@@ -275,12 +478,13 @@ pub fn run_scan_job_batch(
         }
         let Some(entry) = database.next_scan_queue_entry(job_id, &runner_token, RUNNER_LEASE_MS)?
         else {
+            assert_scope_policy_current(database, binding)?;
             persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
             return database
                 .finalize_resumable_scan_job(job_id, &runner_token)
                 .map_err(Into::into);
         };
-        let processed = match process_queue_entry(&canonical_root, &entry) {
+        let processed = match process_queue_entry(&canonical_root, &matcher, &entry) {
             Ok(processed) => processed,
             Err(error) => {
                 persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
@@ -288,6 +492,7 @@ pub fn run_scan_job_batch(
                 return Err(error);
             }
         };
+        assert_scope_policy_current(database, binding)?;
         database.stage_scan_queue_entry(
             job_id,
             &runner_token,
@@ -299,8 +504,10 @@ pub fn run_scan_job_batch(
             0,
             RUNNER_LEASE_MS,
         )?;
+        assert_scope_policy_current(database, binding)?;
     }
 
+    assert_scope_policy_current(database, binding)?;
     persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
     database
         .release_scan_job(job_id, &runner_token)
@@ -345,6 +552,9 @@ pub fn validated_scope_root(
     scope_id: i64,
 ) -> Result<std::path::PathBuf, ScannerError> {
     let scope = database.scope_record(scope_id)?;
+    if scope.platform != std::env::consts::OS {
+        return Err(ScannerError::ScopeChanged);
+    }
     let stored_root =
         path_from_raw(&scope.path_raw).map_err(|_| ScannerError::ScopePathDecodeFailed)?;
     let canonical_root =
@@ -367,11 +577,22 @@ struct ProcessedQueueEntry {
 
 fn process_queue_entry(
     root: &Path,
+    exclusion_matcher: &ScopeExclusionMatcher,
     entry: &QueueEntry,
 ) -> Result<ProcessedQueueEntry, ScannerError> {
     let path = path_from_raw(&entry.path_raw).map_err(|_| ScannerError::ScopePathDecodeFailed)?;
     if comparison_key(&path) != entry.path_key {
         return Err(ScannerError::ScopeChanged);
+    }
+    // A queued raw path can predate the exclusion transaction. Consume it
+    // without metadata inspection, issue logging, or any new path persistence.
+    if exclusion_matcher.is_excluded_path_key(&entry.path_key) {
+        return Ok(ProcessedQueueEntry {
+            observation: None,
+            children: Vec::new(),
+            issues: Vec::new(),
+            skipped_entries: 1,
+        });
     }
     if !entry.is_root && is_temporary_download_path(&path) {
         return Ok(ProcessedQueueEntry {
@@ -449,6 +670,14 @@ fn process_queue_entry(
             skipped_entries: 1,
         });
     }
+    if exclusion_matcher.is_excluded_path_key(&comparison_key(&canonical)) {
+        return Ok(ProcessedQueueEntry {
+            observation: None,
+            children: Vec::new(),
+            issues: Vec::new(),
+            skipped_entries: 1,
+        });
+    }
 
     let kind = if metadata.is_dir() {
         NodeKind::Folder
@@ -468,9 +697,22 @@ fn process_queue_entry(
         NodeKind::File => IdentityNodeKind::File,
         NodeKind::Folder => IdentityNodeKind::Folder,
     };
-    let identity = platform_identity(&canonical, &metadata, identity_kind)
-        .unwrap_or_else(|_| fallback_identity(&path_key, identity_kind));
+    let identity = match platform_identity(&canonical, &metadata, identity_kind) {
+        Ok(identity) => identity,
+        Err(_) if exclusion_matcher.requires_stable_identity() => {
+            return Err(ScannerError::ScopeExclusionIdentityUnavailable);
+        }
+        Err(_) => fallback_identity(&path_key, identity_kind),
+    };
     let identity_key = identity.key;
+    if exclusion_matcher.is_excluded_identity(identity.kind, &identity_key) {
+        return Ok(ProcessedQueueEntry {
+            observation: None,
+            children: Vec::new(),
+            issues: Vec::new(),
+            skipped_entries: 1,
+        });
+    }
 
     let observation = Observation {
         kind,
@@ -497,6 +739,14 @@ fn process_queue_entry(
                     match child {
                         Ok(child) => {
                             let child_path = child.path();
+                            // Never stage an excluded child raw path. The
+                            // canonical key is obtained before persistence;
+                            // a vanished/unresolvable child remains subject to
+                            // the normal bounded reconciliation path.
+                            if child_path_is_excluded(&child_path, exclusion_matcher) {
+                                skipped_entries = skipped_entries.saturating_add(1);
+                                continue;
+                            }
                             children.push(QueuedPath {
                                 path_raw: path_to_raw(&child_path),
                                 path_key: comparison_key(&child_path),
@@ -532,6 +782,42 @@ fn process_queue_entry(
         issues,
         skipped_entries,
     })
+}
+
+fn bind_current_scope_policy(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<(ScopeRevisionBinding, ScopeExclusionMatcher), ScannerError> {
+    let binding = database.bind_core_scope_policy_revision(scope_id)?;
+    let matcher = database.scope_exclusion_matcher(scope_id)?;
+    if matcher.revision != binding.revision
+        || !database.is_core_scope_policy_binding_current(binding)?
+    {
+        return Err(ScannerError::ScopePolicyChanged);
+    }
+    Ok((binding, matcher))
+}
+
+fn assert_scope_policy_current(
+    database: &ManifestDatabase,
+    binding: ScopeRevisionBinding,
+) -> Result<(), ScannerError> {
+    if database.is_core_scope_policy_binding_current(binding)? {
+        Ok(())
+    } else {
+        Err(ScannerError::ScopePolicyChanged)
+    }
+}
+
+fn child_path_is_excluded(path: &Path, exclusion_matcher: &ScopeExclusionMatcher) -> bool {
+    // Check the lexical child key first. An unreadable or removed descendant
+    // beneath an excluded folder must not be staged merely because the alias
+    // defense canonicalization cannot run.
+    if exclusion_matcher.is_excluded_path_key(&comparison_key(path)) {
+        return true;
+    }
+    fs::canonicalize(path)
+        .is_ok_and(|canonical| exclusion_matcher.is_excluded_path_key(&comparison_key(&canonical)))
 }
 
 fn runner_token() -> Result<String, ScannerError> {
@@ -665,11 +951,18 @@ fn modified_unix_ns(metadata: &Metadata) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deskgraph_database::ScopeExclusionWrite;
 
     fn setup() -> (tempfile::TempDir, ManifestDatabase, i64) {
         let directory = tempfile::tempdir().expect("fixture root should exist");
-        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
-        let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = authorize_scope_with_access_grant(
+            &mut database,
+            directory.path(),
+            std::env::consts::OS,
+            b"scanner-test-grant",
+        )
+        .expect("scope should authorize with an active test grant");
         (directory, database, scope.id)
     }
 
@@ -682,6 +975,177 @@ mod tests {
 
         let error = authorize_scope(&database, &file).expect_err("file scope must fail");
         assert!(matches!(error, ScannerError::ScopeIsNotDirectory));
+    }
+
+    #[test]
+    fn foreign_platform_scope_cannot_be_reused_on_this_host() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let canonical = fs::canonicalize(directory.path()).expect("fixture should canonicalize");
+        let foreign_platform = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        let scope = database
+            .add_scope(
+                &path_to_raw(&canonical),
+                &comparison_key(&canonical),
+                &canonical.to_string_lossy(),
+                foreign_platform,
+            )
+            .expect("foreign-platform fixture should persist");
+
+        assert!(matches!(
+            validated_scope_root(&database, scope.id),
+            Err(ScannerError::ScopeChanged)
+        ));
+    }
+
+    #[test]
+    fn prepared_exclusions_are_canonical_identity_bound_and_debug_redacted() {
+        let (directory, database, scope_id) = setup();
+        let nested = directory.path().join("private");
+        fs::create_dir(&nested).expect("nested folder should create");
+
+        let prepared = prepare_scope_exclusion_batch(
+            &database,
+            scope_id,
+            &[ScopeExclusionSelection {
+                requested_path: &nested,
+            }],
+        )
+        .expect("strict child should prepare");
+
+        assert_eq!(prepared.scope_id, scope_id);
+        assert_eq!(prepared.exclusions.len(), 1);
+        let exclusion = &prepared.exclusions[0];
+        assert_eq!(exclusion.kind, ScopeExclusionKind::Folder);
+        assert_eq!(exclusion.path_key, comparison_key(&exclusion.resolved_path));
+        assert!(!exclusion.identity_key.is_empty());
+        assert_eq!(
+            exclusion.display_path,
+            exclusion.resolved_path.to_string_lossy()
+        );
+        let debug = format!("{prepared:?}");
+        assert!(!debug.contains("private"));
+        assert!(!debug.contains(&*String::from_utf8_lossy(&exclusion.identity_key)));
+    }
+
+    #[test]
+    fn excluded_missing_child_is_rejected_lexically_before_canonicalization() {
+        let (directory, mut database, scope_id) = setup();
+        let excluded = directory.path().join("private");
+        fs::create_dir(&excluded).expect("excluded child should exist for picker validation");
+        let canonical_excluded =
+            fs::canonicalize(&excluded).expect("excluded child should canonicalize for traversal");
+        let prepared = prepare_scope_exclusion_batch(
+            &database,
+            scope_id,
+            &[ScopeExclusionSelection {
+                requested_path: &excluded,
+            }],
+        )
+        .expect("strict excluded child should prepare");
+        let writes = prepared
+            .exclusions
+            .iter()
+            .map(|exclusion| ScopeExclusionWrite {
+                kind: exclusion.kind,
+                path_raw: &exclusion.path_raw,
+                path_key: &exclusion.path_key,
+                display_path: &exclusion.display_path,
+                identity_kind: &exclusion.identity_kind,
+                identity_key: &exclusion.identity_key,
+            })
+            .collect::<Vec<_>>();
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("active fixture scope should bind");
+        let applied = database
+            .apply_scope_exclusion_batch(binding, &writes, 1)
+            .expect("exclusion should commit");
+        assert_eq!(applied.exclusions.len(), 1);
+        assert_eq!(
+            applied.exclusions[0].path_key,
+            comparison_key(&canonical_excluded)
+        );
+        let matcher = database
+            .scope_exclusion_matcher(scope_id)
+            .expect("matcher should load after exclusion");
+        assert!(
+            matcher.is_excluded_path_key(&comparison_key(&canonical_excluded)),
+            "the committed exclusion must match the existing child"
+        );
+
+        fs::remove_dir(&excluded).expect("child should disappear before traversal");
+        assert!(
+            child_path_is_excluded(&canonical_excluded, &matcher),
+            "the lexical exclusion must prevent enqueue when canonicalization cannot run"
+        );
+    }
+
+    #[test]
+    fn exclusion_preparation_rejects_root_and_overlapping_children() {
+        let (directory, database, scope_id) = setup();
+        let parent = directory.path().join("private");
+        let child = parent.join("child");
+        fs::create_dir(&parent).expect("parent should create");
+        fs::create_dir(&child).expect("child should create");
+
+        let root_error = prepare_scope_exclusion_batch(
+            &database,
+            scope_id,
+            &[ScopeExclusionSelection {
+                requested_path: directory.path(),
+            }],
+        )
+        .expect_err("scope root must not be excludable as a descendant");
+        assert!(matches!(
+            root_error,
+            ScannerError::ScopeExclusionNotStrictDescendant
+                | ScannerError::ScopeExclusionHiddenOrTemporary
+        ));
+
+        let overlap_error = prepare_scope_exclusion_batch(
+            &database,
+            scope_id,
+            &[
+                ScopeExclusionSelection {
+                    requested_path: &parent,
+                },
+                ScopeExclusionSelection {
+                    requested_path: &child,
+                },
+            ],
+        )
+        .expect_err("overlapping exclusions must be rejected");
+        assert!(matches!(overlap_error, ScannerError::ScopeExclusionOverlap));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusion_preparation_rejects_symlink_picker_path() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, database, scope_id) = setup();
+        let target = directory.path().join("private");
+        let link = directory.path().join("private-link");
+        fs::create_dir(&target).expect("target should create");
+        symlink(&target, &link).expect("link should create");
+
+        let error = prepare_scope_exclusion_batch(
+            &database,
+            scope_id,
+            &[ScopeExclusionSelection {
+                requested_path: &link,
+            }],
+        )
+        .expect_err("symlink picker selection must fail");
+        assert!(matches!(
+            error,
+            ScannerError::ScopeExclusionSymlinkOrReparse
+        ));
     }
 
     #[test]
@@ -977,7 +1441,13 @@ mod tests {
         );
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
 
-        let scope = authorize_scope(&database, &alternate_case).expect("alias should authorize");
+        let scope = authorize_scope_with_access_grant(
+            &mut database,
+            &alternate_case,
+            std::env::consts::OS,
+            b"case-test-grant",
+        )
+        .expect("alias should authorize with an active test grant");
         let report = scan_scope(&mut database, scope.id).expect("canonical scope should scan");
 
         assert_eq!(report.discovered_files, 1);
@@ -1047,6 +1517,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
         let denied = directory.path().join("denied");
         fs::create_dir(&denied).expect("denied fixture should create");
         fs::write(denied.join("private.txt"), "not readable").expect("fixture should write");
@@ -1066,7 +1538,10 @@ mod tests {
             is_root: false,
         };
 
-        let processed = process_queue_entry(&canonical_root, &entry);
+        let matcher = database
+            .scope_exclusion_matcher(scope.id)
+            .expect("policy matcher should load");
+        let processed = process_queue_entry(&canonical_root, &matcher, &entry);
         fs::set_permissions(&denied, original_permissions).expect("permissions should restore");
         let processed = processed.expect("permission issue should be recoverable");
 
