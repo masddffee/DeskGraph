@@ -60,6 +60,44 @@ export const en = {
       'Confirm one or more local folders in one step, build their metadata manifests, and keep bounded text extraction on this computer—without uploading paths or content.',
     release: 'PRE-RELEASE',
   },
+  journey: {
+    kicker: 'A safe first pass',
+    heading: 'See useful local context in three explicit steps.',
+    description:
+      'Choose the coverage, scan metadata, then review only the local suggestions you ask for. DeskGraph never starts with your whole computer.',
+    privacy: 'No uploads · no automatic scan · no file changes',
+    scope: {
+      title: '1 · Choose coverage',
+      description:
+        'Select one or more folders in the native picker. Authorization alone does not read or scan them.',
+      action: 'Choose local folders',
+    },
+    search: {
+      title: '2 · Scan, then search',
+      description:
+        'Run an initial metadata scan for a chosen folder, then search filenames and opt-in extracted text in SQLite.',
+      action: 'Open search',
+    },
+    review: {
+      title: '3 · Review explained suggestions',
+      description:
+        'Inspect local project candidates and cleanup previews. Neither screen can change, trash, delete, or undo files.',
+      projectsAction: 'Review projects',
+      cleanupAction: 'Review cleanup',
+    },
+    mcp: {
+      title: 'Read-only MCP is separate',
+      description:
+        'After a completed scan, the independently launched macOS/Linux local MCP slice can search only its launch-granted scopes. This Desktop screen does not configure it or expose write tools.',
+    },
+    status: {
+      noScope: 'Choose coverage to begin',
+      scopesReady: (count) =>
+        `${count} authorized folder${count === 1 ? '' : 's'} · scanning stays explicit`,
+      scanNeeded: 'Run an initial scan before search, Projects, or Cleanup can evaluate a folder',
+      scanReady: 'A completed local scan is ready for search and review',
+    },
+  },
   loading: {
     heading: 'Opening the local manifest',
     description: 'No authorized folder is scanned automatically.',

@@ -370,7 +370,8 @@ h2 {
 .panel--cleanup,
 .panel--projects,
 .panel--scopes,
-.panel--settings {
+.panel--settings,
+.panel--journey {
   grid-column: 1 / -1;
 }
 
@@ -497,6 +498,97 @@ footer {
 
 .panel--privacy .metric span {
   color: #b7c7ba;
+}
+
+.journey-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  padding: 0;
+  margin: 1.4rem 0 0;
+  list-style: none;
+}
+
+.journey-step {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid rgba(27, 59, 40, 0.14);
+  border-radius: 0.95rem;
+  padding: 1rem;
+  background: #f4f7f1;
+}
+
+.journey-step--next {
+  border-color: rgba(31, 98, 72, 0.3);
+  background: linear-gradient(135deg, #f2f8f0, #e7f2e7);
+  box-shadow: inset 3px 0 0 #1f6248;
+}
+
+.journey-step-copy {
+  min-width: 0;
+}
+
+.journey-step h3 {
+  margin: 0;
+  color: #1d3e2d;
+  font-size: 0.96rem;
+  line-height: 1.35;
+}
+
+.journey-step p {
+  margin: 0.55rem 0 0;
+  color: #56655c;
+  font-size: 0.83rem;
+  line-height: 1.55;
+}
+
+.journey-status {
+  display: block;
+  margin-top: 0.75rem;
+  color: #31513d;
+  font-size: 0.76rem;
+  font-weight: 800;
+  line-height: 1.45;
+}
+
+.journey-step > button,
+.journey-actions {
+  align-self: flex-start;
+}
+
+.journey-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.journey-actions .button-secondary,
+.journey-step > button {
+  padding: 0.58rem 0.82rem;
+  font-size: 0.78rem;
+}
+
+.journey-mcp {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.38fr) minmax(0, 1fr);
+  gap: 1rem;
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  margin-top: 1.15rem;
+  padding-top: 1rem;
+}
+
+.journey-mcp strong {
+  color: #31513d;
+  font-size: 0.82rem;
+}
+
+.journey-mcp span {
+  color: #657269;
+  font-size: 0.8rem;
+  line-height: 1.55;
 }
 
 .extraction-progress {
@@ -1613,7 +1705,9 @@ footer {
   .rename-paths,
   .policy-checks,
   .cleanup-preview-facts,
-  .settings-grid {
+  .settings-grid,
+  .journey-steps,
+  .journey-mcp {
     grid-template-columns: 1fr;
   }
 

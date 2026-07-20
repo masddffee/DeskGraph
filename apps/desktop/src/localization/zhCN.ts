@@ -60,6 +60,41 @@ export const zhCN = {
       '一次明确确认一个或多个本机文件夹，建立元数据清单，并将受限文本提取留在这台电脑上，不上传路径或内容。',
     release: '预发布版',
   },
+  journey: {
+    kicker: '安全的首次操作',
+    heading: '三个明确步骤，先看到有用的本机上下文。',
+    description:
+      '先选择覆盖范围，再扫描元数据，最后只查看你要求的本机建议。DeskGraph 不会一开始就读取整台电脑。',
+    privacy: '不上传 · 不自动扫描 · 不更改文件',
+    scope: {
+      title: '1 · 选择覆盖范围',
+      description: '在原生选择器中选择一个或多个文件夹。仅授权不会读取或扫描其中内容。',
+      action: '选择本机文件夹',
+    },
+    search: {
+      title: '2 · 扫描后再搜索',
+      description:
+        '先对选择的文件夹进行初始元数据扫描，再在 SQLite 中搜索文件名与明确选择后提取的文本。',
+      action: '打开搜索',
+    },
+    review: {
+      title: '3 · 查看可解释的建议',
+      description: '查看本机项目候选与清理预览；两个页面都不能更改、移至废纸篓、删除或撤销文件。',
+      projectsAction: '查看项目',
+      cleanupAction: '查看清理建议',
+    },
+    mcp: {
+      title: '只读 MCP 需单独启动',
+      description:
+        '完成扫描后，独立启动的 macOS/Linux 本机 MCP 切片只能搜索启动时授权的范围。此 Desktop 页面不会配置它，也不提供写入工具。',
+    },
+    status: {
+      noScope: '请先选择覆盖范围',
+      scopesReady: (count) => `已授权 ${count} 个文件夹 · 扫描仍需明确启动`,
+      scanNeeded: '请先完成初始扫描，才能让搜索、项目或清理评估此文件夹',
+      scanReady: '已有完成的本机扫描，可供搜索与查看',
+    },
+  },
   loading: {
     heading: '正在打开本机清单',
     description: '不会自动扫描任何已授权文件夹。',

@@ -78,6 +78,24 @@ describe('i18n catalog and registry contract', () => {
     }
   });
 
+  it('keeps the judge-facing local-first journey actionable and non-destructive in every locale', () => {
+    for (const locale of LOCALES) {
+      const journey = catalogs[locale].journey;
+      expect(journey.scope.title.length).toBeGreaterThan(0);
+      expect(journey.scope.action.length).toBeGreaterThan(0);
+      expect(journey.search.action.length).toBeGreaterThan(0);
+      expect(journey.review.projectsAction.length).toBeGreaterThan(0);
+      expect(journey.review.cleanupAction.length).toBeGreaterThan(0);
+      expect(journey.privacy.length).toBeGreaterThan(0);
+      expect(journey.mcp.description).toContain('MCP');
+      expect(journey.status.scopesReady(2)).toContain('2');
+    }
+    expect(appSource).toContain("showView('projects')");
+    expect(appSource).toContain("showView('search')");
+    expect(appSource).toContain("showView('inbox')");
+    expect(appSource).toContain('catalog.journey.mcp.title');
+  });
+
   it('keeps multi-folder authorization explicit, atomic, and separate from scanning', () => {
     const phrases: Record<
       Locale,

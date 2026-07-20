@@ -589,6 +589,16 @@ export default function App() {
     window.requestAnimationFrame(() => viewHeadingRef.current?.focus());
   }
 
+  function openGuidedScopes() {
+    showView('projects');
+    window.requestAnimationFrame(() => {
+      const heading = document.getElementById('scopes-title');
+      if (!(heading instanceof HTMLElement)) return;
+      heading.scrollIntoView({ block: 'start' });
+      heading.focus();
+    });
+  }
+
   function invalidateHardExclusion() {
     hardExclusionGenerationRef.current += 1;
     setHardExclusionState({ kind: 'idle' });
@@ -1543,11 +1553,17 @@ export default function App() {
       <main id="main-content" className="app-shell" tabIndex={-1}>
         <header className="workspace-header">
           <div>
-            <p className="eyebrow">{catalog.navigation.views[activeView].label}</p>
+            <p className="eyebrow">
+              {activeView === 'home'
+                ? catalog.hero.eyebrow
+                : catalog.navigation.views[activeView].label}
+            </p>
             <h1 ref={viewHeadingRef} tabIndex={-1}>
-              {activeViewCopy.title}
+              {activeView === 'home' ? catalog.hero.heading : activeViewCopy.title}
             </h1>
-            <p className="hero-copy">{activeViewCopy.description}</p>
+            <p className="hero-copy">
+              {activeView === 'home' ? catalog.hero.description : activeViewCopy.description}
+            </p>
           </div>
           <div className="workspace-badges" aria-label={catalog.runtime.localOnly}>
             <span className="connected-indicator">{catalog.navigation.localOnly}</span>
@@ -1583,6 +1599,90 @@ export default function App() {
           <div className="dashboard">
             {activeView === 'home' ? (
               <>
+                <section className="panel panel--journey" aria-labelledby="journey-title">
+                  <div className="panel-heading panel-heading--wrap">
+                    <div>
+                      <p className="panel-kicker">{catalog.journey.kicker}</p>
+                      <h2 id="journey-title">{catalog.journey.heading}</h2>
+                      <p>{catalog.journey.description}</p>
+                    </div>
+                    <span className="connected-indicator connected-indicator--quiet">
+                      {catalog.journey.privacy}
+                    </span>
+                  </div>
+                  <ol className="journey-steps">
+                    <li
+                      className={
+                        state.scopes.length === 0
+                          ? 'journey-step journey-step--next'
+                          : 'journey-step'
+                      }
+                    >
+                      <div className="journey-step-copy">
+                        <h3>{catalog.journey.scope.title}</h3>
+                        <p>{catalog.journey.scope.description}</p>
+                        <span className="journey-status" role="status">
+                          {state.scopes.length === 0
+                            ? catalog.journey.status.noScope
+                            : catalog.journey.status.scopesReady(state.scopes.length)}
+                        </span>
+                      </div>
+                      <button type="button" onClick={openGuidedScopes}>
+                        {catalog.journey.scope.action}
+                      </button>
+                    </li>
+                    <li
+                      className={
+                        state.manifest.completed_scan_count === 0
+                          ? 'journey-step journey-step--next'
+                          : 'journey-step'
+                      }
+                    >
+                      <div className="journey-step-copy">
+                        <h3>{catalog.journey.search.title}</h3>
+                        <p>{catalog.journey.search.description}</p>
+                        <span className="journey-status" role="status">
+                          {state.manifest.completed_scan_count === 0
+                            ? catalog.journey.status.scanNeeded
+                            : catalog.journey.status.scanReady}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => showView('search')}
+                      >
+                        {catalog.journey.search.action}
+                      </button>
+                    </li>
+                    <li className="journey-step">
+                      <div className="journey-step-copy">
+                        <h3>{catalog.journey.review.title}</h3>
+                        <p>{catalog.journey.review.description}</p>
+                      </div>
+                      <div className="journey-actions">
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          onClick={() => showView('projects')}
+                        >
+                          {catalog.journey.review.projectsAction}
+                        </button>
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          onClick={() => showView('inbox')}
+                        >
+                          {catalog.journey.review.cleanupAction}
+                        </button>
+                      </div>
+                    </li>
+                  </ol>
+                  <aside className="journey-mcp" aria-label={catalog.journey.mcp.title}>
+                    <strong>{catalog.journey.mcp.title}</strong>
+                    <span>{catalog.journey.mcp.description}</span>
+                  </aside>
+                </section>
                 <section className="panel" aria-labelledby="runtime-title">
                   <div className="panel-heading">
                     <div>

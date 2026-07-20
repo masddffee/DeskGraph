@@ -54,6 +54,41 @@ export const zhTW = {
       '一次明確確認一個或多個本機資料夾，建立其中繼資料清單，並將受限文字抽取留在這台電腦上，不上傳路徑或內容。',
     release: '預先發行版',
   },
+  journey: {
+    kicker: '安全的第一次操作',
+    heading: '三個明確步驟，先看見有用的本機脈絡。',
+    description:
+      '先選擇涵蓋範圍，再掃描中繼資料，最後只檢視你要求的本機建議。DeskGraph 不會一開始就讀取整台電腦。',
+    privacy: '不上傳 · 不自動掃描 · 不變更檔案',
+    scope: {
+      title: '1 · 選擇涵蓋範圍',
+      description: '在原生選取器中選擇一個或多個資料夾。僅授權不會讀取或掃描其中內容。',
+      action: '選擇本機資料夾',
+    },
+    search: {
+      title: '2 · 掃描後再搜尋',
+      description:
+        '先對選擇的資料夾進行初始中繼資料掃描，再在 SQLite 中搜尋檔名與明確選擇後抽取的文字。',
+      action: '開啟搜尋',
+    },
+    review: {
+      title: '3 · 檢視可說明的建議',
+      description: '檢視本機專案候選與清理預覽；兩個畫面都不能變更、移至垃圾桶、刪除或復原檔案。',
+      projectsAction: '檢視專案',
+      cleanupAction: '檢視清理建議',
+    },
+    mcp: {
+      title: '唯讀 MCP 需另行啟動',
+      description:
+        '完成掃描後，獨立啟動的 macOS/Linux 本機 MCP 切片只能搜尋啟動時授權的範圍。此 Desktop 畫面不會設定它，也不提供寫入工具。',
+    },
+    status: {
+      noScope: '請先選擇涵蓋範圍',
+      scopesReady: (count) => `已授權 ${count} 個資料夾 · 掃描仍需明確啟動`,
+      scanNeeded: '請先完成初始掃描，才能讓搜尋、專案或清理評估此資料夾',
+      scanReady: '已有完成的本機掃描，可供搜尋與檢視',
+    },
+  },
   loading: { heading: '正在開啟本機清單', description: '不會自動掃描任何已授權資料夾。' },
   backendError: {
     heading: '本機清單無法使用',

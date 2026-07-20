@@ -22,6 +22,27 @@ export type Catalog = {
     description: string;
     release: string;
   };
+  journey: {
+    kicker: string;
+    heading: string;
+    description: string;
+    privacy: string;
+    scope: { title: string; description: string; action: string };
+    search: { title: string; description: string; action: string };
+    review: {
+      title: string;
+      description: string;
+      projectsAction: string;
+      cleanupAction: string;
+    };
+    mcp: { title: string; description: string };
+    status: {
+      noScope: string;
+      scopesReady: (count: number) => string;
+      scanNeeded: string;
+      scanReady: string;
+    };
+  };
   loading: { heading: string; description: string };
   backendError: { heading: string; description: string; retry: string };
   runtime: {
