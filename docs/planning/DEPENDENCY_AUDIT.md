@@ -1,8 +1,8 @@
 # Dependency Audit
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-20
 
-Authorization-model note: ADR-033 requires no new package. The already locked `tauri-plugin-dialog 2.7.1` exposes `blocking_pick_folders() -> Option<Vec<FilePath>>`; its existing `rfd` desktop backends request native multiple-directory selection on macOS and Windows. DeskGraph now prepares one grant per selected canonical root and persists the bounded set atomically; packaged Windows retained-access and signed multi-root restart evidence remain open. Hard exclusions, policy revision and SQLite privacy purge use existing Rust/SQLite layers and must not add an LLM, network, Python, Docker or filesystem-delete dependency.
+Authorization-model note: ADR-033 requires no new package. The already locked `tauri-plugin-dialog 2.7.1` exposes `blocking_pick_folders() -> Option<Vec<FilePath>>`; its existing `rfd` desktop backends request native multiple-directory selection on macOS and Windows. DeskGraph prepares one grant per selected canonical root and persists the bounded set atomically; the add-only exclusion slice reuses the same native picker plus existing Rust/SQLite transactions for active-grant/host/policy-revision revalidation and atomic derived-data purge. It adds no LLM, network, Python, Docker or filesystem-delete dependency. Packaged Windows retained-access and signed multi-root/exclusion restart evidence remain open.
 
 ## Policy
 

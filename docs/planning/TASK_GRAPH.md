@@ -1,6 +1,6 @@
 # DeskGraph v0.1 Task Graph
 
-Last updated: 2026-07-19
+Last updated: 2026-07-20
 
 ## Dependency graph
 
@@ -75,8 +75,9 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 ### Step 2 — M1 coverage policy and manifest schema
 
 - Context: begin from `prompts/02_MANIFEST_GRAPH.md`; SQLite/file identity dependencies are unaudited until selected.
-- Build: atomic native multi-root authorization, canonical Coverage Set, durable hard exclusions and policy revision, privacy purge, File/Folder graph, scan job state.
-- Tests: all-or-nothing picker/grant persistence; root overlap; symlink/junction/case/Unicode/permission/idempotency; pre-scan exclusion; post-index FTS/OCR/Graph purge; in-flight revision races and crash rollback.
+- Build: atomic native multi-root authorization, canonical Coverage Set, add-only durable hard exclusions and policy revision, privacy purge, File/Folder graph, scan job state.
+- Current: Settings uses Rust-owned native file/folder pickers; a bounded one-shot Preview is revalidated against active grant, host platform, live scope, canonical stable identity/kind and policy revision before a single immediate transaction adds the exclusion, advances revision, purges affected derived data and records a path-free receipt. The excluded identity remains durable: an unscanned selected hard-link alias closes over an already indexed same-scope node, and Scanner/DB publication/Extraction/Retrieval prevent that identity from re-entering through another path. Current manifest/FTS/content/OCR/image-metadata/Graph/Project/relation/screenshot/Cleanup and pristine Preview-only action data are in scope; later action journals block the change, source files are unchanged, and future vector embeddings must join the same contract. CLI `scope add` also atomically creates a versioned path-free current-host consent receipt, with a real child-process add → scan → search regression. The local workspace gate is green; signed, clean-machine and packaged cross-platform acceptance remain open.
+- Tests: all-or-nothing picker/grant persistence; root overlap; symlink/junction/case/Unicode/permission/idempotency; pre-scan exclusion; post-index FTS/OCR/Graph purge; unscanned hard-link identity closure and rescan denial; in-flight revision races and crash rollback. Add removal/revocation, foreign-grant, SQLite page-remnant, cross-process and packaged platform matrices before M1 exit.
 - Verify: 10k scan, rescan, move identity, scope escape.
 - Rollback: forward-only development migration or documented reversible migration before release.
 - Exit: CLI and UI show real graph statistics for confirmed coverage; excluded paths never enter or remain in current manifest/search/MCP/graph/action state, and source files are byte-for-byte unchanged by privacy purge.

@@ -1,6 +1,6 @@
 # External Actions Required
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-20
 
 No external step should block safe local implementation. Do not add real credentials to the repository.
 
@@ -90,6 +90,34 @@ two-process contention, paused-owner exclusion beyond the SQLite lease, terminat
 `WAIT_ABANDONED` recovery-only behavior, namespace squatting/replacement denial, fail-before-
 database ordering, and no SQLite WAL interference. Package names, SIDs, filesystem paths and
 security descriptors must not enter ordinary product logs.
+
+## ADR-033 hard-exclusion acceptance matrix (needed before M1/M9 release claims)
+
+The local implementation is add-only and is not a signed-package claim. Run this matrix only on
+disposable, explicitly authorized synthetic scopes after an Initial Manifest Scan has indexed files
+both inside and outside a candidate exclusion. Preserve path-free receipts and test artefacts; do
+not put ordinary paths, file names, OCR text, embeddings, grants, package identities or source
+contents in product logs.
+
+On signed macOS arm64 plus Intel or the final Universal artifact, and on packaged Windows x64 with
+the accepted stable package-family identity, prove all of the following:
+
+- add an exclusion after metadata, FTS, OCR/content, graph/project/relation/screenshot/Cleanup and
+  safe Preview-only action derivations exist; verify that only derived records inside the canonical
+  target are purged, no source file is changed, and unrelated in-scope records remain;
+- restart after apply; attempt a stale, revoked, malformed, foreign-platform or otherwise inactive
+  grant; and verify denial before traversal, query, return, action policy or persisted publication;
+- race apply against scan, Watch reconciliation, extraction/OCR, search, MCP, Project/Cleanup and
+  action-policy requests; kill the process at each durable boundary, reopen the database, and prove
+  atomic all-or-nothing policy/revision/purge/receipt state with no reachable excluded derivative;
+- verify canonical directory/file identity and symlink/reparse/hard-link behavior, policy-revision
+  invalidation, path-free ordinary receipts/history/logs, and that no network egress carries local
+  path, content, OCR, embedding or graph data during the complete flow;
+- on Windows additionally prove the package identity used for this matrix survives install, update,
+  repair and restart, and that unpackaged or foreign-package execution fails closed.
+
+Removal/revocation and any retention policy for non-preview action receipts remain separate release
+work; this matrix must not be interpreted as permission to expose a source-mutating action.
 
 ## Clean-machine validation (needed in M9)
 
