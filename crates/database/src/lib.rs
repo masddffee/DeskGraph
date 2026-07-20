@@ -155,6 +155,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "scope_exclusions_and_privacy_purge",
         sql: include_str!("../../../migrations/0024_scope_exclusions_and_privacy_purge.sql"),
     },
+    Migration {
+        version: 25,
+        name: "scope_root_revocation",
+        sql: include_str!("../../../migrations/0025_scope_root_revocation.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -727,6 +732,62 @@ fn insert_all_privacy_targets(
     Ok(())
 }
 
+/// Builds the conservative target closure for withdrawing an entire coverage
+/// root. Unlike an exclusion purge, this deliberately selects every
+/// scope-owned derived record and never depends on a path prefix.
+fn insert_full_scope_privacy_targets(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO privacy_purge_location_targets(\
+             nonce, location_id, node_id, direct_match\
+         ) SELECT ?1, id, node_id, 1 FROM locations WHERE scope_id=?2",
+        params![nonce, scope_id],
+    )?;
+    close_privacy_targets_over_same_scope_hardlinks(transaction, nonce, scope_id)?;
+    for (table, id_column, target_table, target_column) in [
+        (
+            "projects",
+            "id",
+            "privacy_purge_project_targets",
+            "project_id",
+        ),
+        (
+            "action_plans",
+            "id",
+            "privacy_purge_action_plan_targets",
+            "plan_id",
+        ),
+        (
+            "file_relation_candidates",
+            "id",
+            "privacy_purge_relation_targets",
+            "relation_id",
+        ),
+        (
+            "screenshot_group_candidates",
+            "id",
+            "privacy_purge_screenshot_group_targets",
+            "group_id",
+        ),
+        (
+            "cleanup_action_plans",
+            "id",
+            "privacy_purge_cleanup_action_plan_targets",
+            "plan_id",
+        ),
+    ] {
+        let sql = format!(
+            "INSERT OR IGNORE INTO {target_table}(nonce, {target_column}) \
+             SELECT ?1, {id_column} FROM {table} WHERE scope_id=?2"
+        );
+        transaction.execute(&sql, params![nonce, scope_id])?;
+    }
+    Ok(())
+}
+
 fn close_privacy_targets_over_same_scope_hardlinks(
     transaction: &Transaction<'_>,
     nonce: &[u8],
@@ -909,6 +970,27 @@ fn privacy_purge_impact(
         blocking_action_count: blocking_actions,
         pending_job_count: pending,
     })
+}
+
+fn scope_root_revocation_impact(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+) -> Result<ScopeExclusionImpactPreview, DatabaseError> {
+    let mut impact = privacy_purge_impact(transaction, nonce, scope_id)?;
+    impact.watch_event_count = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM watch_events WHERE scope_id=?2 AND ?1=?1",
+        nonce,
+        scope_id,
+    )?;
+    impact.scan_job_count = count_query(
+        transaction,
+        "SELECT COUNT(*) FROM scan_jobs WHERE scope_id=?2 AND ?1=?1",
+        nonce,
+        scope_id,
+    )?;
+    Ok(impact)
 }
 
 fn ensure_privacy_purge_actions_are_safe(
@@ -1192,6 +1274,50 @@ fn execute_privacy_purge(
     Ok(total)
 }
 
+fn execute_scope_root_revocation_purge(
+    transaction: &Transaction<'_>,
+    nonce: &[u8],
+    scope_id: i64,
+    new_revision: i64,
+) -> Result<u64, DatabaseError> {
+    let mut total = execute_privacy_purge(transaction, nonce, scope_id, new_revision)?;
+    // Watch rows and scan issues may carry paths even when they were already
+    // terminal or did not match a user exclusion. Root withdrawal removes all
+    // of them. Path-free scan job counters remain as local operational history,
+    // while every queue/staged row is invalidated by the revision transition.
+    execute_counted(
+        transaction,
+        "DELETE FROM watch_events WHERE scope_id=?1",
+        [scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_issues WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1)",
+        [scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_queue WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1)",
+        [scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_staged_observations WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1)",
+        [scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "DELETE FROM scan_staged_issues WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1)",
+        [scope_id],
+        &mut total,
+    )?;
+    Ok(total)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
     File,
@@ -1438,6 +1564,34 @@ pub struct ScopeExclusionApplyResult {
     pub receipt: PrivacyPurgeReceipt,
     pub purged: ScopeExclusionImpactPreview,
     pub exclusions: Vec<ScopeExclusionRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopeRootRevocationPreview {
+    pub scope_id: i64,
+    pub base_policy_revision: i64,
+    pub impact: ScopeExclusionImpactPreview,
+    pub exclusion_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopeRootRevocationReceipt {
+    pub id: i64,
+    pub scope_id: i64,
+    pub from_revision: i64,
+    pub to_revision: i64,
+    pub affected_location_count: u64,
+    pub affected_node_count: u64,
+    pub exclusions_removed: u64,
+    pub purged_row_count: u64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopeRootRevocationApplyResult {
+    pub policy: ScopePolicyRevision,
+    pub receipt: ScopeRootRevocationReceipt,
+    pub purged: ScopeExclusionImpactPreview,
 }
 
 /// The durable lifecycle state of a platform-owned scope access grant.
@@ -2893,6 +3047,151 @@ impl ManifestDatabase {
         })
     }
 
+    pub fn preview_scope_root_revocation(
+        &self,
+        binding: ScopePolicyBinding,
+    ) -> Result<ScopeRootRevocationPreview, DatabaseError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        assert_scope_policy_binding_in_transaction(&transaction, binding)?;
+        let next_revision = binding
+            .revision
+            .checked_add(1)
+            .ok_or(DatabaseError::InvalidCount)?;
+        let nonce = begin_privacy_purge_capability(
+            &transaction,
+            binding.scope_id,
+            binding.revision,
+            next_revision,
+            0,
+        )?;
+        insert_full_scope_privacy_targets(&transaction, &nonce, binding.scope_id)?;
+        let impact = scope_root_revocation_impact(&transaction, &nonce, binding.scope_id)?;
+        let exclusion_count = transaction.query_row(
+            "SELECT COUNT(*) FROM scope_exclusions WHERE scope_id=?1",
+            [binding.scope_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let exclusion_count =
+            u64::try_from(exclusion_count).map_err(|_| DatabaseError::InvalidCount)?;
+        transaction.rollback()?;
+        Ok(ScopeRootRevocationPreview {
+            scope_id: binding.scope_id,
+            base_policy_revision: binding.revision,
+            impact,
+            exclusion_count,
+        })
+    }
+
+    /// Atomically withdraws one active coverage root. The source filesystem is
+    /// never opened or mutated; only the local grant and derived SQLite state
+    /// are changed. The fixed one-byte grant tombstone cannot be restored as a
+    /// platform capability and avoids retaining the previous bookmark/token.
+    pub fn apply_scope_root_revocation(
+        &self,
+        binding: ScopePolicyBinding,
+        now_unix_ms: i64,
+    ) -> Result<ScopeRootRevocationApplyResult, DatabaseError> {
+        if now_unix_ms < 0 {
+            return Err(DatabaseError::InvalidTimestamp);
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        assert_scope_policy_binding_in_transaction(&transaction, binding)?;
+        let next_revision = binding
+            .revision
+            .checked_add(1)
+            .ok_or(DatabaseError::InvalidCount)?;
+        let nonce = begin_privacy_purge_capability(
+            &transaction,
+            binding.scope_id,
+            binding.revision,
+            next_revision,
+            now_unix_ms,
+        )?;
+        insert_full_scope_privacy_targets(&transaction, &nonce, binding.scope_id)?;
+        let impact = scope_root_revocation_impact(&transaction, &nonce, binding.scope_id)?;
+        ensure_privacy_purge_actions_are_safe(&transaction, &nonce, binding.scope_id)?;
+
+        let changed = transaction.execute(
+            "UPDATE authorized_scopes SET policy_revision=?3 \
+             WHERE id=?1 AND policy_revision=?2",
+            params![binding.scope_id, binding.revision, next_revision],
+        )?;
+        if changed != 1 {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
+        let revoked = transaction.execute(
+            "UPDATE scope_access_grants \
+             SET opaque_grant=X'00', state='revoked', updated_at_unix_ms=?2 \
+             WHERE scope_id=?1 AND state='active' \
+               AND platform=(SELECT platform FROM authorized_scopes WHERE id=?1)",
+            params![binding.scope_id, now_unix_ms],
+        )?;
+        if revoked != 1 {
+            return Err(DatabaseError::ScopeAccessGrantNotActive);
+        }
+
+        let mut purged_row_count = execute_scope_root_revocation_purge(
+            &transaction,
+            &nonce,
+            binding.scope_id,
+            next_revision,
+        )?;
+        let exclusions_removed = transaction.execute(
+            "DELETE FROM scope_exclusions WHERE scope_id=?1",
+            [binding.scope_id],
+        )?;
+        let exclusions_removed =
+            u64::try_from(exclusions_removed).map_err(|_| DatabaseError::InvalidCount)?;
+        purged_row_count = purged_row_count
+            .checked_add(exclusions_removed)
+            .ok_or(DatabaseError::InvalidCount)?;
+        transaction.execute(
+            "INSERT INTO scope_root_revocation_receipts( \
+                 scope_id, from_revision, to_revision, affected_location_count, \
+                 affected_node_count, exclusions_removed, purged_row_count, created_at_unix_ms \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                binding.scope_id,
+                binding.revision,
+                next_revision,
+                to_i64(impact.conservative_location_count)?,
+                to_i64(impact.conservative_node_count)?,
+                to_i64(exclusions_removed)?,
+                to_i64(purged_row_count)?,
+                now_unix_ms,
+            ],
+        )?;
+        let receipt_id = transaction.last_insert_rowid();
+        let consumed = transaction.execute(
+            "DELETE FROM privacy_purge_capabilities WHERE nonce=?1 AND scope_id=?2",
+            params![nonce, binding.scope_id],
+        )?;
+        if consumed != 1 {
+            return Err(DatabaseError::InvalidStoredValue);
+        }
+        transaction.commit()?;
+        Ok(ScopeRootRevocationApplyResult {
+            policy: ScopePolicyRevision {
+                scope_id: binding.scope_id,
+                revision: next_revision,
+            },
+            receipt: ScopeRootRevocationReceipt {
+                id: receipt_id,
+                scope_id: binding.scope_id,
+                from_revision: binding.revision,
+                to_revision: next_revision,
+                affected_location_count: impact.conservative_location_count,
+                affected_node_count: impact.conservative_node_count,
+                exclusions_removed,
+                purged_row_count,
+                created_at_unix_ms: now_unix_ms,
+            },
+            purged: impact,
+        })
+    }
+
     /// Stores or replaces a platform-owned grant for an existing scope.
     ///
     /// This is one SQLite upsert, so a failed write cannot leave a partially
@@ -3053,7 +3352,9 @@ impl ManifestDatabase {
     }
 
     pub fn mark_scope_access_grant_revoked(&self, scope_id: i64) -> Result<(), DatabaseError> {
-        self.mark_scope_access_grant_state(scope_id, ScopeAccessGrantState::Revoked)
+        let binding = self.bind_scope_policy_revision(scope_id)?;
+        self.apply_scope_root_revocation(binding, unix_ms()?)?;
+        Ok(())
     }
 
     fn mark_scope_access_grant_state(
@@ -14089,7 +14390,7 @@ mod tests {
         apply_migrations_before_scope_exclusions(&connection);
         drop(connection);
 
-        let database = ManifestDatabase::open(&path).expect("0024 migration should apply");
+        let database = ManifestDatabase::open(&path).expect("privacy migrations should apply");
         assert_eq!(
             database
                 .connection
@@ -14099,6 +14400,28 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("0024 registry row should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=25 AND name='scope_root_revocation'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("0025 registry row should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='scope_root_revocation_receipts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("root revocation receipt table should load"),
             1
         );
         assert_eq!(
@@ -14488,6 +14811,9 @@ mod tests {
             ScopeAccessGrantState::NeedsReauthorization
         );
         database
+            .upsert_scope_access_grant(scope.id, "macos", b"replacement-grant")
+            .expect("explicit reauthorization should restore the grant before revocation");
+        database
             .mark_scope_access_grant_revoked(scope.id)
             .expect("grant should become revoked");
         let revoked = database
@@ -14495,7 +14821,11 @@ mod tests {
             .expect("revoked grant should remain backend-readable")
             .expect("grant should remain durable for platform diagnostics");
         assert_eq!(revoked.state, ScopeAccessGrantState::Revoked);
-        assert_eq!(revoked.opaque_grant, b"replacement-grant");
+        assert_eq!(
+            revoked.opaque_grant,
+            [0],
+            "revocation must wipe grant bytes"
+        );
         assert!(
             !database
                 .scope_has_active_access_grant(scope.id)
@@ -14570,7 +14900,7 @@ mod tests {
         ));
         assert!(matches!(
             database.mark_scope_access_grant_revoked(scope.id),
-            Err(DatabaseError::ScopeAccessGrantNotFound)
+            Err(DatabaseError::ScopeAccessGrantNotActive)
         ));
         assert!(matches!(
             database.upsert_scope_access_grant(999, "macos", b"grant"),
@@ -16642,14 +16972,14 @@ mod tests {
         ));
         assert!(matches!(
             database.screenshot_group_candidate(candidate.group_id),
-            Err(DatabaseError::ScopeAccessGrantNotActive)
+            Err(DatabaseError::ScreenshotGroupCandidateNotFound)
         ));
-        let summary = database
-            .recent_screenshot_group_candidates()
-            .expect("revoked-grant history should remain readable")
-            .remove(0);
-        assert!(!summary.current_evidence);
-        assert!(!format!("{summary:?}").contains("/scope"));
+        assert!(
+            database
+                .recent_screenshot_group_candidates()
+                .expect("revocation should leave no derived screenshot history")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -19835,6 +20165,218 @@ mod tests {
                     "SELECT COUNT(*) FROM privacy_purge_capabilities",
                     [],
                     |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn scope_root_revocation_atomically_wipes_grant_and_scope_derived_data() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let initial_binding =
+            test_active_binding(&database, scope_id).expect("scope should activate");
+        let extraction = database
+            .create_extraction_job(scope_id, node_id)
+            .expect("content extraction should queue");
+        database
+            .claim_extraction_job(extraction.job_id, "revoke-runner", 60_000)
+            .expect("content extraction should claim");
+        database
+            .complete_extraction_job(
+                extraction.job_id,
+                "revoke-runner",
+                "deskgraph.utf8-text",
+                "1",
+                4,
+                Some(1),
+                20,
+                1,
+                &[ContentChunkWrite {
+                    ordinal: 0,
+                    text: "private root content".to_string(),
+                    provenance: ContentChunkProvenanceWrite::ByteRange { start: 0, end: 4 },
+                    trust_class: "untrusted_extracted_text",
+                }],
+            )
+            .expect("content should publish");
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id=?1",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("scan should exist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO scan_issues(scan_id, code, path_key, detail_code) \
+                 VALUES (?1, 'source_unavailable', '/scope/private-path', 'fixture')",
+                [scan_id],
+            )
+            .expect("path-bearing scan issue should persist");
+        database
+            .apply_scope_exclusion_batch(
+                initial_binding,
+                &[ScopeExclusionWrite {
+                    kind: ScopeExclusionKind::Folder,
+                    path_raw: b"/scope/excluded",
+                    path_key: "/scope/excluded",
+                    display_path: "/scope/excluded",
+                    identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+                    identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+                }],
+                2,
+            )
+            .expect("non-matching exclusion should persist without removing the fixture");
+        record_file_watch_event(&mut database, scope_id, "/scope/watched.txt", 5, None);
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("revised scope should bind");
+        let preview = database
+            .preview_scope_root_revocation(binding)
+            .expect("revocation impact should preview without mutation");
+        assert_eq!(preview.scope_id, scope_id);
+        assert_eq!(preview.base_policy_revision, 2);
+        assert_eq!(preview.exclusion_count, 1);
+        assert!(preview.impact.conservative_location_count >= 2);
+        assert_eq!(preview.impact.content_chunk_count, 1);
+        assert_eq!(preview.impact.watch_event_count, 1);
+        assert!(
+            database
+                .scope_has_active_access_grant(scope_id)
+                .expect("preview must leave grant active")
+        );
+
+        let applied = database
+            .apply_scope_root_revocation(binding, 3)
+            .expect("root revocation should commit atomically");
+        assert_eq!(applied.policy.revision, 3);
+        assert_eq!(applied.receipt.exclusions_removed, 1);
+        assert!(applied.receipt.purged_row_count > 0);
+        let grant = database
+            .scope_access_grant(scope_id)
+            .expect("revoked grant should load")
+            .expect("grant tombstone should remain");
+        assert_eq!(grant.state, ScopeAccessGrantState::Revoked);
+        assert_eq!(grant.opaque_grant, [0]);
+        for table in [
+            "locations",
+            "content_chunks",
+            "extraction_jobs",
+            "watch_events",
+            "scan_issues",
+            "scope_exclusions",
+            "privacy_purge_capabilities",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                database
+                    .connection
+                    .query_row(&sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{table} must not retain root-derived data"
+            );
+        }
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM content_search_fts WHERE content_search_fts MATCH 'private'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scope_root_revocation_receipts WHERE scope_id=?1",
+                    [scope_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            database
+                .connection
+                .execute(
+                    "DELETE FROM scope_root_revocation_receipts WHERE scope_id=?1",
+                    [scope_id],
+                )
+                .is_err(),
+            "revocation receipt must be immutable"
+        );
+    }
+
+    #[test]
+    fn scope_root_revocation_blocks_non_pristine_action_history_and_rolls_back() {
+        let (mut database, scope_id, node_id, _) = extraction_setup();
+        test_active_binding(&database, scope_id).expect("scope should activate");
+        let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        insert_terminal_action_fixture(&mut database, preview.plan_id, "terminal-revoke-0001");
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("scope should bind");
+        let location_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            database.apply_scope_root_revocation(binding, 2),
+            Err(DatabaseError::ScopePrivacyPurgeBlocked)
+        ));
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .unwrap()
+                .revision,
+            binding.revision
+        );
+        assert!(
+            database
+                .scope_has_active_access_grant(scope_id)
+                .expect("failed revocation must leave the runtime grant durable")
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1",
+                    [scope_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            location_count
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM scope_root_revocation_receipts",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM privacy_purge_capabilities",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
                 )
                 .unwrap(),
             0
