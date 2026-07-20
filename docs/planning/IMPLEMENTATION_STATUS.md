@@ -41,8 +41,8 @@ Four bounded M6 vertical slices now run end to end. Untrusted path hints are can
 | Acceptance criterion                                     | Status             | Evidence / blocker                                                         |
 | -------------------------------------------------------- | ------------------ | -------------------------------------------------------------------------- |
 | Monorepo established                                     | Verified locally   | Rust workspace, pnpm workspace, Tauri/React desktop, CLI, and both lockfiles |
-| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 360 deterministic tests pass with two host-only macOS FSEvents tests explicitly filtered |
-| TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 43 Vitest tests, and Vite build pass            |
+| Rust format, lint, and tests configured                  | Verified locally   | Rust 1.97.0; current workspace format and Clippy pass; 408 deterministic tests pass with two host-only macOS FSEvents tests explicitly filtered |
+| TypeScript format, lint, typecheck, and tests configured | Verified locally   | Format, ESLint, TypeScript, 66 Vitest tests, and Vite build pass            |
 | ADR template                                             | Verified locally   | `docs/architecture/adr/0000-template.md`                                   |
 | Root and nested AGENTS instructions                      | Verified locally   | Root plus Desktop, scanner, extractor, transaction, and watcher safety instructions |
 | Cross-platform CI matrix configured                      | Verified locally   | Pinned-action workflow covers macOS, Windows, and Linux                    |
