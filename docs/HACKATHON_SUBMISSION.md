@@ -16,7 +16,8 @@ a narrowly scoped read-only MCP search tool without uploading their filenames,
 paths, content, OCR, embeddings, or graph by default.
 
 DeskGraph is a working pre-release development build, not a public v0.1
-release. The strongest honest demo is a synthetic local folder on macOS arm64:
+release. The strongest honest demo separates the Desktop experience from the
+one-command CLI backend proof; they use different local databases:
 
 - native selection of one or more explicit, non-overlapping folders;
 - metadata-only initial manifest scan with durable progress and recovery;
@@ -26,15 +27,19 @@ release. The strongest honest demo is a synthetic local folder on macOS arm64:
   a bounded untrusted-text snippet and an explanation of the matching field;
 - conservative Folder Profile, marker-backed Project candidate, exact
   duplicate/version suggestion, and screenshot-review-group discovery;
+- a deterministic bilingual CLI fixture that verifies real extraction,
+  Traditional Chinese/English FTS, Project, duplicate/version, and Smart
+  Cleanup Inbox plus a durable non-executable Cleanup Preview without changing
+  its created source files;
 - Smart Cleanup Inbox and durable Cleanup Preview as review assistance only;
-  no file is changed by either surface; and
+  neither authorizes a file action; and
 - an independently launched local stdio MCP server with exactly one read-only
   `search_files` tool over launch-granted, already-scanned scopes.
 
-The latest local verification record is 408 Rust tests passed with zero
+The latest local verification record is 413 Rust tests passed with zero
 failures (two named live macOS FSEvents tests intentionally filtered because
 they require unsandboxed host events), plus `pnpm check` passing Prettier,
-ESLint, TypeScript, 66 Vitest tests, and the Vite production build. See the
+ESLint, TypeScript, 70 Vitest tests, and the Vite production build. See the
 [implementation status](planning/IMPLEMENTATION_STATUS.md) for the full test
 evidence and its boundaries.
 
@@ -64,16 +69,16 @@ Record only after the local build and synthetic demo scope are verified. Use a
 synthetic folder with harmless documents; do not show personal paths, file
 contents, access tokens, or private OCR text.
 
-| Time      | Screen action                                                                                              | Voiceover                                                                                                                                                                                                                                                     |
-| --------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0:00–0:20 | Show the DeskGraph Home screen and its local-only status.                                                  | “Our computers contain useful context, but handing an AI our whole filesystem is not acceptable. DeskGraph graphifies only the folders a person explicitly chooses, and keeps the manifest and search local.”                                                 |
-| 0:20–0:45 | Select a synthetic folder with the native picker; show that authorization and scanning are separate.       | “The WebView never submits an arbitrary path. Native selection creates the local scope, and selecting it does not read file contents or start a scan.”                                                                                                        |
-| 0:45–1:10 | Start and complete an Initial Manifest Scan.                                                               | “The first scan records metadata inside this boundary. It is resumable and atomically publishes a completed manifest, while hidden entries and symlinks are not followed.”                                                                                    |
-| 1:10–1:35 | Extract one synthetic Markdown or text-layer PDF file, then search a Traditional Chinese or English query. | “Content extraction is opt-in and bounded. Search is offline SQLite lexical retrieval, and the result explains whether the filename or extracted local text matched.”                                                                                         |
-| 1:35–1:55 | Show a Project candidate and Smart Cleanup Inbox item, then open a Cleanup Preview.                        | “DeskGraph can surface conservative project, duplicate, version, and screenshot-review evidence. At this stage these are review aids only: the preview cannot execute a file operation.”                                                                      |
-| 1:55–2:18 | Show the MCP launch command and a `search_files` call against the completed synthetic scope.               | “For agents, the local MCP server exposes one read-only search tool. It has no arbitrary path parameter, no write tool, and snippets are opt-in and labeled untrusted.”                                                                                       |
-| 2:18–2:43 | Show the repository history, tests, and this README.                                                       | “I built DeskGraph with Codex and GPT-5.6 as an implementation collaborator: it helped decompose the Rust, Tauri, React, SQLite, and MCP work into testable vertical slices. Safety-critical decisions remain explicit in the code, ADRs, and passing tests.” |
-| 2:43–3:00 | Return to the safety contract and current limitations.                                                     | “This is a working pre-release, not a finished v0.1 release. Vector search, executable organization, Undo, installers, and cross-platform runtime validation remain gated. The point is useful local context without pretending unsafe automation is ready.”  |
+| Time      | Screen action                                                                                                                                             | Voiceover                                                                                                                                                                                                                                                    |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 0:00–0:20 | Show the DeskGraph Home screen and its local-only status.                                                                                                 | “Our computers contain useful context, but handing an AI our whole filesystem is not acceptable. DeskGraph graphifies only the folders a person explicitly chooses, and keeps the manifest and search local.”                                                |
+| 0:20–0:45 | Select a synthetic folder with the native picker; show that authorization and scanning are separate.                                                      | “The WebView never submits an arbitrary path. Native selection creates the local scope, and selecting it does not read file contents or start a scan.”                                                                                                       |
+| 0:45–1:08 | Start and complete an Initial Manifest Scan, then search metadata.                                                                                        | “The first scan records metadata inside this boundary. It is resumable and atomically publishes a completed manifest, while hidden entries and symlinks are not followed.”                                                                                   |
+| 1:08–1:35 | Only if the final integrated build passes: explicitly extract the synthetic Markdown result, then repeat a Traditional Chinese or English content search. | “Content extraction starts only when I choose this scanned file. The Rust backend revalidates the local grant and file identity, runs a bounded durable job, and SQLite explains that the result matched extracted text.”                                    |
+| 1:35–1:58 | In Terminal, run the one-command `fixture demo`; show Project, duplicate/version, Smart Cleanup Preview, and unchanged-source fields.                     | “This separate synthetic CLI proof exercises the same real Rust and SQLite cores. Its durable Preview requires confirmation but cannot execute; it does not share the Desktop database or perform an organization action.”                                   |
+| 1:58–2:20 | Show the MCP launch command and a `search_files` call against its explicitly granted completed scope.                                                     | “For agents, the local MCP server exposes one read-only search tool. It has no arbitrary path parameter, no write tool, and snippets are opt-in and labeled untrusted.”                                                                                      |
+| 2:20–2:45 | Show the repository history, tests, and the Preview-only ADR.                                                                                             | “Codex with GPT-5.6 built and reviewed these vertical slices. One adversarial review reproduced a wrong-inode race in Unix rename, so we rejected unsafe execution and kept organization Preview-only instead of hiding the risk for this demo.”             |
+| 2:45–3:00 | Return to the safety contract and current limitations.                                                                                                    | “This is a working pre-release, not a finished v0.1 release. Vector search, executable organization, Undo, installers, and cross-platform runtime validation remain gated. The point is useful local context without pretending unsafe automation is ready.” |
 
 ## Devpost description draft
 
@@ -101,11 +106,15 @@ inputs.
 
 Codex running GPT-5.6 was used as a development collaborator to investigate
 the codebase, break work into safety-bounded vertical slices, implement and
-review changes, and run the repository's Rust and TypeScript gates. The git
-history documents the incremental implementation period from 2026-07-16
-through 2026-07-20, including the manifest scan, extraction, search,
-read-only MCP, cleanup-preview, and hard-exclusion slices. It did not receive
-or upload a user's DeskGraph database or files as part of the product design.
+review changes, and run the repository's Rust and TypeScript gates. For one
+concrete safety decision, an adversarial Codex review reproduced a Unix
+wrong-inode race between final validation and a pathname rename. We therefore
+rejected that production execution adapter and kept Rename/Move Preview-only,
+instead of weakening the invariant for a demo. The git history documents the
+incremental implementation period from 2026-07-16 through 2026-07-20,
+including manifest scan, extraction, search, read-only MCP, cleanup-preview,
+and hard-exclusion slices. The product does not upload a user's DeskGraph
+database or files to Codex or another service by default.
 
 ### Why it matters
 
@@ -140,15 +149,21 @@ pnpm check
 pnpm desktop:dev
 ```
 
-For a CLI-only, offline test path, create a temporary folder with a text file,
-then replace the example absolute path below with that folder:
+For the CLI-only offline proof, provide a brand-new path. The command refuses
+to overwrite an existing entry:
 
 ```bash
-cargo run -p deskgraph-cli -- manifest init --database ./deskgraph-demo.sqlite3
-cargo run -p deskgraph-cli -- scope add --database ./deskgraph-demo.sqlite3 --path /absolute/path/to/synthetic-folder
-cargo run -p deskgraph-cli -- scan start --database ./deskgraph-demo.sqlite3 --scope 1
-cargo run -p deskgraph-cli -- search --database ./deskgraph-demo.sqlite3 --query "local context" --scope 1
+cargo run -p deskgraph-cli -- fixture demo --path /absolute/new/path/deskgraph-demo
 ```
+
+The JSON report is successful only after real local backends verify seven
+generated files, two bounded extractions, Traditional Chinese and English FTS
+matches, a marker-backed Project, exact-duplicate and numeric-version evidence,
+and a Smart Cleanup Inbox containing both relation kinds. It also proves the
+created source files are unchanged and creates a durable Preview whose
+`action_authorized` and `execution_available` flags are false. This command's
+database is deliberately separate from Desktop app-data; do not imply that the
+UI will display its derived state.
 
 The full setup, sample extraction, search, preview-only organization, and MCP
 instructions are in the [README](../README.md) and
@@ -161,8 +176,9 @@ instructions are in the [README](../README.md) and
       from this repository.
 - [ ] **Country:** select the submitter's actual country; do not infer it from
       this repository.
-- [ ] **Category:** select the actual Build Week category after checking the
-      current Devpost form.
+- [ ] **Category:** confirm `Apps for Your Life`, the current submission-plan
+      choice, or document why the final demonstrated audience requires a
+      different category.
 - [ ] **Public repository URL:** make the repository public, then paste its
       final URL into Devpost. This workspace currently has no configured git
       remote, so this action is intentionally not represented as complete here.

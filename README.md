@@ -55,6 +55,29 @@ Run the privacy-safe CLI health check:
 cargo run -p deskgraph-cli -- health
 ```
 
+## Build Week one-command demo
+
+Use a brand-new path to generate harmless bilingual sample files and run the real local backends
+end to end. The command refuses to overwrite an existing path.
+
+```bash
+cargo run -p deskgraph-cli -- fixture demo --path /absolute/new/path/deskgraph-demo
+```
+
+The command creates a synthetic authorized scope plus a separate SQLite database, then verifies a
+metadata scan, bounded Markdown/code extraction, Traditional Chinese and English FTS results, a
+marker-backed Project candidate, exact-duplicate and numeric-version evidence, and Smart Cleanup
+Inbox derivation plus a durable `system_trash_preview`. The Preview requires confirmation while
+`action_authorized` and `execution_available` remain false. Its JSON report includes
+`source_files_unchanged: true` and confirms that no organization action was performed. It uses no
+OCR, model, API key, network service, Python, Docker, or Ollama. Because this is an explicit CLI
+response, its stdout intentionally returns the generated demo paths and search snippets;
+structured logs remain path/content-free.
+
+This reproducible CLI proof has its own generated database. It does not populate the Desktop
+application's private app-data database and must not be presented as though both processes share
+one live state.
+
 Run the M1 metadata-only CLI slice with a new local manifest and a test folder you explicitly choose:
 
 ```bash

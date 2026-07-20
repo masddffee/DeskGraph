@@ -63,6 +63,18 @@ H0 Freeze truthful judge story and acceptance gates
 Rollback is concern-based: revert only the failing sample, UI or documentation commit. The
 production graph and safety invariants remain authoritative throughout the sprint.
 
+### Current H status
+
+| Gate | Status | Evidence / next action |
+| --- | --- | --- |
+| H0 story and gates | Verified locally | Judge story, truthful claim boundary and external actions are frozen in this graph |
+| H1 sample and backend smoke | Verified locally | `fixture demo` real child process verifies scan, two extractions, bilingual FTS, Project, duplicate/version, Smart Cleanup and durable non-executable Preview without changing created sources |
+| H2 Desktop journey | Verified locally except live rehearsal | Four-locale Home guidance, pre-scan routing and explicit identifier-only document extraction pass Rust/TS tests and builds |
+| H3 submission package | Verified locally as draft | README quickstart, Devpost copy, judge instructions and narrated script exist; public URLs and Session ID remain empty |
+| H4 integration | Automated gates verified locally | 413 Rust and 70 Vitest tests pass with two named live host-event tests filtered; run the real Desktop rehearsal before recording |
+| H5 submission inputs | External action required | Obtain `/feedback` Session ID, public repository URL and narrated public/unlisted YouTube URL |
+| H6 publish and submit | Not started | Requires explicit owner approval after H5 validation |
+
 ## Dependency graph
 
 ```text

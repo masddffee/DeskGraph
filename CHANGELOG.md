@@ -10,6 +10,8 @@ All notable changes to DeskGraph will be documented here. The project follows Se
 
 ### Added
 
+- One-command, non-overwriting Build Week demo fixture that generates a bilingual synthetic scope and uses the real Rust/SQLite path to verify manifest scan, two bounded extractions, Traditional Chinese/English FTS, Project, exact-duplicate, numeric-version, Smart Cleanup Inbox and a durable non-executable Cleanup Preview; the child-process test proves source bytes stay unchanged and ordinary logs omit the generated path.
+- Four-locale judge-oriented Home guidance plus explicit Desktop document extraction from supported metadata-search results. The WebView sends only `scope_id + node_id` or an opaque job ID; Rust requires a live native grant, rejects image jobs, and delegates exclusion/source-identity/bounded publication to the existing durable extraction service before offering an explicit extracted-text search. The pre-scan CTA now reaches and focuses the real scan control instead of an empty Search view.
 - Repository assessment and Version B v0.1 task graph.
 - M0 governance, architecture, CI, and privacy-safe health slice.
 - M1 bundled SQLite manifest with checksummed migration, stable file identity, canonical scope policy, and metadata-only scanner.
