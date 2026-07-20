@@ -12,7 +12,9 @@ import {
 import {
   activeScreenshotOcrJobIds,
   cancelScreenshotOcrJob,
+  createContentExtractionJob,
   createScreenshotOcrJob,
+  isContentExtractionCandidateDisplayPath,
   isScreenshotOcrCapacityBusy,
   isScreenshotCandidateDisplayPath,
   loadScreenshotOcrJobForNode,
@@ -21,6 +23,7 @@ import {
   loadRecentExtractions,
   mergePolledScreenshotOcrJob,
   resumeScreenshotOcrJob,
+  runContentExtractionJob,
   runScreenshotOcrJob,
   type ExtractionJobProgress,
   type ExtractionStats,
@@ -161,6 +164,16 @@ type OcrActionState =
   | { kind: 'working'; scopeId: number; nodeId: number }
   | { kind: 'success'; scopeId: number; nodeId: number; message: OcrMessage }
   | { kind: 'error'; scopeId: number; nodeId: number; message: OcrMessage };
+type ContentExtractionMessage = 'indexed' | 'failed' | 'denied';
+type ContentExtractionActionState =
+  | { kind: 'idle' }
+  | { kind: 'working'; scopeId: number; nodeId: number }
+  | {
+      kind: 'success' | 'error';
+      scopeId: number;
+      nodeId: number;
+      message: ContentExtractionMessage;
+    };
 type CleanupInboxState =
   | { kind: 'idle' }
   | { kind: 'loading' }
@@ -290,6 +303,18 @@ function screenshotOcrJobForResult(
   return jobs.find(
     (job) =>
       job.operation === 'screenshot_ocr' &&
+      job.scope_id === result.scope_id &&
+      job.node_id === result.node_id,
+  );
+}
+
+function contentExtractionJobForResult(
+  jobs: ExtractionJobProgress[],
+  result: SearchResult,
+): ExtractionJobProgress | undefined {
+  return jobs.find(
+    (job) =>
+      job.operation === 'content' &&
       job.scope_id === result.scope_id &&
       job.node_id === result.node_id,
   );
@@ -496,6 +521,8 @@ export default function App() {
   const [renameNewName, setRenameNewName] = useState('');
   const [renameState, setRenameState] = useState<RenamePreviewState>({ kind: 'idle' });
   const [ocrAction, setOcrAction] = useState<OcrActionState>({ kind: 'idle' });
+  const [contentExtractionAction, setContentExtractionAction] =
+    useState<ContentExtractionActionState>({ kind: 'idle' });
   const [cleanupScopeId, setCleanupScopeId] = useState<number | null>(null);
   const [cleanupInboxState, setCleanupInboxState] = useState<CleanupInboxState>({ kind: 'idle' });
   const [cleanupReviewState, setCleanupReviewState] = useState<CleanupReviewState>({
@@ -515,6 +542,7 @@ export default function App() {
   });
   const [activeView, setActiveView] = useState<AppView>('home');
   const ocrRequestInFlight = useRef(new Set<string>());
+  const contentExtractionRequestInFlight = useRef(new Set<string>());
   const viewHeadingRef = useRef<HTMLHeadingElement>(null);
   const cleanupReviewHeadingRef = useRef<HTMLHeadingElement>(null);
   const cleanupReviewGenerationRef = useRef(0);
@@ -599,6 +627,21 @@ export default function App() {
     });
   }
 
+  function openGuidedScanOrSearch() {
+    if (state.kind !== 'ready' || state.manifest.completed_scan_count > 0) {
+      showView('search');
+      return;
+    }
+    showView('projects');
+    window.requestAnimationFrame(() => {
+      const target =
+        document.querySelector<HTMLElement>('[data-initial-scan-control="true"]') ??
+        document.getElementById('scopes-title');
+      target?.scrollIntoView({ block: 'center' });
+      target?.focus();
+    });
+  }
+
   function invalidateHardExclusion() {
     hardExclusionGenerationRef.current += 1;
     setHardExclusionState({ kind: 'idle' });
@@ -617,6 +660,7 @@ export default function App() {
     setSearchModifiedBefore('');
     setSearchState({ kind: 'idle' });
     setOcrAction({ kind: 'idle' });
+    setContentExtractionAction({ kind: 'idle' });
     setRenameScopeId(null);
     setRenameSourcePath('');
     setRenameNewName('');
@@ -1181,6 +1225,78 @@ export default function App() {
     }
   }
 
+  async function runSelectedContentExtraction(job: ExtractionJobProgress) {
+    setContentExtractionAction({
+      kind: 'working',
+      scopeId: job.scope_id,
+      nodeId: job.node_id,
+    });
+    try {
+      const progress = await runContentExtractionJob(job.job_id);
+      updateExtractionJob(progress);
+      await refreshManifest().catch(() => undefined);
+      setContentExtractionAction({
+        kind: progress.status === 'completed' ? 'success' : 'error',
+        scopeId: progress.scope_id,
+        nodeId: progress.node_id,
+        message: progress.status === 'completed' ? 'indexed' : 'failed',
+      });
+    } catch {
+      await refreshManifest().catch(() => undefined);
+      setContentExtractionAction({
+        kind: 'error',
+        scopeId: job.scope_id,
+        nodeId: job.node_id,
+        message: 'failed',
+      });
+    }
+  }
+
+  async function startContentExtraction(result: SearchResult) {
+    const requestKey = `${result.scope_id}:${result.node_id}`;
+    if (contentExtractionRequestInFlight.current.size > 0) return;
+    contentExtractionRequestInFlight.current.add(requestKey);
+    setContentExtractionAction({
+      kind: 'working',
+      scopeId: result.scope_id,
+      nodeId: result.node_id,
+    });
+    try {
+      const job = await createContentExtractionJob(result.scope_id, result.node_id);
+      updateExtractionJob(job);
+      await runSelectedContentExtraction(job);
+    } catch {
+      await refreshManifest().catch(() => undefined);
+      setContentExtractionAction({
+        kind: 'error',
+        scopeId: result.scope_id,
+        nodeId: result.node_id,
+        message: 'denied',
+      });
+    } finally {
+      contentExtractionRequestInFlight.current.delete(requestKey);
+    }
+  }
+
+  async function retryQueuedContentExtraction(job: ExtractionJobProgress) {
+    const requestKey = `${job.scope_id}:${job.node_id}`;
+    if (contentExtractionRequestInFlight.current.size > 0) return;
+    contentExtractionRequestInFlight.current.add(requestKey);
+    try {
+      await runSelectedContentExtraction(job);
+    } finally {
+      contentExtractionRequestInFlight.current.delete(requestKey);
+    }
+  }
+
+  function prepareExtractedTextSearch() {
+    searchGenerationRef.current += 1;
+    setSearchQuery('');
+    setSearchSource('extracted_text');
+    setSearchState({ kind: 'idle' });
+    window.requestAnimationFrame(() => document.getElementById('search-query')?.focus());
+  }
+
   function setOcrFeedbackFromProgress(
     progress: ExtractionJobProgress,
     generation = ocrGenerationRef.current,
@@ -1650,9 +1766,11 @@ export default function App() {
                       <button
                         type="button"
                         className="button-secondary"
-                        onClick={() => showView('search')}
+                        onClick={openGuidedScanOrSearch}
                       >
-                        {catalog.journey.search.action}
+                        {state.manifest.completed_scan_count === 0
+                          ? catalog.journey.search.scanAction
+                          : catalog.journey.search.action}
                       </button>
                     </li>
                     <li className="journey-step">
@@ -1873,6 +1991,10 @@ export default function App() {
                   <ol className="search-results">
                     {searchState.response.results.map((result) => {
                       const ocrJob = screenshotOcrJobForResult(state.extractionJobs, result);
+                      const contentJob = contentExtractionJobForResult(
+                        state.extractionJobs,
+                        result,
+                      );
                       const ocrIsRunning = ocrJob?.status === 'running';
                       const ocrIsQueued = ocrJob?.status === 'queued';
                       const anotherOcrIsRunning = state.extractionJobs.some(
@@ -1885,6 +2007,10 @@ export default function App() {
                         ocrAction.kind !== 'idle' &&
                         ocrAction.scopeId === result.scope_id &&
                         ocrAction.nodeId === result.node_id;
+                      const contentFeedbackMatches =
+                        contentExtractionAction.kind !== 'idle' &&
+                        contentExtractionAction.scopeId === result.scope_id &&
+                        contentExtractionAction.nodeId === result.node_id;
                       return (
                         <li key={`${result.node_id}:${result.location_id}`}>
                           <div className="search-result-heading">
@@ -1894,6 +2020,71 @@ export default function App() {
                             <strong>{searchExplanation(result, catalog)}</strong>
                           </div>
                           <code>{result.display_path}</code>
+                          {isContentExtractionCandidateDisplayPath(result.display_path) ? (
+                            <div
+                              className="search-result-action"
+                              aria-label={catalog.search.content.controlsAria}
+                            >
+                              <div className="search-result-action-row">
+                                <div>
+                                  <strong>
+                                    {contentJob
+                                      ? extractionStatusLabel(contentJob, catalog)
+                                      : catalog.search.content.notRead}
+                                  </strong>
+                                  <span>{catalog.search.content.description}</span>
+                                </div>
+                                {contentJob?.status === 'queued' ? (
+                                  <button
+                                    type="button"
+                                    disabled={contentExtractionAction.kind === 'working'}
+                                    onClick={() => void retryQueuedContentExtraction(contentJob)}
+                                  >
+                                    {catalog.search.content.runQueued}
+                                  </button>
+                                ) : contentJob?.status === 'running' ||
+                                  (contentFeedbackMatches &&
+                                    contentExtractionAction.kind === 'working') ? (
+                                  <button type="button" disabled>
+                                    {catalog.search.content.reading}
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    disabled={contentExtractionAction.kind === 'working'}
+                                    onClick={() => void startContentExtraction(result)}
+                                  >
+                                    {contentJob?.status === 'completed'
+                                      ? catalog.search.content.readAgain
+                                      : catalog.search.content.read}
+                                  </button>
+                                )}
+                              </div>
+                              {contentFeedbackMatches &&
+                              contentExtractionAction.kind === 'error' ? (
+                                <p className="ocr-feedback ocr-feedback--error" role="alert">
+                                  {catalog.search.content[contentExtractionAction.message]}
+                                </p>
+                              ) : null}
+                              {contentJob?.status === 'completed' ? (
+                                <div className="search-result-action-buttons">
+                                  <span className="ocr-feedback">
+                                    {contentFeedbackMatches &&
+                                    contentExtractionAction.kind === 'success'
+                                      ? catalog.search.content[contentExtractionAction.message]
+                                      : catalog.search.content.completed}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="button-secondary"
+                                    onClick={prepareExtractedTextSearch}
+                                  >
+                                    {catalog.search.content.searchExtracted}
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
                           {isScreenshotCandidateDisplayPath(result.display_path) ? (
                             <div
                               className="search-result-action"
@@ -2874,6 +3065,7 @@ export default function App() {
                             {!resumableJob ? (
                               <button
                                 type="button"
+                                data-initial-scan-control="true"
                                 disabled={action.kind === 'working'}
                                 onClick={() => void scan(scope)}
                               >

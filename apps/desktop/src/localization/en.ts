@@ -77,6 +77,7 @@ export const en = {
       description:
         'Run an initial metadata scan for a chosen folder, then search filenames and opt-in extracted text in SQLite.',
       action: 'Open search',
+      scanAction: 'Open scan controls',
     },
     review: {
       title: '3 · Review explained suggestions',
@@ -175,6 +176,21 @@ export const en = {
       pathAndText: 'Path + extracted text',
       path: 'Filename or path',
       text: 'Extracted text',
+    },
+    content: {
+      controlsAria: 'Bounded local text extraction controls',
+      notRead: 'File contents have not been read',
+      description:
+        'Only this selected, already-scanned text, PDF, or Office file is revalidated and read locally.',
+      read: 'Extract text locally',
+      readAgain: 'Extract again',
+      runQueued: 'Run queued extraction',
+      reading: 'Extracting safely…',
+      completed: 'Bounded text is indexed locally.',
+      searchExtracted: 'Search extracted text',
+      indexed: 'Text was indexed locally. Enter a phrase from the document to search it.',
+      failed: 'Extraction stopped safely. No partial text replaced the last complete index.',
+      denied: 'Extraction was denied safely. Rescan a changed file or choose a supported file.',
     },
     ocr: {
       controlsAria: 'Local screenshot OCR controls',

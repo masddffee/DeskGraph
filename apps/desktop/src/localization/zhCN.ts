@@ -76,6 +76,7 @@ export const zhCN = {
       description:
         '先对选择的文件夹进行初始元数据扫描，再在 SQLite 中搜索文件名与明确选择后提取的文本。',
       action: '打开搜索',
+      scanAction: '打开扫描控制',
     },
     review: {
       title: '3 · 查看可解释的建议',
@@ -171,6 +172,20 @@ export const zhCN = {
       pathAndText: '路径 + 已提取文本',
       path: '文件名或路径',
       text: '已提取文本',
+    },
+    content: {
+      controlsAria: '受限本机文本提取控件',
+      notRead: '尚未读取文件内容',
+      description: '只会重新验证并在本机读取这个明确选择、已扫描的文本、PDF 或 Office 文件。',
+      read: '在本机提取文本',
+      readAgain: '再次提取',
+      runQueued: '运行排队中的提取',
+      reading: '正在安全提取…',
+      completed: '受限文本已在本机建立索引。',
+      searchExtracted: '搜索已提取文本',
+      indexed: '文本已在本机建立索引。请输入文档中的词句进行搜索。',
+      failed: '提取已安全停止；任何部分文本都不会替换先前完整索引。',
+      denied: '提取已安全拒绝。请重新扫描已更改文件，或选择支持的文件。',
     },
     ocr: {
       controlsAria: '本机截图 OCR 控件',

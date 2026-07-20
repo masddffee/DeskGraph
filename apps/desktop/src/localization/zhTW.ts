@@ -70,6 +70,7 @@ export const zhTW = {
       description:
         '先對選擇的資料夾進行初始中繼資料掃描，再在 SQLite 中搜尋檔名與明確選擇後抽取的文字。',
       action: '開啟搜尋',
+      scanAction: '開啟掃描控制',
     },
     review: {
       title: '3 · 檢視可說明的建議',
@@ -159,6 +160,20 @@ export const zhTW = {
       pathAndText: '路徑 + 已抽取文字',
       path: '檔名或路徑',
       text: '已抽取文字',
+    },
+    content: {
+      controlsAria: '受限本機文字抽取控制項',
+      notRead: '尚未讀取檔案內容',
+      description: '只會重新驗證並在本機讀取這個明確選取、已掃描的文字、PDF 或 Office 檔案。',
+      read: '在本機抽取文字',
+      readAgain: '再次抽取',
+      runQueued: '執行排隊中的抽取',
+      reading: '正在安全抽取…',
+      completed: '受限文字已在本機建立索引。',
+      searchExtracted: '搜尋已抽取文字',
+      indexed: '文字已在本機建立索引。請輸入文件中的詞句進行搜尋。',
+      failed: '抽取已安全停止；任何部分文字都不會取代先前完整索引。',
+      denied: '抽取已安全拒絕。請重新掃描已變更檔案，或選擇支援的檔案。',
     },
     ocr: {
       controlsAria: '本機截圖 OCR 控制項',

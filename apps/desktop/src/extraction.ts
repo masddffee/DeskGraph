@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core';
 
 export const EXTRACTION_STATS_COMMAND = 'content_extraction_stats';
 export const RECENT_EXTRACTIONS_COMMAND = 'recent_content_extractions';
+export const CREATE_CONTENT_EXTRACTION_JOB_COMMAND = 'create_content_extraction_job';
+export const RUN_CONTENT_EXTRACTION_JOB_COMMAND = 'run_content_extraction_job';
 export const CREATE_SCREENSHOT_OCR_JOB_COMMAND = 'create_screenshot_ocr_job';
 export const RUN_SCREENSHOT_OCR_JOB_COMMAND = 'run_screenshot_ocr_job';
 export const SCREENSHOT_OCR_JOB_STATUS_COMMAND = 'screenshot_ocr_job_status';
@@ -77,6 +79,74 @@ export function isScreenshotCandidateDisplayPath(displayPath: string): boolean {
 
   const extension = basename.slice(extensionStart).toLowerCase();
   return extension === '.png' || extension === '.jpg' || extension === '.jpeg';
+}
+
+const CONTENT_EXTRACTION_EXTENSIONS = new Set([
+  'txt',
+  'text',
+  'log',
+  'csv',
+  'tsv',
+  'md',
+  'markdown',
+  'mdown',
+  'mkd',
+  'mdx',
+  'rs',
+  'c',
+  'h',
+  'cc',
+  'cpp',
+  'cxx',
+  'hpp',
+  'cs',
+  'go',
+  'java',
+  'kt',
+  'kts',
+  'swift',
+  'js',
+  'jsx',
+  'mjs',
+  'cjs',
+  'ts',
+  'tsx',
+  'py',
+  'rb',
+  'php',
+  'sh',
+  'bash',
+  'zsh',
+  'fish',
+  'sql',
+  'html',
+  'htm',
+  'css',
+  'scss',
+  'sass',
+  'less',
+  'json',
+  'jsonl',
+  'toml',
+  'yaml',
+  'yml',
+  'xml',
+  'pdf',
+  'docx',
+  'pptx',
+  'xlsx',
+]);
+
+/**
+ * Display-only eligibility. The Rust command independently checks the manifest
+ * node's stored media kind before it creates a durable job.
+ */
+export function isContentExtractionCandidateDisplayPath(displayPath: string): boolean {
+  const basename = displayPath.split(/[\\/]/).at(-1);
+  if (!basename) return false;
+  const extensionStart = basename.lastIndexOf('.');
+  if (extensionStart <= 0) return false;
+  return CONTENT_EXTRACTION_EXTENSIONS.has(basename.slice(extensionStart + 1).toLowerCase());
 }
 
 export function activeScreenshotOcrJobIds(jobs: ExtractionJobProgress[]): number[] {
@@ -191,6 +261,29 @@ export async function loadRecentExtractions(
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
 ): Promise<ExtractionJobProgress[]> {
   return parseExtractionJobs(await invokeCommand(RECENT_EXTRACTIONS_COMMAND));
+}
+
+export async function createContentExtractionJob(
+  scopeId: number,
+  nodeId: number,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<ExtractionJobProgress> {
+  const job = parseExtractionJob(
+    await invokeCommand(CREATE_CONTENT_EXTRACTION_JOB_COMMAND, { scopeId, nodeId }),
+  );
+  if (job.operation !== 'content') throw new Error('Invalid content extraction job response');
+  return job;
+}
+
+export async function runContentExtractionJob(
+  jobId: number,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<ExtractionJobProgress> {
+  const job = parseExtractionJob(
+    await invokeCommand(RUN_CONTENT_EXTRACTION_JOB_COMMAND, { jobId }),
+  );
+  if (job.operation !== 'content') throw new Error('Invalid content extraction job response');
+  return job;
 }
 
 export async function createScreenshotOcrJob(

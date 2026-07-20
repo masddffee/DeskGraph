@@ -28,7 +28,7 @@ export type Catalog = {
     description: string;
     privacy: string;
     scope: { title: string; description: string; action: string };
-    search: { title: string; description: string; action: string };
+    search: { title: string; description: string; action: string; scanAction: string };
     review: {
       title: string;
       description: string;
@@ -102,6 +102,20 @@ export type Catalog = {
       pathAndText: string;
       path: string;
       text: string;
+    };
+    content: {
+      controlsAria: string;
+      notRead: string;
+      description: string;
+      read: string;
+      readAgain: string;
+      runQueued: string;
+      reading: string;
+      completed: string;
+      searchExtracted: string;
+      indexed: string;
+      failed: string;
+      denied: string;
     };
     ocr: {
       controlsAria: string;

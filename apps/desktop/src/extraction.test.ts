@@ -2,15 +2,18 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   CANCEL_SCREENSHOT_OCR_JOB_COMMAND,
+  CREATE_CONTENT_EXTRACTION_JOB_COMMAND,
   CREATE_SCREENSHOT_OCR_JOB_COMMAND,
   EXTRACTION_STATS_COMMAND,
   RECENT_EXTRACTIONS_COMMAND,
   RESUME_SCREENSHOT_OCR_JOB_COMMAND,
+  RUN_CONTENT_EXTRACTION_JOB_COMMAND,
   RUN_SCREENSHOT_OCR_JOB_COMMAND,
   SCREENSHOT_OCR_JOB_FOR_NODE_COMMAND,
   SCREENSHOT_OCR_JOB_STATUS_COMMAND,
   activeScreenshotOcrJobIds,
   cancelScreenshotOcrJob,
+  createContentExtractionJob,
   createScreenshotOcrJob,
   loadScreenshotOcrJobStatus,
   loadExtractionStats,
@@ -21,9 +24,11 @@ import {
   parseExtractionStats,
   resumeScreenshotOcrJob,
   isScreenshotCandidateDisplayPath,
+  isContentExtractionCandidateDisplayPath,
   isScreenshotOcrCapacityBusy,
   loadScreenshotOcrJobForNode,
   runScreenshotOcrJob,
+  runContentExtractionJob,
   type ExtractionJobProgress,
   type ExtractionStats,
 } from './extraction';
@@ -55,6 +60,21 @@ const job: ExtractionJobProgress = {
 };
 
 describe('extraction contract', () => {
+  it('offers bounded content extraction only for supported non-image display suffixes', () => {
+    for (const displayPath of [
+      'notes.md',
+      '/authorized/report.PDF',
+      'C:\\authorized\\deck.pptx',
+      'sheet.xlsx',
+      'source.TSX',
+    ]) {
+      expect(isContentExtractionCandidateDisplayPath(displayPath)).toBe(true);
+    }
+    for (const displayPath of ['', '.md', 'archive.zip', 'screenshot.png', 'report.pdf.bak']) {
+      expect(isContentExtractionCandidateDisplayPath(displayPath)).toBe(false);
+    }
+  });
+
   it('offers screenshot OCR only for supported image display-path suffixes', () => {
     for (const displayPath of [
       'Screenshot.png',
@@ -233,6 +253,35 @@ describe('extraction contract', () => {
       scopeId: 2,
       nodeId: 9,
     });
+  });
+
+  it('creates and runs content extraction with identifiers only', async () => {
+    const queued = { ...job, status: 'queued' as const };
+    const invokeCommand = vi.fn().mockImplementation((command: string) => {
+      if (command === CREATE_CONTENT_EXTRACTION_JOB_COMMAND) return Promise.resolve(queued);
+      if (command === RUN_CONTENT_EXTRACTION_JOB_COMMAND) return Promise.resolve(job);
+      return Promise.reject(new Error('unexpected command'));
+    });
+
+    await expect(createContentExtractionJob(2, 9, invokeCommand)).resolves.toEqual(queued);
+    await expect(runContentExtractionJob(7, invokeCommand)).resolves.toEqual(job);
+    expect(invokeCommand).toHaveBeenNthCalledWith(1, CREATE_CONTENT_EXTRACTION_JOB_COMMAND, {
+      scopeId: 2,
+      nodeId: 9,
+    });
+    expect(invokeCommand).toHaveBeenNthCalledWith(2, RUN_CONTENT_EXTRACTION_JOB_COMMAND, {
+      jobId: 7,
+    });
+  });
+
+  it('rejects an OCR job returned by a content extraction command', async () => {
+    const ocrJob = { ...job, operation: 'screenshot_ocr' as const };
+    await expect(
+      createContentExtractionJob(2, 9, vi.fn().mockResolvedValue(ocrJob)),
+    ).rejects.toThrow('Invalid content extraction job response');
+    await expect(runContentExtractionJob(7, vi.fn().mockResolvedValue(ocrJob))).rejects.toThrow(
+      'Invalid content extraction job response',
+    );
   });
 
   it('rejects a non-OCR job returned by a screenshot OCR command', async () => {

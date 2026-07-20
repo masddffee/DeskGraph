@@ -26,7 +26,8 @@ use deskgraph_domain::{WatchEventReason, WatchEventStatus};
 #[cfg(test)]
 use deskgraph_extractors::extraction_stats_at as read_extraction_stats_at;
 use deskgraph_extractors::{
-    ExtractionLimits, cancel_extraction_job_at, create_screenshot_ocr_job_at, extraction_job_at,
+    ExtractionLimits, MediaKind, cancel_extraction_job_at, create_extraction_job_at,
+    create_screenshot_ocr_job_at, extraction_job_at, media_kind_for_extension,
     recent_extraction_jobs_at as read_recent_extraction_jobs_at, resume_extraction_job_at,
     run_extraction_job_at,
 };
@@ -1178,6 +1179,44 @@ fn recent_content_extractions(
         .map_err(str::to_string)
 }
 
+/// Queues bounded extraction for one explicitly selected, already-scanned
+/// text-bearing node. The WebView supplies only stable manifest identifiers;
+/// current access, exclusion policy, media kind, and source identity are all
+/// checked again by Rust before text can be published.
+#[tauri::command]
+fn create_content_extraction_job(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+    node_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    require_active_scope(&state, scope_id)?;
+    let progress =
+        create_content_extraction_job_for_database(&state.database_path, scope_id, node_id)
+            .map_err(str::to_string)?;
+    log_content_extraction_progress("content_extraction_created", &progress);
+    Ok(progress)
+}
+
+/// Runs only a previously-created content job. No path, filename, query, or
+/// document text crosses this IPC boundary.
+#[tauri::command]
+async fn run_content_extraction_job(
+    state: State<'_, ManifestState>,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, String> {
+    let pending =
+        require_content_extraction_job(&state.database_path, job_id).map_err(str::to_string)?;
+    require_active_scope(&state, pending.scope_id)?;
+    let database_path = state.database_path.clone();
+    let progress = tauri::async_runtime::spawn_blocking(move || {
+        run_content_extraction_job_at(&database_path, job_id).map_err(str::to_string)
+    })
+    .await
+    .map_err(|_| "content_extraction_worker_failed".to_string())??;
+    log_content_extraction_progress("content_extraction_runner_stopped", &progress);
+    Ok(progress)
+}
+
 /// Queues OCR for an already-scanned image. The core service revalidates the
 /// authorized scope and node identity; callers never provide a filesystem path.
 #[tauri::command]
@@ -1859,6 +1898,47 @@ fn recent_content_extractions_at(path: &Path) -> Result<Vec<ExtractionJobProgres
     read_recent_extraction_jobs_at(path).map_err(|error| error.code())
 }
 
+fn create_content_extraction_job_for_database(
+    path: &Path,
+    scope_id: i64,
+    node_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    let database = ManifestDatabase::open(path).map_err(|error| error.code())?;
+    let source = database
+        .extractable_file(scope_id, node_id)
+        .map_err(|error| error.code())?;
+    let extension = Path::new(&source.path_key)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or("extraction_media_kind_unsupported")?;
+    let media_kind =
+        media_kind_for_extension(extension).ok_or("extraction_media_kind_unsupported")?;
+    if matches!(media_kind, MediaKind::Image(_)) {
+        return Err("extraction_media_kind_unsupported");
+    }
+    drop(database);
+    create_extraction_job_at(path, scope_id, node_id).map_err(|error| error.code())
+}
+
+fn run_content_extraction_job_at(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    require_content_extraction_job(path, job_id)?;
+    run_extraction_job_at(path, job_id, ExtractionLimits::default()).map_err(|error| error.code())
+}
+
+fn require_content_extraction_job(
+    path: &Path,
+    job_id: i64,
+) -> Result<ExtractionJobProgress, &'static str> {
+    let progress = extraction_job_at(path, job_id).map_err(|error| error.code())?;
+    if progress.operation != ExtractionOperation::Content {
+        return Err("content_extraction_job_required");
+    }
+    Ok(progress)
+}
+
 fn create_screenshot_ocr_job_for_database(
     path: &Path,
     scope_id: i64,
@@ -1999,6 +2079,19 @@ fn log_screenshot_ocr_progress(event: &'static str, progress: &ExtractionJobProg
     );
 }
 
+fn log_content_extraction_progress(event: &'static str, progress: &ExtractionJobProgress) {
+    info!(
+        event,
+        scope_id = progress.scope_id,
+        node_id = progress.node_id,
+        job_id = progress.job_id,
+        status = ?progress.status,
+        chunk_count = progress.chunk_count,
+        output_bytes = progress.output_bytes,
+        error_code = progress.error_code
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _logger_installed = init_privacy_safe_logging(Service::Desktop);
@@ -2036,6 +2129,8 @@ pub fn run() {
             project_scope_has_completed_scan,
             content_extraction_stats,
             recent_content_extractions,
+            create_content_extraction_job,
+            run_content_extraction_job,
             create_screenshot_ocr_job,
             run_screenshot_ocr_job,
             screenshot_ocr_job_status,
@@ -2289,6 +2384,8 @@ mod tests {
                 .expect_err("scan resume must require a live grant"),
             create_screenshot_ocr_job(app.state(), scope.id, node_id)
                 .expect_err("OCR create must require a live grant"),
+            create_content_extraction_job(app.state(), scope.id, node_id)
+                .expect_err("content extraction create must require a live grant"),
             screenshot_ocr_job_status(app.state(), ocr_job.job_id)
                 .expect_err("OCR status must require a live grant"),
             screenshot_ocr_job_for_node(app.state(), scope.id, node_id)
@@ -3023,6 +3120,126 @@ mod tests {
         assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
         assert!(payload.contains("deskgraph.extraction-stats.v1"));
         assert!(payload.contains("\"status\":\"completed\""));
+    }
+
+    #[test]
+    fn desktop_content_extraction_is_explicit_bounded_and_searchable() {
+        let private_text = "Selected document phrase 僅本機抽取";
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("selected-document.md", private_text);
+
+        let queued = create_content_extraction_job_for_database(&database_path, scope.id, node_id)
+            .expect("explicit content extraction should queue");
+        assert_eq!(queued.operation, ExtractionOperation::Content);
+        assert_eq!(queued.status, ExtractionStatus::Queued);
+
+        let completed = run_content_extraction_job_at(&database_path, queued.job_id)
+            .expect("bounded content extraction should complete");
+        assert_eq!(completed.status, ExtractionStatus::Completed);
+        assert!(completed.chunk_count > 0);
+
+        let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        database
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"content-search-grant")
+            .expect("search fixture grant should become active");
+        drop(database);
+
+        let response = search_local_at(
+            &database_path,
+            "僅本機抽取",
+            &SearchFilters {
+                scope_id: Some(scope.id),
+                source: SearchSourceFilter::ExtractedText,
+                extension: Some("md".to_string()),
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+            },
+            Some(10),
+        )
+        .expect("extracted text search should pass");
+        assert_eq!(response.result_count, 1);
+        assert_eq!(response.results[0].node_id, node_id);
+
+        let payload = serde_json::to_string(&completed).expect("progress should serialize");
+        assert!(!payload.contains("selected-document.md"));
+        assert!(!payload.contains(private_text));
+        assert!(!payload.contains("\"path\""));
+        assert!(!payload.contains("\"text\""));
+    }
+
+    #[test]
+    fn desktop_content_extraction_rejects_images_before_job_creation() {
+        let image = png_bytes(64, 64, b"private image marker");
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("selected-screenshot.png", image);
+        let before = recent_content_extractions_at(&database_path)
+            .expect("recent jobs should load before rejection");
+
+        assert_eq!(
+            create_content_extraction_job_for_database(&database_path, scope.id, node_id)
+                .expect_err("images must remain on the explicit OCR path"),
+            "extraction_media_kind_unsupported"
+        );
+        assert_eq!(
+            recent_content_extractions_at(&database_path)
+                .expect("rejection must not create a durable job"),
+            before
+        );
+    }
+
+    #[test]
+    fn content_extraction_helpers_reject_ocr_job_ids() {
+        let image = png_bytes(64, 64, b"private OCR marker");
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("selected-screenshot.png", image);
+        let ocr_job = create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
+            .expect("OCR job should queue");
+
+        assert_eq!(
+            require_content_extraction_job(&database_path, ocr_job.job_id)
+                .expect_err("content status must reject OCR job IDs"),
+            "content_extraction_job_required"
+        );
+        assert_eq!(
+            run_content_extraction_job_at(&database_path, ocr_job.job_id)
+                .expect_err("content runner must reject OCR job IDs"),
+            "content_extraction_job_required"
+        );
+        assert_eq!(
+            extraction_job_at(&database_path, ocr_job.job_id)
+                .expect("rejected OCR job should stay queued")
+                .status,
+            ExtractionStatus::Queued
+        );
+    }
+
+    #[test]
+    fn content_extraction_commands_require_a_live_native_grant() {
+        let (_directory, database_path, scope, node_id) =
+            scanned_file_fixture("selected-document.md", "private local content");
+        let queued = create_content_extraction_job_for_database(&database_path, scope.id, node_id)
+            .expect("content fixture job should queue");
+        let app = tauri::test::mock_builder()
+            .manage(start_manifest_state(database_path))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Desktop app should build");
+
+        assert_eq!(
+            create_content_extraction_job(app.state(), scope.id, node_id)
+                .expect_err("create must require a live native grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(run_content_extraction_job(app.state(), queued.job_id,))
+                .expect_err("run must require a live native grant"),
+            "scope_reauthorization_required"
+        );
+        assert_eq!(
+            extraction_job_at(&app.state::<ManifestState>().database_path, queued.job_id)
+                .expect("denied job should remain queued")
+                .status,
+            ExtractionStatus::Queued
+        );
     }
 
     #[test]

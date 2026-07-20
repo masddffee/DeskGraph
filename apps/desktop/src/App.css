@@ -1172,6 +1172,15 @@ select:focus-visible {
   gap: 0.5rem;
 }
 
+.search-result-action > .search-result-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-top: 0.65rem;
+}
+
 .search-result-action-row strong {
   color: #235c3a;
   font-size: 0.84rem;
