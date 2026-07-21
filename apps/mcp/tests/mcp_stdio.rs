@@ -46,6 +46,13 @@ fn fixture_with_content() -> Fixture {
             b"mcp-integration-active-grant",
         )
         .expect("granted scope should have an active platform grant");
+    database
+        .upsert_scope_access_grant(
+            denied.id,
+            std::env::consts::OS,
+            b"mcp-integration-denied-scope-grant",
+        )
+        .expect("the denied MCP scope still needs local scan authorization");
     scan_scope(&mut database, granted.id).expect("granted scope should scan");
     scan_scope(&mut database, denied.id).expect("denied scope should scan");
     let granted_node_id = database

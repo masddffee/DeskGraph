@@ -174,6 +174,212 @@ fn scope_add_child_process_creates_a_path_free_active_grant_for_scan_and_search(
 }
 
 #[test]
+fn revoked_scope_is_hidden_and_scan_commands_require_explicit_reauthorization() {
+    let directory = tempfile::tempdir().expect("fixture root should exist");
+    let database_path = directory.path().join("revocation-manifest.sqlite3");
+    let scope_path = directory.path().join("private-revoked-root");
+    std::fs::create_dir(&scope_path).expect("scope should create");
+    let source_path = scope_path.join("private-note.md");
+    std::fs::write(&source_path, "private metadata fixture").expect("fixture should write");
+
+    let binary = env!("CARGO_BIN_EXE_deskgraph");
+    let database_arg = database_path
+        .to_str()
+        .expect("database path should be UTF-8");
+    let scope_path_arg = scope_path.to_str().expect("scope path should be UTF-8");
+    let run = |arguments: &[&str]| {
+        Command::new(binary)
+            .args(arguments)
+            .output()
+            .expect("deskgraph child process should start")
+    };
+
+    assert!(
+        run(&["manifest", "init", "--database", database_arg])
+            .status
+            .success()
+    );
+    let added = run(&[
+        "scope",
+        "add",
+        "--database",
+        database_arg,
+        "--path",
+        scope_path_arg,
+    ]);
+    assert!(added.status.success());
+    let added_scope: serde_json::Value =
+        serde_json::from_slice(&added.stdout).expect("scope add should emit JSON");
+    let scope_id = added_scope["id"]
+        .as_i64()
+        .expect("scope add should return an ID");
+    let scope_id_arg = scope_id.to_string();
+
+    let created = run(&[
+        "scan",
+        "create",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_id_arg,
+    ]);
+    assert!(created.status.success());
+    let created_job: serde_json::Value =
+        serde_json::from_slice(&created.stdout).expect("scan create should emit JSON");
+    let queued_job_id = created_job["job_id"]
+        .as_i64()
+        .expect("scan create should return a job ID");
+    let queued_job_id_arg = queued_job_id.to_string();
+
+    let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+    let binding = database
+        .bind_scope_policy_revision(scope_id)
+        .expect("active scope should bind for revocation");
+    database
+        .apply_scope_root_revocation(binding, 1)
+        .expect("root revocation should commit");
+    drop(database);
+    let moved_scope_path = directory.path().join("private-revoked-root-moved");
+    std::fs::rename(&scope_path, &moved_scope_path)
+        .expect("revoked fixture should move before denied path commands");
+    let source_path_arg = source_path.to_str().expect("source path should be UTF-8");
+
+    let listed = run(&["scope", "list", "--database", database_arg]);
+    assert!(listed.status.success());
+    let listed_scopes: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("scope list should emit JSON");
+    assert_eq!(listed_scopes, serde_json::json!([]));
+
+    let denied = [
+        run(&[
+            "scan",
+            "start",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+        ]),
+        run(&[
+            "scan",
+            "create",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+        ]),
+        run(&[
+            "scan",
+            "run",
+            "--database",
+            database_arg,
+            "--job",
+            &queued_job_id_arg,
+        ]),
+        run(&[
+            "scan",
+            "advance",
+            "--database",
+            database_arg,
+            "--job",
+            &queued_job_id_arg,
+            "--batch-size",
+            "1",
+        ]),
+        run(&[
+            "extract",
+            "create",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+            "--path",
+            source_path_arg,
+        ]),
+        run(&[
+            "extract",
+            "ocr-create",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+            "--path",
+            source_path_arg,
+        ]),
+        run(&[
+            "folder",
+            "profile",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+            "--path",
+            scope_path_arg,
+        ]),
+        run(&[
+            "project",
+            "propose",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+            "--path",
+            scope_path_arg,
+        ]),
+        run(&[
+            "relation",
+            "duplicate",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+            "--left",
+            source_path_arg,
+            "--right",
+            source_path_arg,
+        ]),
+    ];
+    for output in &denied {
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("scope_access_grant_not_active"));
+        assert!(!stderr.contains(scope_path_arg));
+        assert!(!stderr.contains(database_arg));
+        assert!(!stderr.contains("private-note.md"));
+        assert!(!stderr.contains("private metadata fixture"));
+    }
+    std::fs::rename(&moved_scope_path, &scope_path)
+        .expect("fixture root should restore before reauthorization");
+
+    let reauthorized = run(&[
+        "scope",
+        "add",
+        "--database",
+        database_arg,
+        "--path",
+        scope_path_arg,
+    ]);
+    assert!(reauthorized.status.success());
+    let reauthorized_scope: serde_json::Value = serde_json::from_slice(&reauthorized.stdout)
+        .expect("scope reauthorization should emit JSON");
+    assert_eq!(reauthorized_scope["id"], scope_id);
+
+    let fresh_scan = run(&[
+        "scan",
+        "start",
+        "--database",
+        database_arg,
+        "--scope",
+        &scope_id_arg,
+    ]);
+    assert!(fresh_scan.status.success());
+    let fresh_report: serde_json::Value =
+        serde_json::from_slice(&fresh_scan.stdout).expect("fresh scan should emit JSON");
+    assert_eq!(fresh_report["status"], "completed");
+    assert_eq!(fresh_report["scope_id"], scope_id);
+}
+
+#[test]
 fn demo_fixture_command_runs_the_real_bilingual_cleanup_vertical_slice_without_mutation() {
     let directory = tempfile::tempdir().expect("fixture parent should exist");
     let workspace_path = directory.path().join("judge-demo-workspace");
@@ -321,7 +527,13 @@ fn extraction_command_emits_counts_without_paths_or_content() {
     let private_text = "不可出現在 CLI 輸出的私人內容";
     std::fs::write(&source_path, private_text).expect("fixture should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"extract-cli-test-grant",
+    )
+    .expect("scope should authorize with an active grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
@@ -381,7 +593,13 @@ fn ocr_create_command_emits_path_free_durable_job_status() {
     png[20..24].copy_from_slice(&480_u32.to_be_bytes());
     std::fs::write(&source_path, png).expect("fixture should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"ocr-cli-test-grant",
+    )
+    .expect("scope should authorize with an active grant");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
@@ -701,10 +919,10 @@ fn cleanup_inbox_revalidates_sources_without_paths_or_file_actions() {
     std::fs::write(&newer_path, b"secret new plan").expect("newer should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
     let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-    scan_scope(&mut database, scope.id).expect("scope should scan");
     database
         .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
         .expect("active grant should persist");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
     let database_arg = database_path
@@ -821,7 +1039,13 @@ fn image_metadata_command_returns_only_bounded_structured_fields() {
     png[20..24].copy_from_slice(&1440_u32.to_be_bytes());
     std::fs::write(&source_path, png).expect("fixture should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"image-metadata-cli-test-grant",
+    )
+    .expect("scope should authorize");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     let node_id = database
         .node_id_for_path_key(
@@ -980,7 +1204,13 @@ fn watch_observe_persists_path_free_progress_without_logging_the_hint() {
     let watched_path = scope_path.join("private-watch-notes.md");
     std::fs::write(&watched_path, "private local context").expect("fixture should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
-    let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+    let scope = authorize_scope_with_access_grant(
+        &mut database,
+        &scope_path,
+        std::env::consts::OS,
+        b"watch-observe-cli-test-grant",
+    )
+    .expect("scope should authorize");
     scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
@@ -1127,10 +1357,10 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
     std::fs::write(&private_source, "pub fn secret_context() {}").expect("source should write");
     let mut database = ManifestDatabase::open(&database_path).expect("database should initialize");
     let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-    scan_scope(&mut database, scope.id).expect("scope should scan");
     database
         .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"project-cli-test-grant")
         .expect("test grant should activate");
+    scan_scope(&mut database, scope.id).expect("scope should scan");
     drop(database);
 
     let database_arg = database_path
@@ -1322,14 +1552,11 @@ fn project_feedback_is_durable_correctable_and_path_free_in_list_and_logs() {
         assert!(!stderr.contains(path_arg));
         assert!(!stderr.contains("secret_context.rs"));
     }
-    let candidate = ManifestDatabase::open(&database_path)
+    let candidate_error = ManifestDatabase::open(&database_path)
         .expect("database should reopen")
         .project_candidate(project_id)
-        .expect("candidate should remain readable to the test");
-    assert_eq!(
-        candidate.state,
-        deskgraph_domain::ProjectCandidateState::Accepted
-    );
+        .expect_err("privacy withdrawal must purge the project candidate");
+    assert_eq!(candidate_error.code(), "project_candidate_not_found");
 }
 
 #[test]

@@ -185,7 +185,11 @@ pub fn create_rename_preview(
     source_path: &Path,
     new_name: &str,
 ) -> Result<ActionPlanPreview, TransactionError> {
+    let read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
     let (policy_binding, exclusion_matcher) = bind_transaction_scope_policy(database, scope_id)?;
+    if read_fence.binding() != policy_binding {
+        return Err(TransactionError::ScopePolicyChanged);
+    }
     validate_portable_name(new_name)?;
     if !source_path.is_absolute() {
         return Err(TransactionError::SourcePathMustBeAbsolute);
@@ -290,8 +294,12 @@ pub fn create_cleanup_preview(
     database: &mut ManifestDatabase,
     selection: CleanupActionSelection,
 ) -> Result<CleanupActionPlanPreview, TransactionError> {
+    let read_fence = database.acquire_scope_filesystem_read_fence(selection.scope_id)?;
     let (policy_binding, exclusion_matcher) =
         bind_transaction_scope_policy(database, selection.scope_id)?;
+    if read_fence.binding() != policy_binding {
+        return Err(TransactionError::ScopePolicyChanged);
+    }
     let (execution_source, keeper_execution_source) = database.cleanup_action_sources(selection)?;
     let source = &execution_source.source;
     let canonical_root = validated_scope_root(database, selection.scope_id)?;
@@ -471,6 +479,7 @@ fn run_rename_command(
     command: ActionCommandKind,
 ) -> Result<ActionCommandResult, TransactionError> {
     let plan = database.action_execution_plan(plan_id)?;
+    let _read_fence = database.acquire_scope_filesystem_read_fence(plan.scope_id)?;
     validate_execution_plan(&plan)?;
     let before = database.action_execution_record(plan_id)?;
     let start = database.start_action_command(ActionCommandWrite {
@@ -794,6 +803,7 @@ fn recover_one_action(
             #[cfg(unix)]
             {
                 let plan = database.action_execution_plan(item.plan_id)?;
+                let _read_fence = database.acquire_scope_filesystem_read_fence(plan.scope_id)?;
                 validate_execution_plan(&plan)?;
                 database.renew_action_executor_lease(
                     item.plan_id,
@@ -1845,7 +1855,8 @@ mod tests {
                 error.code(),
                 "scope_policy_changed" | "cleanup_action_source_not_current"
             ),
-            "privacy purge or the runtime guard must deny an excluded keeper"
+            "privacy purge or the runtime guard must deny an excluded keeper; code={}",
+            error.code()
         );
         assert!(fixture.target_path.exists());
         assert!(fixture.keeper_path.exists());

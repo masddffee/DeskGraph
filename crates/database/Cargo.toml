@@ -10,5 +10,15 @@ deskgraph-domain = { path = "../domain" }
 deskgraph-identity = { path = "../identity" }
 rusqlite.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
+  "Win32_System_IO",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true

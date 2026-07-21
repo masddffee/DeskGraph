@@ -337,6 +337,81 @@ describe('i18n catalog and registry contract', () => {
     expect(appSource).toContain('catalog.hardExclusion.removalUnavailable');
   });
 
+  it('keeps root revocation preview-only, source-safe, and local-only in every catalog', () => {
+    const phrases: Record<
+      Locale,
+      {
+        sourceSafe: string;
+        noAutomaticRead: string;
+        conditional: string;
+        actionPreview: string;
+        cleanupPreview: string;
+        blocked: string;
+      }
+    > = {
+      en: {
+        sourceSafe: 'not be moved',
+        noAutomaticRead: 'No new scan',
+        conditional: 'would be cleared',
+        actionPreview: 'rename/move preview',
+        cleanupPreview: 'Cleanup preview',
+        blocked: 'would be retained',
+      },
+      'zh-TW': {
+        sourceSafe: '不會移動',
+        noAutomaticRead: '開始新的掃描',
+        conditional: '確認後，本機將清除',
+        actionPreview: '重新命名／移動預覽',
+        cleanupPreview: '安全清理預覽',
+        blocked: '不會被清除',
+      },
+      'zh-CN': {
+        sourceSafe: '不会移动',
+        noAutomaticRead: '开始新的扫描',
+        conditional: '确认后，本机将清除',
+        actionPreview: '重命名／移动预览',
+        cleanupPreview: '安全清理预览',
+        blocked: '不会被清除',
+      },
+      ja: {
+        sourceSafe: '移動、変更',
+        noAutomaticRead: 'スキャン',
+        conditional: '確認後、ローカルで',
+        actionPreview: '名前変更／移動プレビュー',
+        cleanupPreview: '安全クリーンアッププレビュー',
+        blocked: '消去されません',
+      },
+    };
+    for (const locale of LOCALES) {
+      const revocation = catalogs[locale].rootRevocation;
+      expect(revocation.description.length).toBeGreaterThan(40);
+      expect(revocation.sourceSafe).toContain(phrases[locale].sourceSafe);
+      expect(revocation.noAutomaticRead).toContain(phrases[locale].noAutomaticRead);
+      expect(revocation.impact(0, 0, 0, 0, 0, 0, 0, 0)).toContain(phrases[locale].conditional);
+      expect(revocation.impact(0, 0, 0, 0, 1, 2, 0, 2)).toContain(phrases[locale].blocked);
+      const impact = revocation.impact(0, 0, 0, 0, 1, 2, 0, 0);
+      expect(impact).toContain(phrases[locale].actionPreview);
+      expect(impact).toContain(phrases[locale].cleanupPreview);
+      expect(impact).toContain('1');
+      expect(impact).toContain('2');
+      expect(revocation.exclusionCount(2)).toContain('2');
+      expect(revocation.loading.length).toBeGreaterThan(10);
+      expect(revocation.notConfirmable.length).toBeGreaterThan(20);
+      expect(revocation.committed(0)).toContain('0');
+    }
+    expect(appSource).toContain('previewScopeRootRevocation(scope.id)');
+    expect(appSource).toContain('confirmScopeRootRevocation(preview.preview_id)');
+    expect(appSource).toContain('discardScopeRootRevocation(preview.preview_id)');
+    expect(appSource).toContain("setRootRevocationState({ kind: 'loading', scopeId: scope.id })");
+    expect(appSource).toContain('catalog.rootRevocation.noAutomaticRead');
+    expect(appSource).toContain('rootRevocationState.scope.display_path');
+    expect(appSource).toContain('rootRevocationState.preview.exclusion_count');
+    expect(appSource).toContain('rootRevocationState.preview.impact.action_plan_count');
+    expect(appSource).toContain('rootRevocationState.preview.impact.cleanup_action_plan_count');
+    expect(appSource).toContain('commit.scope_id !== preview.scope_id');
+    expect(appSource).toContain('commit.policy_revision !== expectedRevision');
+  });
+
   it('keeps primary navigation complete and honest in every catalog', () => {
     const phrases: Record<
       Locale,

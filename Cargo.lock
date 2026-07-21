@@ -760,8 +760,10 @@ version = "0.1.0"
 dependencies = [
  "deskgraph-domain",
  "deskgraph-identity",
+ "libc",
  "rusqlite",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

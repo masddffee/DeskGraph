@@ -408,7 +408,11 @@ pub fn check_exact_duplicate(
     left_path: &Path,
     right_path: &Path,
 ) -> Result<FileRelationCandidate, ProjectError> {
+    let read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
     let binding = bind_project_scope_policy(database, scope_id)?;
+    if read_fence.binding() != binding {
+        return Err(ProjectError::ScopePolicyChanged);
+    }
     let canonical_root = validated_scope_root(database, scope_id)?;
     let left = open_relation_source(database, scope_id, &canonical_root, left_path, None)?;
     let right = open_relation_source(database, scope_id, &canonical_root, right_path, None)?;
@@ -430,7 +434,11 @@ pub fn verify_exact_duplicate(
     relation_id: i64,
 ) -> Result<FileRelationCandidate, ProjectError> {
     let (left_snapshot, right_snapshot) = database.exact_duplicate_sources(relation_id)?;
+    let read_fence = database.acquire_scope_filesystem_read_fence(left_snapshot.scope_id)?;
     let binding = bind_project_scope_policy(database, left_snapshot.scope_id)?;
+    if read_fence.binding() != binding {
+        return Err(ProjectError::ScopePolicyChanged);
+    }
     let canonical_root = validated_scope_root(database, left_snapshot.scope_id)?;
     let left_path = path_from_raw(&left_snapshot.path_raw)
         .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
@@ -502,7 +510,11 @@ pub fn suggest_file_version(
     first_path: &Path,
     second_path: &Path,
 ) -> Result<FileVersionCandidate, ProjectError> {
+    let read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
     let binding = bind_project_scope_policy(database, scope_id)?;
+    if read_fence.binding() != binding {
+        return Err(ProjectError::ScopePolicyChanged);
+    }
     let canonical_root = validated_scope_root(database, scope_id)?;
     let first = open_relation_source(database, scope_id, &canonical_root, first_path, None)?;
     let second = open_relation_source(database, scope_id, &canonical_root, second_path, None)?;
@@ -524,7 +536,11 @@ pub fn verify_file_version(
     relation_id: i64,
 ) -> Result<FileVersionCandidate, ProjectError> {
     let (first_snapshot, second_snapshot) = database.file_version_sources(relation_id)?;
+    let read_fence = database.acquire_scope_filesystem_read_fence(first_snapshot.scope_id)?;
     let binding = bind_project_scope_policy(database, first_snapshot.scope_id)?;
+    if read_fence.binding() != binding {
+        return Err(ProjectError::ScopePolicyChanged);
+    }
     let canonical_root = validated_scope_root(database, first_snapshot.scope_id)?;
     let first_path = path_from_raw(&first_snapshot.path_raw)
         .map_err(|_| ProjectError::RelationPathDecodeFailed)?;
@@ -1247,10 +1263,10 @@ mod tests {
             std::fs::write(asset_folder.join("logo.png"), b"png").expect("asset should write");
             let mut database = ManifestDatabase::open_in_memory().expect("database should open");
             let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-            scan_scope(&mut database, scope.id).expect("scope should scan");
             database
                 .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"project-test-grant")
                 .expect("test grant should activate");
+            scan_scope(&mut database, scope.id).expect("scope should scan");
             let canonical_root =
                 std::fs::canonicalize(&scope_path).expect("root should canonicalize");
             let canonical_source =
@@ -1328,10 +1344,10 @@ mod tests {
         std::fs::write(scope_path.join("README.md"), "folder notes").expect("README should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_root = std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
         let root_node_id = database
             .node_id_for_path_key(scope.id, &comparison_key(&canonical_root))
@@ -1559,7 +1575,6 @@ mod tests {
         }
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(
                 scope.id,
@@ -1567,6 +1582,7 @@ mod tests {
                 b"project-discovery-test-grant",
             )
             .expect("test grant should activate");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
 
         let discovery = discover_projects(&mut database, scope.id)
             .expect("bounded discovery should return verified roots");
@@ -1612,10 +1628,10 @@ mod tests {
         std::fs::write(&right_path, private_bytes).expect("right should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
         let canonical_right =
             std::fs::canonicalize(&right_path).expect("right should canonicalize");
@@ -1733,10 +1749,10 @@ mod tests {
         };
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_left = std::fs::canonicalize(&left_path).expect("left should canonicalize");
         let canonical_right =
             std::fs::canonicalize(&right_path).expect("right should canonicalize");
@@ -1830,10 +1846,10 @@ mod tests {
         std::fs::write(&unsupported_path, b"unsupported").expect("unsupported should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_first =
             std::fs::canonicalize(&first_path).expect("first should canonicalize");
         let canonical_second =
@@ -1951,10 +1967,10 @@ mod tests {
             .expect("large right should resize");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_empty_left =
             std::fs::canonicalize(&empty_left).expect("empty left should canonicalize");
         let canonical_empty_right =
@@ -2000,10 +2016,10 @@ mod tests {
 
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_duplicate_left =
             std::fs::canonicalize(&duplicate_left).expect("left should canonicalize");
         let canonical_duplicate_right =
@@ -2089,10 +2105,10 @@ mod tests {
         std::fs::write(&right, b"same private detail bytes").expect("right should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_left = std::fs::canonicalize(&left).expect("left should canonicalize");
         let canonical_right = std::fs::canonicalize(&right).expect("right should canonicalize");
         let candidate =
@@ -2173,10 +2189,10 @@ mod tests {
         std::fs::write(&newer, b"new revision with different bytes").expect("newer should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         let canonical_newer = std::fs::canonicalize(&newer).expect("newer should canonicalize");
         let canonical_older = std::fs::canonicalize(&older).expect("older should canonicalize");
         let candidate =
@@ -2234,10 +2250,10 @@ mod tests {
         std::fs::write(&right, b"same private bytes").expect("right should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
-        scan_scope(&mut database, scope.id).expect("scope should scan");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
             .expect("active grant should persist");
+        scan_scope(&mut database, scope.id).expect("scope should scan");
         check_exact_duplicate(
             &mut database,
             scope.id,

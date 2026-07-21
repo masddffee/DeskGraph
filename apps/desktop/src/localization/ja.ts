@@ -557,6 +557,53 @@ export const ja = {
     error: 'ハード除外は確定されませんでした。ローカルのプライバシー消去完了とは表示しません。',
     sourceSafe: '元ファイルを移動、変更、削除しません。',
   },
+  rootRevocation: {
+    kicker: '対象範囲のアクセス',
+    heading: '許可済みルートを取り消す',
+    description:
+      '取り消すと、このルートに由来する DeskGraph のローカル索引データを恒久的に消去し、このランタイムのアクセス権も破棄します。元ファイルの移動、ゴミ箱への移動、削除は行いません。',
+    empty: '取り消せる有効な許可済みルートはありません。',
+    revoke: 'ルートを取り消す…',
+    previewHeading: 'ルート取り消しを確認',
+    exclusionCount: (count) => `${count} 件のハード除外をこのルートとともに削除します。`,
+    previewNotice:
+      '影響するローカル派生索引データを恒久的に消去し、このルートを DeskGraph から削除します。この画面から元に戻すことはできません。',
+    sourceSafe: '元ファイルの移動、変更、ゴミ箱への移動、削除は行いません。',
+    noAutomaticRead:
+      'この取り消されたルートに対して、新しいスキャン、抽出、OCR、embedding、その他のファイルシステム読み取りは開始されません。ほかの許可済みルートで進行中の処理は継続できます。',
+    impact: (
+      locations,
+      content,
+      graph,
+      candidates,
+      actionPlans,
+      cleanupActionPlans,
+      jobs,
+      actions,
+    ) =>
+      `確認後、ローカルで ${locations} 件の場所、${content} 件の内容／OCR チャンク、${graph} 件のグラフ事実、${candidates} 件の派生候補、${actionPlans} 件の名前変更／移動プレビュー、${cleanupActionPlans} 件の安全クリーンアッププレビュー、${jobs} 件の保留ジョブを消去します。${actions === 0 ? 'この取り消しを妨げる操作安全記録はありません。' : `${actions} 件の操作安全記録が取り消しを妨げており、それらは消去されません。`}`,
+    confirm: '取り消しを確定してローカル索引を消去',
+    loading: 'ローカル限定の取り消し確認を準備しています…',
+    confirming: 'ローカル対象範囲を安全に取り消しています…',
+    cancel: 'プレビューをキャンセル',
+    cancelled: '取り消しプレビューをキャンセルしました。このルートは許可されたままです。',
+    notConfirmable:
+      '操作ジャーナルの安全記録がこの取り消しを妨げており、消去されません。別途審査された復旧フローでの解決が必要で、待機や再試行だけでは解除できません。元ファイルは変更されていません。',
+    committed: (exclusions) =>
+      `ルートのアクセスを取り消してローカル派生データを消去しました。${exclusions} 件のハード除外もルートとともに削除しました。`,
+    refreshFailed: (exclusions) =>
+      `ルートのアクセスを取り消し、${exclusions} 件のハード除外を削除しましたが、ローカルダッシュボードの再読み込みに失敗しました。`,
+    watchSyncPending: (callbackRetired, runtimeStopped) =>
+      runtimeStopped
+        ? 'アクセスは取り消されました。ネイティブ callback を退役させ、キュー済みヒントを消去し、自動監視を完全に停止しました。ルートを再認証する前に DeskGraph を再起動してください。'
+        : callbackRetired
+          ? 'アクセスは取り消されました。ネイティブ callback は退役し、キュー済みヒントも消去しましたが、coordinator の停止は確認できていません。DeskGraph は OS の監視登録が閉じたとは報告しません。再認証前に再起動してください。'
+          : 'アクセスは取り消されました。新しい callback の受付を閉じ、キュー済みヒントを消去しましたが、実行中 callback と coordinator の停止は確認できていません。DeskGraph は OS の監視登録が閉じたとは報告しません。再認証前に再起動してください。',
+    stale:
+      'プレビューを開いている間にこのルートが変わりました。取り消しは適用されていません。現在のローカル対象範囲をもう一度確認してください。',
+    error:
+      '取り消しの最終状態を確認できませんでした。再試行する前にローカル対象範囲を再読み込みしてください。この操作で元ファイルは変更されていません。',
+  },
   footer: {
     version: (version) => `DeskGraph ${version}`,
     description: 'メタデータ + 制限付きローカルテキスト · アップロードなし · ファイル操作なし',

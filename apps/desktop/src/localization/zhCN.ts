@@ -516,6 +516,51 @@ export const zhCN = {
     error: '未确认硬性排除；不会报告本机隐私清除已完成。',
     sourceSafe: '不会移动、更改或删除源文件。',
   },
+  rootRevocation: {
+    kicker: '覆盖范围访问',
+    heading: '撤销已授权根目录',
+    description:
+      '撤销会永久清除这个根目录在 DeskGraph 衍生出的本机索引数据，并放弃此运行时访问能力；绝不移动、移至废纸篓或删除源文件。',
+    empty: '没有可撤销的有效已授权根目录。',
+    revoke: '撤销根目录…',
+    previewHeading: '查看根目录撤销',
+    exclusionCount: (count) => `${count} 个硬性排除项会随此根目录移除。`,
+    previewNotice:
+      '这会永久清除受影响的本机衍生索引数据，并从 DeskGraph 移除此根目录；无法在此页面撤销。',
+    sourceSafe: '不会移动、更改、移至废纸篓或删除源文件。',
+    noAutomaticRead:
+      '此次撤销不会为这个根目录开始新的扫描、提取、OCR、embedding 或其他文件系统读取；其他仍授权根目录的现有工作可以继续。',
+    impact: (
+      locations,
+      content,
+      graph,
+      candidates,
+      actionPlans,
+      cleanupActionPlans,
+      jobs,
+      actions,
+    ) =>
+      `确认后，本机将清除 ${locations} 个位置、${content} 个内容／OCR 块、${graph} 个图谱事实、${candidates} 个派生候选、${actionPlans} 个重命名／移动预览、${cleanupActionPlans} 个安全清理预览及 ${jobs} 个待处理任务。${actions === 0 ? '没有操作安全记录阻止此次撤销。' : `${actions} 条操作安全记录会阻止此次撤销，且不会被清除。`}`,
+    confirm: '确认撤销并清除本机索引',
+    loading: '正在准备仅限本机的撤销审阅…',
+    confirming: '正在安全撤销本机覆盖范围…',
+    cancel: '取消预览',
+    cancelled: '已取消撤销预览；此根目录仍保持授权。',
+    notConfirmable:
+      '操作 journal 安全记录会阻止此次撤销且不会被清除；必须通过另行审查的恢复流程处理，单纯等待或重试不足以解除。源文件未更改。',
+    committed: (exclusions) =>
+      `已撤销根目录访问并清除本机派生数据；${exclusions} 个硬性排除项也随根目录移除。`,
+    refreshFailed: (exclusions) =>
+      `已撤销根目录访问并移除 ${exclusions} 个硬性排除项，但本机仪表板刷新失败。`,
+    watchSyncPending: (callbackRetired, runtimeStopped) =>
+      runtimeStopped
+        ? '访问权已撤销。原生 callback 已退役、队列提示已清除，且自动监视已完全停止。再次授权任何根目录前，请先重新启动 DeskGraph。'
+        : callbackRetired
+          ? '访问权已撤销。原生 callback 已退役且队列提示已清除，但尚未确认 coordinator 停止；DeskGraph 不会声称操作系统监视注册已关闭。再次授权前请重新启动。'
+          : '访问权已撤销。新的 callback 已停止进入且队列提示已清除，但现有 callback 与 coordinator 停止均未确认；DeskGraph 不会声称操作系统监视注册已关闭。再次授权前请重新启动。',
+    stale: '预览打开期间此根目录已更改。未应用撤销；请重新查看当前本机覆盖范围。',
+    error: '无法确认撤销的最终状态。再次尝试前，请刷新本机覆盖范围；此次操作未更改任何源文件。',
+  },
   footer: {
     version: (version) => `DeskGraph ${version}`,
     description: '元数据 + 受限本机文本 · 不上传 · 不进行文件操作',

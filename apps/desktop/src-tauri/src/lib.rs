@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
     CleanupActionSelection, ManifestDatabase, ScopeExclusionImpactPreview, ScopeExclusionKind,
-    ScopeExclusionWrite,
+    ScopeExclusionWrite, ScopeRootRevocationPreview,
 };
 use deskgraph_domain::{
     ActionPlanPreview, ActionPlanSummary, AuthorizedScope, CleanupActionPlanPreview,
@@ -38,19 +38,20 @@ use deskgraph_projects::{
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at as run_search_at};
 use deskgraph_scanner::{
     CoverageRootAuthorizationRequest, MAX_COVERAGE_ROOTS_PER_SELECTION, ScopeExclusionSelection,
-    authorize_coverage_roots_with_access_grants, comparison_key, create_scan_job, pause_scan_job,
-    prepare_scope_exclusion_batch, resume_scan_job, run_scan_job_batch, validated_scope_root,
+    authorize_coverage_roots_with_access_grants, comparison_key, create_scan_job_with_active_grant,
+    pause_scan_job, prepare_scope_exclusion_batch_with_active_grant,
+    prepare_scope_exclusion_batch_with_revocation_fence, resume_scan_job_with_active_grant,
+    run_scan_job_batch_with_active_grant, validated_scope_root,
 };
 #[cfg(test)]
-use deskgraph_scanner::{
-    authorize_scope, authorize_scope_with_access_grant, run_scan_job_to_terminal,
-};
+use deskgraph_scanner::{authorize_scope_with_access_grant, run_scan_job_to_terminal};
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{
     create_cleanup_preview_at, create_rename_preview_at, recent_action_plans_at,
 };
 use deskgraph_watcher::{
-    NativeWatchEventSource, PollingWatchPolicy, WatchCoordinator, WatchPolicy,
+    NativeWatchCallbackRetirement, NativeWatchEventSource, NativeWatchSynchronizationBarrier,
+    PollingWatchPolicy, WatchCoordinator, WatchPolicy,
     recent_watch_events_at as read_recent_watch_events_at,
 };
 use scope_access::{ActiveScopeAccess, prepare_selected_scope, restore_scope_access};
@@ -63,22 +64,30 @@ const WATCH_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const WATCH_RUNTIME_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 const WATCH_NATIVE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const WATCH_GATE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const WATCH_NATIVE_SYNCHRONIZATION_TIMEOUT: Duration = Duration::from_secs(2);
 const FOREGROUND_SCAN_BATCH_SIZE: usize = 256;
 const WATCH_ADAPTER_NATIVE: &str = "native_with_periodic_reconciliation";
 const WATCH_ADAPTER_PERIODIC_ONLY: &str = "periodic_reconciliation_only";
 const MAX_PENDING_HARD_EXCLUSION_PREVIEWS: usize = 16;
 const HARD_EXCLUSION_PREVIEW_TTL_MS: i64 = 5 * 60 * 1_000;
 static HARD_EXCLUSION_PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_PENDING_SCOPE_ROOT_REVOCATION_PREVIEWS: usize = 16;
+const SCOPE_ROOT_REVOCATION_PREVIEW_TTL_MS: i64 = 5 * 60 * 1_000;
+static SCOPE_ROOT_REVOCATION_PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct ManifestState {
     database_path: PathBuf,
     database_gate: Arc<Mutex<()>>,
+    path_read_gate: Arc<Mutex<()>>,
     watch_status: Arc<Mutex<WatchRuntimeStatus>>,
     watch_stop: Arc<AtomicBool>,
     watch_wake: SyncSender<()>,
+    native_watch_sync: NativeWatchSynchronizationBarrier,
+    native_watch_callback_retirement: NativeWatchCallbackRetirement,
     watch_thread: Mutex<Option<JoinHandle<()>>>,
-    scope_accesses: Arc<Mutex<HashMap<i64, ActiveScopeAccess>>>,
+    scope_accesses: Arc<Mutex<HashMap<i64, Arc<ActiveScopeAccess>>>>,
     hard_exclusion_previews: Mutex<HardExclusionPreviewRegistry>,
+    scope_root_revocation_previews: Mutex<ScopeRootRevocationPreviewRegistry>,
 }
 
 /// This is deliberately the only IPC-selectable kind. The WebView chooses a
@@ -135,6 +144,13 @@ struct HardExclusionImpactResponse {
     content_chunk_count: u64,
     graph_fact_count: u64,
     derived_candidate_count: u64,
+    /// Durable rename/move preview plans. These are deliberately reported
+    /// separately from graph-derived candidates so a privacy purge is not
+    /// mistaken for an operation on the source files.
+    action_plan_count: u64,
+    /// Smart Cleanup preview plans, also distinct from graph-derived
+    /// candidates and never an instruction to trash a source file.
+    cleanup_action_plan_count: u64,
     pending_job_count: u64,
     blocking_action_count: u64,
 }
@@ -151,6 +167,35 @@ struct HardExclusionCommitResponse {
     automatic_extractions_started: u64,
 }
 
+#[derive(Serialize)]
+struct ScopeRootRevocationPreviewResponse {
+    api_version: &'static str,
+    preview_id: String,
+    scope_id: i64,
+    base_policy_revision: i64,
+    expires_at_unix_ms: i64,
+    impact: HardExclusionImpactResponse,
+    exclusion_count: u64,
+    confirmable: bool,
+    source_files_will_change: bool,
+}
+
+#[derive(Serialize)]
+struct ScopeRootRevocationCommitResponse {
+    api_version: &'static str,
+    scope_id: i64,
+    policy_revision: i64,
+    purged: HardExclusionImpactResponse,
+    exclusions_removed: u64,
+    runtime_capability_dropped: bool,
+    native_watch_sync_confirmed: bool,
+    native_watch_callback_retired: bool,
+    watch_runtime_stopped: bool,
+    source_files_changed: bool,
+    revoked_scope_scans_started: u64,
+    revoked_scope_extractions_started: u64,
+}
+
 /// Path- and identity-bearing picker state never crosses IPC or ordinary
 /// logging. It exists only until a one-time Settings confirmation.
 struct PendingHardExclusionPreview {
@@ -165,6 +210,18 @@ struct PendingHardExclusionPreview {
 #[derive(Default)]
 struct HardExclusionPreviewRegistry {
     entries: HashMap<String, PendingHardExclusionPreview>,
+    insertion_order: VecDeque<String>,
+}
+
+struct PendingScopeRootRevocationPreview {
+    database_preview: ScopeRootRevocationPreview,
+    expires_at_unix_ms: i64,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct ScopeRootRevocationPreviewRegistry {
+    entries: HashMap<String, PendingScopeRootRevocationPreview>,
     insertion_order: VecDeque<String>,
 }
 
@@ -250,11 +307,32 @@ fn lock_database(state: &ManifestState) -> Result<MutexGuard<'_, ()>, String> {
 
 fn lock_scope_accesses(
     state: &ManifestState,
-) -> Result<MutexGuard<'_, HashMap<i64, ActiveScopeAccess>>, String> {
+) -> Result<MutexGuard<'_, HashMap<i64, Arc<ActiveScopeAccess>>>, String> {
     state
         .scope_accesses
         .lock()
         .map_err(|_| "scope_access_registry_poisoned".to_string())
+}
+
+fn lock_path_read_gate(gate: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // The fence carries no user data or mutable product state. A panic
+            // has already unwound and closed the provider's owned handles, so
+            // recovery is safer than permanently disabling privacy withdrawal
+            // until process restart.
+            error!(
+                event = "path_read_gate_recovered",
+                error_code = "path_read_gate_poisoned"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn lock_path_reads(state: &ManifestState) -> MutexGuard<'_, ()> {
+    lock_path_read_gate(&state.path_read_gate)
 }
 
 fn lock_hard_exclusion_previews(
@@ -266,11 +344,28 @@ fn lock_hard_exclusion_previews(
         .map_err(|_| "hard_exclusion_preview_registry_poisoned".to_string())
 }
 
+fn lock_scope_root_revocation_previews(
+    state: &ManifestState,
+) -> Result<MutexGuard<'_, ScopeRootRevocationPreviewRegistry>, String> {
+    state
+        .scope_root_revocation_previews
+        .lock()
+        .map_err(|_| "scope_root_revocation_preview_registry_poisoned".to_string())
+}
+
 fn hard_exclusion_now_unix_ms() -> Result<i64, String> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "hard_exclusion_clock_unavailable".to_string())?;
     i64::try_from(elapsed.as_millis()).map_err(|_| "hard_exclusion_clock_unavailable".to_string())
+}
+
+fn scope_root_revocation_now_unix_ms() -> Result<i64, String> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "scope_root_revocation_clock_unavailable".to_string())?;
+    i64::try_from(elapsed.as_millis())
+        .map_err(|_| "scope_root_revocation_clock_unavailable".to_string())
 }
 
 fn hard_exclusion_preview_id(now_unix_ms: i64) -> String {
@@ -280,6 +375,11 @@ fn hard_exclusion_preview_id(now_unix_ms: i64) -> String {
     // consumes it once and still revalidates the active grant, policy revision,
     // selected source identity/kind, and database transaction fence.
     format!("hep-{:x}-{:x}", now_unix_ms, sequence)
+}
+
+fn scope_root_revocation_preview_id(now_unix_ms: i64) -> String {
+    let sequence = SCOPE_ROOT_REVOCATION_PREVIEW_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("srrp-{:x}-{:x}", now_unix_ms, sequence)
 }
 
 impl HardExclusionPreviewRegistry {
@@ -327,6 +427,64 @@ impl HardExclusionPreviewRegistry {
         self.entries.remove(preview_id);
         self.insertion_order.retain(|id| id != preview_id);
     }
+
+    fn discard_scope(&mut self, scope_id: i64) {
+        self.entries
+            .retain(|_, preview| preview.scope_id != scope_id);
+        self.insertion_order
+            .retain(|preview_id| self.entries.contains_key(preview_id));
+    }
+}
+
+impl ScopeRootRevocationPreviewRegistry {
+    fn discard_expired_at(&mut self, now: Instant) {
+        self.entries.retain(|_, preview| preview.expires_at > now);
+        self.insertion_order
+            .retain(|preview_id| self.entries.contains_key(preview_id));
+    }
+
+    fn insert_at(&mut self, preview: PendingScopeRootRevocationPreview, now: Instant) -> String {
+        self.discard_expired_at(now);
+        while self.entries.len() >= MAX_PENDING_SCOPE_ROOT_REVOCATION_PREVIEWS {
+            let Some(expired_or_oldest) = self.insertion_order.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&expired_or_oldest);
+        }
+        let preview_id = scope_root_revocation_preview_id(preview.expires_at_unix_ms);
+        self.insertion_order.push_back(preview_id.clone());
+        self.entries.insert(preview_id.clone(), preview);
+        preview_id
+    }
+
+    fn take_for_confirmation_at(
+        &mut self,
+        preview_id: &str,
+        now: Instant,
+    ) -> Result<PendingScopeRootRevocationPreview, &'static str> {
+        let preview = self
+            .entries
+            .remove(preview_id)
+            .ok_or("scope_root_revocation_preview_not_found")?;
+        self.insertion_order.retain(|id| id != preview_id);
+        if preview.expires_at <= now {
+            return Err("scope_root_revocation_preview_expired");
+        }
+        Ok(preview)
+    }
+
+    fn discard(&mut self, preview_id: &str) {
+        self.entries.remove(preview_id);
+        self.insertion_order.retain(|id| id != preview_id);
+    }
+
+    fn discard_scope(&mut self, scope_id: i64) {
+        self.entries
+            .retain(|_, preview| preview.database_preview.scope_id != scope_id);
+        self.insertion_order
+            .retain(|preview_id| self.entries.contains_key(preview_id));
+    }
 }
 
 fn scope_exclusion_kind_name(kind: ScopeExclusionKind) -> &'static str {
@@ -336,9 +494,7 @@ fn scope_exclusion_kind_name(kind: ScopeExclusionKind) -> &'static str {
     }
 }
 
-fn map_hard_exclusion_impact(
-    impact: ScopeExclusionImpactPreview,
-) -> Result<HardExclusionImpactResponse, String> {
+fn map_hard_exclusion_impact(impact: ScopeExclusionImpactPreview) -> HardExclusionImpactResponse {
     // Relations are derived candidates rather than graph facts. Action and
     // Cleanup records are plans, likewise not candidates. Action safety
     // records that cannot be removed under ADR-033 are reported separately.
@@ -349,18 +505,41 @@ fn map_hard_exclusion_impact(
         impact.screenshot_group_count,
     ]
     .into_iter()
-    .try_fold(0_u64, |total, value| total.checked_add(value))
-    .ok_or("hard_exclusion_impact_out_of_range")?;
-    Ok(HardExclusionImpactResponse {
+    .fold(0_u64, u64::saturating_add);
+    HardExclusionImpactResponse {
         // Conservative location count also covers same-scope hard-link
         // withholding; reporting only direct rows would understate the purge.
         location_count: impact.conservative_location_count,
         content_chunk_count: impact.content_chunk_count,
         graph_fact_count,
         derived_candidate_count,
+        action_plan_count: impact.action_plan_count,
+        cleanup_action_plan_count: impact.cleanup_action_plan_count,
         pending_job_count: impact.pending_job_count,
         blocking_action_count: impact.blocking_action_count,
-    })
+    }
+}
+
+fn with_active_scope_read_fence<T>(
+    path_read_gate: &Mutex<()>,
+    scope_accesses: &Mutex<HashMap<i64, Arc<ActiveScopeAccess>>>,
+    scope_id: i64,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _path_read_guard = lock_path_read_gate(path_read_gate);
+    let access = {
+        let scope_guard = scope_accesses
+            .lock()
+            .map_err(|_| "scope_access_registry_poisoned".to_string())?;
+        Arc::clone(
+            scope_guard
+                .get(&scope_id)
+                .ok_or("scope_reauthorization_required")?,
+        )
+    };
+    let result = operation();
+    drop(access);
+    result
 }
 
 fn require_active_scope(state: &ManifestState, scope_id: i64) -> Result<(), String> {
@@ -407,6 +586,80 @@ fn wake_watch_runtime(state: &ManifestState) {
     notify_watch_wake(&state.watch_wake);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WatchRuntimeRetirementOutcome {
+    native_watch_callback_retired: bool,
+    watch_runtime_stopped: bool,
+}
+
+/// A revocation has already committed when this path is reached, so it must
+/// never turn that durable privacy withdrawal into an IPC error.  Callback
+/// admission is closed and its path queue is cleared *before* the coordinator
+/// is stopped.  This is the fail-closed boundary when a platform watcher or
+/// coordinator cannot be joined promptly.
+fn retire_watch_runtime_after_revocation_timeout(
+    state: &ManifestState,
+) -> WatchRuntimeRetirementOutcome {
+    let mut native_watch_callback_retired = state
+        .native_watch_callback_retirement
+        .retire_and_clear(WATCH_RUNTIME_SHUTDOWN_TIMEOUT);
+    state.watch_stop.store(true, Ordering::Release);
+    wake_watch_runtime(state);
+
+    let Ok(mut watch_thread) = state.watch_thread.lock() else {
+        error!(
+            event = "watch_runtime_revocation_shutdown_lock_failed",
+            error_code = "watch_runtime_revocation_shutdown_lock_failed"
+        );
+        return WatchRuntimeRetirementOutcome {
+            native_watch_callback_retired,
+            watch_runtime_stopped: false,
+        };
+    };
+    let Some(handle) = watch_thread.as_ref() else {
+        return WatchRuntimeRetirementOutcome {
+            native_watch_callback_retired,
+            watch_runtime_stopped: true,
+        };
+    };
+    let deadline = Instant::now() + WATCH_RUNTIME_SHUTDOWN_TIMEOUT;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(WATCH_RUNTIME_SHUTDOWN_POLL);
+    }
+    if !handle.is_finished() {
+        error!(
+            event = "watch_runtime_revocation_shutdown_timed_out",
+            error_code = "watch_runtime_revocation_shutdown_timed_out"
+        );
+        return WatchRuntimeRetirementOutcome {
+            native_watch_callback_retired,
+            watch_runtime_stopped: false,
+        };
+    }
+    let handle = watch_thread
+        .take()
+        .expect("finished watch thread should still have a handle");
+    if handle.join().is_err() {
+        error!(
+            event = "watch_runtime_revocation_shutdown_panicked",
+            error_code = "watch_runtime_revocation_shutdown_panicked"
+        );
+        return WatchRuntimeRetirementOutcome {
+            native_watch_callback_retired,
+            watch_runtime_stopped: false,
+        };
+    }
+    if !native_watch_callback_retired {
+        native_watch_callback_retired = state
+            .native_watch_callback_retirement
+            .retire_and_clear(Duration::ZERO);
+    }
+    WatchRuntimeRetirementOutcome {
+        native_watch_callback_retired,
+        watch_runtime_stopped: true,
+    }
+}
+
 #[cfg(test)]
 fn start_manifest_state(database_path: PathBuf) -> ManifestState {
     start_manifest_state_with_accesses(database_path, HashMap::new())
@@ -418,8 +671,10 @@ struct WatchCoordinatorRuntime {
     stop: Arc<AtomicBool>,
     wake: SyncSender<()>,
     wake_receiver: Receiver<()>,
+    native_watch_sync: NativeWatchSynchronizationBarrier,
+    native_watch_callback_retirement: NativeWatchCallbackRetirement,
     status: Arc<Mutex<WatchRuntimeStatus>>,
-    scope_accesses: Arc<Mutex<HashMap<i64, ActiveScopeAccess>>>,
+    scope_accesses: Arc<Mutex<HashMap<i64, Arc<ActiveScopeAccess>>>>,
     polling_policy: PollingWatchPolicy,
 }
 
@@ -428,8 +683,11 @@ fn start_manifest_state_with_accesses(
     scope_accesses: HashMap<i64, ActiveScopeAccess>,
 ) -> ManifestState {
     let database_gate = Arc::new(Mutex::new(()));
+    let path_read_gate = Arc::new(Mutex::new(()));
     let watch_stop = Arc::new(AtomicBool::new(false));
     let (watch_wake, watch_wake_receiver) = sync_channel(1);
+    let native_watch_sync = NativeWatchSynchronizationBarrier::default();
+    let native_watch_callback_retirement = NativeWatchCallbackRetirement::default();
     let polling_policy = PollingWatchPolicy::default();
     let watch_status = Arc::new(Mutex::new(WatchRuntimeStatus::starting(polling_policy)));
     let thread_database_path = database_path.clone();
@@ -437,7 +695,12 @@ fn start_manifest_state_with_accesses(
     let thread_watch_stop = Arc::clone(&watch_stop);
     let thread_watch_wake = watch_wake.clone();
     let thread_watch_status = Arc::clone(&watch_status);
-    let scope_accesses = Arc::new(Mutex::new(scope_accesses));
+    let scope_accesses = Arc::new(Mutex::new(
+        scope_accesses
+            .into_iter()
+            .map(|(scope_id, access)| (scope_id, Arc::new(access)))
+            .collect(),
+    ));
     let thread_scope_accesses = Arc::clone(&scope_accesses);
     let runtime = WatchCoordinatorRuntime {
         database_path: thread_database_path,
@@ -445,6 +708,8 @@ fn start_manifest_state_with_accesses(
         stop: thread_watch_stop,
         wake: thread_watch_wake,
         wake_receiver: watch_wake_receiver,
+        native_watch_sync: native_watch_sync.clone(),
+        native_watch_callback_retirement: native_watch_callback_retirement.clone(),
         status: thread_watch_status,
         scope_accesses: thread_scope_accesses,
         polling_policy,
@@ -466,12 +731,16 @@ fn start_manifest_state_with_accesses(
     ManifestState {
         database_path,
         database_gate,
+        path_read_gate,
         watch_status,
         watch_stop,
         watch_wake,
+        native_watch_sync,
+        native_watch_callback_retirement,
         watch_thread: Mutex::new(watch_thread),
         scope_accesses,
         hard_exclusion_previews: Mutex::new(HardExclusionPreviewRegistry::default()),
+        scope_root_revocation_previews: Mutex::new(ScopeRootRevocationPreviewRegistry::default()),
     }
 }
 
@@ -482,6 +751,8 @@ fn run_watch_coordinator(runtime: WatchCoordinatorRuntime) {
         stop,
         wake,
         wake_receiver,
+        native_watch_sync,
+        native_watch_callback_retirement,
         status,
         scope_accesses,
         polling_policy,
@@ -510,6 +781,8 @@ fn run_watch_coordinator(runtime: WatchCoordinatorRuntime) {
     let mut reconcile_after_native_change = false;
 
     while !stop.load(Ordering::Acquire) {
+        let native_synchronization_pass = native_watch_sync.begin_pass();
+        let registration_only_pass = native_watch_sync.has_pending(native_synchronization_pass);
         let runtime_active_scope_ids = match scope_accesses.lock() {
             Ok(accesses) => accesses.keys().copied().collect::<Vec<_>>(),
             Err(_) => {
@@ -521,11 +794,15 @@ fn run_watch_coordinator(runtime: WatchCoordinatorRuntime) {
             }
         };
         coordinator.replace_runtime_active_scope_ids(runtime_active_scope_ids);
-        if native_source.is_none() && Instant::now() >= next_native_retry {
+        if !registration_only_pass && native_source.is_none() && Instant::now() >= next_native_retry
+        {
             let callback_wake = wake.clone();
-            match NativeWatchEventSource::new(Arc::new(move || {
-                notify_watch_wake(&callback_wake);
-            })) {
+            match NativeWatchEventSource::new_with_retirement(
+                Arc::new(move || {
+                    notify_watch_wake(&callback_wake);
+                }),
+                native_watch_callback_retirement.clone(),
+            ) {
                 Ok(source) => {
                     native_source = Some(source);
                     native_error = None;
@@ -542,14 +819,29 @@ fn run_watch_coordinator(runtime: WatchCoordinatorRuntime) {
             match coordinator.synchronize_native_event_source(source) {
                 Ok(changed) => {
                     reconcile_after_native_change |= changed;
+                    native_watch_sync.acknowledge(native_synchronization_pass);
                 }
                 Err(_) => {
                     native_source = None;
                     native_error = Some("watch_native_adapter_unavailable");
                     next_native_retry = Instant::now() + WATCH_NATIVE_RETRY_INTERVAL;
                     reconcile_after_native_change = true;
+                    // Dropping the failed source closes all of its native
+                    // registrations. There is no stale subscription left to
+                    // wait for, even though the adapter is now degraded.
+                    native_watch_sync.acknowledge(native_synchronization_pass);
                 }
             }
+        } else {
+            // No native source means there is no OS registration to retire.
+            native_watch_sync.acknowledge(native_synchronization_pass);
+        }
+
+        if registration_only_pass {
+            // A privacy-withdrawal wake is an immediate native-registration
+            // barrier only. It cannot retry an adapter, request a remaining-
+            // scope reconciliation, or run the polling scheduler in this pass.
+            continue;
         }
 
         let cycle = match database_gate.try_lock() {
@@ -787,6 +1079,215 @@ fn coverage_policy_detail(
     })
 }
 
+#[tauri::command]
+fn preview_scope_root_revocation(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+) -> Result<ScopeRootRevocationPreviewResponse, String> {
+    preview_scope_root_revocation_for_state(&state, scope_id)
+}
+
+fn preview_scope_root_revocation_for_state(
+    state: &ManifestState,
+    scope_id: i64,
+) -> Result<ScopeRootRevocationPreviewResponse, String> {
+    let now_unix_ms = scope_root_revocation_now_unix_ms()?;
+    let expires_at_unix_ms = now_unix_ms
+        .checked_add(SCOPE_ROOT_REVOCATION_PREVIEW_TTL_MS)
+        .ok_or("scope_root_revocation_clock_unavailable")?;
+    let expires_at = Instant::now()
+        .checked_add(Duration::from_millis(
+            SCOPE_ROOT_REVOCATION_PREVIEW_TTL_MS as u64,
+        ))
+        .ok_or("scope_root_revocation_clock_unavailable")?;
+    let _database_guard = lock_database(state)?;
+    let scope_guard = lock_scope_accesses(state)?;
+    if !scope_guard.contains_key(&scope_id) {
+        return Err("scope_reauthorization_required".to_string());
+    }
+    let database = ManifestDatabase::open(&state.database_path).map_err(|error| error.code())?;
+    let binding = database
+        .bind_scope_policy_revision(scope_id)
+        .map_err(|error| error.code())?;
+    let preview = database
+        .preview_scope_root_revocation(binding)
+        .map_err(|error| error.code().to_string())?;
+    let impact = map_hard_exclusion_impact(preview.impact);
+    let confirmable = impact.blocking_action_count == 0;
+    drop(scope_guard);
+    let preview_id = lock_scope_root_revocation_previews(state)?.insert_at(
+        PendingScopeRootRevocationPreview {
+            database_preview: preview,
+            expires_at_unix_ms,
+            expires_at,
+        },
+        Instant::now(),
+    );
+    Ok(ScopeRootRevocationPreviewResponse {
+        api_version: "deskgraph.scope-root-revocation-preview.v1",
+        preview_id,
+        scope_id,
+        base_policy_revision: preview.base_policy_revision,
+        expires_at_unix_ms,
+        impact,
+        exclusion_count: preview.exclusion_count,
+        confirmable,
+        source_files_will_change: false,
+    })
+}
+
+#[tauri::command]
+fn confirm_scope_root_revocation(
+    state: State<'_, ManifestState>,
+    preview_id: String,
+) -> Result<ScopeRootRevocationCommitResponse, String> {
+    confirm_scope_root_revocation_for_state(&state, preview_id)
+}
+
+fn confirm_scope_root_revocation_for_state(
+    state: &ManifestState,
+    preview_id: String,
+) -> Result<ScopeRootRevocationCommitResponse, String> {
+    if preview_id.is_empty() || preview_id.len() > 128 {
+        return Err("scope_root_revocation_preview_not_found".to_string());
+    }
+    let pending = lock_scope_root_revocation_previews(state)?
+        .take_for_confirmation_at(&preview_id, Instant::now())
+        .map_err(str::to_string)?;
+
+    // Lock order is process read gate -> database gate -> runtime registry ->
+    // cross-process scope fence -> SQLite mutation. The first gate drains
+    // in-process work; the scope fence then drains cooperating CLI/Desktop
+    // readers before the privacy commit and capability drop.
+    let _path_read_guard = lock_path_reads(state);
+    let _database_guard = lock_database(state)?;
+    let mut scope_guard = lock_scope_accesses(state)?;
+    if !scope_guard.contains_key(&pending.database_preview.scope_id) {
+        return Err("scope_reauthorization_required".to_string());
+    }
+    if pending.expires_at <= Instant::now() {
+        return Err("scope_root_revocation_preview_expired".to_string());
+    }
+    let now_unix_ms = scope_root_revocation_now_unix_ms()?;
+    let database = ManifestDatabase::open(&state.database_path).map_err(|error| error.code())?;
+    // This cross-process advisory fence drains any CLI or Desktop filesystem
+    // read that started before revocation. It is acquired before the SQLite
+    // mutation and remains held until the runtime capability is dropped.
+    let filesystem_revocation_fence = database
+        .acquire_scope_filesystem_revocation_fence(pending.database_preview.scope_id)
+        .map_err(|error| error.code())?;
+    let binding = database
+        .bind_scope_policy_revision(pending.database_preview.scope_id)
+        .map_err(|error| error.code())?;
+    if binding.revision != pending.database_preview.base_policy_revision {
+        return Err("scope_policy_changed".to_string());
+    }
+    let applied = database
+        .apply_scope_root_revocation_from_preview_with_fence(
+            &filesystem_revocation_fence,
+            pending.database_preview,
+            now_unix_ms,
+        )
+        .map_err(|error| error.code().to_string())?;
+    let purged = map_hard_exclusion_impact(applied.purged);
+    // Request while the registry lock is still held. Any Watch pass that can
+    // acknowledge this ticket must therefore read the registry only after the
+    // revoked capability has been removed below.
+    let native_watch_ticket = state.native_watch_sync.request();
+    let access = scope_guard.remove(&pending.database_preview.scope_id);
+    drop(access);
+    match state.hard_exclusion_previews.lock() {
+        Ok(mut previews) => previews.discard_scope(pending.database_preview.scope_id),
+        Err(poisoned) => {
+            error!(
+                event = "hard_exclusion_preview_cleanup_recovered",
+                error_code = "hard_exclusion_preview_registry_poisoned"
+            );
+            poisoned
+                .into_inner()
+                .discard_scope(pending.database_preview.scope_id);
+        }
+    }
+    match state.scope_root_revocation_previews.lock() {
+        Ok(mut previews) => previews.discard_scope(pending.database_preview.scope_id),
+        Err(poisoned) => {
+            error!(
+                event = "scope_root_revocation_preview_cleanup_recovered",
+                error_code = "scope_root_revocation_preview_registry_poisoned"
+            );
+            poisoned
+                .into_inner()
+                .discard_scope(pending.database_preview.scope_id);
+        }
+    }
+    drop(scope_guard);
+    drop(_database_guard);
+    drop(_path_read_guard);
+    wake_watch_runtime(state);
+    // Revocation is already durably committed at this point. A native
+    // registration acknowledgement timeout is therefore a fail-closed
+    // post-commit condition, not a failed mutation: immediately terminate the
+    // entire coordinator so its native source is dropped. The UI must require
+    // a restart rather than imply that automatic monitoring remains active.
+    let native_watch_sync_confirmed = state
+        .native_watch_sync
+        .wait_for(native_watch_ticket, WATCH_NATIVE_SYNCHRONIZATION_TIMEOUT);
+    let watch_retirement = if native_watch_sync_confirmed {
+        WatchRuntimeRetirementOutcome {
+            native_watch_callback_retired: false,
+            watch_runtime_stopped: false,
+        }
+    } else {
+        let outcome = retire_watch_runtime_after_revocation_timeout(state);
+        error!(
+            event = "scope_root_revocation_native_watch_sync_timed_out",
+            error_code = "scope_root_revocation_native_watch_sync_timed_out",
+            native_watch_callback_retired = outcome.native_watch_callback_retired,
+            watch_runtime_stopped = outcome.watch_runtime_stopped
+        );
+        outcome
+    };
+    let response = ScopeRootRevocationCommitResponse {
+        api_version: "deskgraph.scope-root-revocation-commit.v1",
+        scope_id: applied.policy.scope_id,
+        policy_revision: applied.policy.revision,
+        purged,
+        exclusions_removed: applied.receipt.exclusions_removed,
+        runtime_capability_dropped: true,
+        native_watch_sync_confirmed,
+        native_watch_callback_retired: watch_retirement.native_watch_callback_retired,
+        watch_runtime_stopped: watch_retirement.watch_runtime_stopped,
+        source_files_changed: false,
+        revoked_scope_scans_started: 0,
+        revoked_scope_extractions_started: 0,
+    };
+    info!(
+        event = "scope_root_revoked",
+        scope_id = response.scope_id,
+        policy_revision = response.policy_revision,
+        exclusions_removed = response.exclusions_removed,
+        runtime_capability_dropped = true,
+        native_watch_sync_confirmed,
+        native_watch_callback_retired = response.native_watch_callback_retired,
+        watch_runtime_stopped = response.watch_runtime_stopped,
+        source_files_changed = false,
+        revoked_scope_scans_started = 0_u64,
+        revoked_scope_extractions_started = 0_u64
+    );
+    Ok(response)
+}
+
+#[tauri::command]
+fn discard_scope_root_revocation(
+    state: State<'_, ManifestState>,
+    preview_id: String,
+) -> Result<(), String> {
+    if preview_id.len() <= 128 {
+        lock_scope_root_revocation_previews(&state)?.discard(&preview_id);
+    }
+    Ok(())
+}
+
 /// Opens a native multi-file or multi-folder picker. The selected paths remain
 /// in this process, are revalidated by the scanner, and are never command
 /// arguments or response identifiers.
@@ -843,8 +1344,9 @@ fn select_hard_exclusions_preview_from_native_paths(
             requested_path: path.as_path(),
         })
         .collect::<Vec<_>>();
-    let prepared = prepare_scope_exclusion_batch(&database, scope_id, &selections)
-        .map_err(|error| error.code().to_string())?;
+    let prepared =
+        prepare_scope_exclusion_batch_with_active_grant(&database, scope_id, &selections)
+            .map_err(|error| error.code().to_string())?;
     if prepared
         .exclusions
         .iter()
@@ -867,7 +1369,7 @@ fn select_hard_exclusions_preview_from_native_paths(
     let impact = database
         .preview_scope_exclusion_batch(binding, &writes)
         .map_err(|error| error.code().to_string())?;
-    let impact = map_hard_exclusion_impact(impact)?;
+    let impact = map_hard_exclusion_impact(impact);
     let confirmable = impact.blocking_action_count == 0;
     let items = prepared
         .exclusions
@@ -915,14 +1417,29 @@ fn confirm_hard_exclusion_preview_for_state(
     if preview_id.is_empty() || preview_id.len() > 128 {
         return Err("hard_exclusion_preview_not_found".to_string());
     }
-    let now_unix_ms = hard_exclusion_now_unix_ms()?;
     let pending = lock_hard_exclusion_previews(state)?
         .take_for_confirmation_at(&preview_id, Instant::now())
         .map_err(str::to_string)?;
     require_active_scope(state, pending.scope_id)?;
+    let _path_read_guard = lock_path_reads(state);
     let _database_guard = lock_database(state)?;
+    let active_access = {
+        let scope_guard = lock_scope_accesses(state)?;
+        Arc::clone(
+            scope_guard
+                .get(&pending.scope_id)
+                .ok_or("scope_reauthorization_required")?,
+        )
+    };
+    if pending.expires_at <= Instant::now() {
+        return Err("hard_exclusion_preview_expired".to_string());
+    }
+    let now_unix_ms = hard_exclusion_now_unix_ms()?;
     let mut database =
         ManifestDatabase::open(&state.database_path).map_err(|error| error.code())?;
+    let cross_process_policy_fence = database
+        .acquire_scope_filesystem_revocation_fence(pending.scope_id)
+        .map_err(|error| error.code())?;
     let binding = database
         .bind_scope_policy_revision(pending.scope_id)
         .map_err(|error| error.code())?;
@@ -937,8 +1454,13 @@ fn confirm_hard_exclusion_preview_for_state(
             requested_path: exclusion.resolved_path.as_path(),
         })
         .collect::<Vec<_>>();
-    let revalidated = prepare_scope_exclusion_batch(&database, pending.scope_id, &selections)
-        .map_err(|error| error.code().to_string())?;
+    let revalidated = prepare_scope_exclusion_batch_with_revocation_fence(
+        &database,
+        &cross_process_policy_fence,
+        pending.scope_id,
+        &selections,
+    )
+    .map_err(|error| error.code().to_string())?;
     if revalidated.exclusions.len() != pending.prepared.exclusions.len()
         || revalidated
             .exclusions
@@ -968,9 +1490,14 @@ fn confirm_hard_exclusion_preview_for_state(
     // inside its BEGIN IMMEDIATE transaction; this is the authoritative race
     // fence, not the advisory preview above.
     let applied = database
-        .apply_scope_exclusion_batch(binding, &writes, now_unix_ms)
+        .apply_scope_exclusion_batch_with_fence(
+            &cross_process_policy_fence,
+            binding,
+            &writes,
+            now_unix_ms,
+        )
         .map_err(|error| error.code().to_string())?;
-    let purge = map_hard_exclusion_impact(applied.purged)?;
+    let purge = map_hard_exclusion_impact(applied.purged);
     let response = HardExclusionCommitResponse {
         api_version: "deskgraph.hard-exclusion-commit.v1",
         scope_id: applied.policy.scope_id,
@@ -981,7 +1508,9 @@ fn confirm_hard_exclusion_preview_for_state(
         automatic_scans_started: 0,
         automatic_extractions_started: 0,
     };
+    drop(active_access);
     drop(_database_guard);
+    drop(_path_read_guard);
     // Do not wake the ordinary Watch coordinator here: its wake signal can
     // enter a general reconciliation cycle, which would contradict this IPC
     // contract's explicit zero automatic scans/extractions. The committed
@@ -1076,7 +1605,7 @@ async fn select_and_authorize_scopes(
     drop(requests);
     let mut replaced_accesses = Vec::new();
     for (scope, prepared) in scopes.iter().zip(prepared) {
-        if let Some(replaced) = active_accesses.insert(scope.id, prepared.access) {
+        if let Some(replaced) = active_accesses.insert(scope.id, Arc::new(prepared.access)) {
             replaced_accesses.push(replaced);
         }
     }
@@ -1208,8 +1737,13 @@ async fn run_content_extraction_job(
         require_content_extraction_job(&state.database_path, job_id).map_err(str::to_string)?;
     require_active_scope(&state, pending.scope_id)?;
     let database_path = state.database_path.clone();
+    let path_read_gate = Arc::clone(&state.path_read_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let scope_id = pending.scope_id;
     let progress = tauri::async_runtime::spawn_blocking(move || {
-        run_content_extraction_job_at(&database_path, job_id).map_err(str::to_string)
+        with_active_scope_read_fence(&path_read_gate, &scope_accesses, scope_id, || {
+            run_content_extraction_job_at(&database_path, job_id).map_err(str::to_string)
+        })
     })
     .await
     .map_err(|_| "content_extraction_worker_failed".to_string())??;
@@ -1243,8 +1777,13 @@ async fn run_screenshot_ocr_job(
         require_screenshot_ocr_job(&state.database_path, job_id).map_err(str::to_string)?;
     require_active_scope(&state, pending.scope_id)?;
     let database_path = state.database_path.clone();
+    let path_read_gate = Arc::clone(&state.path_read_gate);
+    let scope_accesses = Arc::clone(&state.scope_accesses);
+    let scope_id = pending.scope_id;
     let progress = tauri::async_runtime::spawn_blocking(move || {
-        run_screenshot_ocr_job_at(&database_path, job_id).map_err(str::to_string)
+        with_active_scope_read_fence(&path_read_gate, &scope_accesses, scope_id, || {
+            run_screenshot_ocr_job_at(&database_path, job_id).map_err(str::to_string)
+        })
     })
     .await
     .map_err(|_| "screenshot_ocr_worker_failed".to_string())??;
@@ -1697,6 +2236,20 @@ fn restore_scope_access_registry(
     let mut restored_accesses = HashMap::new();
 
     for grant in grants {
+        let _read_fence = match database.acquire_scope_filesystem_read_fence(grant.scope_id) {
+            Ok(fence) => fence,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    "scope_access_grant_not_active"
+                        | "scope_access_grant_not_found"
+                        | "scope_policy_revision_stale"
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.code()),
+        };
         let restored = match restore_scope_access(&grant.platform, &grant.opaque_grant) {
             Ok(restored) => restored,
             Err(error_code) => {
@@ -1794,8 +2347,18 @@ fn authorized_scopes_at(path: &Path) -> Result<Vec<AuthorizedScope>, &'static st
 
 #[cfg(test)]
 fn authorize_scope_at(path: &Path, requested_path: &Path) -> Result<AuthorizedScope, &'static str> {
-    let database = ManifestDatabase::open(path).map_err(|error| error.code())?;
-    authorize_scope(&database, requested_path).map_err(|error| error.code())
+    // Test fixtures still need a durable native grant to exercise the same
+    // scan admission path as production. Deliberately drop the prepared live
+    // access at return: tests that construct a Desktop state without adding
+    // it to `scope_accesses` continue to prove commands fail closed without a
+    // runtime capability.
+    let prepared = prepare_selected_scope(requested_path)?;
+    authorize_scope_with_access_grant_at(
+        path,
+        &prepared.resolved_path,
+        prepared.platform,
+        &prepared.opaque_grant,
+    )
 }
 
 #[cfg(test)]
@@ -1821,7 +2384,7 @@ fn authorize_coverage_roots_with_access_grants_at(
 
 fn create_manifest_scan_at(path: &Path, scope_id: i64) -> Result<ScanJobProgress, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
-    create_scan_job(&mut database, scope_id).map_err(|error| error.code())
+    create_scan_job_with_active_grant(&mut database, scope_id).map_err(|error| error.code())
 }
 
 #[cfg(test)]
@@ -1847,7 +2410,7 @@ fn run_manifest_scan_with_gate(
             let _database_guard = database_gate
                 .lock()
                 .map_err(|_| "manifest_writer_gate_poisoned")?;
-            run_scan_job_batch(&mut database, job_id, FOREGROUND_SCAN_BATCH_SIZE)
+            run_scan_job_batch_with_active_grant(&mut database, job_id, FOREGROUND_SCAN_BATCH_SIZE)
                 .map_err(|error| error.code())?
         };
         notify_watch_wake(watch_wake);
@@ -2045,7 +2608,7 @@ fn pause_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &
 
 fn resume_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
     let mut database = ManifestDatabase::open(path).map_err(|error| error.code())?;
-    resume_scan_job(&mut database, job_id).map_err(|error| error.code())
+    resume_scan_job_with_active_grant(&mut database, job_id).map_err(|error| error.code())
 }
 
 fn log_scan_progress(event: &'static str, progress: &ScanJobProgress) {
@@ -2119,6 +2682,9 @@ pub fn run() {
             authorized_scopes,
             coverage_policy_detail,
             select_and_authorize_scopes,
+            preview_scope_root_revocation,
+            confirm_scope_root_revocation,
+            discard_scope_root_revocation,
             select_hard_exclusions_preview,
             confirm_hard_exclusion_preview,
             discard_hard_exclusion_preview,
@@ -2327,6 +2893,10 @@ mod tests {
             .expect("completed scan job should exist");
         let ocr_job = create_screenshot_ocr_job_for_database(&database_path, scope.id, node_id)
             .expect("OCR fixture job should queue before runtime gating");
+        ManifestDatabase::open(&database_path)
+            .expect("fixture database should open")
+            .mark_scope_access_grant_needs_reauthorization(scope.id)
+            .expect("fixture grant should become inactive before Desktop startup");
         let source_path = Path::new(&scope.display_path).join("private-screenshot.png");
 
         let app = tauri::test::mock_builder()
@@ -2759,18 +3329,27 @@ mod tests {
         let scope_path = directory.path().join("authorized");
         std::fs::create_dir(&scope_path).expect("scope should create");
         initialize_manifest(&database_path).expect("manifest should initialize");
-        let scope =
-            authorize_scope_at(&database_path, &scope_path).expect("scope should authorize");
+        let prepared = prepare_selected_scope(&scope_path).expect("scope access should prepare");
+        let scope_root = prepared.resolved_path.clone();
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &scope_root,
+            prepared.platform,
+            &prepared.opaque_grant,
+        )
+        .expect("scope and grant should authorize");
         let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
         run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
         let canonical_scope =
-            std::fs::canonicalize(&scope_path).expect("scope should canonicalize");
+            std::fs::canonicalize(&scope_root).expect("scope should canonicalize");
         let original_key =
             deskgraph_scanner::comparison_key(&canonical_scope.join("native-original.md"));
         let renamed_key =
             deskgraph_scanner::comparison_key(&canonical_scope.join("native-renamed.md"));
 
-        let state = start_manifest_state(database_path.clone());
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared.access);
+        let state = start_manifest_state_with_accesses(database_path.clone(), accesses);
         wait_until(
             || {
                 let status = state
@@ -2786,7 +3365,7 @@ mod tests {
             "native watcher should register after the initial reconciliation",
         );
 
-        let original = scope_path.join("native-original.md");
+        let original = scope_root.join("native-original.md");
         std::fs::write(&original, "one").expect("native create should succeed");
         let created = (0..240).any(|_| {
             let found = {
@@ -2834,7 +3413,7 @@ mod tests {
             "native modify should publish the updated manifest metadata",
         );
 
-        let renamed = scope_path.join("native-renamed.md");
+        let renamed = scope_root.join("native-renamed.md");
         std::fs::rename(&original, &renamed).expect("native rename should succeed");
         wait_until(
             || {
@@ -2978,6 +3557,42 @@ mod tests {
     }
 
     #[test]
+    fn revocation_sync_timeout_disables_the_entire_watch_runtime() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let state = start_manifest_state(database_path);
+
+        let outcome = retire_watch_runtime_after_revocation_timeout(&state);
+        assert!(
+            outcome.native_watch_callback_retired,
+            "the callback must reject new hints and clear its queue"
+        );
+        assert!(
+            outcome.watch_runtime_stopped,
+            "the coordinator must stop so its owned native source is dropped"
+        );
+        assert!(
+            state.watch_stop.load(Ordering::Acquire),
+            "a timed-out revocation must terminally disable automatic monitoring"
+        );
+        assert!(
+            state
+                .watch_thread
+                .lock()
+                .expect("watch thread registry should be readable")
+                .is_none(),
+            "a joined coordinator must not remain available for a later automatic retry"
+        );
+        let status = lock_watch_status(&state.watch_status)
+            .expect("watch status should be readable")
+            .clone();
+        assert_eq!(status.state, WatchRuntimeState::Stopped);
+        assert_eq!(status.native_watched_scope_count, 0);
+        assert_eq!(status.next_wake_unix_ms, None);
+    }
+
+    #[test]
     fn tauri_health_payload_excludes_filesystem_locations() {
         let directory = tempfile::tempdir().expect("fixture root should exist");
         let database_path = directory.path().join("manifest.sqlite3");
@@ -3063,6 +3678,11 @@ mod tests {
         run_extraction_job_at(&database_path, job.job_id, ExtractionLimits::default())
             .expect("extraction should complete");
 
+        ManifestDatabase::open(&database_path)
+            .expect("fixture database should open")
+            .mark_scope_access_grant_needs_reauthorization(scope.id)
+            .expect("fixture grant should become inactive before filtered stats");
+
         let inactive_manifest = manifest_status_with_active_access_grants_at(&database_path)
             .expect("inactive manifest stats should load");
         let inactive_extraction =
@@ -3110,16 +3730,19 @@ mod tests {
             0
         );
 
-        let payload = serde_json::to_string(&(
-            content_extraction_stats_at(&database_path).expect("stats should load"),
-            recent_content_extractions_at(&database_path).expect("jobs should load"),
-        ))
-        .expect("payload should serialize");
+        let revoked_stats =
+            content_extraction_stats_at(&database_path).expect("stats should load after purge");
+        let revoked_jobs =
+            recent_content_extractions_at(&database_path).expect("jobs should load after purge");
+        assert_eq!(revoked_stats.completed_job_count, 0);
+        assert!(revoked_jobs.is_empty());
+        let payload = serde_json::to_string(&(revoked_stats, revoked_jobs))
+            .expect("payload should serialize");
         assert!(!payload.contains(private_text));
         assert!(!payload.contains("private-notes.md"));
         assert!(!payload.contains(scope_path.to_string_lossy().as_ref()));
         assert!(payload.contains("deskgraph.extraction-stats.v1"));
-        assert!(payload.contains("\"status\":\"completed\""));
+        assert!(!payload.contains("\"status\":\"completed\""));
     }
 
     #[test]
@@ -3630,6 +4253,78 @@ mod tests {
         }
     }
 
+    fn pending_scope_root_revocation_preview(
+        expires_at_unix_ms: i64,
+        expires_at: Instant,
+    ) -> PendingScopeRootRevocationPreview {
+        PendingScopeRootRevocationPreview {
+            database_preview: ScopeRootRevocationPreview {
+                scope_id: 1,
+                base_policy_revision: 1,
+                impact: ScopeExclusionImpactPreview::default(),
+                exclusion_count: 0,
+            },
+            expires_at_unix_ms,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn scope_root_revocation_preview_registry_is_bounded_expiring_and_one_time() {
+        let now = Instant::now();
+        let display_expiry = 20_001_i64;
+        let mut registry = ScopeRootRevocationPreviewRegistry::default();
+        let preview_id = registry.insert_at(
+            pending_scope_root_revocation_preview(display_expiry, now + Duration::from_millis(1)),
+            now,
+        );
+        assert!(registry.take_for_confirmation_at(&preview_id, now).is_ok());
+        assert_eq!(
+            registry
+                .take_for_confirmation_at(&preview_id, now)
+                .err()
+                .expect("confirmation must consume the preview"),
+            "scope_root_revocation_preview_not_found"
+        );
+        let expired_id = registry.insert_at(
+            pending_scope_root_revocation_preview(display_expiry, now),
+            now,
+        );
+        assert_eq!(
+            registry
+                .take_for_confirmation_at(&expired_id, now)
+                .err()
+                .expect("expired preview must fail closed"),
+            "scope_root_revocation_preview_expired"
+        );
+        let oldest_id = registry.insert_at(
+            pending_scope_root_revocation_preview(display_expiry, now + Duration::from_secs(1)),
+            now,
+        );
+        for offset in 1..=MAX_PENDING_SCOPE_ROOT_REVOCATION_PREVIEWS {
+            registry.insert_at(
+                pending_scope_root_revocation_preview(
+                    display_expiry + offset as i64,
+                    now + Duration::from_secs(1 + offset as u64),
+                ),
+                now,
+            );
+        }
+        assert_eq!(
+            registry.entries.len(),
+            MAX_PENDING_SCOPE_ROOT_REVOCATION_PREVIEWS
+        );
+        assert_eq!(
+            registry
+                .take_for_confirmation_at(&oldest_id, now)
+                .err()
+                .expect("oldest preview must be evicted"),
+            "scope_root_revocation_preview_not_found"
+        );
+        registry.discard_scope(1);
+        assert!(registry.entries.is_empty());
+    }
+
     #[test]
     fn hard_exclusion_preview_registry_is_bounded_expiring_and_one_time() {
         let now = Instant::now();
@@ -3706,7 +4401,9 @@ mod tests {
                 content_chunk_count: 3,
                 graph_fact_count: 4,
                 derived_candidate_count: 5,
-                pending_job_count: 6,
+                action_plan_count: 6,
+                cleanup_action_plan_count: 7,
+                pending_job_count: 8,
                 blocking_action_count: 0,
             },
             source_files_changed: false,
@@ -3731,12 +4428,253 @@ mod tests {
             cleanup_action_plan_count: 13,
             blocking_action_count: 17,
             ..ScopeExclusionImpactPreview::default()
-        })
-        .expect("bounded impact should map");
+        });
 
         assert_eq!(response.graph_fact_count, 2);
         assert_eq!(response.derived_candidate_count, 15);
+        assert_eq!(response.action_plan_count, 11);
+        assert_eq!(response.cleanup_action_plan_count, 13);
         assert_eq!(response.blocking_action_count, 17);
+    }
+
+    #[test]
+    fn live_scope_root_revocation_drops_runtime_access_and_keeps_source_files() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-coverage");
+        let source_path = scope_path.join("private-derived.md");
+        std::fs::create_dir_all(&scope_path).expect("fixture folder should create");
+        std::fs::write(&source_path, "source must remain on disk")
+            .expect("fixture file should create");
+        let source_bytes_before = std::fs::read(&source_path).expect("source bytes should load");
+        let source_modified_before = std::fs::metadata(&source_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("source modified time should load");
+        let directory_entries_before = std::fs::read_dir(&scope_path)
+            .expect("scope entries should load")
+            .map(|entry| entry.expect("scope entry should load").file_name())
+            .collect::<Vec<_>>();
+        initialize_manifest(&database_path).expect("manifest should initialize");
+
+        let prepared_access = prepare_selected_scope(&scope_path).expect("scope should prepare");
+        let requests = [CoverageRootAuthorizationRequest {
+            requested_path: &prepared_access.resolved_path,
+            grant_platform: prepared_access.platform,
+            opaque_grant: &prepared_access.opaque_grant,
+        }];
+        let scope = authorize_coverage_roots_with_access_grants_at(&database_path, &requests)
+            .expect("scope and grant should persist")
+            .remove(0);
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared_access.access);
+        let state = start_manifest_state_with_accesses(database_path.clone(), accesses);
+
+        let preview = preview_scope_root_revocation_for_state(&state, scope.id)
+            .expect("root revocation should preview");
+        assert!(preview.confirmable);
+        assert!(!preview.source_files_will_change);
+        assert!(preview.impact.location_count >= 2);
+        assert_eq!(preview.impact.action_plan_count, 0);
+        assert_eq!(preview.impact.cleanup_action_plan_count, 0);
+        let preview_id = preview.preview_id.clone();
+        let commit = confirm_scope_root_revocation_for_state(&state, preview.preview_id)
+            .expect("root revocation should commit");
+        assert!(commit.runtime_capability_dropped);
+        assert!(commit.native_watch_sync_confirmed);
+        assert!(!commit.native_watch_callback_retired);
+        assert!(!commit.watch_runtime_stopped);
+        assert!(!commit.source_files_changed);
+        assert_eq!(commit.purged.action_plan_count, 0);
+        assert_eq!(commit.purged.cleanup_action_plan_count, 0);
+        assert_eq!(commit.revoked_scope_scans_started, 0);
+        assert_eq!(commit.revoked_scope_extractions_started, 0);
+        assert!(
+            source_path.exists(),
+            "revocation must not mutate source files"
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source bytes should remain readable"),
+            source_bytes_before
+        );
+        assert_eq!(
+            std::fs::metadata(&source_path)
+                .and_then(|metadata| metadata.modified())
+                .expect("source modified time should remain readable"),
+            source_modified_before
+        );
+        assert_eq!(
+            std::fs::read_dir(&scope_path)
+                .expect("scope entries should remain readable")
+                .map(|entry| entry.expect("scope entry should load").file_name())
+                .collect::<Vec<_>>(),
+            directory_entries_before
+        );
+        assert!(
+            !lock_scope_accesses(&state)
+                .expect("runtime registry should load")
+                .contains_key(&scope.id),
+            "the live OS capability must be dropped before IPC success"
+        );
+        assert_eq!(
+            confirm_scope_root_revocation_for_state(&state, preview_id)
+                .err()
+                .expect("preview reuse must fail"),
+            "scope_root_revocation_preview_not_found"
+        );
+
+        let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        assert_eq!(
+            database
+                .scope_access_grant_state(scope.id)
+                .expect("grant state should load"),
+            deskgraph_database::ScopeAccessGrantState::Revoked
+        );
+        assert_eq!(
+            database
+                .stats()
+                .expect("manifest stats should load")
+                .active_location_count,
+            0
+        );
+    }
+
+    #[test]
+    fn scope_root_revocation_waits_for_an_in_flight_path_read() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-coverage");
+        std::fs::create_dir_all(&scope_path).expect("fixture folder should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+
+        let prepared_access = prepare_selected_scope(&scope_path).expect("scope should prepare");
+        let requests = [CoverageRootAuthorizationRequest {
+            requested_path: &prepared_access.resolved_path,
+            grant_platform: prepared_access.platform,
+            opaque_grant: &prepared_access.opaque_grant,
+        }];
+        let scope = authorize_coverage_roots_with_access_grants_at(&database_path, &requests)
+            .expect("scope and grant should persist")
+            .remove(0);
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared_access.access);
+        let state = Arc::new(start_manifest_state_with_accesses(
+            database_path.clone(),
+            accesses,
+        ));
+        let preview = preview_scope_root_revocation_for_state(&state, scope.id)
+            .expect("root revocation should preview");
+
+        let reader_gate = Arc::clone(&state.path_read_gate);
+        let reader_accesses = Arc::clone(&state.scope_accesses);
+        let (reader_started_tx, reader_started_rx) = sync_channel(1);
+        let (release_reader_tx, release_reader_rx) = sync_channel(1);
+        let reader = thread::spawn(move || {
+            with_active_scope_read_fence(&reader_gate, &reader_accesses, scope.id, || {
+                reader_started_tx
+                    .send(())
+                    .expect("reader start should be observed");
+                release_reader_rx.recv().expect("reader should be released");
+                Ok::<(), String>(())
+            })
+        });
+        reader_started_rx
+            .recv()
+            .expect("reader should acquire the path fence");
+
+        let revocation_state = Arc::clone(&state);
+        let (revocation_started_tx, revocation_started_rx) = sync_channel(1);
+        let revocation = thread::spawn(move || {
+            revocation_started_tx
+                .send(())
+                .expect("revocation start should be observed");
+            confirm_scope_root_revocation_for_state(&revocation_state, preview.preview_id)
+        });
+        revocation_started_rx
+            .recv()
+            .expect("revocation should start");
+        thread::sleep(Duration::from_millis(25));
+        assert!(
+            !revocation.is_finished(),
+            "revocation must wait until the active read operation releases its fence"
+        );
+
+        release_reader_tx
+            .send(())
+            .expect("reader release should be delivered");
+        reader
+            .join()
+            .expect("reader thread should not panic")
+            .expect("reader fence should complete");
+        let commit = revocation
+            .join()
+            .expect("revocation thread should not panic")
+            .expect("revocation should commit after the read completes");
+        assert!(commit.runtime_capability_dropped);
+        assert!(commit.native_watch_sync_confirmed);
+        assert!(!commit.native_watch_callback_retired);
+        assert!(!commit.watch_runtime_stopped);
+        assert!(
+            !lock_scope_accesses(&state)
+                .expect("runtime registry should load")
+                .contains_key(&scope.id)
+        );
+    }
+
+    #[test]
+    fn scope_root_revocation_rejects_changed_impact_and_requires_a_fresh_preview() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-coverage");
+        std::fs::create_dir_all(&scope_path).expect("fixture folder should create");
+        initialize_manifest(&database_path).expect("manifest should initialize");
+
+        let prepared_access = prepare_selected_scope(&scope_path).expect("scope should prepare");
+        let requests = [CoverageRootAuthorizationRequest {
+            requested_path: &prepared_access.resolved_path,
+            grant_platform: prepared_access.platform,
+            opaque_grant: &prepared_access.opaque_grant,
+        }];
+        let scope = authorize_coverage_roots_with_access_grants_at(&database_path, &requests)
+            .expect("scope and grant should persist")
+            .remove(0);
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared_access.access);
+        let state = start_manifest_state_with_accesses(database_path.clone(), accesses);
+        let stale_preview = preview_scope_root_revocation_for_state(&state, scope.id)
+            .expect("root revocation should preview");
+        create_manifest_scan_at(&database_path, scope.id)
+            .expect("derived scan state should change after preview");
+
+        assert_eq!(
+            confirm_scope_root_revocation_for_state(&state, stale_preview.preview_id)
+                .err()
+                .expect("changed impact must fail closed"),
+            "scope_root_revocation_preview_stale"
+        );
+        assert!(
+            lock_scope_accesses(&state)
+                .expect("runtime registry should load")
+                .contains_key(&scope.id),
+            "a stale preview must leave live runtime access intact"
+        );
+        let database = ManifestDatabase::open(&database_path).expect("database should reopen");
+        assert!(
+            database
+                .scope_has_active_access_grant(scope.id)
+                .expect("a stale preview must leave the durable grant active")
+        );
+
+        let fresh_preview = preview_scope_root_revocation_for_state(&state, scope.id)
+            .expect("the changed impact should be previewed again");
+        confirm_scope_root_revocation_for_state(&state, fresh_preview.preview_id)
+            .expect("the fresh exact preview should commit");
+        assert!(
+            !lock_scope_accesses(&state)
+                .expect("runtime registry should load")
+                .contains_key(&scope.id)
+        );
     }
 
     #[test]

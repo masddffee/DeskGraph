@@ -22,8 +22,9 @@ use deskgraph_projects::{
 };
 use deskgraph_retrieval::{SearchRequest, SearchSourceFilter, search_at};
 use deskgraph_scanner::{
-    authorize_scope_with_access_grant, comparison_key, create_scan_job, pause_scan_job,
-    resume_scan_job, run_scan_job_batch, run_scan_job_to_terminal, scan_scope,
+    authorize_scope_with_access_grant, comparison_key, create_scan_job_with_active_grant,
+    pause_scan_job, resume_scan_job_with_active_grant, run_scan_job_batch_with_active_grant,
+    run_scan_job_to_terminal_with_active_grant, scan_scope_with_active_grant,
 };
 use deskgraph_telemetry::{Service, init_privacy_safe_logging};
 use deskgraph_transactions::{action_plan_at, create_rename_preview_at, recent_action_plans_at};
@@ -652,14 +653,23 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             }
             ScopeCommand::List { database } => {
                 let database = open_database(&database)?;
-                let scopes = database.list_scopes().map_err(|error| error.code())?;
+                let active_scope_ids = database
+                    .active_scope_access_grant_ids()
+                    .map_err(|error| error.code())?;
+                let scopes = database
+                    .list_scopes()
+                    .map_err(|error| error.code())?
+                    .into_iter()
+                    .filter(|scope| active_scope_ids.binary_search(&scope.id).is_ok())
+                    .collect::<Vec<_>>();
                 emit_json(&scopes, "scope_list_read")
             }
         },
         Command::Scan { command } => match command {
             ScanCommand::Start { database, scope } => {
                 let mut database = open_database(&database)?;
-                let report = scan_scope(&mut database, scope).map_err(|error| error.code())?;
+                let report = scan_scope_with_active_grant(&mut database, scope)
+                    .map_err(|error| error.code())?;
                 info!(
                     event = "metadata_scan_completed",
                     scope_id = report.scope_id,
@@ -674,14 +684,14 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             }
             ScanCommand::Create { database, scope } => {
                 let mut database = open_database(&database)?;
-                let progress =
-                    create_scan_job(&mut database, scope).map_err(|error| error.code())?;
+                let progress = create_scan_job_with_active_grant(&mut database, scope)
+                    .map_err(|error| error.code())?;
                 emit_scan_progress(&progress, "metadata_scan_created")
             }
             ScanCommand::Run { database, job } => {
                 let mut database = open_database(&database)?;
-                let progress =
-                    run_scan_job_to_terminal(&mut database, job).map_err(|error| error.code())?;
+                let progress = run_scan_job_to_terminal_with_active_grant(&mut database, job)
+                    .map_err(|error| error.code())?;
                 emit_scan_progress(&progress, "metadata_scan_runner_stopped")
             }
             ScanCommand::Advance {
@@ -690,7 +700,7 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 batch_size,
             } => {
                 let mut database = open_database(&database)?;
-                let progress = run_scan_job_batch(&mut database, job, batch_size)
+                let progress = run_scan_job_batch_with_active_grant(&mut database, job, batch_size)
                     .map_err(|error| error.code())?;
                 emit_scan_progress(&progress, "metadata_scan_batch_stopped")
             }
@@ -711,7 +721,8 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             }
             ScanCommand::Resume { database, job } => {
                 let mut database = open_database(&database)?;
-                let progress = resume_scan_job(&mut database, job).map_err(|error| error.code())?;
+                let progress = resume_scan_job_with_active_grant(&mut database, job)
+                    .map_err(|error| error.code())?;
                 emit_scan_progress(&progress, "metadata_scan_resumed")
             }
         },
@@ -993,6 +1004,7 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 left,
                 right,
             } => {
+                ensure_scope_path_access(&database, scope)?;
                 let candidate = check_exact_duplicate_at(&database, scope, &left, &right)
                     .map_err(|error| error.code())?;
                 print_json(&candidate)?;
@@ -1055,6 +1067,7 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 first,
                 second,
             } => {
+                ensure_scope_path_access(&database, scope)?;
                 let candidate = suggest_file_version_at(&database, scope, &first, &second)
                     .map_err(|error| error.code())?;
                 print_json(&candidate)?;
@@ -1248,17 +1261,36 @@ fn resolve_manifest_node(
     manifest_not_found_code: &'static str,
     invalid_selection_code: &'static str,
 ) -> Result<i64, &'static str> {
+    let database = open_database(database_path)?;
+    let _read_fence = database
+        .acquire_scope_filesystem_read_fence(scope_id)
+        .map_err(|error| error.code())?;
     match (node_id, source_path) {
         (Some(node_id), None) => Ok(node_id),
         (None, Some(source_path)) => {
             let canonical =
                 std::fs::canonicalize(source_path).map_err(|_| canonical_not_found_code)?;
-            open_database(database_path)?
+            database
                 .node_id_for_path_key(scope_id, &comparison_key(&canonical))
                 .map_err(|error| error.code())?
                 .ok_or(manifest_not_found_code)
         }
         _ => Err(invalid_selection_code),
+    }
+}
+
+fn ensure_scope_path_access(database_path: &Path, scope_id: i64) -> Result<(), &'static str> {
+    let database = open_database(database_path)?;
+    let binding = database
+        .bind_scope_policy_revision(scope_id)
+        .map_err(|error| error.code())?;
+    if database
+        .is_scope_policy_binding_current(binding)
+        .map_err(|error| error.code())?
+    {
+        Ok(())
+    } else {
+        Err("scope_policy_changed")
     }
 }
 
@@ -1382,7 +1414,8 @@ mod tests {
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
         let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
             .expect("scope should authorize");
-        let job = create_scan_job(&mut manifest, scope.id).expect("job should create");
+        let job =
+            create_scan_job_with_active_grant(&mut manifest, scope.id).expect("job should create");
         drop(manifest);
 
         execute(Cli {
@@ -1435,7 +1468,7 @@ mod tests {
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
         let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
             .expect("scope should authorize");
-        scan_scope(&mut manifest, scope.id).expect("scope should scan");
+        scan_scope_with_active_grant(&mut manifest, scope.id).expect("scope should scan");
         let node_id = manifest
             .node_id_for_path_key(
                 scope.id,
@@ -1482,7 +1515,7 @@ mod tests {
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
         let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
             .expect("scope should authorize");
-        scan_scope(&mut manifest, scope.id).expect("scope should scan");
+        scan_scope_with_active_grant(&mut manifest, scope.id).expect("scope should scan");
         let node_id = manifest
             .node_id_for_path_key(
                 scope.id,
@@ -1538,7 +1571,7 @@ mod tests {
         let mut manifest = ManifestDatabase::open(&database).expect("database should initialize");
         let scope = authorize_scope_with_cli_consent(&mut manifest, &scope_path)
             .expect("scope should authorize");
-        scan_scope(&mut manifest, scope.id).expect("scope should scan");
+        scan_scope_with_active_grant(&mut manifest, scope.id).expect("scope should scan");
         let node_id = manifest
             .node_id_for_path_key(
                 scope.id,

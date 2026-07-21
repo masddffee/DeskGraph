@@ -505,6 +505,52 @@ export const zhTW = {
     error: '未確認硬性排除；不會宣告已完成本機隱私清除。',
     sourceSafe: '不會移動、變更或刪除來源檔案。',
   },
+  rootRevocation: {
+    kicker: '涵蓋範圍存取',
+    heading: '撤銷已授權根目錄',
+    description:
+      '撤銷會永久清除這個根目錄在 DeskGraph 衍生出的本機索引資料，並放棄此執行中的存取能力；絕不移動、移至垃圾桶或刪除來源檔案。',
+    empty: '沒有可撤銷的有效已授權根目錄。',
+    revoke: '撤銷根目錄…',
+    previewHeading: '檢視根目錄撤銷',
+    exclusionCount: (count) => `${count} 個硬性排除項目會隨此根目錄移除。`,
+    previewNotice:
+      '這會永久清除受影響的本機衍生索引資料，並從 DeskGraph 移除此根目錄；無法在此畫面復原。',
+    sourceSafe: '不會移動、變更、移至垃圾桶或刪除來源檔案。',
+    noAutomaticRead:
+      '此次撤銷不會為這個根目錄開始新的掃描、抽取、OCR、embedding 或其他檔案系統讀取；其他仍授權根目錄的既有工作可以繼續。',
+    impact: (
+      locations,
+      content,
+      graph,
+      candidates,
+      actionPlans,
+      cleanupActionPlans,
+      jobs,
+      actions,
+    ) =>
+      `確認後，本機將清除 ${locations} 個位置、${content} 個內容／OCR 區塊、${graph} 個圖譜事實、${candidates} 個衍生候選、${actionPlans} 個重新命名／移動預覽、${cleanupActionPlans} 個安全清理預覽及 ${jobs} 個待處理工作。${actions === 0 ? '沒有操作安全紀錄阻擋此次撤銷。' : `${actions} 筆操作安全紀錄會阻擋此次撤銷，且不會被清除。`}`,
+    confirm: '確認撤銷並清除本機索引',
+    loading: '正在準備僅限本機的撤銷審閱…',
+    confirming: '正在安全撤銷本機涵蓋範圍…',
+    cancel: '取消預覽',
+    cancelled: '已取消撤銷預覽；此根目錄仍維持授權。',
+    notConfirmable:
+      '操作 journal 安全紀錄會阻擋此次撤銷且不會被清除；必須透過另行審查的復原流程處理，單純等待或重試不足以解除。來源檔案未變更。',
+    committed: (exclusions) =>
+      `已撤銷根目錄存取並清除本機衍生資料；${exclusions} 個硬性排除項目也隨根目錄移除。`,
+    refreshFailed: (exclusions) =>
+      `已撤銷根目錄存取並移除 ${exclusions} 個硬性排除項目，但本機儀表板重新整理失敗。`,
+    watchSyncPending: (callbackRetired, runtimeStopped) =>
+      runtimeStopped
+        ? '存取權已撤銷。原生 callback 已退役、佇列提示已清除，且自動監看已完整停止。再次授權任何根目錄前，請先重新啟動 DeskGraph。'
+        : callbackRetired
+          ? '存取權已撤銷。原生 callback 已退役且佇列提示已清除，但尚未確認 coordinator 停止；DeskGraph 不會宣稱作業系統監看註冊已關閉。再次授權前請重新啟動。'
+          : '存取權已撤銷。新的 callback 已停止進入且佇列提示已清除，但既有 callback 與 coordinator 停止皆未確認；DeskGraph 不會宣稱作業系統監看註冊已關閉。再次授權前請重新啟動。',
+    stale: '預覽開啟期間此根目錄已變更。未套用撤銷；請重新檢視目前本機涵蓋範圍。',
+    error:
+      '無法確認撤銷的最終狀態。再次嘗試前，請重新整理本機涵蓋範圍；此次操作未變更任何來源檔案。',
+  },
   footer: {
     version: (version) => `DeskGraph ${version}`,
     description: '中繼資料 + 受限本機文字 · 不上傳 · 不進行檔案操作',

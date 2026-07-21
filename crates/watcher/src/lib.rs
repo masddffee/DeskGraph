@@ -11,9 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskgraph_database::{
-    DatabaseError, ManifestDatabase, QueuedPath, ScopeExclusionMatcher, ScopeRevisionBinding,
-    WatchFileDeltaWrite, WatchObservationWrite, WatchReconciliationKind, WatchSnapshot,
-    WatchSnapshotKind,
+    DatabaseError, ManifestDatabase, QueuedPath, ScopeExclusionMatcher, ScopeFilesystemReadFence,
+    ScopeRevisionBinding, WatchFileDeltaWrite, WatchObservationWrite, WatchReconciliationKind,
+    WatchSnapshot, WatchSnapshotKind,
 };
 use deskgraph_domain::{ScanStatus, WatchEventProgress, WatchEventReason, WatchEventStatus};
 use deskgraph_identity::{
@@ -27,8 +27,11 @@ use deskgraph_scanner::{
 
 mod native;
 
-pub use native::NativeWatchEventSource;
 use native::{MAX_NATIVE_SIGNALS_PER_CYCLE, NativeWatchScope};
+pub use native::{
+    NativeWatchCallbackRetirement, NativeWatchEventSource, NativeWatchSynchronizationBarrier,
+    NativeWatchSynchronizationPass, NativeWatchSynchronizationTicket,
+};
 
 const DEFAULT_STABILITY_WINDOW_MS: i64 = 1_000;
 const MIN_STABILITY_WINDOW_MS: i64 = 250;
@@ -146,24 +149,16 @@ pub struct WatchCoordinator {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WatchScopeAccessPolicy {
+    #[cfg(test)]
     CompletedScan,
     ActivePlatformGrant,
 }
 
 impl WatchCoordinator {
+    /// Opens a fail-closed coordinator. Durable grant state is necessary but
+    /// not sufficient: callers must also supply the exact scope IDs whose live
+    /// platform capabilities are held by this process.
     pub fn open(
-        database_path: &Path,
-        watch_policy: WatchPolicy,
-        polling_policy: PollingWatchPolicy,
-    ) -> Result<Self, WatcherError> {
-        let database = ManifestDatabase::open(database_path)?;
-        Ok(Self::from_database(database, watch_policy, polling_policy))
-    }
-
-    /// Opens the packaged Desktop coordinator. Unlike the general core/CLI
-    /// constructor, this never watches a completed scope unless its current
-    /// platform access grant remains active.
-    pub fn open_requiring_active_platform_grants(
         database_path: &Path,
         watch_policy: WatchPolicy,
         polling_policy: PollingWatchPolicy,
@@ -177,7 +172,48 @@ impl WatchCoordinator {
         ))
     }
 
+    /// Explicitly named compatibility entry point for the packaged Desktop.
+    /// It has the same active-grant and live-capability policy as `open`.
+    pub fn open_requiring_active_platform_grants(
+        database_path: &Path,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+    ) -> Result<Self, WatcherError> {
+        Self::open(database_path, watch_policy, polling_policy)
+    }
+
+    /// Creates the same fail-closed coordinator from an existing connection.
+    /// No scope is watchable until `replace_runtime_active_scope_ids` supplies
+    /// the runtime capabilities actually held by the caller.
     pub fn from_database(
+        database: ManifestDatabase,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+    ) -> Self {
+        Self::from_database_with_scope_access_policy(
+            database,
+            watch_policy,
+            polling_policy,
+            WatchScopeAccessPolicy::ActivePlatformGrant,
+        )
+    }
+
+    #[cfg(test)]
+    fn open_for_completed_scan_tests(
+        database_path: &Path,
+        watch_policy: WatchPolicy,
+        polling_policy: PollingWatchPolicy,
+    ) -> Result<Self, WatcherError> {
+        let database = ManifestDatabase::open(database_path)?;
+        Ok(Self::from_database_for_completed_scan_tests(
+            database,
+            watch_policy,
+            polling_policy,
+        ))
+    }
+
+    #[cfg(test)]
+    fn from_database_for_completed_scan_tests(
         database: ManifestDatabase,
         watch_policy: WatchPolicy,
         polling_policy: PollingWatchPolicy,
@@ -202,6 +238,7 @@ impl WatchCoordinator {
             polling_policy,
             scope_access_policy,
             runtime_active_scope_ids: match scope_access_policy {
+                #[cfg(test)]
                 WatchScopeAccessPolicy::CompletedScan => None,
                 WatchScopeAccessPolicy::ActivePlatformGrant => Some(BTreeSet::new()),
             },
@@ -214,6 +251,7 @@ impl WatchCoordinator {
 
     fn watchable_scope_ids(&self) -> Result<Vec<i64>, WatcherError> {
         let scope_ids = match self.scope_access_policy {
+            #[cfg(test)]
             WatchScopeAccessPolicy::CompletedScan => self.database.watchable_scope_ids(),
             WatchScopeAccessPolicy::ActivePlatformGrant => self
                 .database
@@ -224,6 +262,7 @@ impl WatchCoordinator {
 
     fn authorized_scope_count(&self) -> Result<usize, WatcherError> {
         let scope_ids = match self.scope_access_policy {
+            #[cfg(test)]
             WatchScopeAccessPolicy::CompletedScan => self
                 .database
                 .list_scopes()?
@@ -247,6 +286,21 @@ impl WatchCoordinator {
         }
     }
 
+    fn active_scope_read_fence(
+        &self,
+        scope_id: i64,
+    ) -> Result<Option<ScopeFilesystemReadFence>, WatcherError> {
+        match self.scope_access_policy {
+            #[cfg(test)]
+            WatchScopeAccessPolicy::CompletedScan => Ok(None),
+            WatchScopeAccessPolicy::ActivePlatformGrant => self
+                .database
+                .acquire_scope_filesystem_read_fence(scope_id)
+                .map(Some)
+                .map_err(Into::into),
+        }
+    }
+
     /// Supplies the exact scopes whose platform capability is live in the
     /// packaged Desktop process. Durable `active` state alone is insufficient:
     /// the RAII access guard must also exist for this runtime.
@@ -266,6 +320,7 @@ impl WatchCoordinator {
         let watchable_scope_set = watchable_scope_ids.iter().copied().collect::<BTreeSet<_>>();
         let mut scopes = Vec::with_capacity(watchable_scope_ids.len());
         for scope_id in watchable_scope_ids {
+            let _read_fence = self.active_scope_read_fence(scope_id)?;
             match validated_scope_root(&self.database, scope_id) {
                 Ok(root) => scopes.push(NativeWatchScope { scope_id, root }),
                 Err(error) => {
@@ -288,6 +343,7 @@ impl WatchCoordinator {
         }
         let scope_ids = self.watchable_scope_ids()?;
         match self.scope_access_policy {
+            #[cfg(test)]
             WatchScopeAccessPolicy::CompletedScan => {
                 self.database
                     .request_all_scope_full_reconciliation_at(now_unix_ms)?;
@@ -356,7 +412,8 @@ impl WatchCoordinator {
                 continue;
             }
             hint_scope_count = hint_scope_count.saturating_add(1);
-            if let Err(error) = observe_watch_path_at_time(
+            let _read_fence = self.active_scope_read_fence(hint.scope_id)?;
+            if let Err(error) = observe_watch_path_while_authorized_at_time(
                 &mut self.database,
                 hint.scope_id,
                 &hint.path,
@@ -478,6 +535,7 @@ impl WatchCoordinator {
                 continue;
             }
 
+            let _read_fence = self.active_scope_read_fence(event.scope_id)?;
             let advanced = advance_watch_event_batch_at_time(
                 &mut self.database,
                 event.event_id,
@@ -569,6 +627,7 @@ impl WatchCoordinator {
 
         for (scope_id, _) in due_scopes.into_iter().take(MAX_SCOPES_SCHEDULED_PER_CYCLE) {
             self.deferred_scope_due_at.remove(&scope_id);
+            let _read_fence = self.active_scope_read_fence(scope_id)?;
             let scheduled = validated_scope_root(&self.database, scope_id)
                 .map_err(WatcherError::from)
                 .and_then(|_| {
@@ -806,6 +865,23 @@ pub fn observe_watch_path_at_time(
     policy: WatchPolicy,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
+    let _read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
+    observe_watch_path_while_authorized_at_time(
+        database,
+        scope_id,
+        observed_path,
+        policy,
+        now_unix_ms,
+    )
+}
+
+fn observe_watch_path_while_authorized_at_time(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+    observed_path: &Path,
+    policy: WatchPolicy,
+    now_unix_ms: i64,
+) -> Result<WatchEventProgress, WatcherError> {
     let (binding, matcher) = bind_current_watch_policy(database, scope_id)?;
     if !database.scope_has_completed_scan(scope_id)? {
         return Err(DatabaseError::WatchScopeInitialScanRequired.into());
@@ -880,6 +956,8 @@ pub fn advance_watch_event_at_time(
     policy: WatchPolicy,
     now_unix_ms: i64,
 ) -> Result<WatchEventProgress, WatcherError> {
+    let scope_id = database.watch_event(event_id)?.progress.scope_id;
+    let _read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
     advance_watch_event_with_mode(
         database,
         event_id,
@@ -1644,6 +1722,17 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    fn activate_test_scope(database: &ManifestDatabase, scope_id: i64) {
+        database
+            .upsert_scope_access_grant(
+                scope_id,
+                std::env::consts::OS,
+                b"watch-fixture-active-grant",
+            )
+            .expect("filesystem-reading watcher fixture should have an active grant");
+    }
 
     fn setup() -> (tempfile::TempDir, ManifestDatabase, i64) {
         let directory = tempfile::tempdir().expect("fixture root should exist");
@@ -1746,6 +1835,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("fixture root should exist");
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         let file = directory.path().join("not-scanned.md");
         fs::write(&file, "private").expect("fixture should write");
         let mut source = ScriptedWatchEventSource {
@@ -1780,8 +1870,11 @@ mod tests {
         let (_directory, database, _scope_id) = setup();
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let scheduled = coordinator
             .run_cycle_at_time(1_000)
@@ -1823,8 +1916,11 @@ mod tests {
         fs::rename(&temporary, &final_path).expect("fixture should reach its final name");
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let reconciled = coordinator
             .run_cycle_with_native_batch_at_time(
@@ -1876,8 +1972,11 @@ mod tests {
         .expect("active event should persist");
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let report = coordinator
             .run_cycle_with_native_batch_at_time(
@@ -1919,8 +2018,11 @@ mod tests {
         }
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let scheduled = coordinator
             .run_cycle_at_time(1_000)
@@ -1996,8 +2098,11 @@ mod tests {
         fs::write(&missed_before_registration, "local").expect("fixture should write");
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
         let mut source =
             NativeWatchEventSource::new(Arc::new(|| {})).expect("native source should initialize");
 
@@ -2040,6 +2145,115 @@ mod tests {
     }
 
     #[test]
+    fn queued_revoked_root_hint_does_not_reconcile_or_scan_remaining_scope() {
+        let (directory, mut database, revoked_scope_id) = setup();
+        let remaining_directory = tempfile::tempdir().expect("remaining root should exist");
+        let remaining_scope = authorize_scope_with_access_grant(
+            &mut database,
+            remaining_directory.path(),
+            std::env::consts::OS,
+            b"remaining-watch-test-grant",
+        )
+        .expect("remaining scope should authorize with an active test grant");
+        scan_scope(&mut database, remaining_scope.id)
+            .expect("remaining initial scan should complete");
+
+        let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
+            .expect("test polling policy should be valid");
+        let mut coordinator =
+            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        coordinator.replace_runtime_active_scope_ids([revoked_scope_id, remaining_scope.id]);
+        let mut source =
+            NativeWatchEventSource::new(Arc::new(|| {})).expect("native source should initialize");
+        assert!(
+            coordinator
+                .synchronize_native_event_source(&mut source)
+                .expect("initial scopes should register")
+        );
+        assert_eq!(source.watched_scope_count(), 2);
+        let _ = source.drain(MAX_NATIVE_SIGNALS_PER_CYCLE);
+
+        let retired_path = fs::canonicalize(directory.path())
+            .expect("revoked root should canonicalize")
+            .join("retired.md");
+        source.enqueue_test_event(vec![retired_path.clone()]);
+        coordinator
+            .database
+            .mark_scope_access_grant_revoked(revoked_scope_id)
+            .expect("root revocation should purge local derived data");
+        coordinator.replace_runtime_active_scope_ids([remaining_scope.id]);
+        let barrier = NativeWatchSynchronizationBarrier::default();
+        let ticket = barrier.request();
+        let pass = barrier.begin_pass();
+        assert!(
+            !coordinator
+                .synchronize_native_event_source(&mut source)
+                .expect("revoked root should unregister without a registration gap")
+        );
+        barrier.acknowledge(pass);
+        assert!(
+            barrier.wait_for(ticket, Duration::ZERO),
+            "successful pure removal should acknowledge native unwatch without reconciliation"
+        );
+        assert_eq!(source.watched_scope_count(), 1);
+        coordinator
+            .next_poll_by_scope
+            .insert(remaining_scope.id, 10_000);
+
+        let completed_scans_before = coordinator
+            .database
+            .stats_with_active_access_grants()
+            .expect("active scope stats should load")
+            .completed_scan_count;
+        let batch = source.drain(MAX_NATIVE_SIGNALS_PER_CYCLE);
+        assert!(
+            !batch.reconcile_all,
+            "the queued revoked path must be discarded before native recovery is requested"
+        );
+        let report = coordinator
+            .run_cycle_with_native_batch_at_time(batch, 1_000)
+            .expect("retired hint should be safely ignored");
+
+        assert_eq!(report.native_signal_count, 1);
+        assert_eq!(report.native_hint_scope_count, 0);
+        assert!(!report.native_reconcile_all);
+        assert_eq!(report.forced_scope_reconciliation_count, 0);
+        assert_eq!(report.completed_event_count, 0);
+        assert_eq!(
+            coordinator
+                .database
+                .stats_with_active_access_grants()
+                .expect("active scope stats should load")
+                .completed_scan_count,
+            completed_scans_before,
+            "discarding a retired-root hint must not create a remaining-scope scan"
+        );
+
+        // A callback can arrive after the first post-unwatch drain. Its raw
+        // path is still outside active coverage, so it must remain a no-op
+        // rather than widening reconciliation of the remaining root.
+        source.enqueue_test_event(vec![retired_path]);
+        let late_batch = source.drain(MAX_NATIVE_SIGNALS_PER_CYCLE);
+        assert_eq!(late_batch.signal_count, 1);
+        assert!(late_batch.hints.is_empty());
+        assert!(!late_batch.reconcile_all);
+        let late_report = coordinator
+            .run_cycle_with_native_batch_at_time(late_batch, 1_001)
+            .expect("late revoked hint should be safely ignored");
+        assert_eq!(late_report.forced_scope_reconciliation_count, 0);
+        assert_eq!(late_report.completed_event_count, 0);
+        assert_eq!(
+            coordinator
+                .database
+                .stats_with_active_access_grants()
+                .expect("active scope stats should load")
+                .completed_scan_count,
+            completed_scans_before,
+            "a late revoked path must not create a remaining-scope scan"
+        );
+    }
+
+    #[test]
     fn sustained_churn_cannot_postpone_metadata_reconciliation_past_the_poll_interval() {
         let (directory, mut database, scope_id) = setup();
         let file = directory.path().join("continuous.log");
@@ -2075,8 +2289,11 @@ mod tests {
 
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
         let waiting = coordinator
             .run_cycle_at_time(5_501)
             .expect("pre-bound cycle should remain stable");
@@ -2114,8 +2331,11 @@ mod tests {
         let (_directory, database, _scope_id) = setup();
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let report = coordinator
             .run_cycle_with_native_batch_at_time(
@@ -2220,8 +2440,11 @@ mod tests {
         let _scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let before_scan = coordinator
             .run_cycle_at_time(1_000)
@@ -2251,15 +2474,15 @@ mod tests {
         let active = authorize_scope(&database, &active_path).expect("active scope should persist");
         let durable_only = authorize_scope(&database, &durable_only_path)
             .expect("durable-only scope should persist");
+        activate_test_scope(&database, legacy.id);
+        activate_test_scope(&database, active.id);
+        activate_test_scope(&database, durable_only.id);
         scan_scope(&mut database, legacy.id).expect("legacy scan should complete");
         scan_scope(&mut database, active.id).expect("active scan should complete");
         scan_scope(&mut database, durable_only.id).expect("durable-only scan should complete");
         database
-            .upsert_scope_access_grant(active.id, std::env::consts::OS, b"opaque-grant")
-            .expect("active grant should persist");
-        database
-            .upsert_scope_access_grant(durable_only.id, std::env::consts::OS, b"durable-only-grant")
-            .expect("durable-only grant should persist");
+            .mark_scope_access_grant_needs_reauthorization(legacy.id)
+            .expect("legacy fixture should retain scan history without active access");
 
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
@@ -2325,15 +2548,19 @@ mod tests {
         fs::write(scope_path.join("note.md"), "local").expect("fixture should write");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         drop(database);
         fs::rename(&scope_path, &moved_path).expect("scope should move");
 
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::open(&database_path, WatchPolicy::default(), polling_policy)
-                .expect("coordinator should start");
+        let mut coordinator = WatchCoordinator::open_for_completed_scan_tests(
+            &database_path,
+            WatchPolicy::default(),
+            polling_policy,
+        )
+        .expect("coordinator should start");
         let failed = coordinator
             .run_cycle_at_time(1_000)
             .expect("invalid scope should degrade without crashing");
@@ -2380,13 +2607,17 @@ mod tests {
             let scope_path = directory.path().join(format!("scope-{index}"));
             fs::create_dir(&scope_path).expect("scope should create");
             let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+            activate_test_scope(&database, scope.id);
             scan_scope(&mut database, scope.id).expect("initial scan should complete");
             initial_scope_ids.push(scope.id);
         }
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let first = coordinator
             .run_cycle_at_time(1_000)
@@ -2412,6 +2643,7 @@ mod tests {
             fs::create_dir(&scope_path).expect("new scope should create");
             let scope = authorize_scope(&coordinator.database, &scope_path)
                 .expect("scope should authorize");
+            activate_test_scope(&coordinator.database, scope.id);
             scan_scope(&mut coordinator.database, scope.id)
                 .expect("new initial scan should complete");
         }
@@ -2437,6 +2669,7 @@ mod tests {
             fs::create_dir(&scope_path).expect("new scope should create");
             let scope = authorize_scope(&coordinator.database, &scope_path)
                 .expect("scope should authorize");
+            activate_test_scope(&coordinator.database, scope.id);
             scan_scope(&mut coordinator.database, scope.id)
                 .expect("new initial scan should complete");
         }
@@ -2468,8 +2701,11 @@ mod tests {
             create_scan_job(&mut database, scope_id).expect("foreground scan should start");
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut coordinator =
-            WatchCoordinator::from_database(database, WatchPolicy::default(), polling_policy);
+        let mut coordinator = WatchCoordinator::from_database_for_completed_scan_tests(
+            database,
+            WatchPolicy::default(),
+            polling_policy,
+        );
 
         let contended = coordinator
             .run_cycle_at_time(2_000)
@@ -2506,6 +2742,7 @@ mod tests {
         fs::create_dir(&scope_path).expect("scope should create");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         drop(database);
 
@@ -2513,9 +2750,12 @@ mod tests {
         fs::write(&new_file, "not extracted").expect("fixture should write");
         let polling_policy = PollingWatchPolicy::new(MIN_POLL_INTERVAL_MS)
             .expect("test polling policy should be valid");
-        let mut first_runtime =
-            WatchCoordinator::open(&database_path, WatchPolicy::default(), polling_policy)
-                .expect("coordinator should start");
+        let mut first_runtime = WatchCoordinator::open_for_completed_scan_tests(
+            &database_path,
+            WatchPolicy::default(),
+            polling_policy,
+        )
+        .expect("coordinator should start");
         let scheduled = first_runtime
             .run_cycle_at_time(1_000)
             .expect("first polling cycle should schedule");
@@ -2523,9 +2763,12 @@ mod tests {
         assert_eq!(scheduled.active_event_count, 1);
         drop(first_runtime);
 
-        let mut restarted =
-            WatchCoordinator::open(&database_path, WatchPolicy::default(), polling_policy)
-                .expect("coordinator should restart");
+        let mut restarted = WatchCoordinator::open_for_completed_scan_tests(
+            &database_path,
+            WatchPolicy::default(),
+            polling_policy,
+        )
+        .expect("coordinator should restart");
         let completed = restarted
             .run_cycle_at_time(2_000)
             .expect("restart cycle should resume the durable event");
@@ -2655,6 +2898,7 @@ mod tests {
         fs::write(&sibling, "sibling").expect("sibling fixture should write");
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = authorize_scope(&database, directory.path()).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         let scans_before = database
             .stats()
@@ -2737,6 +2981,7 @@ mod tests {
         fs::write(&watched, "before").expect("fixture should write");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         let scans_before = database
             .stats()
@@ -2853,6 +3098,7 @@ mod tests {
         fs::hard_link(&original, &linked).expect("hard link should create");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         fs::write(&original, "after with a different size").expect("original should change");
         let event = observe_watch_path_at_time(
@@ -2909,6 +3155,7 @@ mod tests {
         fs::write(&old_path, "local context").expect("fixture should write");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         let old_key = comparison_key(&fs::canonicalize(&old_path).expect("path should exist"));
         let original_node = database
@@ -2971,6 +3218,7 @@ mod tests {
         fs::write(&watched_file, "before restart").expect("fixture should write");
         let mut database = ManifestDatabase::open(&database_path).expect("database should open");
         let scope = authorize_scope(&database, &scope_path).expect("scope should authorize");
+        activate_test_scope(&database, scope.id);
         scan_scope(&mut database, scope.id).expect("initial scan should complete");
         fs::write(&watched_file, "after restart").expect("fixture should change");
         let event = observe_watch_path_at_time(

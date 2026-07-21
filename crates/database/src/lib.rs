@@ -1,9 +1,25 @@
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fmt;
-use std::fs;
+#[cfg(not(unix))]
+use std::fs::DirBuilder;
+#[cfg(any(not(unix), test))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::Component;
+#[cfg(not(test))]
 use std::path::{MAIN_SEPARATOR, Path};
+#[cfg(test)]
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskgraph_domain::{
@@ -27,12 +43,16 @@ use deskgraph_domain::{
     WatchEventReason, WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
     parse_explicit_file_version_name, reduce_action_journal,
 };
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use deskgraph_identity::{IdentityNodeKind, is_symlink_or_reparse_point, platform_identity};
-use deskgraph_identity::{comparison_key, path_from_raw};
+use deskgraph_identity::{
+    IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
+    platform_identity, platform_identity_for_open_file,
+};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use rusqlite::OpenFlags;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+#[cfg(windows)]
+mod fence_windows;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -160,6 +180,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "scope_root_revocation",
         sql: include_str!("../../../migrations/0025_scope_root_revocation.sql"),
     },
+    Migration {
+        version: 26,
+        name: "scope_root_revocation_hardening",
+        sql: include_str!("../../../migrations/0026_scope_root_revocation_hardening.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -183,10 +208,13 @@ const MAX_ACTION_PATH_BYTES: usize = 64 * 1024;
 const MAX_FOLDER_PROFILE_ENTRIES: u64 = 100_000;
 const MAX_FILE_RELATION_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SCOPE_ACCESS_GRANT_BYTES: usize = 1024 * 1024;
+const SCOPE_FILESYSTEM_FENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const SCOPE_FILESYSTEM_FENCE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_SCREENSHOT_GROUP_IMAGES: u32 = 2_000;
 const MAX_SCREENSHOT_GROUPS: usize = 20;
 const MAX_SCREENSHOT_GROUP_MEMBERS: usize = 20;
 const SCREENSHOT_GROUP_TIME_WINDOW_NS: i64 = 600 * 1_000_000_000;
+static IN_MEMORY_FENCE_DOMAIN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct Migration {
     version: i64,
@@ -1283,8 +1311,11 @@ fn execute_scope_root_revocation_purge(
     let mut total = execute_privacy_purge(transaction, nonce, scope_id, new_revision)?;
     // Watch rows and scan issues may carry paths even when they were already
     // terminal or did not match a user exclusion. Root withdrawal removes all
-    // of them. Path-free scan job counters remain as local operational history,
-    // while every queue/staged row is invalidated by the revision transition.
+    // of them. Completed scan rows retain only path-free operational counters
+    // but are permanently failed below as the durable authorization-epoch
+    // boundary: reauthorization can never reuse an old completed scan, while
+    // an add-only exclusion may keep the atomically pruned manifest usable
+    // without starting an automatic scan.
     execute_counted(
         transaction,
         "DELETE FROM watch_events WHERE scope_id=?1",
@@ -1312,6 +1343,14 @@ fn execute_scope_root_revocation_purge(
     execute_counted(
         transaction,
         "DELETE FROM scan_staged_issues WHERE scan_id IN (SELECT id FROM scan_jobs WHERE scope_id=?1)",
+        [scope_id],
+        &mut total,
+    )?;
+    execute_counted(
+        transaction,
+        "UPDATE scan_jobs SET status='failed', control_state='ready', pause_requested=0, \
+            runner_token=NULL, lease_expires_at_unix_ms=NULL \
+         WHERE scope_id=?1 AND status='completed'",
         [scope_id],
         &mut total,
     )?;
@@ -2183,7 +2222,10 @@ pub enum DatabaseError {
     ScopeAccessGrantNotActive,
     ScopeAccessGrantInputInvalid,
     ScopeExclusionInputInvalid,
+    ScopeFilesystemFenceInvalid,
+    ScopeFilesystemFenceBusy,
     ScopePolicyRevisionStale,
+    ScopeRootRevocationPreviewStale,
     ScopePrivacyPurgeBlocked,
     ScanJobNotFound,
     ScanJobAlreadyActive,
@@ -2257,7 +2299,10 @@ impl DatabaseError {
             Self::ScopeAccessGrantNotActive => "scope_access_grant_not_active",
             Self::ScopeAccessGrantInputInvalid => "scope_access_grant_input_invalid",
             Self::ScopeExclusionInputInvalid => "scope_exclusion_input_invalid",
+            Self::ScopeFilesystemFenceInvalid => "scope_filesystem_fence_invalid",
+            Self::ScopeFilesystemFenceBusy => "scope_filesystem_fence_busy",
             Self::ScopePolicyRevisionStale => "scope_policy_revision_stale",
+            Self::ScopeRootRevocationPreviewStale => "scope_root_revocation_preview_stale",
             Self::ScopePrivacyPurgeBlocked => "scope_privacy_purge_blocked",
             Self::ScanJobNotFound => "scan_job_not_found",
             Self::ScanJobAlreadyActive => "scan_job_already_active",
@@ -2342,6 +2387,129 @@ impl From<rusqlite::Error> for DatabaseError {
 
 pub struct ManifestDatabase {
     connection: Connection,
+    fence_domain: ScopeFilesystemFenceDomain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScopeFilesystemFenceDomain {
+    File {
+        identity_kind: &'static str,
+        identity_key: Vec<u8>,
+    },
+    ProcessLocal(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopeFilesystemFenceRole {
+    Root,
+    Gate,
+    Data,
+}
+
+impl ScopeFilesystemFenceRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Gate => "gate",
+            Self::Data => "data",
+        }
+    }
+}
+
+/// A cooperative, per-scope, cross-process read admission guard.
+///
+/// DeskGraph-owned readers hold a shared OS lock from their final durable
+/// authorization check through every source-path syscall. Root revocation
+/// holds the matching exclusive lock through its atomic SQLite commit. The
+/// lock file lives only in DeskGraph-managed app data and never inside a user
+/// scope. SQLite policy revision checks remain the durable authorization
+/// source; this guard closes only the live check-to-read race.
+pub struct ScopeFilesystemReadFence {
+    data_file: Option<File>,
+    binding: ScopePolicyBinding,
+    domain: ScopeFilesystemFenceDomain,
+}
+
+impl ScopeFilesystemReadFence {
+    #[must_use]
+    pub fn binding(&self) -> ScopePolicyBinding {
+        self.binding
+    }
+}
+
+impl fmt::Debug for ScopeFilesystemReadFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopeFilesystemReadFence")
+            .field("data_file", &self.data_file.is_some())
+            .field("binding", &self.binding)
+            .field("domain", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for ScopeFilesystemReadFence {
+    fn drop(&mut self) {
+        if let Some(file) = self.data_file.as_ref() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// Scope-matched exclusive capability used while committing root withdrawal
+/// or a hard exclusion. Its private binding prevents callers from forging a
+/// fence for another scope or revision.
+pub struct ScopeFilesystemRevocationFence {
+    gate_file: Option<File>,
+    data_file: Option<File>,
+    binding: ScopePolicyBinding,
+    domain: ScopeFilesystemFenceDomain,
+}
+
+impl ScopeFilesystemRevocationFence {
+    #[must_use]
+    pub fn binding(&self) -> ScopePolicyBinding {
+        self.binding
+    }
+}
+
+impl fmt::Debug for ScopeFilesystemRevocationFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScopeFilesystemRevocationFence")
+            .field("gate_file", &self.gate_file.is_some())
+            .field("data_file", &self.data_file.is_some())
+            .field("binding", &self.binding)
+            .field("domain", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for ScopeFilesystemRevocationFence {
+    fn drop(&mut self) {
+        if let Some(file) = self.data_file.as_ref() {
+            let _ = file.unlock();
+        }
+        if let Some(file) = self.gate_file.as_ref() {
+            let _ = file.unlock();
+        }
+    }
+}
+
+fn lock_scope_filesystem_fence_exclusive(file: &File) -> Result<(), DatabaseError> {
+    let deadline = Instant::now() + SCOPE_FILESYSTEM_FENCE_WAIT_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(SCOPE_FILESYSTEM_FENCE_RETRY_INTERVAL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(DatabaseError::ScopeFilesystemFenceBusy);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
 }
 
 /// A capability-limited connection to an existing, fully migrated manifest.
@@ -2504,6 +2672,34 @@ fn normalize_read_only_query_error(error: DatabaseError) -> DatabaseError {
     }
 }
 
+fn scope_filesystem_fence_domain(
+    connection: &Connection,
+) -> Result<ScopeFilesystemFenceDomain, DatabaseError> {
+    let Some(database_path) = connection.path().filter(|path| !path.is_empty()) else {
+        let nonce = IN_MEMORY_FENCE_DOMAIN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        if nonce == 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        return Ok(ScopeFilesystemFenceDomain::ProcessLocal(nonce));
+    };
+    let canonical = fs::canonicalize(Path::new(database_path))
+        .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+    let metadata =
+        fs::symlink_metadata(&canonical).map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+    if !metadata.is_file() || is_symlink_or_reparse_point(&metadata) {
+        return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+    }
+    let identity = platform_identity(&canonical, &metadata, IdentityNodeKind::File)
+        .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+    if identity.link_count.is_some_and(|links| links != 1) {
+        return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+    }
+    Ok(ScopeFilesystemFenceDomain::File {
+        identity_kind: identity.kind,
+        identity_key: identity.key,
+    })
+}
+
 impl ManifestDatabase {
     pub fn open(path: &Path) -> Result<Self, DatabaseError> {
         if let Some(parent) = path
@@ -2536,7 +2732,11 @@ impl ManifestDatabase {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
 
-        let mut database = Self { connection };
+        let fence_domain = scope_filesystem_fence_domain(&connection)?;
+        let mut database = Self {
+            connection,
+            fence_domain,
+        };
         database.apply_migrations()?;
         database.recover_expired_scan_jobs_at(unix_ms()?)?;
         database.recover_expired_extraction_jobs_at(unix_ms()?)?;
@@ -2748,6 +2948,12 @@ impl ManifestDatabase {
             if persisted_platform != root.grant.grant_platform {
                 return Err(DatabaseError::ScopeAccessGrantInputInvalid);
             }
+            let persisted_opaque_grant: &[u8] =
+                if root.grant.state == ScopeAccessGrantState::Revoked {
+                    &[0]
+                } else {
+                    root.grant.opaque_grant
+                };
             transaction.execute(
                 "INSERT INTO scope_access_grants( \
                      scope_id, platform, opaque_grant, state, updated_at_unix_ms \
@@ -2760,7 +2966,7 @@ impl ManifestDatabase {
                 params![
                     scope.id,
                     root.grant.grant_platform,
-                    root.grant.opaque_grant,
+                    persisted_opaque_grant,
                     root.grant.state.as_str(),
                     created_at
                 ],
@@ -2873,6 +3079,488 @@ impl ManifestDatabase {
         Ok(ScopePolicyBinding { scope_id, revision })
     }
 
+    /// Acquires the shared live-read guard and then repeats the durable access
+    /// check while the guard is held. A revoker that committed between the
+    /// initial check and lock acquisition therefore prevents the caller from
+    /// reaching any user-scope filesystem operation.
+    pub fn acquire_scope_filesystem_read_fence(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeFilesystemReadFence, DatabaseError> {
+        let before = self.bind_scope_policy_revision(scope_id)?;
+        let Some((gate_file, data_file)) = self.open_scope_filesystem_fence_files(scope_id)? else {
+            return Ok(ScopeFilesystemReadFence {
+                data_file: None,
+                binding: before,
+                domain: self.fence_domain.clone(),
+            });
+        };
+        lock_scope_filesystem_fence_exclusive(&gate_file)?;
+        data_file.lock_shared()?;
+        let after = match self.bind_scope_policy_revision(scope_id) {
+            Ok(binding) if binding == before => binding,
+            Ok(_) => return Err(DatabaseError::ScopePolicyRevisionStale),
+            Err(error) => return Err(error),
+        };
+        gate_file.unlock()?;
+        Ok(ScopeFilesystemReadFence {
+            data_file: Some(data_file),
+            binding: after,
+            domain: self.fence_domain.clone(),
+        })
+    }
+
+    /// Acquires an exclusive admission turnstile before draining readers. Once
+    /// the turnstile is held, no new cooperating reader can enter; both waits
+    /// are bounded so a stuck reader becomes an explicit retryable failure
+    /// rather than an indefinitely hung privacy action.
+    pub fn acquire_scope_filesystem_revocation_fence(
+        &self,
+        scope_id: i64,
+    ) -> Result<ScopeFilesystemRevocationFence, DatabaseError> {
+        let before = self.bind_scope_policy_revision(scope_id)?;
+        let Some((gate_file, data_file)) = self.open_scope_filesystem_fence_files(scope_id)? else {
+            return Ok(ScopeFilesystemRevocationFence {
+                gate_file: None,
+                data_file: None,
+                binding: before,
+                domain: self.fence_domain.clone(),
+            });
+        };
+        lock_scope_filesystem_fence_exclusive(&gate_file)?;
+        if let Err(error) = lock_scope_filesystem_fence_exclusive(&data_file) {
+            let _ = gate_file.unlock();
+            return Err(error);
+        }
+        let after = match self.bind_scope_policy_revision(scope_id) {
+            Ok(binding) if binding == before => binding,
+            Ok(_) => return Err(DatabaseError::ScopePolicyRevisionStale),
+            Err(error) => return Err(error),
+        };
+        Ok(ScopeFilesystemRevocationFence {
+            gate_file: Some(gate_file),
+            data_file: Some(data_file),
+            binding: after,
+            domain: self.fence_domain.clone(),
+        })
+    }
+
+    pub fn validate_scope_filesystem_revocation_fence(
+        &self,
+        fence: &ScopeFilesystemRevocationFence,
+        binding: ScopePolicyBinding,
+    ) -> Result<(), DatabaseError> {
+        if fence.domain != self.fence_domain || fence.binding.scope_id != binding.scope_id {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        if fence.binding.revision != binding.revision {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
+        Ok(())
+    }
+
+    pub fn validate_scope_filesystem_read_fence(
+        &self,
+        fence: &ScopeFilesystemReadFence,
+        binding: ScopePolicyBinding,
+    ) -> Result<(), DatabaseError> {
+        if fence.domain != self.fence_domain || fence.binding.scope_id != binding.scope_id {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        if fence.binding.revision != binding.revision {
+            return Err(DatabaseError::ScopePolicyRevisionStale);
+        }
+        Ok(())
+    }
+
+    fn open_scope_filesystem_fence_files(
+        &self,
+        scope_id: i64,
+    ) -> Result<Option<(File, File)>, DatabaseError> {
+        if scope_id <= 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        let Some(database_path) = self.connection.path().filter(|path| !path.is_empty()) else {
+            // An in-memory SQLite database cannot be shared with another
+            // process, so the repeated policy check above is the complete
+            // admission boundary for that test-only/runtime-local case.
+            return Ok(None);
+        };
+        // Resolve aliases after SQLite has created/opened the database so two
+        // cooperating processes that address the same manifest through
+        // different relative or symlinked paths still converge on one fence
+        // directory. Failure is closed because a split fence would re-open
+        // the live check-to-read race this guard exists to prevent.
+        let database_path = fs::canonicalize(Path::new(database_path))
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        let database_parent = database_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        #[cfg(unix)]
+        {
+            self.open_scope_filesystem_fence_files_unix(scope_id, &database_path, database_parent)
+                .map(Some)
+        }
+        #[cfg(windows)]
+        {
+            fence_windows::open_scope_filesystem_fence_files(
+                self,
+                scope_id,
+                &database_path,
+                database_parent,
+            )
+            .map(Some)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let fence_root = database_parent.join("scope-read-fences-v1");
+            self.prepare_scope_filesystem_fence_root(scope_id, &fence_root)?;
+            let gate_path = fence_root.join(format!("scope-{scope_id}.gate"));
+            let data_path = fence_root.join(format!("scope-{scope_id}.lock"));
+            let gate_file = self.open_scope_filesystem_fence_file(
+                scope_id,
+                ScopeFilesystemFenceRole::Gate,
+                &gate_path,
+            )?;
+            let data_file = self.open_scope_filesystem_fence_file(
+                scope_id,
+                ScopeFilesystemFenceRole::Data,
+                &data_path,
+            )?;
+            self.validate_and_bind_scope_filesystem_fence_root(scope_id, &fence_root)?;
+            Ok(Some((gate_file, data_file)))
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_scope_filesystem_fence_files_unix(
+        &self,
+        scope_id: i64,
+        database_path: &Path,
+        database_parent: &Path,
+    ) -> Result<(File, File), DatabaseError> {
+        let fence_root = database_parent.join("scope-read-fences-v1");
+        let parent_name = CString::new(database_parent.as_os_str().as_bytes())
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        // SAFETY: `parent_name` is NUL-terminated and the returned descriptor
+        // becomes owned by `parent`.
+        let parent_fd = unsafe {
+            libc::open(
+                parent_name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NOCTTY,
+            )
+        };
+        if parent_fd < 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        // SAFETY: `parent_fd` is a newly owned descriptor from `open`.
+        let parent = unsafe { File::from_raw_fd(parent_fd) };
+
+        // Before any mkdir/open-with-create, prove that this pinned directory
+        // still contains the exact database inode from which this manifest's
+        // private fence domain was derived.
+        let database_name = database_path
+            .file_name()
+            .ok_or(DatabaseError::ScopeFilesystemFenceInvalid)?;
+        let database_name = CString::new(database_name.as_bytes())
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        // SAFETY: `parent` is a live directory descriptor and `database_name`
+        // is one NUL-terminated child name. O_NOFOLLOW rejects a link leaf.
+        let database_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                database_name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if database_fd < 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        // SAFETY: `database_fd` is a newly owned descriptor from `openat`.
+        let database_file = unsafe { File::from_raw_fd(database_fd) };
+        let database_metadata = database_file.metadata()?;
+        let database_identity = platform_identity_for_open_file(
+            &database_file,
+            database_path,
+            &database_metadata,
+            IdentityNodeKind::File,
+        )
+        .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        if !database_metadata.is_file()
+            || database_identity.link_count.is_some_and(|links| links != 1)
+            || !matches!(
+                &self.fence_domain,
+                ScopeFilesystemFenceDomain::File {
+                    identity_kind,
+                    identity_key,
+                } if *identity_kind == database_identity.kind
+                    && identity_key == &database_identity.key
+            )
+        {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+
+        let root_name = CString::new("scope-read-fences-v1")
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        // SAFETY: `parent` is pinned to the verified database directory and
+        // `root_name` is a single NUL-terminated child name.
+        let created = unsafe { libc::mkdirat(parent.as_raw_fd(), root_name.as_ptr(), 0o700) };
+        if created < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        // SAFETY: the verified parent descriptor remains live, and O_NOFOLLOW
+        // prevents a pre-existing symlink from becoming the fence root.
+        let root_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                root_name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NOCTTY,
+            )
+        };
+        if root_fd < 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        // SAFETY: `root_fd` is a newly owned descriptor from `openat`.
+        let root = unsafe { File::from_raw_fd(root_fd) };
+        let root_metadata = root.metadata()?;
+        if !root_metadata.is_dir() || root_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        let root_identity = platform_identity_for_open_file(
+            &root,
+            &fence_root,
+            &root_metadata,
+            IdentityNodeKind::Folder,
+        )
+        .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        self.bind_scope_filesystem_fence_identity(
+            scope_id,
+            ScopeFilesystemFenceRole::Root,
+            root_identity.kind,
+            &root_identity.key,
+        )?;
+
+        let gate_file = self.open_scope_filesystem_fence_file_at_unix(
+            &root,
+            scope_id,
+            ScopeFilesystemFenceRole::Gate,
+            &format!("scope-{scope_id}.gate"),
+            &fence_root,
+        )?;
+        let data_file = self.open_scope_filesystem_fence_file_at_unix(
+            &root,
+            scope_id,
+            ScopeFilesystemFenceRole::Data,
+            &format!("scope-{scope_id}.lock"),
+            &fence_root,
+        )?;
+        Ok((gate_file, data_file))
+    }
+
+    #[cfg(unix)]
+    fn open_scope_filesystem_fence_file_at_unix(
+        &self,
+        root: &File,
+        scope_id: i64,
+        role: ScopeFilesystemFenceRole,
+        entry_name: &str,
+        fence_root: &Path,
+    ) -> Result<File, DatabaseError> {
+        let entry_name =
+            CString::new(entry_name).map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        // SAFETY: `root` is a pinned, verified directory descriptor and
+        // `entry_name` is one NUL-terminated child. O_NOFOLLOW prevents a link
+        // leaf; mode applies atomically only if O_CREAT creates a new inode.
+        let file_fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                entry_name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_NOCTTY,
+                0o600,
+            )
+        };
+        if file_fd < 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        // SAFETY: `file_fd` is a newly owned descriptor from `openat`.
+        let file = unsafe { File::from_raw_fd(file_fd) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        let diagnostic_path = fence_root.join(format!("scope-{scope_id}.lock"));
+        let identity = platform_identity_for_open_file(
+            &file,
+            &diagnostic_path,
+            &metadata,
+            IdentityNodeKind::File,
+        )
+        .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        if identity.link_count.is_some_and(|links| links != 1) {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        self.bind_scope_filesystem_fence_identity(scope_id, role, identity.kind, &identity.key)?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn prepare_scope_filesystem_fence_root(
+        &self,
+        scope_id: i64,
+        fence_root: &Path,
+    ) -> Result<(), DatabaseError> {
+        match fs::symlink_metadata(fence_root) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let builder = DirBuilder::new();
+                if let Err(error) = builder.create(fence_root)
+                    && error.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.validate_and_bind_scope_filesystem_fence_root(scope_id, fence_root)
+    }
+
+    #[cfg(not(unix))]
+    fn validate_and_bind_scope_filesystem_fence_root(
+        &self,
+        scope_id: i64,
+        fence_root: &Path,
+    ) -> Result<(), DatabaseError> {
+        let metadata = fs::symlink_metadata(fence_root)
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        if !metadata.is_dir() || is_symlink_or_reparse_point(&metadata) {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        let identity = platform_identity(fence_root, &metadata, IdentityNodeKind::Folder)
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        self.bind_scope_filesystem_fence_identity(
+            scope_id,
+            ScopeFilesystemFenceRole::Root,
+            identity.kind,
+            &identity.key,
+        )
+    }
+
+    #[cfg(not(unix))]
+    fn open_scope_filesystem_fence_file(
+        &self,
+        scope_id: i64,
+        role: ScopeFilesystemFenceRole,
+        fence_path: &Path,
+    ) -> Result<File, DatabaseError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        let file = options
+            .open(fence_path)
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        let path_metadata = fs::symlink_metadata(fence_path)?;
+        let open_metadata = file.metadata()?;
+        if !path_metadata.is_file()
+            || !open_metadata.is_file()
+            || is_symlink_or_reparse_point(&path_metadata)
+        {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        let path_identity = platform_identity(fence_path, &path_metadata, IdentityNodeKind::File)
+            .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        let open_identity = platform_identity_for_open_file(
+            &file,
+            fence_path,
+            &open_metadata,
+            IdentityNodeKind::File,
+        )
+        .map_err(|_| DatabaseError::ScopeFilesystemFenceInvalid)?;
+        if path_identity.kind != open_identity.kind
+            || path_identity.key != open_identity.key
+            || path_identity.link_count.is_some_and(|links| links != 1)
+            || open_identity.link_count.is_some_and(|links| links != 1)
+        {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        self.bind_scope_filesystem_fence_identity(
+            scope_id,
+            role,
+            open_identity.kind,
+            &open_identity.key,
+        )?;
+        Ok(file)
+    }
+
+    fn bind_scope_filesystem_fence_identity(
+        &self,
+        scope_id: i64,
+        role: ScopeFilesystemFenceRole,
+        identity_kind: &str,
+        identity_key: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if scope_id <= 0 || identity_kind.is_empty() || identity_key.is_empty() {
+            return Err(DatabaseError::ScopeFilesystemFenceInvalid);
+        }
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT identity_kind, identity_key \
+                 FROM scope_filesystem_fence_identities \
+                 WHERE scope_id=?1 AND role=?2",
+                params![scope_id, role.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((stored_kind, stored_key))
+                if stored_kind == identity_kind && stored_key == identity_key =>
+            {
+                return Ok(());
+            }
+            Some(_) => return Err(DatabaseError::ScopeFilesystemFenceInvalid),
+            None => {}
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT identity_kind, identity_key \
+                 FROM scope_filesystem_fence_identities \
+                 WHERE scope_id=?1 AND role=?2",
+                params![scope_id, role.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((stored_kind, stored_key))
+                if stored_kind == identity_kind && stored_key == identity_key => {}
+            Some(_) => return Err(DatabaseError::ScopeFilesystemFenceInvalid),
+            None => {
+                transaction.execute(
+                    "INSERT INTO scope_filesystem_fence_identities( \
+                         scope_id, role, identity_kind, identity_key \
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![scope_id, role.as_str(), identity_kind, identity_key],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Revision-only binding for core CLI scan/extraction work. Packaged and
     /// query surfaces must use the active-grant `bind_scope_policy_revision`.
     pub fn bind_core_scope_policy_revision(
@@ -2941,6 +3629,27 @@ impl ManifestDatabase {
     }
 
     pub fn apply_scope_exclusion_batch(
+        &mut self,
+        binding: ScopePolicyBinding,
+        writes: &[ScopeExclusionWrite<'_>],
+        now_unix_ms: i64,
+    ) -> Result<ScopeExclusionApplyResult, DatabaseError> {
+        let fence = self.acquire_scope_filesystem_revocation_fence(binding.scope_id)?;
+        self.apply_scope_exclusion_batch_with_fence(&fence, binding, writes, now_unix_ms)
+    }
+
+    pub fn apply_scope_exclusion_batch_with_fence(
+        &mut self,
+        fence: &ScopeFilesystemRevocationFence,
+        binding: ScopePolicyBinding,
+        writes: &[ScopeExclusionWrite<'_>],
+        now_unix_ms: i64,
+    ) -> Result<ScopeExclusionApplyResult, DatabaseError> {
+        self.validate_scope_filesystem_revocation_fence(fence, binding)?;
+        self.apply_scope_exclusion_batch_internal(binding, writes, now_unix_ms)
+    }
+
+    fn apply_scope_exclusion_batch_internal(
         &mut self,
         binding: ScopePolicyBinding,
         writes: &[ScopeExclusionWrite<'_>],
@@ -3092,6 +3801,54 @@ impl ManifestDatabase {
         binding: ScopePolicyBinding,
         now_unix_ms: i64,
     ) -> Result<ScopeRootRevocationApplyResult, DatabaseError> {
+        let fence = self.acquire_scope_filesystem_revocation_fence(binding.scope_id)?;
+        self.apply_scope_root_revocation_with_fence(&fence, binding, now_unix_ms)
+    }
+
+    pub fn apply_scope_root_revocation_with_fence(
+        &self,
+        fence: &ScopeFilesystemRevocationFence,
+        binding: ScopePolicyBinding,
+        now_unix_ms: i64,
+    ) -> Result<ScopeRootRevocationApplyResult, DatabaseError> {
+        self.validate_scope_filesystem_revocation_fence(fence, binding)?;
+        self.apply_scope_root_revocation_internal(binding, None, now_unix_ms)
+    }
+
+    /// Applies exactly the impact that was shown by
+    /// [`Self::preview_scope_root_revocation`]. Derived state can change
+    /// without advancing the policy revision, so the impact and exclusion
+    /// counts are re-read inside the same immediate transaction and must
+    /// still match before any durable mutation is allowed.
+    pub fn apply_scope_root_revocation_from_preview(
+        &self,
+        preview: ScopeRootRevocationPreview,
+        now_unix_ms: i64,
+    ) -> Result<ScopeRootRevocationApplyResult, DatabaseError> {
+        let fence = self.acquire_scope_filesystem_revocation_fence(preview.scope_id)?;
+        self.apply_scope_root_revocation_from_preview_with_fence(&fence, preview, now_unix_ms)
+    }
+
+    pub fn apply_scope_root_revocation_from_preview_with_fence(
+        &self,
+        fence: &ScopeFilesystemRevocationFence,
+        preview: ScopeRootRevocationPreview,
+        now_unix_ms: i64,
+    ) -> Result<ScopeRootRevocationApplyResult, DatabaseError> {
+        let binding = ScopePolicyBinding {
+            scope_id: preview.scope_id,
+            revision: preview.base_policy_revision,
+        };
+        self.validate_scope_filesystem_revocation_fence(fence, binding)?;
+        self.apply_scope_root_revocation_internal(binding, Some(preview), now_unix_ms)
+    }
+
+    fn apply_scope_root_revocation_internal(
+        &self,
+        binding: ScopePolicyBinding,
+        expected_preview: Option<ScopeRootRevocationPreview>,
+        now_unix_ms: i64,
+    ) -> Result<ScopeRootRevocationApplyResult, DatabaseError> {
         if now_unix_ms < 0 {
             return Err(DatabaseError::InvalidTimestamp);
         }
@@ -3111,6 +3868,21 @@ impl ManifestDatabase {
         )?;
         insert_full_scope_privacy_targets(&transaction, &nonce, binding.scope_id)?;
         let impact = scope_root_revocation_impact(&transaction, &nonce, binding.scope_id)?;
+        let exclusion_count = transaction.query_row(
+            "SELECT COUNT(*) FROM scope_exclusions WHERE scope_id=?1",
+            [binding.scope_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let exclusion_count =
+            u64::try_from(exclusion_count).map_err(|_| DatabaseError::InvalidCount)?;
+        if expected_preview.is_some_and(|expected| {
+            expected.scope_id != binding.scope_id
+                || expected.base_policy_revision != binding.revision
+                || expected.impact != impact
+                || expected.exclusion_count != exclusion_count
+        }) {
+            return Err(DatabaseError::ScopeRootRevocationPreviewStale);
+        }
         ensure_privacy_purge_actions_are_safe(&transaction, &nonce, binding.scope_id)?;
 
         let changed = transaction.execute(
@@ -3782,8 +4554,8 @@ impl ManifestDatabase {
         self.connection
             .query_row(
                 "SELECT EXISTS( \
-                    SELECT 1 FROM scan_jobs \
-                    WHERE scope_id = ?1 AND status = 'completed' \
+                    SELECT 1 FROM scan_jobs job \
+                    WHERE job.scope_id = ?1 AND job.status = 'completed' \
                  )",
                 [scope_id],
                 |row| row.get::<_, i64>(0).map(|value| value == 1),
@@ -4387,8 +5159,9 @@ impl ManifestDatabase {
             "SELECT EXISTS( \
                 SELECT 1 FROM scan_jobs \
                 WHERE scope_id = ?1 AND status = 'completed' \
+                  AND policy_revision = ?2 \
              )",
-            [scope_id],
+            params![scope_id, policy_revision],
             |row| row.get(0),
         )?;
         if completed_scan_exists != 1 {
@@ -4439,6 +5212,11 @@ impl ManifestDatabase {
              WHERE id = ?1 AND status = 'reconciling' AND EXISTS ( \
                 SELECT 1 FROM scan_jobs WHERE scan_jobs.id = watch_events.scan_job_id \
                     AND scan_jobs.status = 'completed' \
+                    AND scan_jobs.policy_revision = watch_events.policy_revision \
+                    AND watch_events.policy_revision = ( \
+                        SELECT policy_revision FROM authorized_scopes \
+                        WHERE id = watch_events.scope_id \
+                    ) \
              )",
             params![event_id, now_unix_ms],
         )?;
@@ -8271,8 +9049,8 @@ impl ManifestDatabase {
         if scope_id <= 0 || source_id <= 0 || source_observation_id <= 0 {
             return Err(DatabaseError::SmartCleanupSourceInputInvalid);
         }
-        ensure_scope_queryable(&self.connection, scope_id)?;
         ensure_scope_access_permitted(&self.connection, scope_id)?;
+        ensure_scope_queryable(&self.connection, scope_id)?;
         let item = match source_kind {
             SmartCleanupSourceKind::ExactDuplicate | SmartCleanupSourceKind::Version => {
                 let query = match source_kind {
@@ -10173,8 +10951,8 @@ fn cleanup_selection_snapshot(
     selection: &CleanupActionSelection,
 ) -> Result<CleanupSelectionSnapshot, DatabaseError> {
     validate_cleanup_selection_input(selection)?;
-    ensure_scope_queryable(connection, selection.scope_id)?;
     ensure_scope_access_permitted(connection, selection.scope_id)?;
+    ensure_scope_queryable(connection, selection.scope_id)?;
     match selection.source_kind {
         SmartCleanupSourceKind::ExactDuplicate => {
             let row = connection
@@ -11237,7 +12015,8 @@ fn request_scope_full_reconciliation_in_transaction(
 ) -> Result<i64, DatabaseError> {
     let completed_scan_exists: i64 = transaction.query_row(
         "SELECT EXISTS( \
-            SELECT 1 FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed' \
+            SELECT 1 FROM scan_jobs job \
+            WHERE job.scope_id = ?1 AND job.status = 'completed' \
          )",
         [scope_id],
         |row| row.get(0),
@@ -11619,7 +12398,10 @@ fn ensure_scope_queryable(connection: &Connection, scope_id: i64) -> Result<(), 
         return Err(DatabaseError::ScopeNotFound);
     }
     let completed = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM scan_jobs WHERE scope_id = ?1 AND status = 'completed')",
+        "SELECT EXISTS( \
+            SELECT 1 FROM scan_jobs job \
+            WHERE job.scope_id = ?1 AND job.status = 'completed' \
+         )",
         [scope_id],
         |row| row.get::<_, i64>(0).map(|value| value == 1),
     )?;
@@ -14417,12 +15199,54 @@ mod tests {
             database
                 .connection
                 .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=26 AND name='scope_root_revocation_hardening'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("0026 registry row should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
                     "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='scope_root_revocation_receipts'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("root revocation receipt table should load"),
             1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ( \
+                         'scope_access_grants_revocation_tombstone_update', \
+                         'scope_access_grants_revocation_tombstone_insert', \
+                         'scope_access_grants_revocation_privacy_capability_update' \
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("root revocation grant guards should load"),
+            3
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE \
+                         (type='table' AND name='scope_filesystem_fence_identities') \
+                         OR (type='trigger' AND name IN ( \
+                             'scope_filesystem_fence_identities_immutable_update', \
+                             'scope_filesystem_fence_identities_immutable_delete' \
+                         ))",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("stable fence identity schema should load"),
+            3
         );
         assert_eq!(
             database
@@ -14470,6 +15294,64 @@ mod tests {
                 .expect("durable exclusion identity schema should load"),
             3
         );
+    }
+
+    #[test]
+    fn root_revocation_hardening_backfills_legacy_revoked_capability_bytes() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("pre-root-hardening.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations ( \
+                     version INTEGER PRIMARY KEY, \
+                     name TEXT NOT NULL, \
+                     checksum TEXT NOT NULL, \
+                     applied_at_unix_ms INTEGER NOT NULL \
+                 );",
+            )
+            .expect("migration registry should initialize");
+        for migration in &MIGRATIONS[..25] {
+            connection
+                .execute_batch(migration.sql)
+                .expect("pre-hardening migration should apply");
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at_unix_ms) \
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration.sql)
+                    ],
+                )
+                .expect("pre-hardening migration should register");
+        }
+        connection
+            .execute(
+                "INSERT INTO authorized_scopes( \
+                     id, path_raw, path_key, display_path, platform, created_at_unix_ms \
+                 ) VALUES (1, X'2F6C6567616379', '/legacy', '/legacy', ?1, 0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy scope should persist");
+        connection
+            .execute(
+                "INSERT INTO scope_access_grants( \
+                     scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                 ) VALUES (1, ?1, X'6C65676163792D626F6F6B6D61726B', 'revoked', 0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy revoked capability bytes should persist before hardening");
+        drop(connection);
+
+        let database = ManifestDatabase::open(&path).expect("hardening migration should apply");
+        let grant = database
+            .scope_access_grant(1)
+            .expect("legacy grant should load")
+            .expect("legacy grant row should remain");
+        assert_eq!(grant.state, ScopeAccessGrantState::Revoked);
+        assert_eq!(grant.opaque_grant, [0]);
     }
 
     #[test]
@@ -15041,6 +15923,14 @@ mod tests {
             database.active_scope_grant(inactive_scope.id),
             Err(DatabaseError::ScopeAccessGrantNotActive)
         ));
+        assert_eq!(
+            database
+                .scope_access_grant(inactive_scope.id)
+                .expect("revoked grant should load")
+                .expect("revoked tombstone should persist")
+                .opaque_grant,
+            [0]
+        );
     }
 
     #[test]
@@ -15871,7 +16761,12 @@ mod tests {
                 .commit()
                 .expect("historical migration should commit");
         }
-        let database = ManifestDatabase { connection };
+        let fence_domain =
+            scope_filesystem_fence_domain(&connection).expect("test manifest domain should bind");
+        let database = ManifestDatabase {
+            connection,
+            fence_domain,
+        };
         let scope = database
             .add_scope(b"/scope", "/scope", "/scope", "test")
             .expect("scope should persist");
@@ -15961,7 +16856,7 @@ mod tests {
                 [relation_id],
             )
             .expect("feedback should persist");
-        let ManifestDatabase { connection } = database;
+        let ManifestDatabase { connection, .. } = database;
         drop(connection);
 
         let upgraded = ManifestDatabase::open(&path).expect("version migration should apply");
@@ -20261,6 +21156,46 @@ mod tests {
             .expect("grant tombstone should remain");
         assert_eq!(grant.state, ScopeAccessGrantState::Revoked);
         assert_eq!(grant.opaque_grant, [0]);
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE scope_access_grants SET opaque_grant=X'7265757361626C65' \
+                     WHERE scope_id=?1 AND state='revoked'",
+                    [scope_id],
+                )
+                .is_err(),
+            "an already-revoked row must reject reusable capability bytes"
+        );
+        let inserted_revoked_scope = database
+            .add_scope(
+                b"/scope/revoked-insert",
+                "/scope/revoked-insert",
+                "/scope/revoked-insert",
+                std::env::consts::OS,
+            )
+            .expect("a separate scope should persist");
+        assert!(
+            database
+                .connection
+                .execute(
+                    "INSERT INTO scope_access_grants( \
+                         scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                     ) VALUES (?1, ?2, X'7265757361626C65', 'revoked', 4)",
+                    params![inserted_revoked_scope.id, std::env::consts::OS],
+                )
+                .is_err(),
+            "a newly inserted revoked row must reject reusable capability bytes"
+        );
+        database
+            .connection
+            .execute(
+                "INSERT INTO scope_access_grants( \
+                     scope_id, platform, opaque_grant, state, updated_at_unix_ms \
+                 ) VALUES (?1, ?2, X'00', 'revoked', 4)",
+                params![inserted_revoked_scope.id, std::env::consts::OS],
+            )
+            .expect("the exact fixed tombstone should remain representable");
         for table in [
             "locations",
             "content_chunks",
@@ -20311,6 +21246,781 @@ mod tests {
                 )
                 .is_err(),
             "revocation receipt must be immutable"
+        );
+    }
+
+    #[test]
+    fn scope_root_revocation_rejects_a_preview_when_derived_impact_changed() {
+        let (database, scope_id, _, _) = extraction_setup();
+        let binding = test_active_binding(&database, scope_id).expect("scope should become active");
+        let preview = database
+            .preview_scope_root_revocation(binding)
+            .expect("root revocation should preview");
+        database
+            .connection
+            .execute(
+                "INSERT INTO scan_jobs( \
+                     scope_id, status, started_at_unix_ms, policy_revision \
+                 ) VALUES (?1, 'interrupted', 2, ?2)",
+                params![scope_id, binding.revision],
+            )
+            .expect("derived state should change without a policy revision change");
+
+        assert!(matches!(
+            database.apply_scope_root_revocation_from_preview(preview, 3),
+            Err(DatabaseError::ScopeRootRevocationPreviewStale)
+        ));
+        assert_eq!(
+            database
+                .current_scope_policy_revision(scope_id)
+                .expect("policy should remain readable")
+                .revision,
+            binding.revision
+        );
+        assert!(
+            database
+                .scope_has_active_access_grant(scope_id)
+                .expect("a stale confirmation must leave the grant active")
+        );
+        let fresh = database
+            .preview_scope_root_revocation(binding)
+            .expect("a fresh impact should preview");
+        assert_eq!(
+            fresh.impact.scan_job_count,
+            preview.impact.scan_job_count + 1
+        );
+        database
+            .apply_scope_root_revocation_from_preview(fresh, 4)
+            .expect("the fresh exact preview should commit");
+        assert_eq!(
+            database
+                .scope_access_grant_state(scope_id)
+                .expect("grant state should load"),
+            ScopeAccessGrantState::Revoked
+        );
+    }
+
+    #[test]
+    fn scope_filesystem_fence_drains_a_reader_before_revocation_and_denies_new_reads() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/cooperative-fence",
+                "/cooperative-fence",
+                "/cooperative-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"cooperative-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let preview = database
+            .preview_scope_root_revocation(
+                database
+                    .bind_scope_policy_revision(scope.id)
+                    .expect("scope should bind"),
+            )
+            .expect("revocation should preview");
+        let reader = database
+            .acquire_scope_filesystem_read_fence(scope.id)
+            .expect("reader should acquire the shared fence");
+        assert_eq!(reader.binding().scope_id, scope.id);
+
+        let writer_path = database_path.clone();
+        let (writer_started_tx, writer_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (writer_finished_tx, writer_finished_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let writer_database =
+                ManifestDatabase::open(&writer_path).expect("writer database should open");
+            writer_started_tx
+                .send(())
+                .expect("writer start should be observable");
+            writer_database
+                .apply_scope_root_revocation_from_preview(preview, 2)
+                .expect("the public API must fence and commit after readers drain");
+            writer_finished_tx
+                .send(())
+                .expect("writer completion should be observable");
+        });
+        writer_started_rx
+            .recv()
+            .expect("writer should reach fence acquisition");
+        assert!(
+            writer_finished_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "exclusive revocation must wait for the active shared reader"
+        );
+        drop(reader);
+        writer_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("revocation should finish after the reader drops");
+        writer.join().expect("writer thread should not panic");
+
+        let reopened = ManifestDatabase::open(&database_path).expect("database should reopen");
+        assert!(matches!(
+            reopened.acquire_scope_filesystem_read_fence(scope.id),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+    }
+
+    #[test]
+    fn scope_filesystem_fence_uses_policy_checks_for_an_in_memory_database() {
+        let mut database =
+            ManifestDatabase::open_in_memory().expect("in-memory database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/process-local-fence",
+                "/process-local-fence",
+                "/process-local-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"process-local-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+
+        let reader = database
+            .acquire_scope_filesystem_read_fence(scope.id)
+            .expect("process-local reader should use repeated policy checks");
+        assert_eq!(reader.binding().scope_id, scope.id);
+    }
+
+    #[test]
+    fn scope_filesystem_fence_rejects_a_replaced_lock_inode() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/replaced-fence",
+                "/replaced-fence",
+                "/replaced-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"replaced-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let reader = database
+            .acquire_scope_filesystem_read_fence(scope.id)
+            .expect("reader should bind and hold the original inode");
+        let fence_root = directory.path().join("scope-read-fences-v1");
+        let data_path = fence_root.join(format!("scope-{}.lock", scope.id));
+        let displaced_path = fence_root.join(format!("scope-{}.displaced", scope.id));
+        fs::rename(&data_path, &displaced_path).expect("test should displace the lock inode");
+        let replacement = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&data_path)
+            .expect("test should create a replacement inode");
+        drop(replacement);
+
+        let reopened = ManifestDatabase::open(&database_path).expect("database should reopen");
+        assert!(matches!(
+            reopened.acquire_scope_filesystem_revocation_fence(scope.id),
+            Err(DatabaseError::ScopeFilesystemFenceInvalid)
+        ));
+        assert!(
+            reopened
+                .scope_has_active_access_grant(scope.id)
+                .expect("failed fence admission must not revoke the grant")
+        );
+        drop(reader);
+    }
+
+    #[test]
+    fn scope_filesystem_revocation_fence_is_scope_and_revision_matched() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let first = database
+            .add_scope_with_access_grant(
+                b"/first-fence-scope",
+                "/first-fence-scope",
+                "/first-fence-scope",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"first-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("first scope should persist");
+        let second = database
+            .add_scope_with_access_grant(
+                b"/second-fence-scope",
+                "/second-fence-scope",
+                "/second-fence-scope",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"second-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("second scope should persist");
+        let fence = database
+            .acquire_scope_filesystem_revocation_fence(first.id)
+            .expect("first scope fence should acquire");
+        let second_binding = database
+            .bind_scope_policy_revision(second.id)
+            .expect("second scope should bind");
+
+        assert!(matches!(
+            database.apply_scope_root_revocation_with_fence(&fence, second_binding, 2),
+            Err(DatabaseError::ScopeFilesystemFenceInvalid)
+        ));
+        assert!(
+            database
+                .scope_has_active_access_grant(second.id)
+                .expect("mismatched fence must leave the grant active")
+        );
+    }
+
+    #[test]
+    fn scope_filesystem_revocation_fence_cannot_cross_manifest_domains() {
+        let mut first =
+            ManifestDatabase::open_in_memory().expect("first manifest should initialize");
+        let first_scope = first
+            .add_scope_with_access_grant(
+                b"/first-manifest",
+                "/first-manifest",
+                "/first-manifest",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"first-manifest-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("first scope should persist");
+        let fence = first
+            .acquire_scope_filesystem_revocation_fence(first_scope.id)
+            .expect("first manifest fence should acquire");
+
+        let mut second =
+            ManifestDatabase::open_in_memory().expect("second manifest should initialize");
+        let second_scope = second
+            .add_scope_with_access_grant(
+                b"/second-manifest",
+                "/second-manifest",
+                "/second-manifest",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"second-manifest-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("second scope should persist");
+        let second_binding = second
+            .bind_scope_policy_revision(second_scope.id)
+            .expect("second scope should bind");
+        assert_eq!(fence.binding(), second_binding);
+
+        assert!(matches!(
+            second.apply_scope_root_revocation_with_fence(&fence, second_binding, 2),
+            Err(DatabaseError::ScopeFilesystemFenceInvalid)
+        ));
+        assert!(
+            second
+                .scope_has_active_access_grant(second_scope.id)
+                .expect("foreign-domain token must leave the second grant active")
+        );
+    }
+
+    #[test]
+    fn scope_filesystem_read_fence_cannot_cross_manifest_domains() {
+        let mut first =
+            ManifestDatabase::open_in_memory().expect("first manifest should initialize");
+        let first_scope = first
+            .add_scope_with_access_grant(
+                b"/first-read-manifest",
+                "/first-read-manifest",
+                "/first-read-manifest",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"first-read-manifest-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("first scope should persist");
+        let fence = first
+            .acquire_scope_filesystem_read_fence(first_scope.id)
+            .expect("first manifest read fence should acquire");
+
+        let mut second =
+            ManifestDatabase::open_in_memory().expect("second manifest should initialize");
+        let second_scope = second
+            .add_scope_with_access_grant(
+                b"/second-read-manifest",
+                "/second-read-manifest",
+                "/second-read-manifest",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"second-read-manifest-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("second scope should persist");
+        let second_binding = second
+            .bind_scope_policy_revision(second_scope.id)
+            .expect("second scope should bind");
+        assert_eq!(fence.binding(), second_binding);
+
+        assert!(matches!(
+            second.validate_scope_filesystem_read_fence(&fence, second_binding),
+            Err(DatabaseError::ScopeFilesystemFenceInvalid)
+        ));
+    }
+
+    #[test]
+    fn scope_filesystem_revocation_wait_is_bounded() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/bounded-fence",
+                "/bounded-fence",
+                "/bounded-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"bounded-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let reader = database
+            .acquire_scope_filesystem_read_fence(scope.id)
+            .expect("reader should acquire");
+        let reopened = ManifestDatabase::open(&database_path).expect("database should reopen");
+        let started = Instant::now();
+        assert!(matches!(
+            reopened.acquire_scope_filesystem_revocation_fence(scope.id),
+            Err(DatabaseError::ScopeFilesystemFenceBusy)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "exclusive admission must return a retryable error instead of hanging"
+        );
+        drop(reader);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_filesystem_fence_rejects_a_symlinked_root_without_chmodding_its_target() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/symlinked-fence-root",
+                "/symlinked-fence-root",
+                "/symlinked-fence-root",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"symlinked-fence-root-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let target = directory.path().join("fence-target");
+        fs::create_dir(&target).expect("target should exist");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            .expect("target permissions should be explicit");
+        std::os::unix::fs::symlink(&target, directory.path().join("scope-read-fences-v1"))
+            .expect("fence root symlink should exist");
+
+        assert!(matches!(
+            database.acquire_scope_filesystem_read_fence(scope.id),
+            Err(DatabaseError::ScopeFilesystemFenceInvalid)
+        ));
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target should remain")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "fail-closed validation must happen before any path-based chmod"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_filesystem_fence_rejects_a_hard_link_without_chmodding_its_target() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/hard-linked-fence",
+                "/hard-linked-fence",
+                "/hard-linked-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"hard-linked-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let target = directory.path().join("unrelated-target");
+        fs::write(&target, b"must not be changed").expect("target should exist");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("target permissions should be explicit");
+        let fence_root = directory.path().join("scope-read-fences-v1");
+        fs::create_dir(&fence_root).expect("fence root should exist");
+        fs::set_permissions(&fence_root, fs::Permissions::from_mode(0o700))
+            .expect("fence root should be private");
+        fs::hard_link(&target, fence_root.join(format!("scope-{}.lock", scope.id)))
+            .expect("hard-linked fence entry should exist");
+
+        assert!(matches!(
+            database.acquire_scope_filesystem_read_fence(scope.id),
+            Err(DatabaseError::ScopeFilesystemFenceInvalid)
+        ));
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("target should remain")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "invalid lock entries must be rejected before any permission mutation"
+        );
+        assert_eq!(
+            fs::read(&target).expect("target bytes should remain"),
+            b"must not be changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_filesystem_fence_children_open_relative_to_the_pinned_root() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let first = database
+            .add_scope_with_access_grant(
+                b"/pinned-root-first",
+                "/pinned-root-first",
+                "/pinned-root-first",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"pinned-root-first-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("first scope should persist");
+        database
+            .acquire_scope_filesystem_read_fence(first.id)
+            .expect("first fence should create the private root");
+        let second = database
+            .add_scope_with_access_grant(
+                b"/pinned-root-second",
+                "/pinned-root-second",
+                "/pinned-root-second",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"pinned-root-second-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("second scope should persist");
+        let fence_root = directory.path().join("scope-read-fences-v1");
+        let pinned_root = File::open(&fence_root).expect("root descriptor should pin");
+        let displaced_root = directory.path().join("scope-read-fences-displaced");
+        let wrong_target = directory.path().join("wrong-fence-target");
+        fs::rename(&fence_root, &displaced_root).expect("test should displace the root pathname");
+        fs::create_dir(&wrong_target).expect("wrong target should exist");
+        std::os::unix::fs::symlink(&wrong_target, &fence_root)
+            .expect("replacement root symlink should exist");
+
+        let entry_name = format!("scope-{}.gate", second.id);
+        database
+            .open_scope_filesystem_fence_file_at_unix(
+                &pinned_root,
+                second.id,
+                ScopeFilesystemFenceRole::Gate,
+                &entry_name,
+                &fence_root,
+            )
+            .expect("relative open should stay inside the pinned root");
+        assert!(displaced_root.join(&entry_name).is_file());
+        assert!(
+            fs::read_dir(&wrong_target)
+                .expect("wrong target should remain readable")
+                .next()
+                .is_none(),
+            "a swapped pathname must receive no created child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_filesystem_fence_converges_across_database_path_aliases() {
+        let database_directory = tempfile::tempdir().expect("database tempdir should exist");
+        let alias_directory = tempfile::tempdir().expect("alias tempdir should exist");
+        let database_path = database_directory.path().join("manifest.sqlite3");
+        let alias_path = alias_directory.path().join("manifest-alias.sqlite3");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/aliased-cooperative-fence",
+                "/aliased-cooperative-fence",
+                "/aliased-cooperative-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"aliased-cooperative-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let preview = database
+            .preview_scope_root_revocation(
+                database
+                    .bind_scope_policy_revision(scope.id)
+                    .expect("scope should bind"),
+            )
+            .expect("revocation should preview");
+        std::os::unix::fs::symlink(&database_path, &alias_path)
+            .expect("database alias should be created");
+        let reader = database
+            .acquire_scope_filesystem_read_fence(scope.id)
+            .expect("reader should acquire the shared fence");
+
+        let (writer_finished_tx, writer_finished_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let writer_database =
+                ManifestDatabase::open(&alias_path).expect("aliased writer database should open");
+            let exclusive = writer_database
+                .acquire_scope_filesystem_revocation_fence(scope.id)
+                .expect("aliased writer should acquire the same exclusive fence");
+            writer_database
+                .apply_scope_root_revocation_from_preview_with_fence(&exclusive, preview, 2)
+                .expect("revocation should commit after the aliased reader drains");
+            writer_finished_tx
+                .send(())
+                .expect("writer completion should be observable");
+        });
+        assert!(
+            writer_finished_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "database path aliases must not split the per-scope fence"
+        );
+        drop(reader);
+        writer_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("aliased revocation should finish after the reader drops");
+        writer.join().expect("writer thread should not panic");
+    }
+
+    #[test]
+    fn scope_filesystem_fence_releases_after_a_reader_process_exits() {
+        const CHILD_ENV: &str = "DESKGRAPH_SCOPE_FENCE_CHILD";
+        const DATABASE_ENV: &str = "DESKGRAPH_SCOPE_FENCE_DATABASE";
+        const SCOPE_ENV: &str = "DESKGRAPH_SCOPE_FENCE_SCOPE";
+        const READY_ENV: &str = "DESKGRAPH_SCOPE_FENCE_READY";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let database_path =
+                PathBuf::from(std::env::var_os(DATABASE_ENV).expect("child database path"));
+            let scope_id = std::env::var(SCOPE_ENV)
+                .expect("child scope id")
+                .parse::<i64>()
+                .expect("child scope id should parse");
+            let ready_path = PathBuf::from(std::env::var_os(READY_ENV).expect("child ready path"));
+            let database =
+                ManifestDatabase::open(&database_path).expect("child database should open");
+            let _reader = database
+                .acquire_scope_filesystem_read_fence(scope_id)
+                .expect("child should acquire the shared fence");
+            fs::write(ready_path, b"ready").expect("child readiness should persist");
+            std::thread::sleep(Duration::from_secs(30));
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let database_path = directory.path().join("manifest.sqlite3");
+        let ready_path = directory.path().join("reader-ready");
+        let mut database =
+            ManifestDatabase::open(&database_path).expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/child-fence",
+                "/child-fence",
+                "/child-fence",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"child-fence-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("scope and grant should persist");
+        let preview = database
+            .preview_scope_root_revocation(
+                database
+                    .bind_scope_policy_revision(scope.id)
+                    .expect("scope should bind"),
+            )
+            .expect("revocation should preview");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("test executable should resolve"),
+        )
+        .args([
+            "--exact",
+            "tests::scope_filesystem_fence_releases_after_a_reader_process_exits",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(DATABASE_ENV, &database_path)
+        .env(SCOPE_ENV, scope.id.to_string())
+        .env(READY_ENV, &ready_path)
+        .spawn()
+        .expect("reader child should spawn");
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && Instant::now() < ready_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_path.exists(), "reader child must acquire the fence");
+
+        let writer_path = database_path.clone();
+        let (writer_finished_tx, writer_finished_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let writer_database =
+                ManifestDatabase::open(&writer_path).expect("writer database should open");
+            let exclusive = writer_database
+                .acquire_scope_filesystem_revocation_fence(scope.id)
+                .expect("writer should acquire the exclusive fence");
+            writer_database
+                .apply_scope_root_revocation_from_preview_with_fence(&exclusive, preview, 2)
+                .expect("revocation should commit after child exit");
+            writer_finished_tx
+                .send(())
+                .expect("writer completion should be observable");
+        });
+        assert!(
+            writer_finished_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the reader process must hold the revoker before exit"
+        );
+        child.kill().expect("reader child should terminate");
+        let child_status = child.wait().expect("reader child should be reaped");
+        assert!(!child_status.success(), "the child should be force-stopped");
+        writer_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("OS process exit must release the shared fence");
+        writer.join().expect("writer thread should not panic");
+    }
+
+    #[test]
+    fn reauthorization_requires_a_fresh_scan_for_watch_readiness_and_stats() {
+        let (mut database, scope_id, _, root) = extraction_setup();
+        let binding = test_active_binding(&database, scope_id)
+            .expect("initial scope grant should become active");
+
+        assert!(
+            database
+                .scope_has_completed_scan(scope_id)
+                .expect("initial scan readiness should load")
+        );
+        assert_eq!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("initial watchability should load"),
+            vec![scope_id]
+        );
+        assert_eq!(
+            database
+                .stats_with_active_access_grants()
+                .expect("initial dashboard stats should load")
+                .completed_scan_count,
+            1
+        );
+
+        database
+            .apply_scope_root_revocation(binding, 2)
+            .expect("root revocation should commit");
+        database
+            .upsert_scope_access_grant(scope_id, std::env::consts::OS, b"reauthorized-grant")
+            .expect("reauthorization should restore only the grant");
+
+        assert!(
+            !database
+                .scope_has_completed_scan(scope_id)
+                .expect("revoked scan history must not satisfy readiness")
+        );
+        assert!(
+            database
+                .watchable_scope_ids()
+                .expect("revoked scan history must not make core watchable")
+                .is_empty()
+        );
+        assert!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("revoked scan history must not make Desktop watchable")
+                .is_empty()
+        );
+        let stale_stats = database
+            .stats_with_active_access_grants()
+            .expect("reauthorized dashboard stats should load");
+        assert_eq!(stale_stats.node_count, 0);
+        assert_eq!(stale_stats.file_count, 0);
+        assert_eq!(stale_stats.folder_count, 0);
+        assert_eq!(stale_stats.active_location_count, 0);
+        assert_eq!(stale_stats.issue_count, 0);
+        assert_eq!(stale_stats.completed_scan_count, 0);
+
+        publish_manifest_file(&mut database, scope_id, &root, 4);
+
+        assert!(
+            database
+                .scope_has_completed_scan(scope_id)
+                .expect("fresh scan should restore readiness")
+        );
+        assert_eq!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("fresh scan should restore Desktop watchability"),
+            vec![scope_id]
+        );
+        assert_eq!(
+            database
+                .stats_with_active_access_grants()
+                .expect("fresh dashboard stats should load")
+                .completed_scan_count,
+            1
         );
     }
 
@@ -20692,6 +22402,19 @@ mod tests {
         database
             .apply_scope_exclusion_batch(binding, &[write], 2)
             .expect("private subtree should purge");
+        ensure_scope_queryable(&database.connection, scope.id)
+            .expect("an atomically pruned allowed sibling manifest should remain queryable");
+        assert!(
+            database
+                .scope_has_completed_scan(scope.id)
+                .expect("initial scan readiness should remain")
+        );
+        assert_eq!(
+            database
+                .watchable_scope_ids_with_active_access_grants()
+                .expect("allowed sibling scope should remain watchable"),
+            vec![scope.id]
+        );
         let allowed_results = database
             .lexical_search_candidates("allowed", lexical_filters(Some(scope.id)), 10)
             .expect("allowed sibling should remain queryable");

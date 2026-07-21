@@ -409,6 +409,39 @@ export type Catalog = {
     error: string;
     sourceSafe: string;
   };
+  rootRevocation: {
+    kicker: string;
+    heading: string;
+    description: string;
+    empty: string;
+    revoke: string;
+    previewHeading: string;
+    exclusionCount: (count: number) => string;
+    previewNotice: string;
+    sourceSafe: string;
+    noAutomaticRead: string;
+    impact: (
+      locations: number,
+      content: number,
+      graph: number,
+      candidates: number,
+      actionPlans: number,
+      cleanupActionPlans: number,
+      jobs: number,
+      actions: number,
+    ) => string;
+    confirm: string;
+    loading: string;
+    confirming: string;
+    cancel: string;
+    cancelled: string;
+    notConfirmable: string;
+    committed: (exclusions: number) => string;
+    refreshFailed: (exclusions: number) => string;
+    watchSyncPending: (callbackRetired: boolean, runtimeStopped: boolean) => string;
+    stale: string;
+    error: string;
+  };
   footer: { version: (version: string) => string; description: string };
 };
 

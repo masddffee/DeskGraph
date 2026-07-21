@@ -13,6 +13,9 @@ export const COVERAGE_POLICY_DETAIL_COMMAND = 'coverage_policy_detail';
 export const SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND = 'select_hard_exclusions_preview';
 export const CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND = 'confirm_hard_exclusion_preview';
 export const DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND = 'discard_hard_exclusion_preview';
+export const PREVIEW_SCOPE_ROOT_REVOCATION_COMMAND = 'preview_scope_root_revocation';
+export const CONFIRM_SCOPE_ROOT_REVOCATION_COMMAND = 'confirm_scope_root_revocation';
+export const DISCARD_SCOPE_ROOT_REVOCATION_COMMAND = 'discard_scope_root_revocation';
 
 export interface ManifestStats {
   api_version: 'deskgraph.manifest.v1';
@@ -60,6 +63,8 @@ export interface HardExclusionImpact {
   content_chunk_count: number;
   graph_fact_count: number;
   derived_candidate_count: number;
+  action_plan_count: number;
+  cleanup_action_plan_count: number;
   pending_job_count: number;
   blocking_action_count: number;
 }
@@ -96,6 +101,31 @@ export interface HardExclusionCommit {
   source_files_changed: false;
   automatic_scans_started: 0;
   automatic_extractions_started: 0;
+}
+export interface ScopeRootRevocationPreview {
+  api_version: 'deskgraph.scope-root-revocation-preview.v1';
+  preview_id: string;
+  scope_id: number;
+  base_policy_revision: number;
+  expires_at_unix_ms: number;
+  impact: HardExclusionImpact;
+  exclusion_count: number;
+  confirmable: boolean;
+  source_files_will_change: false;
+}
+export interface ScopeRootRevocationCommit {
+  api_version: 'deskgraph.scope-root-revocation-commit.v1';
+  scope_id: number;
+  policy_revision: number;
+  purged: HardExclusionImpact;
+  exclusions_removed: number;
+  runtime_capability_dropped: true;
+  native_watch_sync_confirmed: boolean;
+  native_watch_callback_retired: boolean;
+  watch_runtime_stopped: boolean;
+  source_files_changed: false;
+  revoked_scope_scans_started: 0;
+  revoked_scope_extractions_started: 0;
 }
 
 type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -139,6 +169,8 @@ function parseHardExclusionImpact(value: unknown): HardExclusionImpact {
       'content_chunk_count',
       'graph_fact_count',
       'derived_candidate_count',
+      'action_plan_count',
+      'cleanup_action_plan_count',
       'pending_job_count',
       'blocking_action_count',
     ]) ||
@@ -261,6 +293,81 @@ export function parseHardExclusionCommit(value: unknown): HardExclusionCommit {
   }
   parseHardExclusionImpact(value.purge);
   return value as unknown as HardExclusionCommit;
+}
+
+export function parseScopeRootRevocationPreview(value: unknown): ScopeRootRevocationPreview {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'api_version',
+      'preview_id',
+      'scope_id',
+      'base_policy_revision',
+      'expires_at_unix_ms',
+      'impact',
+      'exclusion_count',
+      'confirmable',
+      'source_files_will_change',
+    ]) ||
+    value.api_version !== 'deskgraph.scope-root-revocation-preview.v1' ||
+    typeof value.preview_id !== 'string' ||
+    value.preview_id.trim().length === 0 ||
+    value.preview_id.length > 128 ||
+    !isPositiveId(value.scope_id) ||
+    !isPositiveRevision(value.base_policy_revision) ||
+    !isCount(value.expires_at_unix_ms) ||
+    !isCount(value.exclusion_count) ||
+    typeof value.confirmable !== 'boolean' ||
+    value.source_files_will_change !== false
+  ) {
+    throw new Error('Invalid scope root revocation preview response');
+  }
+  const impact = parseHardExclusionImpact(value.impact);
+  if (value.confirmable !== (impact.blocking_action_count === 0)) {
+    throw new Error('Invalid scope root revocation preview response');
+  }
+  return value as unknown as ScopeRootRevocationPreview;
+}
+
+export function parseScopeRootRevocationCommit(value: unknown): ScopeRootRevocationCommit {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'api_version',
+      'scope_id',
+      'policy_revision',
+      'purged',
+      'exclusions_removed',
+      'runtime_capability_dropped',
+      'native_watch_sync_confirmed',
+      'native_watch_callback_retired',
+      'watch_runtime_stopped',
+      'source_files_changed',
+      'revoked_scope_scans_started',
+      'revoked_scope_extractions_started',
+    ]) ||
+    value.api_version !== 'deskgraph.scope-root-revocation-commit.v1' ||
+    !isPositiveId(value.scope_id) ||
+    !isPositiveRevision(value.policy_revision) ||
+    !isCount(value.exclusions_removed) ||
+    value.runtime_capability_dropped !== true ||
+    typeof value.native_watch_sync_confirmed !== 'boolean' ||
+    typeof value.native_watch_callback_retired !== 'boolean' ||
+    typeof value.watch_runtime_stopped !== 'boolean' ||
+    (value.native_watch_sync_confirmed &&
+      (value.native_watch_callback_retired || value.watch_runtime_stopped)) ||
+    (value.watch_runtime_stopped && !value.native_watch_callback_retired) ||
+    value.source_files_changed !== false ||
+    value.revoked_scope_scans_started !== 0 ||
+    value.revoked_scope_extractions_started !== 0
+  ) {
+    throw new Error('Invalid scope root revocation commit response');
+  }
+  const purged = parseHardExclusionImpact(value.purged);
+  if (purged.blocking_action_count !== 0) {
+    throw new Error('Invalid scope root revocation commit response');
+  }
+  return value as unknown as ScopeRootRevocationCommit;
 }
 
 export function parseManifestStats(value: unknown): ManifestStats {
@@ -460,4 +567,29 @@ export async function discardHardExclusionPreview(
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
 ): Promise<void> {
   await invokeCommand(DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND, { previewId });
+}
+
+export async function previewScopeRootRevocation(
+  scopeId: number,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<ScopeRootRevocationPreview> {
+  return parseScopeRootRevocationPreview(
+    await invokeCommand(PREVIEW_SCOPE_ROOT_REVOCATION_COMMAND, { scopeId }),
+  );
+}
+
+export async function confirmScopeRootRevocation(
+  previewId: string,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<ScopeRootRevocationCommit> {
+  return parseScopeRootRevocationCommit(
+    await invokeCommand(CONFIRM_SCOPE_ROOT_REVOCATION_COMMAND, { previewId }),
+  );
+}
+
+export async function discardScopeRootRevocation(
+  previewId: string,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<void> {
+  await invokeCommand(DISCARD_SCOPE_ROOT_REVOCATION_COMMAND, { previewId });
 }

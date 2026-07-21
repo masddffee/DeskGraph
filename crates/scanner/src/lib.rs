@@ -7,7 +7,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use deskgraph_database::{
     CoverageRootAccessGrantWrite, DatabaseError, ManifestDatabase, NodeKind, Observation,
     QueueEntry, QueuedPath, ScanIssue, ScopeAccessGrantState, ScopeAccessGrantWrite,
-    ScopeExclusionKind, ScopeExclusionMatcher, ScopeRevisionBinding,
+    ScopeExclusionKind, ScopeExclusionMatcher, ScopeFilesystemRevocationFence, ScopePolicyBinding,
+    ScopeRevisionBinding,
 };
 use deskgraph_domain::{AuthorizedScope, ScanJobProgress, ScanReport, ScanStatus};
 pub use deskgraph_identity::comparison_key;
@@ -77,6 +78,18 @@ pub const MAX_COVERAGE_ROOTS_PER_SELECTION: usize = 32;
 /// untrusted hints, not a durable policy capability.
 pub const MAX_SCOPE_EXCLUSIONS_PER_SELECTION: usize = 64;
 const RUNNER_LEASE_MS: i64 = 30_000;
+
+#[derive(Clone, Copy)]
+struct ScanPolicyGate(ScopePolicyBinding);
+
+impl ScanPolicyGate {
+    fn revision_binding(self) -> ScopeRevisionBinding {
+        ScopeRevisionBinding {
+            scope_id: self.0.scope_id,
+            revision: self.0.revision,
+        }
+    }
+}
 
 /// One native-picker result in a user-confirmed coverage-set transaction.
 /// The opaque grant remains backend-only and is never returned by this API.
@@ -322,6 +335,14 @@ pub fn prepare_scope_exclusion_batch(
     scope_id: i64,
     selections: &[ScopeExclusionSelection<'_>],
 ) -> Result<PreparedScopeExclusionBatch, ScannerError> {
+    prepare_scope_exclusion_batch_with_active_grant(database, scope_id, selections)
+}
+
+fn prepare_scope_exclusion_batch_while_authorized(
+    database: &ManifestDatabase,
+    scope_id: i64,
+    selections: &[ScopeExclusionSelection<'_>],
+) -> Result<PreparedScopeExclusionBatch, ScannerError> {
     if selections.is_empty() {
         return Err(ScannerError::ScopeExclusionSelectionEmpty);
     }
@@ -329,7 +350,7 @@ pub fn prepare_scope_exclusion_batch(
         return Err(ScannerError::ScopeExclusionSelectionTooLarge);
     }
 
-    let root = validated_scope_root(database, scope_id)?;
+    let root = validated_scope_root_while_authorized(database, scope_id)?;
     let mut canonical_selections = Vec::with_capacity(selections.len());
     for selection in selections {
         canonical_selections.push(prepare_scope_exclusion(&root, selection.requested_path)?);
@@ -351,6 +372,40 @@ pub fn prepare_scope_exclusion_batch(
             .map(|(_, exclusion)| exclusion)
             .collect(),
     })
+}
+
+/// Revalidates one picker exclusion selection while holding the cooperative
+/// cross-process scope read fence.
+///
+/// This explicit name is retained for callers that want to make the product
+/// authorization boundary visible. The shorter public API has the same safety
+/// contract and delegates here.
+pub fn prepare_scope_exclusion_batch_with_active_grant(
+    database: &ManifestDatabase,
+    scope_id: i64,
+    selections: &[ScopeExclusionSelection<'_>],
+) -> Result<PreparedScopeExclusionBatch, ScannerError> {
+    let _read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
+    prepare_scope_exclusion_batch_while_authorized(database, scope_id, selections)
+}
+
+/// Revalidates filesystem-backed exclusion selections while the caller holds
+/// the scope-matched exclusive policy fence. This avoids recursively acquiring
+/// a shared read fence during the final hard-exclusion transaction.
+pub fn prepare_scope_exclusion_batch_with_revocation_fence(
+    database: &ManifestDatabase,
+    fence: &ScopeFilesystemRevocationFence,
+    scope_id: i64,
+    selections: &[ScopeExclusionSelection<'_>],
+) -> Result<PreparedScopeExclusionBatch, ScannerError> {
+    let fence_binding = fence.binding();
+    database.validate_scope_filesystem_revocation_fence(fence, fence_binding)?;
+    if fence_binding.scope_id != scope_id {
+        return Err(ScannerError::Database(
+            DatabaseError::ScopeFilesystemFenceInvalid,
+        ));
+    }
+    prepare_scope_exclusion_batch_while_authorized(database, scope_id, selections)
 }
 
 fn prepare_scope_exclusion(
@@ -420,8 +475,19 @@ pub fn scan_scope(
     database: &mut ManifestDatabase,
     scope_id: i64,
 ) -> Result<ScanReport, ScannerError> {
-    let job = create_scan_job(database, scope_id)?;
-    let completed = run_scan_job_to_terminal(database, job.job_id)?;
+    scan_scope_with_active_grant(database, scope_id)
+}
+
+/// Runs a foreground scan only while the scope has a current-host active grant.
+///
+/// The public scanner API never reads a source path from a revision-only
+/// binding. [`scan_scope`] delegates here for backwards-compatible naming.
+pub fn scan_scope_with_active_grant(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+) -> Result<ScanReport, ScannerError> {
+    let job = create_scan_job_with_active_grant(database, scope_id)?;
+    let completed = run_scan_job_to_terminal_with_active_grant(database, job.job_id)?;
     ScanReport::try_from(completed).map_err(|_| ScannerError::ScanNotCompleted)
 }
 
@@ -429,8 +495,17 @@ pub fn create_scan_job(
     database: &mut ManifestDatabase,
     scope_id: i64,
 ) -> Result<ScanJobProgress, ScannerError> {
-    let (binding, _) = bind_current_scope_policy(database, scope_id)?;
-    let canonical_root = validated_scope_root(database, scope_id)?;
+    create_scan_job_with_active_grant(database, scope_id)
+}
+
+fn create_scan_job_with_bound_policy(
+    database: &mut ManifestDatabase,
+    gate: ScanPolicyGate,
+) -> Result<ScanJobProgress, ScannerError> {
+    assert_scan_policy_current(database, gate)?;
+    let binding = gate.revision_binding();
+    let canonical_root = validated_scope_root_while_authorized(database, binding.scope_id)?;
+    assert_scan_policy_current(database, gate)?;
     let job = database
         .create_resumable_scan_job_with_policy(
             binding,
@@ -442,8 +517,18 @@ pub fn create_scan_job(
             },
         )
         .map_err(ScannerError::from)?;
-    assert_scope_policy_current(database, binding)?;
+    assert_scan_policy_current(database, gate)?;
     Ok(job)
+}
+
+/// Creates a durable scan job only for a current-host active grant.
+pub fn create_scan_job_with_active_grant(
+    database: &mut ManifestDatabase,
+    scope_id: i64,
+) -> Result<ScanJobProgress, ScannerError> {
+    let _read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
+    let binding = bind_active_scope_policy(database, scope_id)?;
+    create_scan_job_with_bound_policy(database, ScanPolicyGate(binding))
 }
 
 pub fn run_scan_job_batch(
@@ -451,26 +536,40 @@ pub fn run_scan_job_batch(
     job_id: i64,
     batch_size: usize,
 ) -> Result<ScanJobProgress, ScannerError> {
-    if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
-        return Err(ScannerError::InvalidBatchSize);
-    }
-    let current = database.scan_job(job_id)?;
+    run_scan_job_batch_with_active_grant(database, job_id, batch_size)
+}
+
+fn run_scan_job_batch_with_bound_policy(
+    database: &mut ManifestDatabase,
+    current: ScanJobProgress,
+    batch_size: usize,
+    gate: ScanPolicyGate,
+    matcher: ScopeExclusionMatcher,
+) -> Result<ScanJobProgress, ScannerError> {
+    assert_scan_policy_current(database, gate)?;
     if current.is_terminal()
         || matches!(current.status, ScanStatus::Paused | ScanStatus::Interrupted)
     {
+        assert_scan_policy_current(database, gate)?;
         return Ok(current);
     }
-    let (binding, matcher) = bind_current_scope_policy(database, current.scope_id)?;
-    let canonical_root = validated_scope_root(database, current.scope_id)?;
+    let binding = gate.revision_binding();
+    if current.scope_id != binding.scope_id || matcher.revision != binding.revision {
+        return Err(ScannerError::ScopePolicyChanged);
+    }
+    let job_id = current.job_id;
+    assert_scan_policy_current(database, gate)?;
+    let canonical_root = validated_scope_root_while_authorized(database, current.scope_id)?;
+    assert_scan_policy_current(database, gate)?;
     let runner_token = runner_token()?;
     database.claim_scan_job(job_id, &runner_token, RUNNER_LEASE_MS)?;
-    assert_scope_policy_current(database, binding)?;
+    assert_scan_policy_current(database, gate)?;
     let batch_started = Instant::now();
 
     for _ in 0..batch_size {
         let progress = database.scan_job(job_id)?;
         if progress.pause_requested {
-            assert_scope_policy_current(database, binding)?;
+            assert_scan_policy_current(database, gate)?;
             persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
             return database
                 .release_scan_job(job_id, &runner_token)
@@ -478,12 +577,13 @@ pub fn run_scan_job_batch(
         }
         let Some(entry) = database.next_scan_queue_entry(job_id, &runner_token, RUNNER_LEASE_MS)?
         else {
-            assert_scope_policy_current(database, binding)?;
+            assert_scan_policy_current(database, gate)?;
             persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
             return database
                 .finalize_resumable_scan_job(job_id, &runner_token)
                 .map_err(Into::into);
         };
+        assert_scan_policy_current(database, gate)?;
         let processed = match process_queue_entry(&canonical_root, &matcher, &entry) {
             Ok(processed) => processed,
             Err(error) => {
@@ -492,7 +592,7 @@ pub fn run_scan_job_batch(
                 return Err(error);
             }
         };
-        assert_scope_policy_current(database, binding)?;
+        assert_scan_policy_current(database, gate)?;
         database.stage_scan_queue_entry(
             job_id,
             &runner_token,
@@ -504,22 +604,59 @@ pub fn run_scan_job_batch(
             0,
             RUNNER_LEASE_MS,
         )?;
-        assert_scope_policy_current(database, binding)?;
+        assert_scan_policy_current(database, gate)?;
     }
 
-    assert_scope_policy_current(database, binding)?;
+    assert_scan_policy_current(database, gate)?;
     persist_batch_elapsed(database, job_id, &runner_token, batch_started)?;
     database
         .release_scan_job(job_id, &runner_token)
         .map_err(Into::into)
 }
 
+/// Advances a scan job only while its scope has a current-host active grant.
+///
+/// The authorization check deliberately precedes the low-level terminal-job
+/// fast path so a revoked job cannot be reported as a successful CLI run.
+pub fn run_scan_job_batch_with_active_grant(
+    database: &mut ManifestDatabase,
+    job_id: i64,
+    batch_size: usize,
+) -> Result<ScanJobProgress, ScannerError> {
+    if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
+        return Err(ScannerError::InvalidBatchSize);
+    }
+    let current = database.scan_job(job_id)?;
+    let _read_fence = database.acquire_scope_filesystem_read_fence(current.scope_id)?;
+    let binding = bind_active_scope_policy(database, current.scope_id)?;
+    let matcher = database.scope_exclusion_matcher(current.scope_id)?;
+    if matcher.revision != binding.revision {
+        return Err(ScannerError::ScopePolicyChanged);
+    }
+    run_scan_job_batch_with_bound_policy(
+        database,
+        current,
+        batch_size,
+        ScanPolicyGate(binding),
+        matcher,
+    )
+}
+
 pub fn run_scan_job_to_terminal(
     database: &mut ManifestDatabase,
     job_id: i64,
 ) -> Result<ScanJobProgress, ScannerError> {
+    run_scan_job_to_terminal_with_active_grant(database, job_id)
+}
+
+/// Runs a scan job to a stopping state while revalidating the active grant for
+/// every bounded batch.
+pub fn run_scan_job_to_terminal_with_active_grant(
+    database: &mut ManifestDatabase,
+    job_id: i64,
+) -> Result<ScanJobProgress, ScannerError> {
     loop {
-        let progress = run_scan_job_batch(database, job_id, DEFAULT_BATCH_SIZE)?;
+        let progress = run_scan_job_batch_with_active_grant(database, job_id, DEFAULT_BATCH_SIZE)?;
         if progress.is_terminal()
             || matches!(
                 progress.status,
@@ -542,12 +679,35 @@ pub fn resume_scan_job(
     database: &mut ManifestDatabase,
     job_id: i64,
 ) -> Result<ScanJobProgress, ScannerError> {
+    resume_scan_job_with_active_grant(database, job_id)
+}
+
+/// Resumes a durable scan only while the current-host grant and cooperative
+/// cross-process source-read fence are held.
+pub fn resume_scan_job_with_active_grant(
+    database: &mut ManifestDatabase,
+    job_id: i64,
+) -> Result<ScanJobProgress, ScannerError> {
     let progress = database.scan_job(job_id)?;
-    validated_scope_root(database, progress.scope_id)?;
+    let _read_fence = database.acquire_scope_filesystem_read_fence(progress.scope_id)?;
+    validated_scope_root_while_authorized(database, progress.scope_id)?;
     database.resume_scan_job(job_id).map_err(Into::into)
 }
 
+/// Canonicalizes an authorized root only after proving the current host still
+/// has its durable grant and holding the shared filesystem read fence.
+///
+/// The path-bearing implementation is private so revision-only callers cannot
+/// accidentally introduce an authorization check-to-read race.
 pub fn validated_scope_root(
+    database: &ManifestDatabase,
+    scope_id: i64,
+) -> Result<std::path::PathBuf, ScannerError> {
+    let _read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
+    validated_scope_root_while_authorized(database, scope_id)
+}
+
+fn validated_scope_root_while_authorized(
     database: &ManifestDatabase,
     scope_id: i64,
 ) -> Result<std::path::PathBuf, ScannerError> {
@@ -784,29 +944,34 @@ fn process_queue_entry(
     })
 }
 
-fn bind_current_scope_policy(
+fn bind_active_scope_policy(
     database: &ManifestDatabase,
     scope_id: i64,
-) -> Result<(ScopeRevisionBinding, ScopeExclusionMatcher), ScannerError> {
-    let binding = database.bind_core_scope_policy_revision(scope_id)?;
-    let matcher = database.scope_exclusion_matcher(scope_id)?;
-    if matcher.revision != binding.revision
-        || !database.is_core_scope_policy_binding_current(binding)?
-    {
-        return Err(ScannerError::ScopePolicyChanged);
+) -> Result<ScopePolicyBinding, ScannerError> {
+    let binding = database.bind_scope_policy_revision(scope_id)?;
+    if database.is_scope_policy_binding_current(binding)? {
+        Ok(binding)
+    } else {
+        Err(ScannerError::ScopePolicyChanged)
     }
-    Ok((binding, matcher))
 }
 
-fn assert_scope_policy_current(
+fn assert_active_scope_policy_current(
     database: &ManifestDatabase,
-    binding: ScopeRevisionBinding,
+    binding: ScopePolicyBinding,
 ) -> Result<(), ScannerError> {
-    if database.is_core_scope_policy_binding_current(binding)? {
+    if database.is_scope_policy_binding_current(binding)? {
         Ok(())
     } else {
         Err(ScannerError::ScopePolicyChanged)
     }
+}
+
+fn assert_scan_policy_current(
+    database: &ManifestDatabase,
+    gate: ScanPolicyGate,
+) -> Result<(), ScannerError> {
+    assert_active_scope_policy_current(database, gate.0)
 }
 
 fn child_path_is_excluded(path: &Path, exclusion_matcher: &ScopeExclusionMatcher) -> bool {
@@ -996,9 +1161,12 @@ mod tests {
             )
             .expect("foreign-platform fixture should persist");
 
+        let error = validated_scope_root(&database, scope.id)
+            .expect_err("foreign-platform scope must never reach a filesystem read");
         assert!(matches!(
-            validated_scope_root(&database, scope.id),
-            Err(ScannerError::ScopeChanged)
+            error,
+            ScannerError::ScopeChanged
+                | ScannerError::Database(DatabaseError::ScopeAccessGrantNotActive)
         ));
     }
 
@@ -1508,6 +1676,124 @@ mod tests {
                 .status,
             ScanStatus::Paused
         );
+        fs::rename(&moved_root, directory.path()).expect("fixture root should restore");
+    }
+
+    #[test]
+    fn active_grant_scan_gate_denies_revoked_scope_and_preexisting_job() {
+        let (directory, mut database, scope_id) = setup();
+        fs::write(directory.path().join("note.md"), "metadata only").expect("fixture should write");
+        let queued = create_scan_job_with_active_grant(&mut database, scope_id)
+            .expect("active scope should create a job");
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("active scope should bind");
+        database
+            .apply_scope_root_revocation(binding, 1)
+            .expect("revocation should commit");
+
+        for error in [
+            create_scan_job_with_active_grant(&mut database, scope_id)
+                .expect_err("revoked scope must not create a job"),
+            run_scan_job_batch_with_active_grant(&mut database, queued.job_id, 1)
+                .expect_err("revoked queued job must not advance"),
+            run_scan_job_to_terminal_with_active_grant(&mut database, queued.job_id)
+                .expect_err("revoked queued job must not run"),
+        ] {
+            assert_eq!(error.code(), "scope_access_grant_not_active");
+        }
+
+        // The historical short names are retained only as source-compatible
+        // aliases. They must share the active-grant fence rather than revive
+        // the old revision-only filesystem path.
+        for error in [
+            create_scan_job(&mut database, scope_id)
+                .expect_err("legacy create alias must not read a revoked scope"),
+            run_scan_job_batch(&mut database, queued.job_id, 1)
+                .expect_err("legacy batch alias must not read a revoked scope"),
+            run_scan_job_to_terminal(&mut database, queued.job_id)
+                .expect_err("legacy terminal alias must not read a revoked scope"),
+            resume_scan_job(&mut database, queued.job_id)
+                .expect_err("legacy resume alias must not read a revoked scope"),
+            scan_scope(&mut database, scope_id)
+                .expect_err("legacy foreground alias must not read a revoked scope"),
+        ] {
+            assert_eq!(error.code(), "scope_access_grant_not_active");
+        }
+        assert_eq!(
+            database
+                .scan_job(queued.job_id)
+                .expect("revoked job history should remain path-free")
+                .status,
+            ScanStatus::Failed
+        );
+
+        authorize_scope_with_access_grant(
+            &mut database,
+            directory.path(),
+            std::env::consts::OS,
+            b"scanner-test-reauthorization",
+        )
+        .expect("explicit reauthorization should restore the active grant");
+        let report = scan_scope_with_active_grant(&mut database, scope_id)
+            .expect("a fresh current-policy scan should succeed");
+        assert_eq!(report.status, ScanStatus::Completed);
+        assert_eq!(report.discovered_files, 1);
+    }
+
+    #[test]
+    fn stale_active_binding_cannot_rebind_or_reach_scope_after_revocation() {
+        let (directory, mut database, scope_id) = setup();
+        let first_binding = bind_active_scope_policy(&database, scope_id)
+            .expect("active scope should bind before the race");
+        database
+            .apply_scope_root_revocation(first_binding, 1)
+            .expect("the interleaved revocation should commit");
+
+        let create_error =
+            create_scan_job_with_bound_policy(&mut database, ScanPolicyGate(first_binding))
+                .expect_err("a stale active binding must not create against the new revision");
+        assert_eq!(create_error.code(), "scope_policy_changed");
+        assert!(
+            database
+                .recent_scan_jobs()
+                .expect("scan history should load")
+                .is_empty(),
+            "the failed race must leave no queued job"
+        );
+
+        authorize_scope_with_access_grant(
+            &mut database,
+            directory.path(),
+            std::env::consts::OS,
+            b"scanner-test-race-reauthorization",
+        )
+        .expect("scope should reauthorize for the run race");
+        let queued = create_scan_job_with_active_grant(&mut database, scope_id)
+            .expect("current binding should create a queued job");
+        let second_binding = bind_active_scope_policy(&database, scope_id)
+            .expect("reauthorized scope should bind before the run race");
+        let matcher = database
+            .scope_exclusion_matcher(scope_id)
+            .expect("current matcher should bind before the run race");
+        database
+            .apply_scope_root_revocation(second_binding, 2)
+            .expect("the second interleaved revocation should commit");
+        let moved_root = directory.path().with_extension("moved-after-revoke");
+        fs::rename(directory.path(), &moved_root).expect("fixture root should move after revoke");
+        let current = database
+            .scan_job(queued.job_id)
+            .expect("revoked job history should remain");
+
+        let run_error = run_scan_job_batch_with_bound_policy(
+            &mut database,
+            current,
+            1,
+            ScanPolicyGate(second_binding),
+            matcher,
+        )
+        .expect_err("a stale binding must fail before scope canonicalization");
+        assert_eq!(run_error.code(), "scope_policy_changed");
         fs::rename(&moved_root, directory.path()).expect("fixture root should restore");
     }
 

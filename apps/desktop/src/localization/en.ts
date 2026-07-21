@@ -540,6 +540,54 @@ export const en = {
     error: 'Hard exclusion was not confirmed. No local privacy purge is reported.',
     sourceSafe: 'Source files will not be moved, changed, or deleted.',
   },
+  rootRevocation: {
+    kicker: 'Coverage access',
+    heading: 'Revoke an authorized root',
+    description:
+      'Revocation permanently clears DeskGraph-derived local index data for this root and drops this runtime capability. It never moves, trashes, or deletes source files.',
+    empty: 'No active authorized roots are available to revoke.',
+    revoke: 'Revoke root…',
+    previewHeading: 'Review root revocation',
+    exclusionCount: (count) =>
+      `${englishCount(count, 'hard exclusion')} will be removed with this root.`,
+    previewNotice:
+      'This permanently clears affected local derived index data and removes this root from DeskGraph. It cannot be undone from this screen.',
+    sourceSafe: 'Source files will not be moved, changed, trashed, or deleted.',
+    noAutomaticRead:
+      'No new scan, extraction, OCR, embedding, or other filesystem read starts for this revoked root. Existing work for other authorized roots may continue.',
+    impact: (
+      locations,
+      content,
+      graph,
+      candidates,
+      actionPlans,
+      cleanupActionPlans,
+      jobs,
+      actions,
+    ) =>
+      `After confirmation, ${locations} locations, ${content} content/OCR chunks, ${graph} graph facts, ${candidates} derived candidates, ${englishCount(actionPlans, 'rename/move preview')}, ${englishCount(cleanupActionPlans, 'Cleanup preview')}, and ${jobs} pending jobs would be cleared locally. ${actions === 0 ? 'No action safety record blocks this revocation.' : `${englishCount(actions, 'action safety record')} block this revocation and would be retained.`}`,
+    confirm: 'Confirm revocation and clear local index',
+    loading: 'Preparing a local-only revocation review…',
+    confirming: 'Revoking local coverage safely…',
+    cancel: 'Cancel preview',
+    cancelled: 'Revocation preview cancelled; this root remains authorized.',
+    notConfirmable:
+      'Action journal safety records block this revocation and will be retained. Resolve them through a separately reviewed recovery flow; retrying or waiting is not sufficient. Source files have not changed.',
+    committed: (exclusions) =>
+      `Root access was revoked, local derived data was cleared, and ${exclusions} hard exclusion${exclusions === 1 ? '' : 's'} were removed with the root.`,
+    refreshFailed: (exclusions) =>
+      `Root access was revoked and ${exclusions} hard exclusion${exclusions === 1 ? '' : 's'} were removed, but local dashboard refresh failed.`,
+    watchSyncPending: (callbackRetired, runtimeStopped) =>
+      runtimeStopped
+        ? 'Access is revoked. The native callback was retired, queued hints were cleared, and automatic monitoring fully stopped. Restart DeskGraph before authorizing any root again.'
+        : callbackRetired
+          ? 'Access is revoked. The native callback was retired and queued hints were cleared, but coordinator shutdown was not confirmed; DeskGraph does not report the OS registration as closed. Restart before authorizing any root again.'
+          : 'Access is revoked. New callback admission is closed and queued hints were cleared, but an in-flight callback and coordinator shutdown were not confirmed; DeskGraph does not report the OS registration as closed. Restart before authorizing any root again.',
+    stale:
+      'This root changed while the preview was open. No revocation was applied; review the current local coverage again.',
+    error:
+      'The final revocation state could not be confirmed. Refresh local coverage before retrying. No source file was changed by this operation.',
+  },
   footer: {
     version: (version) => `DeskGraph ${version}`,
     description: 'Metadata + bounded local text · No uploads · No file operations',

@@ -144,7 +144,11 @@ pub fn create_screenshot_ocr_job_at(
     node_id: i64,
 ) -> Result<ExtractionJobProgress, ExtractionServiceError> {
     let mut database = ManifestDatabase::open(database_path)?;
+    let read_fence = database.acquire_scope_filesystem_read_fence(scope_id)?;
     let (binding, matcher) = bind_current_extraction_policy(&database, scope_id)?;
+    if read_fence.binding().revision != binding.revision {
+        return Err(ExtractionServiceError::ScopePolicyChanged);
+    }
     let source = database.extractable_file(scope_id, node_id)?;
     ensure_extraction_source_not_excluded(&matcher, &source)?;
     let (mut file, media_kind) = validate_source(&database, &source)?;
@@ -244,7 +248,11 @@ pub fn resume_extraction_job_at(
         return Err(DatabaseError::InvalidExtractionJobState.into());
     }
     let source = database.extractable_file_for_job(job_id)?;
+    let read_fence = database.acquire_scope_filesystem_read_fence(source.scope_id)?;
     let (_, matcher) = bind_current_extraction_policy(&database, source.scope_id)?;
+    if read_fence.binding().revision != matcher.revision {
+        return Err(ExtractionServiceError::ScopePolicyChanged);
+    }
     ensure_extraction_source_not_excluded(&matcher, &source)?;
     validate_source(&database, &source)?;
     database.resume_extraction_job(job_id).map_err(Into::into)
@@ -269,7 +277,11 @@ fn run_extraction_job_with_ocr_provider_at(
     if current.is_terminal() || current.status == ExtractionStatus::Interrupted {
         return Ok(current);
     }
+    let read_fence = database.acquire_scope_filesystem_read_fence(current.scope_id)?;
     let (policy_binding, matcher) = bind_current_extraction_policy(&database, current.scope_id)?;
+    if read_fence.binding().revision != policy_binding.revision {
+        return Err(ExtractionServiceError::ScopePolicyChanged);
+    }
     let source = database.extractable_file_for_job(job_id)?;
     ensure_extraction_source_not_excluded(&matcher, &source)?;
     let runner_token = runner_token()?;
@@ -287,6 +299,7 @@ fn run_extraction_job_with_ocr_provider_at(
     let provider_id = attempt.provider_id;
     let provider_version = attempt.provider_version;
     let result = attempt.result;
+    drop(read_fence);
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match result {
         Ok(output) => {

@@ -10,11 +10,16 @@ import {
   SCAN_JOB_STATUS_COMMAND,
   SELECT_AND_AUTHORIZE_SCOPES_COMMAND,
   CONFIRM_HARD_EXCLUSION_PREVIEW_COMMAND,
+  CONFIRM_SCOPE_ROOT_REVOCATION_COMMAND,
   COVERAGE_POLICY_DETAIL_COMMAND,
   DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND,
+  DISCARD_SCOPE_ROOT_REVOCATION_COMMAND,
+  PREVIEW_SCOPE_ROOT_REVOCATION_COMMAND,
   SELECT_HARD_EXCLUSIONS_PREVIEW_COMMAND,
   confirmHardExclusionPreview,
+  confirmScopeRootRevocation,
   discardHardExclusionPreview,
+  discardScopeRootRevocation,
   loadCoveragePolicyDetail,
   createManifestScan,
   loadRecentScanJobs,
@@ -28,11 +33,14 @@ import {
   parseCoveragePolicyDetail,
   parseHardExclusionCommit,
   parseHardExclusionPreview,
+  parseScopeRootRevocationCommit,
+  parseScopeRootRevocationPreview,
   pauseManifestScan,
   resumeManifestScan,
   runManifestScan,
   selectAndAuthorizeScopes,
   selectHardExclusionsPreview,
+  previewScopeRootRevocation,
   type ManifestStats,
   type ScanJobProgress,
 } from './manifest';
@@ -57,8 +65,10 @@ const purge = {
   content_chunk_count: 2,
   graph_fact_count: 3,
   derived_candidate_count: 4,
-  pending_job_count: 5,
-  blocking_action_count: 6,
+  action_plan_count: 5,
+  cleanup_action_plan_count: 6,
+  pending_job_count: 7,
+  blocking_action_count: 8,
 } as const;
 const exclusionPreview = {
   api_version: 'deskgraph.hard-exclusion-preview.v1',
@@ -80,6 +90,32 @@ const exclusionCommit = {
   source_files_changed: false,
   automatic_scans_started: 0,
   automatic_extractions_started: 0,
+} as const;
+const rootPurge = { ...purge, blocking_action_count: 0 } as const;
+const rootRevocationPreview = {
+  api_version: 'deskgraph.scope-root-revocation-preview.v1',
+  preview_id: 'opaque-root-preview',
+  scope_id: 4,
+  base_policy_revision: 2,
+  expires_at_unix_ms: 99,
+  impact: rootPurge,
+  exclusion_count: 0,
+  confirmable: true,
+  source_files_will_change: false,
+} as const;
+const rootRevocationCommit = {
+  api_version: 'deskgraph.scope-root-revocation-commit.v1',
+  scope_id: 4,
+  policy_revision: 3,
+  purged: rootPurge,
+  exclusions_removed: 0,
+  runtime_capability_dropped: true,
+  native_watch_sync_confirmed: true,
+  native_watch_callback_retired: false,
+  watch_runtime_stopped: false,
+  source_files_changed: false,
+  revoked_scope_scans_started: 0,
+  revoked_scope_extractions_started: 0,
 } as const;
 
 const stats: ManifestStats = {
@@ -280,5 +316,138 @@ describe('manifest contract', () => {
     expect(invokeCommand).toHaveBeenNthCalledWith(4, DISCARD_HARD_EXCLUSION_PREVIEW_COMMAND, {
       previewId: 'opaque-preview',
     });
+  });
+
+  it('accepts exact root revocation preview and commit contracts with zero-or-positive purge counts', () => {
+    expect(parseScopeRootRevocationPreview(rootRevocationPreview)).toEqual(rootRevocationPreview);
+    expect(parseScopeRootRevocationCommit(rootRevocationCommit)).toEqual(rootRevocationCommit);
+    expect(
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        native_watch_sync_confirmed: false,
+      }),
+    ).toEqual({
+      ...rootRevocationCommit,
+      native_watch_sync_confirmed: false,
+    });
+    expect(
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        native_watch_sync_confirmed: false,
+        native_watch_callback_retired: true,
+        watch_runtime_stopped: true,
+      }),
+    ).toEqual({
+      ...rootRevocationCommit,
+      native_watch_sync_confirmed: false,
+      native_watch_callback_retired: true,
+      watch_runtime_stopped: true,
+    });
+    expect(() =>
+      parseScopeRootRevocationPreview({ ...rootRevocationPreview, scope_id: 0 }),
+    ).toThrow('Invalid scope root revocation preview response');
+    expect(() =>
+      parseScopeRootRevocationPreview({ ...rootRevocationPreview, exclusion_count: -1 }),
+    ).toThrow('Invalid scope root revocation preview response');
+    expect(() =>
+      parseScopeRootRevocationPreview({
+        ...rootRevocationPreview,
+        impact: { ...rootPurge, action_plan_count: -1 },
+      }),
+    ).toThrow('Invalid hard exclusion impact response');
+    expect(() =>
+      parseScopeRootRevocationPreview({
+        ...rootRevocationPreview,
+        impact: { ...rootPurge, cleanup_action_plan_count: undefined },
+      }),
+    ).toThrow('Invalid hard exclusion impact response');
+    expect(() =>
+      parseScopeRootRevocationPreview({
+        ...rootRevocationPreview,
+        confirmable: true,
+        impact: { ...rootPurge, blocking_action_count: 1 },
+      }),
+    ).toThrow('Invalid scope root revocation preview response');
+    expect(() =>
+      parseScopeRootRevocationPreview({ ...rootRevocationPreview, confirmable: false }),
+    ).toThrow('Invalid scope root revocation preview response');
+    expect(() =>
+      parseScopeRootRevocationPreview({
+        ...rootRevocationPreview,
+        source_path: '/must-not-arrive',
+      }),
+    ).toThrow('Invalid scope root revocation preview response');
+    expect(() =>
+      parseScopeRootRevocationCommit({ ...rootRevocationCommit, exclusions_removed: -1 }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        runtime_capability_dropped: false,
+      }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        native_watch_sync_confirmed: undefined,
+      }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        native_watch_callback_retired: true,
+      }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        native_watch_sync_confirmed: false,
+        watch_runtime_stopped: true,
+      }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({ ...rootRevocationCommit, revoked_scope_scans_started: 1 }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        purged: { ...rootPurge, blocking_action_count: 1 },
+      }),
+    ).toThrow('Invalid scope root revocation commit response');
+    expect(() =>
+      parseScopeRootRevocationCommit({
+        ...rootRevocationCommit,
+        purged: { ...rootPurge, cleanup_action_plan_count: -1 },
+      }),
+    ).toThrow('Invalid hard exclusion impact response');
+  });
+
+  it('uses only an opaque preview ID after a scope-ID root revocation preview', async () => {
+    const invokeCommand = vi.fn().mockImplementation((command: string) => {
+      if (command === PREVIEW_SCOPE_ROOT_REVOCATION_COMMAND)
+        return Promise.resolve(rootRevocationPreview);
+      if (command === CONFIRM_SCOPE_ROOT_REVOCATION_COMMAND)
+        return Promise.resolve(rootRevocationCommit);
+      return Promise.resolve(undefined);
+    });
+
+    await expect(previewScopeRootRevocation(4, invokeCommand)).resolves.toEqual(
+      rootRevocationPreview,
+    );
+    await expect(confirmScopeRootRevocation('opaque-root-preview', invokeCommand)).resolves.toEqual(
+      rootRevocationCommit,
+    );
+    await discardScopeRootRevocation('opaque-root-preview', invokeCommand);
+
+    expect(invokeCommand).toHaveBeenNthCalledWith(1, PREVIEW_SCOPE_ROOT_REVOCATION_COMMAND, {
+      scopeId: 4,
+    });
+    expect(invokeCommand).toHaveBeenNthCalledWith(2, CONFIRM_SCOPE_ROOT_REVOCATION_COMMAND, {
+      previewId: 'opaque-root-preview',
+    });
+    expect(invokeCommand).toHaveBeenNthCalledWith(3, DISCARD_SCOPE_ROOT_REVOCATION_COMMAND, {
+      previewId: 'opaque-root-preview',
+    });
+    expect(JSON.stringify(invokeCommand.mock.calls)).not.toContain('/must-not-arrive');
   });
 });

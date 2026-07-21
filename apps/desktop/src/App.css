@@ -1570,6 +1570,88 @@ input:focus-visible {
   margin: 0;
 }
 
+.root-revocation {
+  display: grid;
+  gap: 0.8rem;
+  border-top: 1px solid rgba(27, 59, 40, 0.12);
+  margin-top: 1.4rem;
+  padding-top: 1.4rem;
+}
+
+.root-revocation .panel-heading {
+  margin-bottom: 0;
+}
+
+.root-revocation-list {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.root-revocation-list li {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid rgba(139, 68, 40, 0.24);
+  border-radius: 0.8rem;
+  padding: 0.8rem;
+  background: #fbf4ef;
+}
+
+.root-revocation-list li > div {
+  min-width: 0;
+}
+
+.root-revocation-list code {
+  display: block;
+  overflow-wrap: anywhere;
+  color: #3c3028;
+  font-size: 0.82rem;
+}
+
+.root-revocation-list .button-secondary {
+  flex: 0 0 auto;
+  border-color: rgba(139, 68, 40, 0.3);
+  color: #783d29;
+  background: #f7e8df;
+}
+
+.root-revocation-list .button-secondary:not(:disabled):hover {
+  background: #f0d8cb;
+}
+
+.root-revocation-preview {
+  display: grid;
+  gap: 0.75rem;
+  border: 1px solid rgba(139, 68, 40, 0.32);
+  border-radius: 0.9rem;
+  padding: 1rem;
+  color: #5b3829;
+  background: #fff7f2;
+}
+
+.root-revocation-preview h4,
+.root-revocation-preview p {
+  margin: 0;
+}
+
+.root-revocation-preview h4 {
+  color: #783d29;
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 1.05rem;
+  font-weight: 500;
+}
+
+.root-revocation-preview p {
+  color: #654335;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
 .state-card {
   justify-content: flex-start;
   min-height: 11rem;
@@ -1701,7 +1783,8 @@ footer {
   .action-plan-list li,
   .search-form-row,
   .search-result-action-row,
-  .scope-list li {
+  .scope-list li,
+  .root-revocation-list li {
     align-items: stretch;
     flex-direction: column;
   }

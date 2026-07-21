@@ -40,12 +40,16 @@ import {
   runManifestScan,
   selectAndAuthorizeScopes,
   confirmHardExclusionPreview,
+  confirmScopeRootRevocation,
   discardHardExclusionPreview,
+  discardScopeRootRevocation,
   loadCoveragePolicyDetail,
+  previewScopeRootRevocation,
   selectHardExclusionsPreview,
   type CoveragePolicyDetail,
   type HardExclusionEntryKind,
   type HardExclusionPreview,
+  type ScopeRootRevocationPreview,
   type AuthorizedScope,
   type ManifestStats,
   type ScanJobProgress,
@@ -214,6 +218,21 @@ type HardExclusionState =
     }
   | { kind: 'cancelled'; detail: CoveragePolicyDetail; source: 'picker' | 'preview' }
   | { kind: 'error'; detail?: CoveragePolicyDetail };
+type RootRevocationState =
+  | { kind: 'idle' }
+  | { kind: 'loading'; scopeId: number }
+  | { kind: 'preview'; scope: AuthorizedScope; preview: ScopeRootRevocationPreview }
+  | { kind: 'confirming'; scope: AuthorizedScope; preview: ScopeRootRevocationPreview }
+  | { kind: 'cancelled'; scopeId: number }
+  | {
+      kind: 'success';
+      exclusions: number;
+      refreshFailed: boolean;
+      nativeWatchSyncConfirmed: boolean;
+      nativeWatchCallbackRetired: boolean;
+      watchRuntimeStopped: boolean;
+    }
+  | { kind: 'error'; message: 'stale' | 'failed' };
 type AppView = 'home' | 'search' | 'projects' | 'inbox' | 'history' | 'settings';
 
 const APP_VIEWS: readonly AppView[] = [
@@ -540,6 +559,9 @@ export default function App() {
   const [hardExclusionState, setHardExclusionState] = useState<HardExclusionState>({
     kind: 'idle',
   });
+  const [rootRevocationState, setRootRevocationState] = useState<RootRevocationState>({
+    kind: 'idle',
+  });
   const [activeView, setActiveView] = useState<AppView>('home');
   const ocrRequestInFlight = useRef(new Set<string>());
   const contentExtractionRequestInFlight = useRef(new Set<string>());
@@ -554,6 +576,7 @@ export default function App() {
   const projectReviewTriggerRef = useRef<HTMLButtonElement | null>(null);
   const projectReviewHeadingRef = useRef<HTMLHeadingElement>(null);
   const hardExclusionGenerationRef = useRef(0);
+  const rootRevocationGenerationRef = useRef(0);
   const searchGenerationRef = useRef(0);
   const ocrGenerationRef = useRef(0);
   const renameGenerationRef = useRef(0);
@@ -612,6 +635,7 @@ export default function App() {
     if (nextView !== 'settings') {
       invalidateHardExclusion();
       setHardExclusionScopeId(null);
+      invalidateRootRevocation();
     }
     setActiveView(nextView);
     window.requestAnimationFrame(() => viewHeadingRef.current?.focus());
@@ -645,6 +669,11 @@ export default function App() {
   function invalidateHardExclusion() {
     hardExclusionGenerationRef.current += 1;
     setHardExclusionState({ kind: 'idle' });
+  }
+
+  function invalidateRootRevocation() {
+    rootRevocationGenerationRef.current += 1;
+    setRootRevocationState({ kind: 'idle' });
   }
 
   function clearPurgedTransientState() {
@@ -764,6 +793,118 @@ export default function App() {
     } catch {
       if (hardExclusionGenerationRef.current === generation)
         setHardExclusionState({ kind: 'error', detail });
+    }
+  }
+
+  function rootRevocationErrorMessage(error: unknown): 'stale' | 'failed' {
+    const message = String(error);
+    return message.includes('scope_policy') || message.includes('preview_stale')
+      ? 'stale'
+      : 'failed';
+  }
+
+  async function createRootRevocationPreview(scope: AuthorizedScope) {
+    const generation = rootRevocationGenerationRef.current + 1;
+    rootRevocationGenerationRef.current = generation;
+    setRootRevocationState({ kind: 'loading', scopeId: scope.id });
+    try {
+      const preview = await previewScopeRootRevocation(scope.id);
+      if (rootRevocationGenerationRef.current !== generation) return;
+      if (preview.scope_id !== scope.id) {
+        setRootRevocationState({ kind: 'error', message: 'failed' });
+        return;
+      }
+      setRootRevocationState({ kind: 'preview', scope, preview });
+    } catch (error) {
+      if (rootRevocationGenerationRef.current === generation) {
+        setRootRevocationState({ kind: 'error', message: rootRevocationErrorMessage(error) });
+      }
+    }
+  }
+
+  async function cancelRootRevocationPreview() {
+    if (rootRevocationState.kind !== 'preview') return;
+    const { preview } = rootRevocationState;
+    const generation = rootRevocationGenerationRef.current + 1;
+    rootRevocationGenerationRef.current = generation;
+    setRootRevocationState({ kind: 'loading', scopeId: preview.scope_id });
+    try {
+      await discardScopeRootRevocation(preview.preview_id);
+      if (rootRevocationGenerationRef.current === generation) {
+        setRootRevocationState({ kind: 'cancelled', scopeId: preview.scope_id });
+      }
+    } catch (error) {
+      if (rootRevocationGenerationRef.current === generation) {
+        setRootRevocationState({ kind: 'error', message: rootRevocationErrorMessage(error) });
+      }
+    }
+  }
+
+  async function confirmRootRevocation() {
+    if (rootRevocationState.kind !== 'preview') return;
+    const { preview, scope } = rootRevocationState;
+    const generation = rootRevocationGenerationRef.current + 1;
+    rootRevocationGenerationRef.current = generation;
+    setRootRevocationState({ kind: 'confirming', scope, preview });
+    try {
+      const commit = await confirmScopeRootRevocation(preview.preview_id);
+      const expectedRevision = preview.base_policy_revision + 1;
+      if (
+        commit.scope_id !== preview.scope_id ||
+        !Number.isSafeInteger(expectedRevision) ||
+        commit.policy_revision !== expectedRevision
+      ) {
+        throw new Error('scope_root_revocation_commit_mismatch');
+      }
+      // A mutation response must reconcile local state even if the user left
+      // Settings while the native command was running. The generation guard
+      // controls only whether the old confirmation status is rendered.
+      clearPurgedTransientState();
+      if (hardExclusionScopeId === commit.scope_id) {
+        setHardExclusionScopeId(null);
+        setHardExclusionState({ kind: 'idle' });
+      }
+      setState((current) => {
+        if (current.kind !== 'ready') return current;
+        return {
+          ...current,
+          scopes: current.scopes.filter((candidate) => candidate.id !== commit.scope_id),
+          jobs: current.jobs.filter((job) => job.scope_id !== commit.scope_id),
+          extractionJobs: current.extractionJobs.filter((job) => job.scope_id !== commit.scope_id),
+          watchEvents: current.watchEvents.filter((event) => event.scope_id !== commit.scope_id),
+          actionPlans: current.actionPlans.filter((plan) => plan.scope_id !== commit.scope_id),
+        };
+      });
+      try {
+        await refreshManifest();
+        if (rootRevocationGenerationRef.current === generation) {
+          setRootRevocationState({
+            kind: 'success',
+            exclusions: commit.exclusions_removed,
+            refreshFailed: false,
+            nativeWatchSyncConfirmed: commit.native_watch_sync_confirmed,
+            nativeWatchCallbackRetired: commit.native_watch_callback_retired,
+            watchRuntimeStopped: commit.watch_runtime_stopped,
+          });
+        }
+      } catch {
+        if (rootRevocationGenerationRef.current === generation) {
+          setRootRevocationState({
+            kind: 'success',
+            exclusions: commit.exclusions_removed,
+            refreshFailed: true,
+            nativeWatchSyncConfirmed: commit.native_watch_sync_confirmed,
+            nativeWatchCallbackRetired: commit.native_watch_callback_retired,
+            watchRuntimeStopped: commit.watch_runtime_stopped,
+          });
+        }
+      }
+    } catch (error) {
+      clearPurgedTransientState();
+      await refreshManifest().catch(() => undefined);
+      if (rootRevocationGenerationRef.current === generation) {
+        setRootRevocationState({ kind: 'error', message: rootRevocationErrorMessage(error) });
+      }
     }
   }
 
@@ -3293,6 +3434,138 @@ export default function App() {
                   ) : null}
                   {hardExclusionState.kind === 'error' ? (
                     <p role="alert">{catalog.hardExclusion.error}</p>
+                  ) : null}
+                </section>
+                <section className="root-revocation" aria-labelledby="root-revocation-title">
+                  <div className="panel-heading panel-heading--wrap">
+                    <div>
+                      <p className="panel-kicker">{catalog.rootRevocation.kicker}</p>
+                      <h3 id="root-revocation-title">{catalog.rootRevocation.heading}</h3>
+                      <p>{catalog.rootRevocation.description}</p>
+                    </div>
+                  </div>
+                  {state.scopes.length === 0 ? (
+                    <p className="content-empty" role="status">
+                      {catalog.rootRevocation.empty}
+                    </p>
+                  ) : (
+                    <ul className="root-revocation-list">
+                      {state.scopes.map((scope) => (
+                        <li key={scope.id}>
+                          <div>
+                            <span className="scope-label">{catalog.scope.label(scope.id)}</span>
+                            <code>{scope.display_path}</code>
+                          </div>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            disabled={
+                              rootRevocationState.kind === 'loading' ||
+                              rootRevocationState.kind === 'preview' ||
+                              rootRevocationState.kind === 'confirming'
+                            }
+                            onClick={() => void createRootRevocationPreview(scope)}
+                          >
+                            {catalog.rootRevocation.revoke}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {rootRevocationState.kind === 'preview' ||
+                  rootRevocationState.kind === 'confirming' ? (
+                    <section
+                      className="root-revocation-preview"
+                      aria-labelledby="root-revocation-preview-title"
+                      aria-live="polite"
+                    >
+                      <div>
+                        <h4 id="root-revocation-preview-title">
+                          {catalog.rootRevocation.previewHeading}
+                        </h4>
+                        <p>
+                          <span className="scope-label">
+                            {catalog.scope.label(rootRevocationState.scope.id)}
+                          </span>{' '}
+                          <code>{rootRevocationState.scope.display_path}</code>
+                        </p>
+                        <p>
+                          {catalog.rootRevocation.exclusionCount(
+                            rootRevocationState.preview.exclusion_count,
+                          )}
+                        </p>
+                        <p>{catalog.rootRevocation.previewNotice}</p>
+                        <p>{catalog.rootRevocation.sourceSafe}</p>
+                        <p>{catalog.rootRevocation.noAutomaticRead}</p>
+                      </div>
+                      <p>
+                        {catalog.rootRevocation.impact(
+                          rootRevocationState.preview.impact.location_count,
+                          rootRevocationState.preview.impact.content_chunk_count,
+                          rootRevocationState.preview.impact.graph_fact_count,
+                          rootRevocationState.preview.impact.derived_candidate_count,
+                          rootRevocationState.preview.impact.action_plan_count,
+                          rootRevocationState.preview.impact.cleanup_action_plan_count,
+                          rootRevocationState.preview.impact.pending_job_count,
+                          rootRevocationState.preview.impact.blocking_action_count,
+                        )}
+                      </p>
+                      {rootRevocationState.kind === 'confirming' ? (
+                        <p role="status">{catalog.rootRevocation.confirming}</p>
+                      ) : (
+                        <>
+                          <div className="scope-form-row">
+                            <button
+                              type="button"
+                              disabled={!rootRevocationState.preview.confirmable}
+                              onClick={() => void confirmRootRevocation()}
+                            >
+                              {catalog.rootRevocation.confirm}
+                            </button>
+                            <button
+                              type="button"
+                              className="button-secondary"
+                              onClick={() => void cancelRootRevocationPreview()}
+                            >
+                              {catalog.rootRevocation.cancel}
+                            </button>
+                          </div>
+                          {!rootRevocationState.preview.confirmable ? (
+                            <p>{catalog.rootRevocation.notConfirmable}</p>
+                          ) : null}
+                        </>
+                      )}
+                    </section>
+                  ) : null}
+                  {rootRevocationState.kind === 'loading' ? (
+                    <p role="status">{catalog.rootRevocation.loading}</p>
+                  ) : null}
+                  {rootRevocationState.kind === 'cancelled' ? (
+                    <p role="status">{catalog.rootRevocation.cancelled}</p>
+                  ) : null}
+                  {rootRevocationState.kind === 'success' ? (
+                    <>
+                      <p role="status">
+                        {rootRevocationState.refreshFailed
+                          ? catalog.rootRevocation.refreshFailed(rootRevocationState.exclusions)
+                          : catalog.rootRevocation.committed(rootRevocationState.exclusions)}
+                      </p>
+                      {!rootRevocationState.nativeWatchSyncConfirmed ? (
+                        <p role="alert">
+                          {catalog.rootRevocation.watchSyncPending(
+                            rootRevocationState.nativeWatchCallbackRetired,
+                            rootRevocationState.watchRuntimeStopped,
+                          )}
+                        </p>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {rootRevocationState.kind === 'error' ? (
+                    <p role="alert">
+                      {rootRevocationState.message === 'stale'
+                        ? catalog.rootRevocation.stale
+                        : catalog.rootRevocation.error}
+                    </p>
                   ) : null}
                 </section>
               </section>
