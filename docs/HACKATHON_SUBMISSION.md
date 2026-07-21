@@ -199,8 +199,8 @@ instructions are in the [README](../README.md) and
       choice, or document why the final demonstrated audience requires a
       different category.
 - [x] **Public repository URL:** `https://github.com/masddffee/DeskGraph` is
-      public and saved in the Devpost project. Remote `main` was verified at
-      commit `c224445940c83f71ac8fe3d059b8249b0011baa3`.
+      public and saved in the Devpost project. The initial public source push
+      was verified at commit `c224445940c83f71ac8fe3d059b8249b0011baa3`.
 - [ ] **Judge instructions:** paste the “Judge setup and test path” above and
       point judges to the synthetic-scope limitation.
 - [ ] **Dev-tool instructions:** paste the “How I built it” section and state
