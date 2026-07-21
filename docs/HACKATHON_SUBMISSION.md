@@ -70,14 +70,15 @@ is a safety decision, not an omitted demo control: DeskGraph must not mutate a
 user's files until its identity, transaction, platform-fence, recovery, and
 Undo guarantees have passed their remaining acceptance gates.
 
-## Video script (2:45 target)
+## Video script (95-second target)
 
 Record only after the local build and synthetic demo scope are verified. Use a
 synthetic folder with harmless documents; do not show personal paths, file
 contents, access tokens, or private OCR text. The timestamped shot list and
-voiceover are in [BUILD_WEEK_DEMO_SCRIPT.md](BUILD_WEEK_DEMO_SCRIPT.md).
-It is deliberately 2:45 at the planned pace, leaving 15 seconds under the
-three-minute limit for natural pauses or capture transitions.
+English voiceover are in [BUILD_WEEK_DEMO_SCRIPT.md](BUILD_WEEK_DEMO_SCRIPT.md).
+The reviewed local English cut is 95 seconds, comfortably below the
+three-minute cap. It remains a guided demo rather than a continuous
+live-operation recording.
 
 ## Devpost description draft
 
@@ -215,7 +216,11 @@ instructions are in the [README](../README.md) and
       verified CLI evidence. It is intentionally not represented as continuous
       live operation. The local artifact is ignored by git; SHA-256:
       `bca6e8c72817919ae32fcfd69def3cff15f4e14655ab443342d0ab41462255e5`.
-- [ ] Upload an unlisted or public YouTube video under three minutes with a
+- [x] Generate and review a local English-voiceover remix of that guided cut:
+      95 seconds, 1280×720 H.264/AAC, with the required explanation of what was
+      built and how Codex/GPT-5.6 was used. The ignored local artifact SHA-256
+      is `0edcc765b4b1227212aac649b769ee3161f83a9d2c9eb5b815fd8a63d83ea220`.
+- [ ] Upload a public YouTube video under three minutes with a
       voiceover. It must cover what was built, how Codex/GPT-5.6 was used, and
       the real pre-release limitations above.
 - [ ] Add the video URL, public repository URL, name, tagline, and Devpost
