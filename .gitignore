@@ -23,6 +23,9 @@ apps/desktop/src-tauri/icons/ios/
 !.env.example
 *.log
 
+# Local capture output (publish final media through the release channel)
+artifacts/
+
 # IDE settings
 .idea/
 .vscode/
