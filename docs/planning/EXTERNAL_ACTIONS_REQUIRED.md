@@ -11,8 +11,13 @@ project draft `1343809`, currently named `Untitled` in `submission_pre_draft`. T
 deadline is 2026-07-22 00:00 UTC (2026-07-22 08:00 Asia/Taipei). Local implementation and all
 submission copy may continue without external mutation.
 
-The deterministic local golden-path fixture and final local validation gates pass. The Desktop
-recording, final voice track and upload remain deadline-critical local/external work.
+The deterministic local golden-path fixture and final local validation gates pass. A reviewed
+95-second 1280×720 H.264 silent guided cut exists locally at the ignored path
+`artifacts/demo/DeskGraph-Build-Week-demo-silent.mp4`; it uses real synthetic-scope Desktop
+scan/search states plus separately verified CLI evidence and does not claim continuous live
+operation. Its SHA-256 is
+`bca6e8c72817919ae32fcfd69def3cff15f4e14655ab443342d0ab41462255e5`. Final voice recording,
+mixing and upload remain deadline-critical owner/external work.
 
 Required owner-approved actions before submission:
 
@@ -20,7 +25,7 @@ Required owner-approved actions before submission:
 2. Re-authenticate the intended GitHub account, create the public Apache-2.0 repository and approve
    the first push, or share the private repository with `testing@devpost.com` and
    `build-week-event@openai.com`.
-3. Review the final under-three-minute local screen recording, record the supplied Traditional
+3. Review the final under-three-minute guided cut, record the supplied 95-second Traditional
    Chinese voiceover against its timestamps, and approve mixing it into the final video. Upload the
    narrated result as an unlisted or public YouTube video; it must show the project working and
    explain how both Codex and GPT-5.6 were used.

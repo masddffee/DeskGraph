@@ -210,6 +210,11 @@ instructions are in the [README](../README.md) and
       invent, reuse, or guess one.
 - [ ] Confirm the public repository includes `LICENSE`, `README.md`, this
       setup/test path, and the source required to run the documented sample.
+- [x] Create and visually review a local 95-second 1280×720 H.264 silent guided
+      cut using real synthetic-scope Desktop scan/search states plus separately
+      verified CLI evidence. It is intentionally not represented as continuous
+      live operation. The local artifact is ignored by git; SHA-256:
+      `bca6e8c72817919ae32fcfd69def3cff15f4e14655ab443342d0ab41462255e5`.
 - [ ] Upload an unlisted or public YouTube video under three minutes with a
       voiceover. It must cover what was built, how Codex/GPT-5.6 was used, and
       the real pre-release limitations above.
