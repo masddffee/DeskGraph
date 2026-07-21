@@ -17792,8 +17792,14 @@ mod tests {
         let execution_plan = database
             .action_execution_plan(preview.plan_id)
             .expect("bound plan should expose trusted raw execution detail");
-        assert_eq!(execution_plan.source_path_raw, b"/scope/file.txt");
-        assert_eq!(execution_plan.destination_path_raw, b"/scope/renamed.txt");
+        assert_eq!(
+            execution_plan.source_path_raw,
+            TestPath::from_logical("/scope/file.txt").raw
+        );
+        assert_eq!(
+            execution_plan.destination_path_raw,
+            TestPath::from_logical("/scope/renamed.txt").raw
+        );
         assert_eq!(execution_plan.binding, binding.binding);
 
         let execute = database
