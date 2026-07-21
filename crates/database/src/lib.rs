@@ -13478,10 +13478,78 @@ fn test_active_binding(
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
     const TEST_EXCLUDED_FILE_IDENTITY: &[u8] = b"f0000000000000000";
+    #[cfg(windows)]
+    const TEST_EXCLUDED_FILE_IDENTITY: &[u8] = b"f000000000000";
+    #[cfg(not(windows))]
     const TEST_EXCLUDED_FILE_IDENTITY_2: &[u8] = b"f0000000000000001";
+    #[cfg(windows)]
+    const TEST_EXCLUDED_FILE_IDENTITY_2: &[u8] = b"f000000000001";
+    #[cfg(not(windows))]
     const TEST_EXCLUDED_FOLDER_IDENTITY: &[u8] = b"d0000000000000000";
+    #[cfg(windows)]
+    const TEST_EXCLUDED_FOLDER_IDENTITY: &[u8] = b"d000000000000";
+    #[cfg(not(windows))]
     const TEST_EXCLUDED_IDENTITY_KIND: &str = "unix_device_inode";
+    #[cfg(windows)]
+    const TEST_EXCLUDED_IDENTITY_KIND: &str = "windows_volume_file_index";
+
+    #[derive(Clone, Debug)]
+    struct TestPath {
+        raw: Vec<u8>,
+        key: String,
+        display: String,
+    }
+
+    impl TestPath {
+        /// Builds one native absolute path from a slash-delimited logical test
+        /// path. Tests stay readable while Windows receives UTF-16LE raw bytes
+        /// and backslash-separated comparison keys.
+        fn from_logical(logical: &str) -> Self {
+            let components = logical
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|component| !component.is_empty());
+            #[cfg(windows)]
+            let mut path = std::path::PathBuf::from(r"C:\");
+            #[cfg(not(windows))]
+            let mut path = std::path::PathBuf::from("/");
+            for component in components {
+                path.push(component);
+            }
+            Self {
+                raw: deskgraph_identity::path_to_raw(&path),
+                key: comparison_key(&path),
+                display: path.to_string_lossy().into_owned(),
+            }
+        }
+
+        fn observation(&self, kind: NodeKind, parent: Option<Vec<u8>>) -> Observation {
+            Observation {
+                kind,
+                identity_kind: "test_identity".to_string(),
+                identity_key: format!("identity:{}", self.key).into_bytes(),
+                parent_identity_key: parent,
+                path_raw: self.raw.clone(),
+                path_key: self.key.clone(),
+                display_path: self.display.clone(),
+                size_bytes: if kind == NodeKind::File { 4 } else { 0 },
+                modified_unix_ns: Some(1),
+                link_count: Some(1),
+            }
+        }
+
+        fn child(&self, name: &str) -> Self {
+            let parent = path_from_raw(&self.raw).expect("test path raw bytes should decode");
+            let path = parent.join(name);
+            Self {
+                raw: deskgraph_identity::path_to_raw(&path),
+                key: comparison_key(&path),
+                display: path.to_string_lossy().into_owned(),
+            }
+        }
+    }
 
     fn lexical_filters(scope_id: Option<i64>) -> LexicalSearchFilters<'static> {
         LexicalSearchFilters {
@@ -13496,11 +13564,12 @@ mod tests {
 
     fn folder_search_setup() -> (ManifestDatabase, i64) {
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope_path = TestPath::from_logical("/scope");
         let scope = database
             .add_scope_with_access_grant(
-                b"/scope",
-                "/scope",
-                "/scope",
+                &scope_path.raw,
+                &scope_path.key,
+                &scope_path.display,
                 ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -13516,37 +13585,20 @@ mod tests {
                     .expect("core scope binding should load"),
             )
             .expect("folder-search scan should start");
-        let root = observation("/scope", NodeKind::Folder, None);
-        let selected = observation(
-            "/scope/needle-project",
-            NodeKind::Folder,
-            Some(root.identity_key.clone()),
-        );
-        let deep = observation(
-            "/scope/needle-project/needle-deep",
-            NodeKind::Folder,
-            Some(selected.identity_key.clone()),
-        );
-        let direct = observation(
-            "/scope/needle-project/needle-direct.txt",
-            NodeKind::File,
-            Some(selected.identity_key.clone()),
-        );
-        let deep_file = observation(
-            "/scope/needle-project/needle-deep/needle-deep-file.txt",
-            NodeKind::File,
-            Some(deep.identity_key.clone()),
-        );
-        let stale = observation(
-            "/scope/needle-project/needle-stale.txt",
-            NodeKind::File,
-            Some(selected.identity_key.clone()),
-        );
-        let sibling = observation(
-            "/scope/needle-sibling.txt",
-            NodeKind::File,
-            Some(root.identity_key.clone()),
-        );
+        let root = scope_path.observation(NodeKind::Folder, None);
+        let selected = TestPath::from_logical("/scope/needle-project")
+            .observation(NodeKind::Folder, Some(root.identity_key.clone()));
+        let deep = TestPath::from_logical("/scope/needle-project/needle-deep")
+            .observation(NodeKind::Folder, Some(selected.identity_key.clone()));
+        let direct = TestPath::from_logical("/scope/needle-project/needle-direct.txt")
+            .observation(NodeKind::File, Some(selected.identity_key.clone()));
+        let deep_file =
+            TestPath::from_logical("/scope/needle-project/needle-deep/needle-deep-file.txt")
+                .observation(NodeKind::File, Some(deep.identity_key.clone()));
+        let stale = TestPath::from_logical("/scope/needle-project/needle-stale.txt")
+            .observation(NodeKind::File, Some(selected.identity_key.clone()));
+        let sibling = TestPath::from_logical("/scope/needle-sibling.txt")
+            .observation(NodeKind::File, Some(root.identity_key.clone()));
         database
             .complete_scan(
                 scan_id,
@@ -13561,8 +13613,9 @@ mod tests {
     }
 
     fn folder_search_node_id(database: &ManifestDatabase, scope_id: i64, path: &str) -> i64 {
+        let path = TestPath::from_logical(path);
         database
-            .node_id_for_path_key(scope_id, path)
+            .node_id_for_path_key(scope_id, &path.key)
             .expect("folder-search node lookup should pass")
             .expect("folder-search node should exist")
     }
@@ -13574,11 +13627,12 @@ mod tests {
         text: &str,
         active: bool,
     ) {
+        let path = TestPath::from_logical(path);
         let (node_id, location_id): (i64, i64) = database
             .connection
             .query_row(
                 "SELECT node_id,id FROM locations WHERE scope_id=?1 AND path_key=?2",
-                params![scope_id, path],
+                params![scope_id, path.key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("folder-search location should load");
@@ -13652,6 +13706,55 @@ mod tests {
             "windows" => "macos",
             _ => "windows",
         }
+    }
+
+    fn insert_active_scope_fixture(
+        database: &ManifestDatabase,
+        raw: &[u8],
+        key: &str,
+        display: &str,
+        platform: &str,
+        grant: &[u8],
+    ) -> i64 {
+        database
+            .connection
+            .execute(
+                "INSERT INTO authorized_scopes(path_raw,path_key,display_path,platform,created_at_unix_ms) \
+                 VALUES(?1,?2,?3,?4,0)",
+                params![raw, key, display, platform],
+            )
+            .expect("low-level scope fixture should persist");
+        let scope_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO scope_access_grants(scope_id,platform,opaque_grant,state,updated_at_unix_ms) \
+                 VALUES(?1,?2,?3,'active',0)",
+                params![scope_id, platform, grant],
+            )
+            .expect("low-level active grant fixture should persist");
+        scope_id
+    }
+
+    fn add_host_scope_with_grant(
+        database: &mut ManifestDatabase,
+        logical_path: &str,
+        grant: &[u8],
+    ) -> AuthorizedScope {
+        let path = TestPath::from_logical(logical_path);
+        database
+            .add_scope_with_access_grant(
+                &path.raw,
+                &path.key,
+                &path.display,
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: grant,
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("host-native scope and grant should persist")
     }
 
     fn clone_table_row_without_id(
@@ -13744,6 +13847,43 @@ mod tests {
                 observed_at_unix_ms: 1,
             })
             .expect("watch event should persist")
+    }
+
+    fn record_host_file_watch_event(
+        database: &mut ManifestDatabase,
+        scope_id: i64,
+        path: &TestPath,
+        stable_after_unix_ms: i64,
+    ) -> WatchEventRecord {
+        if !database
+            .scope_has_completed_scan(scope_id)
+            .expect("scope readiness should load")
+        {
+            let job_id = database
+                .create_scan_job(scope_id)
+                .expect("initial scan should start");
+            database
+                .complete_scan(job_id, scope_id, &[], &[], 0, 0)
+                .expect("initial scan should complete");
+        }
+        let snapshot = WatchSnapshot {
+            kind: WatchSnapshotKind::File,
+            size_bytes: Some(7),
+            modified_unix_ns: Some(11),
+            identity_key: Some(format!("identity:{}", path.key).into_bytes()),
+        };
+        database
+            .record_watch_observation_at(WatchObservationWrite {
+                scope_id,
+                path_raw: &path.raw,
+                path_key: &path.key,
+                snapshot: &snapshot,
+                stable_after_unix_ms,
+                ignored_reason: None,
+                reconciliation_kind: WatchReconciliationKind::FullScope,
+                observed_at_unix_ms: 1,
+            })
+            .expect("host-native watch event should persist")
     }
 
     #[test]
@@ -14835,6 +14975,83 @@ mod tests {
         (database, scope_id, node_id, root)
     }
 
+    fn host_extraction_setup() -> (ManifestDatabase, i64, i64, QueuedPath) {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope_path = TestPath::from_logical("/scope");
+        let scope = database
+            .add_scope(
+                &scope_path.raw,
+                &scope_path.key,
+                &scope_path.display,
+                std::env::consts::OS,
+            )
+            .expect("host-native scope should persist");
+        let root = QueuedPath {
+            path_raw: scope_path.raw.clone(),
+            path_key: scope_path.key.clone(),
+            parent_identity_key: None,
+            is_root: true,
+        };
+        let job = database
+            .create_resumable_scan_job(scope.id, &root)
+            .expect("host-native scan job should create");
+        database
+            .claim_scan_job(job.job_id, "host-scan-runner", 60_000)
+            .expect("host-native scan should claim");
+        let root_entry = database
+            .next_scan_queue_entry(job.job_id, "host-scan-runner", 60_000)
+            .expect("host-native queue should load")
+            .expect("host-native root should exist");
+        let root_observation = scope_path.observation(NodeKind::Folder, None);
+        let file_path = scope_path.child("file.txt");
+        let child = QueuedPath {
+            path_raw: file_path.raw.clone(),
+            path_key: file_path.key.clone(),
+            parent_identity_key: Some(root_observation.identity_key.clone()),
+            is_root: false,
+        };
+        database
+            .stage_scan_queue_entry(
+                job.job_id,
+                "host-scan-runner",
+                root_entry.id,
+                Some(&root_observation),
+                std::slice::from_ref(&child),
+                &[],
+                0,
+                1,
+                60_000,
+            )
+            .expect("host-native root should stage");
+        let child_entry = database
+            .next_scan_queue_entry(job.job_id, "host-scan-runner", 60_000)
+            .expect("host-native queue should load")
+            .expect("host-native child should exist");
+        let file_observation =
+            file_path.observation(NodeKind::File, Some(root_observation.identity_key));
+        database
+            .stage_scan_queue_entry(
+                job.job_id,
+                "host-scan-runner",
+                child_entry.id,
+                Some(&file_observation),
+                &[],
+                &[],
+                0,
+                1,
+                60_000,
+            )
+            .expect("host-native file should stage");
+        database
+            .finalize_resumable_scan_job(job.job_id, "host-scan-runner")
+            .expect("host-native scan should publish");
+        let node_id = database
+            .node_id_for_path_key(scope.id, &file_path.key)
+            .expect("host-native node query should pass")
+            .expect("host-native file node should exist");
+        (database, scope.id, node_id, root)
+    }
+
     fn synthetic_screenshot_group_source(
         node_id: i64,
         modified_unix_ns: i64,
@@ -14865,7 +15082,7 @@ mod tests {
         index: i64,
         ocr_provider_version: &str,
     ) -> i64 {
-        let path = format!("/scope/screenshot-{index}.png");
+        let path = TestPath::from_logical(&format!("/scope/screenshot-{index}.png"));
         let identity = format!("screenshot-identity-{index}");
         database
             .connection
@@ -14891,8 +15108,8 @@ mod tests {
             .execute(
                 "INSERT INTO locations( \
                     scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id \
-                 ) VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)",
-                params![scope_id, node_id, path.as_bytes(), path, scan_id],
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                params![scope_id, node_id, path.raw, path.key, path.display, scan_id],
             )
             .expect("image location should persist");
         let location_id = database.connection.last_insert_rowid();
@@ -14982,8 +15199,14 @@ mod tests {
     fn screenshot_group_setup_in(
         mut database: ManifestDatabase,
     ) -> (ManifestDatabase, i64, Vec<ScreenshotGroupSourceRecord>) {
+        let scope_path = TestPath::from_logical("/scope");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
+            .add_scope(
+                &scope_path.raw,
+                &scope_path.key,
+                &scope_path.display,
+                std::env::consts::OS,
+            )
             .expect("scope should persist");
         database
             .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"test-grant")
@@ -15010,11 +15233,25 @@ mod tests {
         scope_id: i64,
         node_id: i64,
     ) -> ActionPlanPreview {
+        let source_path_key: String = database
+            .connection
+            .query_row(
+                "SELECT path_key FROM locations WHERE scope_id=?1 AND node_id=?2 AND present=1",
+                params![scope_id, node_id],
+                |row| row.get(0),
+            )
+            .expect("execution source path should load from a completed manifest");
         let execution_source = database
-            .action_execution_source_for_path_key(scope_id, "/scope/file.txt")
+            .action_execution_source_for_path_key(scope_id, &source_path_key)
             .expect("execution source should load from a completed manifest");
         let source = &execution_source.source;
         assert_eq!(source.node_id, node_id);
+        let mut destination =
+            path_from_raw(&source.path_raw).expect("execution source raw path should decode");
+        destination.set_file_name("renamed.txt");
+        let destination_raw = deskgraph_identity::path_to_raw(&destination);
+        let destination_key = comparison_key(&destination);
+        let destination_display = destination.to_string_lossy().into_owned();
         let source_sha256 = [0xa5; 32];
         database
             .create_rename_action_plan(ActionPlanWrite {
@@ -15024,9 +15261,9 @@ mod tests {
                 source_path_raw: &source.path_raw,
                 source_path_key: &source.path_key,
                 source_display_path: &source.display_path,
-                destination_path_raw: b"/scope/renamed.txt",
-                destination_path_key: "/scope/renamed.txt",
-                destination_display_path: "/scope/renamed.txt",
+                destination_path_raw: &destination_raw,
+                destination_path_key: &destination_key,
+                destination_display_path: &destination_display,
                 source_identity_kind: &source.identity_kind,
                 source_identity_key: &source.identity_key,
                 source_size_bytes: source.size_bytes,
@@ -15050,11 +15287,12 @@ mod tests {
         let binding = database
             .bind_scope_policy_revision(scope_id)
             .expect("active policy binding should load");
+        let excluded_path = TestPath::from_logical("/scope/renamed.txt");
         let write = ScopeExclusionWrite {
             kind: ScopeExclusionKind::File,
-            path_raw: b"/scope/renamed.txt",
-            path_key: "/scope/renamed.txt",
-            display_path: "/scope/renamed.txt",
+            path_raw: &excluded_path.raw,
+            path_key: &excluded_path.key,
+            display_path: &excluded_path.display,
             identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
             identity_key: TEST_EXCLUDED_FILE_IDENTITY,
         };
@@ -15252,7 +15490,23 @@ mod tests {
     }
 
     fn project_setup() -> (ManifestDatabase, i64, i64) {
-        let (mut database, scope_id, root) = resumable_setup();
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope_path = TestPath::from_logical("/scope");
+        let scope = database
+            .add_scope(
+                &scope_path.raw,
+                &scope_path.key,
+                &scope_path.display,
+                std::env::consts::OS,
+            )
+            .expect("scope should persist");
+        let scope_id = scope.id;
+        let root = QueuedPath {
+            path_raw: scope_path.raw.clone(),
+            path_key: scope_path.key.clone(),
+            parent_identity_key: None,
+            is_root: true,
+        };
         let job = database
             .create_resumable_scan_job(scope_id, &root)
             .expect("scan job should create");
@@ -15263,10 +15517,11 @@ mod tests {
             .next_scan_queue_entry(job.job_id, "project-scan", 60_000)
             .expect("queue should load")
             .expect("root should exist");
-        let root_observation = observation("/scope", NodeKind::Folder, None);
+        let root_observation = scope_path.observation(NodeKind::Folder, None);
+        let cargo_path = TestPath::from_logical("/scope/Cargo.toml");
         let child = QueuedPath {
-            path_raw: b"/scope/Cargo.toml".to_vec(),
-            path_key: "/scope/Cargo.toml".to_string(),
+            path_raw: cargo_path.raw.clone(),
+            path_key: cargo_path.key.clone(),
             parent_identity_key: Some(root_observation.identity_key.clone()),
             is_root: false,
         };
@@ -15287,11 +15542,8 @@ mod tests {
             .next_scan_queue_entry(job.job_id, "project-scan", 60_000)
             .expect("queue should load")
             .expect("child should exist");
-        let cargo_observation = observation(
-            "/scope/Cargo.toml",
-            NodeKind::File,
-            Some(root_observation.identity_key),
-        );
+        let cargo_observation =
+            cargo_path.observation(NodeKind::File, Some(root_observation.identity_key));
         database
             .stage_scan_queue_entry(
                 job.job_id,
@@ -15309,7 +15561,7 @@ mod tests {
             .finalize_resumable_scan_job(job.job_id, "project-scan")
             .expect("scan should publish");
         let root_node_id = database
-            .node_id_for_path_key(scope_id, "/scope")
+            .node_id_for_path_key(scope_id, &scope_path.key)
             .expect("node query should pass")
             .expect("root node should exist");
         (database, scope_id, root_node_id)
@@ -16106,6 +16358,23 @@ mod tests {
                      (7, 'windows', X'77696E646F77732D6368696C64', 'active', 0);",
             )
             .expect("legacy overlapping grants should persist");
+        #[cfg(windows)]
+        {
+            let windows_root = TestPath::from_logical("/");
+            let windows_child = TestPath::from_logical("/root-child");
+            connection
+                .execute(
+                    "UPDATE authorized_scopes SET path_raw=?2,path_key=?3,display_path=?4 WHERE id=1+?1",
+                    params![5_i64, windows_root.raw, windows_root.key, windows_root.display],
+                )
+                .expect("native Windows root bytes should replace the legacy text fixture");
+            connection
+                .execute(
+                    "UPDATE authorized_scopes SET path_raw=?2,path_key=?3,display_path=?4 WHERE id=1+?1",
+                    params![6_i64, windows_child.raw, windows_child.key, windows_child.display],
+                )
+                .expect("native Windows child bytes should replace the legacy text fixture");
+        }
         drop(connection);
 
         let mut database = ManifestDatabase::open(&path).expect("overlap migration should apply");
@@ -16143,20 +16412,34 @@ mod tests {
                 _ => Vec::new(),
             }
         );
+        let descendant_id = match std::env::consts::OS {
+            "macos" => 2,
+            "linux" => 5,
+            "windows" => 7,
+            _ => 2,
+        };
         assert!(
             database
-                .upsert_scope_access_grant(2, "macos", b"reactivated-child")
+                .upsert_scope_access_grant(
+                    descendant_id,
+                    std::env::consts::OS,
+                    b"reactivated-child",
+                )
                 .is_err(),
             "an inactive descendant must not reactivate beside its active parent"
         );
+        let broad_root = match std::env::consts::OS {
+            "macos" => TestPath::from_logical("/home/person"),
+            _ => TestPath::from_logical("/"),
+        };
         database
             .add_scope_with_access_grant(
-                b"/home/person",
-                "/home/person",
-                "/home/person",
+                &broad_root.raw,
+                &broad_root.key,
+                &broad_root.display,
                 ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"refreshed-parent",
                     state: ScopeAccessGrantState::Active,
                 },
@@ -16386,11 +16669,12 @@ mod tests {
     #[test]
     fn scope_and_access_grant_are_committed_or_rolled_back_together() {
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let selected_path = TestPath::from_logical("/selected");
         let scope = database
             .add_scope_with_access_grant(
-                b"/selected",
-                "/selected",
-                "/selected",
+                &selected_path.raw,
+                &selected_path.key,
+                &selected_path.display,
                 ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -16414,10 +16698,11 @@ mod tests {
             1
         );
 
+        let replaced_path = TestPath::from_logical("/selected-replaced");
         let failed = database.add_scope_with_access_grant(
-            b"/selected-replaced",
-            "/selected",
-            "/selected-replaced",
+            &replaced_path.raw,
+            &selected_path.key,
+            &replaced_path.display,
             ScopeAccessGrantWrite {
                 scope_platform: foreign_platform(),
                 grant_platform: foreign_platform(),
@@ -16432,8 +16717,8 @@ mod tests {
         let record = database
             .scope_record(scope.id)
             .expect("scope should remain readable");
-        assert_eq!(record.path_raw, b"/selected");
-        assert_eq!(record.display_path, "/selected");
+        assert_eq!(record.path_raw, selected_path.raw);
+        assert_eq!(record.display_path, selected_path.display);
         assert_eq!(
             database
                 .active_scope_grant(scope.id)
@@ -16442,11 +16727,12 @@ mod tests {
             b"picker-grant"
         );
 
+        let revoked_path = TestPath::from_logical("/revoked");
         let inactive_scope = database
             .add_scope_with_access_grant(
-                b"/revoked",
-                "/revoked",
-                "/revoked",
+                &revoked_path.raw,
+                &revoked_path.key,
+                &revoked_path.display,
                 ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -16472,11 +16758,13 @@ mod tests {
     #[test]
     fn coverage_roots_and_grants_commit_as_one_bounded_set() {
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let desktop = TestPath::from_logical("/desktop");
+        let documents = TestPath::from_logical("/documents");
         let roots = [
             CoverageRootAccessGrantWrite {
-                path_raw: b"/desktop",
-                path_key: "/desktop",
-                display_path: "/desktop",
+                path_raw: &desktop.raw,
+                path_key: &desktop.key,
+                display_path: &desktop.display,
                 grant: ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -16485,9 +16773,9 @@ mod tests {
                 },
             },
             CoverageRootAccessGrantWrite {
-                path_raw: b"/documents",
-                path_key: "/documents",
-                display_path: "/documents",
+                path_raw: &documents.raw,
+                path_key: &documents.key,
+                display_path: &documents.display,
                 grant: ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -16526,20 +16814,15 @@ mod tests {
 
     #[test]
     fn coverage_root_overlap_trigger_guards_every_writer() {
-        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
-        let parent = database
-            .add_scope_with_access_grant(
-                b"/home/person",
-                "/home/person",
-                "/home/person",
-                ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
-                    opaque_grant: b"home-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("parent root should persist");
+        let database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let parent_id = insert_active_scope_fixture(
+            &database,
+            b"/home/person",
+            "/home/person",
+            "/home/person",
+            "macos",
+            b"home-grant",
+        );
         assert!(
             database
                 .add_scope(
@@ -16554,7 +16837,7 @@ mod tests {
         let exact = database
             .add_scope(b"/home/person", "/home/person", "/home/person", "macos")
             .expect("exact reauthorization should remain valid");
-        assert_eq!(exact.id, parent.id);
+        assert_eq!(exact.id, parent_id);
         database
             .add_scope(
                 b"/home/person-2",
@@ -16564,19 +16847,14 @@ mod tests {
             )
             .expect("component sibling must not be treated as a descendant");
 
-        database
-            .add_scope_with_access_grant(
-                b"C:\\Users\\person",
-                "c:\\users\\person",
-                "C:\\Users\\person",
-                ScopeAccessGrantWrite {
-                    scope_platform: "windows",
-                    grant_platform: "windows",
-                    opaque_grant: b"windows-home-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("Windows parent root should persist");
+        insert_active_scope_fixture(
+            &database,
+            b"C:\\Users\\person",
+            "c:\\users\\person",
+            "C:\\Users\\person",
+            "windows",
+            b"windows-home-grant",
+        );
         assert!(
             database
                 .add_scope(
@@ -16592,7 +16870,7 @@ mod tests {
 
     #[test]
     fn coverage_root_separator_keys_cannot_bypass_active_grant_overlap_guards() {
-        let mut unix_database =
+        let unix_database =
             ManifestDatabase::open_in_memory().expect("Unix database should initialize");
         let unix_inactive_child = unix_database
             .add_scope(
@@ -16602,19 +16880,7 @@ mod tests {
                 "macos",
             )
             .expect("inactive Unix child fixture should persist");
-        unix_database
-            .add_scope_with_access_grant(
-                b"/",
-                "/",
-                "/",
-                ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
-                    opaque_grant: b"unix-root-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("low-level Unix root fixture should persist");
+        insert_active_scope_fixture(&unix_database, b"/", "/", "/", "macos", b"unix-root-grant");
         assert!(
             unix_database
                 .add_scope(b"/child", "/child", "/child", "macos",)
@@ -16623,16 +16889,17 @@ mod tests {
         );
         assert!(
             unix_database
-                .upsert_scope_access_grant(
-                    unix_inactive_child.id,
-                    "macos",
-                    b"unix-inactive-child-grant",
+                .connection
+                .execute(
+                    "INSERT INTO scope_access_grants(scope_id,platform,opaque_grant,state,updated_at_unix_ms) \
+                     VALUES(?1,'macos',?2,'active',0)",
+                    params![unix_inactive_child.id, b"unix-inactive-child-grant"],
                 )
                 .is_err(),
             "the grant trigger must reject activating a Unix descendant beneath '/'"
         );
 
-        let mut windows_database =
+        let windows_database =
             ManifestDatabase::open_in_memory().expect("Windows database should initialize");
         let windows_inactive_child = windows_database
             .add_scope(
@@ -16642,19 +16909,14 @@ mod tests {
                 "windows",
             )
             .expect("inactive Windows child fixture should persist");
-        windows_database
-            .add_scope_with_access_grant(
-                b"C:\\",
-                "c:\\",
-                "C:\\",
-                ScopeAccessGrantWrite {
-                    scope_platform: "windows",
-                    grant_platform: "windows",
-                    opaque_grant: b"windows-root-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("low-level Windows root fixture should persist");
+        insert_active_scope_fixture(
+            &windows_database,
+            b"C:\\",
+            "c:\\",
+            "C:\\",
+            "windows",
+            b"windows-root-grant",
+        );
         assert!(
             windows_database
                 .add_scope(b"C:\\child", "c:\\child", "C:\\child", "windows",)
@@ -16663,10 +16925,11 @@ mod tests {
         );
         assert!(
             windows_database
-                .upsert_scope_access_grant(
-                    windows_inactive_child.id,
-                    "windows",
-                    b"windows-inactive-child-grant",
+                .connection
+                .execute(
+                    "INSERT INTO scope_access_grants(scope_id,platform,opaque_grant,state,updated_at_unix_ms) \
+                     VALUES(?1,'windows',?2,'active',0)",
+                    params![windows_inactive_child.id, b"windows-inactive-child-grant"],
                 )
                 .is_err(),
             "the grant trigger must reject activating a Windows descendant beneath 'C:\\'"
@@ -16730,25 +16993,27 @@ mod tests {
                 .is_empty()
         );
 
+        let home_path = TestPath::from_logical("/home/person");
+        let desktop_path = TestPath::from_logical("/home/person/Desktop");
         let nested_roots = [
             CoverageRootAccessGrantWrite {
-                path_raw: b"/home/person",
-                path_key: "/home/person",
-                display_path: "/home/person",
+                path_raw: &home_path.raw,
+                path_key: &home_path.key,
+                display_path: &home_path.display,
                 grant: ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"home-grant",
                     state: ScopeAccessGrantState::Active,
                 },
             },
             CoverageRootAccessGrantWrite {
-                path_raw: b"/home/person/Desktop",
-                path_key: "/home/person/Desktop",
-                display_path: "/home/person/Desktop",
+                path_raw: &desktop_path.raw,
+                path_key: &desktop_path.key,
+                display_path: &desktop_path.display,
                 grant: ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"desktop-grant",
                     state: ScopeAccessGrantState::Active,
                 },
@@ -16765,38 +17030,40 @@ mod tests {
                 .is_empty()
         );
 
+        let existing_path = TestPath::from_logical("/existing");
         let existing = database
             .add_scope_with_access_grant(
-                b"C:\\existing",
-                "c:\\existing",
-                "C:\\existing",
+                &existing_path.raw,
+                &existing_path.key,
+                &existing_path.display,
                 ScopeAccessGrantWrite {
-                    scope_platform: "windows",
-                    grant_platform: "windows",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"existing-windows-grant",
                     state: ScopeAccessGrantState::Active,
                 },
             )
             .expect("existing platform-bound root should persist");
+        let first_new_path = TestPath::from_logical("/first-new-root");
         let transaction_failure = [
             CoverageRootAccessGrantWrite {
-                path_raw: b"/first-new-root",
-                path_key: "/first-new-root",
-                display_path: "/first-new-root",
+                path_raw: &first_new_path.raw,
+                path_key: &first_new_path.key,
+                display_path: &first_new_path.display,
                 grant: ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"first-new-grant",
                     state: ScopeAccessGrantState::Active,
                 },
             },
             CoverageRootAccessGrantWrite {
-                path_raw: b"C:\\existing",
-                path_key: "c:\\existing",
-                display_path: "C:\\existing",
+                path_raw: &existing_path.raw,
+                path_key: &existing_path.key,
+                display_path: &existing_path.display,
                 grant: ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: foreign_platform(),
+                    grant_platform: foreign_platform(),
                     opaque_grant: b"wrong-platform-replacement",
                     state: ScopeAccessGrantState::Active,
                 },
@@ -19852,9 +20119,13 @@ mod tests {
     fn folder_scoped_search_never_returns_a_sibling_hard_link_location() {
         let (database, scope_id) = folder_search_setup();
         let selected_id = folder_search_node_id(&database, scope_id, "/scope/needle-project");
-        let selected_path = "/scope/needle-project/needle-direct.txt";
-        let sibling_path = "/scope/needle-hardlink-sibling.txt";
-        let shared_node_id = folder_search_node_id(&database, scope_id, selected_path);
+        let selected_path = TestPath::from_logical("/scope/needle-project/needle-direct.txt");
+        let sibling_path = TestPath::from_logical("/scope/needle-hardlink-sibling.txt");
+        let shared_node_id = folder_search_node_id(
+            &database,
+            scope_id,
+            "/scope/needle-project/needle-direct.txt",
+        );
         let root_node_id = folder_search_node_id(&database, scope_id, "/scope");
         let scan_id: i64 = database
             .connection
@@ -19873,8 +20144,8 @@ mod tests {
                 params![
                     scope_id,
                     shared_node_id,
-                    sibling_path.as_bytes(),
-                    sibling_path,
+                    sibling_path.raw,
+                    sibling_path.key,
                     scan_id
                 ],
             )
@@ -19898,14 +20169,14 @@ mod tests {
         insert_folder_search_content(
             &database,
             scope_id,
-            selected_path,
+            "/scope/needle-project/needle-direct.txt",
             "needle hardlink shared body",
             true,
         );
         insert_folder_search_content(
             &database,
             scope_id,
-            sibling_path,
+            "/scope/needle-hardlink-sibling.txt",
             "needle hardlink shared body",
             true,
         );
@@ -19925,12 +20196,12 @@ mod tests {
         assert!(
             metadata
                 .iter()
-                .any(|candidate| candidate.display_path == selected_path)
+                .any(|candidate| candidate.display_path == selected_path.display)
         );
         assert!(
             metadata
                 .iter()
-                .all(|candidate| candidate.display_path != sibling_path),
+                .all(|candidate| candidate.display_path != sibling_path.display),
             "node membership must not authorize a sibling hard-link location"
         );
 
@@ -19947,13 +20218,13 @@ mod tests {
             )
             .expect("folder-scoped content search should pass");
         assert_eq!(content.len(), 1);
-        assert_eq!(content[0].display_path, selected_path);
+        assert_eq!(content[0].display_path, selected_path.display);
         assert_eq!(content[0].location_id, {
             database
                 .connection
                 .query_row(
                     "SELECT id FROM locations WHERE scope_id=?1 AND path_key=?2",
-                    params![scope_id, selected_path],
+                    params![scope_id, selected_path.key],
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("selected hard-link location should load")
@@ -19963,8 +20234,8 @@ mod tests {
     #[test]
     fn folder_search_selector_and_path_list_fail_closed_at_every_boundary() {
         let (mut database, scope_id) = folder_search_setup();
-        let selected_path = "/scope/needle-project";
-        let selected_id = folder_search_node_id(&database, scope_id, selected_path);
+        let selected_path = TestPath::from_logical("/scope/needle-project");
+        let selected_id = folder_search_node_id(&database, scope_id, "/scope/needle-project");
         let file_id = folder_search_node_id(
             &database,
             scope_id,
@@ -19982,10 +20253,10 @@ mod tests {
             list.folders
                 .iter()
                 .any(|folder| folder.folder_node_id == selected_id
-                    && folder.display_path == selected_path)
+                    && folder.display_path == selected_path.display)
         );
         let debug = format!("{list:?}");
-        assert!(!debug.contains(selected_path));
+        assert!(!debug.contains(&selected_path.display));
         assert!(debug.contains("<redacted>"));
 
         let bounded = database
@@ -20048,7 +20319,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("completed scan should load");
-        let ambiguous_path = "/scope/needle-project-alias";
+        let ambiguous_path = TestPath::from_logical("/scope/needle-project-alias");
         database
             .connection
             .execute(
@@ -20058,8 +20329,8 @@ mod tests {
                 params![
                     scope_id,
                     selected_id,
-                    ambiguous_path.as_bytes(),
-                    ambiguous_path,
+                    ambiguous_path.raw,
+                    ambiguous_path.key,
                     scan_id
                 ],
             )
@@ -20080,15 +20351,16 @@ mod tests {
             .connection
             .execute(
                 "UPDATE locations SET present=0 WHERE scope_id=?1 AND path_key=?2",
-                params![scope_id, ambiguous_path],
+                params![scope_id, ambiguous_path.key],
             )
             .expect("ambiguous folder location should become absent");
 
+        let other_path = TestPath::from_logical("/other");
         let other = database
             .add_scope_with_access_grant(
-                b"/other",
-                "/other",
-                "/other",
+                &other_path.raw,
+                &other_path.key,
+                &other_path.display,
                 ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -20183,9 +20455,9 @@ mod tests {
                 binding,
                 &[ScopeExclusionWrite {
                     kind: ScopeExclusionKind::Folder,
-                    path_raw: selected_path.as_bytes(),
-                    path_key: selected_path,
-                    display_path: selected_path,
+                    path_raw: &selected_path.raw,
+                    path_key: &selected_path.key,
+                    display_path: &selected_path.display,
                     identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
                     identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
                 }],
@@ -20718,7 +20990,7 @@ mod tests {
                             path.strip_prefix(workspace)
                                 .unwrap_or(&path)
                                 .to_string_lossy()
-                                .into_owned(),
+                                .replace('\\', "/"),
                         );
                     }
                 }
@@ -21898,13 +22170,14 @@ mod tests {
 
     #[test]
     fn stale_exclusion_binding_rolls_back_policy_data_receipt_and_capability() {
-        let (mut database, scope_id, _, _) = extraction_setup();
+        let (mut database, scope_id, _, _) = host_extraction_setup();
         let binding = test_active_binding(&database, scope_id).expect("active binding should load");
+        let old_private = TestPath::from_logical("/scope/old-private");
         let first = ScopeExclusionWrite {
             kind: ScopeExclusionKind::Folder,
-            path_raw: b"/scope/old-private",
-            path_key: "/scope/old-private",
-            display_path: "/scope/old-private",
+            path_raw: &old_private.raw,
+            path_key: &old_private.key,
+            display_path: &old_private.display,
             identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
             identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
         };
@@ -21919,11 +22192,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let file_path = TestPath::from_logical("/scope/file.txt");
         let stale_target = ScopeExclusionWrite {
             kind: ScopeExclusionKind::File,
-            path_raw: b"/scope/file.txt",
-            path_key: "/scope/file.txt",
-            display_path: "/scope/file.txt",
+            path_raw: &file_path.raw,
+            path_key: &file_path.key,
+            display_path: &file_path.display,
             identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
             identity_key: TEST_EXCLUDED_FILE_IDENTITY,
         };
@@ -21973,13 +22247,14 @@ mod tests {
 
     #[test]
     fn exclusion_identity_validation_and_corrupt_stored_identity_fail_closed() {
-        let (mut database, scope_id, _, _) = extraction_setup();
+        let (mut database, scope_id, _, _) = host_extraction_setup();
         let binding = test_active_binding(&database, scope_id).expect("scope should bind");
+        let private_path = TestPath::from_logical("/scope/private");
         let weak = ScopeExclusionWrite {
             kind: ScopeExclusionKind::Folder,
-            path_raw: b"/scope/private",
-            path_key: "/scope/private",
-            display_path: "/scope/private",
+            path_raw: &private_path.raw,
+            path_key: &private_path.key,
+            display_path: &private_path.display,
             identity_kind: "path_fallback",
             identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
         };
@@ -22022,23 +22297,39 @@ mod tests {
 
     #[test]
     fn privacy_purge_capability_is_next_revision_bound_immutable_and_rollback_clean() {
-        let (mut database, scope_id, _, _) = extraction_setup();
+        let (mut database, scope_id, _, _) = host_extraction_setup();
         let binding = test_active_binding(&database, scope_id).expect("scope should activate");
+        let private_path = TestPath::from_logical("/scope/private");
+        let other_path = TestPath::from_logical("/other");
         let other = database
-            .add_scope(b"/other", "/other", "/other", std::env::consts::OS)
+            .add_scope(
+                &other_path.raw,
+                &other_path.key,
+                &other_path.display,
+                std::env::consts::OS,
+            )
             .expect("second scope should persist");
         database
             .upsert_scope_access_grant(other.id, std::env::consts::OS, b"other-grant")
             .expect("second scope grant should persist");
         let insert_exclusion = "INSERT INTO scope_exclusions( \
              scope_id,kind,path_raw,path_key,display_path,identity_kind,identity_key,policy_revision,created_at_unix_ms) \
-             VALUES(?1,'folder',X'2F73636F70652F70726976617465','/scope/private','/scope/private', \
-                    'unix_device_inode',X'6430303030303030303030303030303030',2,1)";
+             VALUES(?1,'folder',?2,?3,?4,?5,?6,2,1)";
 
         assert!(
             database
                 .connection
-                .execute(insert_exclusion, [scope_id])
+                .execute(
+                    insert_exclusion,
+                    params![
+                        scope_id,
+                        private_path.raw,
+                        private_path.key,
+                        private_path.display,
+                        TEST_EXCLUDED_IDENTITY_KIND,
+                        TEST_EXCLUDED_FOLDER_IDENTITY
+                    ],
+                )
                 .is_err()
         );
         assert!(database
@@ -22066,7 +22357,21 @@ mod tests {
                     [scope_id],
                 )
                 .is_err());
-            assert!(transaction.execute(insert_exclusion, [scope_id]).is_err());
+            assert!(
+                transaction
+                    .execute(
+                        insert_exclusion,
+                        params![
+                            scope_id,
+                            private_path.raw,
+                            private_path.key,
+                            private_path.display,
+                            TEST_EXCLUDED_IDENTITY_KIND,
+                            TEST_EXCLUDED_FOLDER_IDENTITY
+                        ],
+                    )
+                    .is_err()
+            );
             transaction.rollback().unwrap();
         }
         {
@@ -22083,7 +22388,21 @@ mod tests {
                 "UPDATE authorized_scopes SET policy_revision=2 WHERE id=?1 AND policy_revision=1",
                 [scope_id],
             ).unwrap();
-            assert!(transaction.execute(insert_exclusion, [scope_id]).is_err());
+            assert!(
+                transaction
+                    .execute(
+                        insert_exclusion,
+                        params![
+                            scope_id,
+                            private_path.raw,
+                            private_path.key,
+                            private_path.display,
+                            TEST_EXCLUDED_IDENTITY_KIND,
+                            TEST_EXCLUDED_FOLDER_IDENTITY
+                        ],
+                    )
+                    .is_err()
+            );
             transaction.rollback().unwrap();
         }
         {
@@ -22100,7 +22419,19 @@ mod tests {
                 "UPDATE authorized_scopes SET policy_revision=2 WHERE id=?1 AND policy_revision=1",
                 [scope_id],
             ).unwrap();
-            transaction.execute(insert_exclusion, [scope_id]).unwrap();
+            transaction
+                .execute(
+                    insert_exclusion,
+                    params![
+                        scope_id,
+                        private_path.raw,
+                        private_path.key,
+                        private_path.display,
+                        TEST_EXCLUDED_IDENTITY_KIND,
+                        TEST_EXCLUDED_FOLDER_IDENTITY
+                    ],
+                )
+                .unwrap();
             assert!(
                 transaction
                     .execute(
@@ -22136,9 +22467,9 @@ mod tests {
                 binding,
                 &[ScopeExclusionWrite {
                     kind: ScopeExclusionKind::Folder,
-                    path_raw: b"/scope/private",
-                    path_key: "/scope/private",
-                    display_path: "/scope/private",
+                    path_raw: &private_path.raw,
+                    path_key: &private_path.key,
+                    display_path: &private_path.display,
                     identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
                     identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
                 }],
@@ -22178,7 +22509,7 @@ mod tests {
 
     #[test]
     fn scope_root_revocation_atomically_wipes_grant_and_scope_derived_data() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let initial_binding =
             test_active_binding(&database, scope_id).expect("scope should activate");
         let extraction = database
@@ -22221,21 +22552,27 @@ mod tests {
                 [scan_id],
             )
             .expect("path-bearing scan issue should persist");
+        let excluded_path = TestPath::from_logical("/scope/excluded");
         database
             .apply_scope_exclusion_batch(
                 initial_binding,
                 &[ScopeExclusionWrite {
                     kind: ScopeExclusionKind::Folder,
-                    path_raw: b"/scope/excluded",
-                    path_key: "/scope/excluded",
-                    display_path: "/scope/excluded",
+                    path_raw: &excluded_path.raw,
+                    path_key: &excluded_path.key,
+                    display_path: &excluded_path.display,
                     identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
                     identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
                 }],
                 2,
             )
             .expect("non-matching exclusion should persist without removing the fixture");
-        record_file_watch_event(&mut database, scope_id, "/scope/watched.txt", 5, None);
+        record_host_file_watch_event(
+            &mut database,
+            scope_id,
+            &TestPath::from_logical("/scope/watched.txt"),
+            5,
+        );
         let binding = database
             .bind_scope_policy_revision(scope_id)
             .expect("revised scope should bind");
@@ -22509,19 +22846,8 @@ mod tests {
         let database_path = directory.path().join("manifest.sqlite3");
         let mut database =
             ManifestDatabase::open(&database_path).expect("database should initialize");
-        let scope = database
-            .add_scope_with_access_grant(
-                b"/replaced-fence",
-                "/replaced-fence",
-                "/replaced-fence",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"replaced-fence-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("scope and grant should persist");
+        let scope =
+            add_host_scope_with_grant(&mut database, "/replaced-fence", b"replaced-fence-grant");
         let reader = database
             .acquire_scope_filesystem_read_fence(scope.id)
             .expect("reader should bind and hold the original inode");
@@ -22556,32 +22882,10 @@ mod tests {
         let database_path = directory.path().join("manifest.sqlite3");
         let mut database =
             ManifestDatabase::open(&database_path).expect("database should initialize");
-        let first = database
-            .add_scope_with_access_grant(
-                b"/first-fence-scope",
-                "/first-fence-scope",
-                "/first-fence-scope",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"first-fence-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("first scope should persist");
-        let second = database
-            .add_scope_with_access_grant(
-                b"/second-fence-scope",
-                "/second-fence-scope",
-                "/second-fence-scope",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"second-fence-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("second scope should persist");
+        let first =
+            add_host_scope_with_grant(&mut database, "/first-fence-scope", b"first-fence-grant");
+        let second =
+            add_host_scope_with_grant(&mut database, "/second-fence-scope", b"second-fence-grant");
         let fence = database
             .acquire_scope_filesystem_revocation_fence(first.id)
             .expect("first scope fence should acquire");
@@ -22604,38 +22908,16 @@ mod tests {
     fn scope_filesystem_revocation_fence_cannot_cross_manifest_domains() {
         let mut first =
             ManifestDatabase::open_in_memory().expect("first manifest should initialize");
-        let first_scope = first
-            .add_scope_with_access_grant(
-                b"/first-manifest",
-                "/first-manifest",
-                "/first-manifest",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"first-manifest-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("first scope should persist");
+        let first_scope =
+            add_host_scope_with_grant(&mut first, "/first-manifest", b"first-manifest-grant");
         let fence = first
             .acquire_scope_filesystem_revocation_fence(first_scope.id)
             .expect("first manifest fence should acquire");
 
         let mut second =
             ManifestDatabase::open_in_memory().expect("second manifest should initialize");
-        let second_scope = second
-            .add_scope_with_access_grant(
-                b"/second-manifest",
-                "/second-manifest",
-                "/second-manifest",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"second-manifest-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("second scope should persist");
+        let second_scope =
+            add_host_scope_with_grant(&mut second, "/second-manifest", b"second-manifest-grant");
         let second_binding = second
             .bind_scope_policy_revision(second_scope.id)
             .expect("second scope should bind");
@@ -22656,38 +22938,22 @@ mod tests {
     fn scope_filesystem_read_fence_cannot_cross_manifest_domains() {
         let mut first =
             ManifestDatabase::open_in_memory().expect("first manifest should initialize");
-        let first_scope = first
-            .add_scope_with_access_grant(
-                b"/first-read-manifest",
-                "/first-read-manifest",
-                "/first-read-manifest",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"first-read-manifest-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("first scope should persist");
+        let first_scope = add_host_scope_with_grant(
+            &mut first,
+            "/first-read-manifest",
+            b"first-read-manifest-grant",
+        );
         let fence = first
             .acquire_scope_filesystem_read_fence(first_scope.id)
             .expect("first manifest read fence should acquire");
 
         let mut second =
             ManifestDatabase::open_in_memory().expect("second manifest should initialize");
-        let second_scope = second
-            .add_scope_with_access_grant(
-                b"/second-read-manifest",
-                "/second-read-manifest",
-                "/second-read-manifest",
-                ScopeAccessGrantWrite {
-                    scope_platform: std::env::consts::OS,
-                    grant_platform: std::env::consts::OS,
-                    opaque_grant: b"second-read-manifest-grant",
-                    state: ScopeAccessGrantState::Active,
-                },
-            )
-            .expect("second scope should persist");
+        let second_scope = add_host_scope_with_grant(
+            &mut second,
+            "/second-read-manifest",
+            b"second-read-manifest-grant",
+        );
         let second_binding = second
             .bind_scope_policy_revision(second_scope.id)
             .expect("second scope should bind");
@@ -23296,7 +23562,7 @@ mod tests {
 
     #[test]
     fn stale_direct_scan_extraction_and_watch_inserts_and_updates_are_trigger_rejected() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let binding = test_active_binding(&database, scope_id).expect("active binding should load");
         let location_id: i64 = database
             .connection
@@ -23337,11 +23603,12 @@ mod tests {
             )
             .expect("completed scan should load");
 
+        let unused_private = TestPath::from_logical("/scope/unused-private");
         let write = ScopeExclusionWrite {
             kind: ScopeExclusionKind::Folder,
-            path_raw: b"/scope/unused-private",
-            path_key: "/scope/unused-private",
-            display_path: "/scope/unused-private",
+            path_raw: &unused_private.raw,
+            path_key: &unused_private.key,
+            display_path: &unused_private.display,
             identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
             identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
         };
@@ -23422,11 +23689,12 @@ mod tests {
     #[test]
     fn hard_exclusion_keeps_allowed_sibling_metadata_and_content_searchable() {
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope_path = TestPath::from_logical("/scope");
         let scope = database
             .add_scope_with_access_grant(
-                b"/scope",
-                "/scope",
-                "/scope",
+                &scope_path.raw,
+                &scope_path.key,
+                &scope_path.display,
                 ScopeAccessGrantWrite {
                     scope_platform: std::env::consts::OS,
                     grant_platform: std::env::consts::OS,
@@ -23440,22 +23708,13 @@ mod tests {
                 database.bind_core_scope_policy_revision(scope.id).unwrap(),
             )
             .expect("scan should start");
-        let root = observation("/scope", NodeKind::Folder, None);
-        let private = observation(
-            "/scope/private",
-            NodeKind::Folder,
-            Some(root.identity_key.clone()),
-        );
-        let secret = observation(
-            "/scope/private/secret.txt",
-            NodeKind::File,
-            Some(private.identity_key.clone()),
-        );
-        let allowed = observation(
-            "/scope/public-allowed.txt",
-            NodeKind::File,
-            Some(root.identity_key.clone()),
-        );
+        let private_path = TestPath::from_logical("/scope/private");
+        let secret_path = TestPath::from_logical("/scope/private/secret.txt");
+        let allowed_path = TestPath::from_logical("/scope/public-allowed.txt");
+        let root = scope_path.observation(NodeKind::Folder, None);
+        let private = private_path.observation(NodeKind::Folder, Some(root.identity_key.clone()));
+        let secret = secret_path.observation(NodeKind::File, Some(private.identity_key.clone()));
+        let allowed = allowed_path.observation(NodeKind::File, Some(root.identity_key.clone()));
         database
             .complete_scan(
                 scan_id,
@@ -23467,14 +23726,14 @@ mod tests {
             )
             .expect("manifest should publish");
         for (path, text) in [
-            ("/scope/private/secret.txt", "secret private body"),
-            ("/scope/public-allowed.txt", "allowed sibling body"),
+            (&secret_path, "secret private body"),
+            (&allowed_path, "allowed sibling body"),
         ] {
             let (node_id, location_id): (i64, i64) = database
                 .connection
                 .query_row(
                     "SELECT node_id,id FROM locations WHERE scope_id=?1 AND path_key=?2",
-                    params![scope.id, path],
+                    params![scope.id, path.key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .expect("file location should load");
@@ -23503,9 +23762,9 @@ mod tests {
         let binding = database.bind_scope_policy_revision(scope.id).unwrap();
         let write = ScopeExclusionWrite {
             kind: ScopeExclusionKind::Folder,
-            path_raw: b"/scope/private",
-            path_key: "/scope/private",
-            display_path: "/scope/private",
+            path_raw: &private_path.raw,
+            path_key: &private_path.key,
+            display_path: &private_path.display,
             identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
             identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
         };
@@ -23532,7 +23791,7 @@ mod tests {
         assert!(
             allowed_results
                 .iter()
-                .all(|candidate| candidate.path_key == "/scope/public-allowed.txt")
+                .all(|candidate| candidate.path_key == allowed_path.key)
         );
         assert!(
             allowed_results
@@ -23554,7 +23813,7 @@ mod tests {
 
     #[test]
     fn execute_requested_action_blocks_privacy_purge_with_full_rollback() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         database
             .start_action_command(ActionCommandWrite {
@@ -23569,7 +23828,7 @@ mod tests {
 
     #[test]
     fn execution_needs_attention_blocks_privacy_purge_with_full_rollback() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         let execute = database
             .start_action_command(ActionCommandWrite {
@@ -23605,7 +23864,7 @@ mod tests {
 
     #[test]
     fn undo_needs_attention_blocks_privacy_purge_with_full_rollback() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         let execute = database
             .start_action_command(ActionCommandWrite {
@@ -23730,11 +23989,12 @@ mod tests {
         ).unwrap();
 
         let binding = database.bind_scope_policy_revision(scope_id).unwrap();
+        let excluded_path = TestPath::from_logical("/scope/screenshot-0.png");
         let write = ScopeExclusionWrite {
             kind: ScopeExclusionKind::File,
-            path_raw: b"/scope/screenshot-0.png",
-            path_key: "/scope/screenshot-0.png",
-            display_path: "/scope/screenshot-0.png",
+            path_raw: &excluded_path.raw,
+            path_key: &excluded_path.key,
+            display_path: &excluded_path.display,
             identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
             identity_key: TEST_EXCLUDED_FILE_IDENTITY,
         };
@@ -23764,25 +24024,40 @@ mod tests {
                 "{table} should be purged as one closed source"
             );
         }
-        assert_eq!(database.connection.query_row(
-            "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND path_key IN('/scope/screenshot-1.png','/scope/screenshot-2.png')",
-            [scope_id],
-            |row| row.get::<_,i64>(0),
-        ).unwrap(), 2);
-        assert_eq!(database.connection.query_row(
-            "SELECT COUNT(*) FROM content_chunks c JOIN locations l ON l.id=c.location_id \
-             WHERE l.scope_id=?1 AND l.path_key IN('/scope/screenshot-1.png','/scope/screenshot-2.png')",
-            [scope_id],
-            |row| row.get::<_,i64>(0),
-        ).unwrap(), 2);
+        let remaining_one = TestPath::from_logical("/scope/screenshot-1.png");
+        let remaining_two = TestPath::from_logical("/scope/screenshot-2.png");
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND path_key IN(?2,?3)",
+                    params![scope_id, remaining_one.key, remaining_two.key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM content_chunks c JOIN locations l ON l.id=c.location_id \
+             WHERE l.scope_id=?1 AND l.path_key IN(?2,?3)",
+                    params![scope_id, remaining_one.key, remaining_two.key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
     fn project_marker_and_action_destination_are_closed_over_privacy_targets() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
+        let root_path = TestPath::from_logical("/scope");
         let root_node_id = database
-            .node_id_for_path_key(scope_id, "/scope")
+            .node_id_for_path_key(scope_id, &root_path.key)
             .expect("root lookup should pass")
             .expect("root should exist");
         let scan_id: i64 = database
@@ -23802,6 +24077,7 @@ mod tests {
             )
             .expect("project marker node should persist");
         let marker_node_id = database.connection.last_insert_rowid();
+        let marker_path = TestPath::from_logical("/scope/Cargo.toml");
         database
             .connection
             .execute(
@@ -23813,8 +24089,15 @@ mod tests {
             .connection
             .execute(
                 "INSERT INTO locations(scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id) \
-                 VALUES(?1,?2,X'2F73636F70652F436172676F2E746F6D6C','/scope/Cargo.toml','/scope/Cargo.toml',1,?3)",
-                params![scope_id, marker_node_id, scan_id],
+                 VALUES(?1,?2,?3,?4,?5,1,?6)",
+                params![
+                    scope_id,
+                    marker_node_id,
+                    marker_path.raw,
+                    marker_path.key,
+                    marker_path.display,
+                    scan_id
+                ],
             )
             .expect("marker location should persist");
         database
@@ -23836,20 +24119,21 @@ mod tests {
         let project_id = database.connection.last_insert_rowid();
 
         let binding = database.bind_scope_policy_revision(scope_id).unwrap();
+        let destination_path = TestPath::from_logical("/scope/renamed.txt");
         let writes = [
             ScopeExclusionWrite {
                 kind: ScopeExclusionKind::File,
-                path_raw: b"/scope/Cargo.toml",
-                path_key: "/scope/Cargo.toml",
-                display_path: "/scope/Cargo.toml",
+                path_raw: &marker_path.raw,
+                path_key: &marker_path.key,
+                display_path: &marker_path.display,
                 identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
                 identity_key: TEST_EXCLUDED_FILE_IDENTITY,
             },
             ScopeExclusionWrite {
                 kind: ScopeExclusionKind::File,
-                path_raw: b"/scope/renamed.txt",
-                path_key: "/scope/renamed.txt",
-                display_path: "/scope/renamed.txt",
+                path_raw: &destination_path.raw,
+                path_key: &destination_path.key,
+                display_path: &destination_path.display,
                 identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
                 identity_key: TEST_EXCLUDED_FILE_IDENTITY_2,
             },
@@ -23886,11 +24170,14 @@ mod tests {
             0
         );
         assert_eq!(
-            database.connection.query_row(
-                "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND path_key='/scope/file.txt'",
-                [scope_id],
-                |row| row.get::<_, i64>(0)
-            ).unwrap(),
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM locations WHERE scope_id=?1 AND path_key=?2",
+                    params![scope_id, TestPath::from_logical("/scope/file.txt").key],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
             1,
             "destination-only closure must not purge the action source"
         );
