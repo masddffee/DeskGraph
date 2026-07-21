@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -24,10 +26,55 @@ pub enum SearchSourceFilter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SearchFilters {
     pub scope_id: Option<i64>,
+    pub folder_node_id: Option<i64>,
     pub source: SearchSourceFilter,
     pub extension: Option<String>,
     pub modified_since_unix_seconds: Option<i64>,
     pub modified_before_unix_seconds: Option<i64>,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchFolderOption {
+    pub scope_id: i64,
+    pub folder_node_id: i64,
+    pub display_path: String,
+}
+
+impl fmt::Debug for SearchFolderOption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchFolderOption")
+            .field("scope_id", &self.scope_id)
+            .field("folder_node_id", &self.folder_node_id)
+            .field("display_path", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SearchFolderListResponse {
+    pub api_version: &'static str,
+    pub scope_id: i64,
+    pub folder_count: u64,
+    pub folders: Vec<SearchFolderOption>,
+    pub truncated: bool,
+}
+
+impl SearchFolderListResponse {
+    pub const API_VERSION: &str = "deskgraph.search-folders.v1";
+}
+
+impl fmt::Debug for SearchFolderListResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchFolderListResponse")
+            .field("api_version", &self.api_version)
+            .field("scope_id", &self.scope_id)
+            .field("folder_count", &self.folder_count)
+            .field("folders", &self.folders)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -71,6 +118,7 @@ mod tests {
             query: "專案 context".to_string(),
             filters: SearchFilters {
                 scope_id: Some(1),
+                folder_node_id: Some(4),
                 source: SearchSourceFilter::All,
                 extension: Some("md".to_string()),
                 modified_since_unix_seconds: None,
@@ -98,7 +146,37 @@ mod tests {
         assert_eq!(value["mode"], "lexical");
         assert_eq!(value["embeddings_enabled"], false);
         assert_eq!(value["filters"]["source"], "all");
+        assert_eq!(value["filters"]["folder_node_id"], 4);
         assert_eq!(value["filters"]["extension"], "md");
         assert_eq!(value["results"][0]["matched_fields"][1], "extracted_text");
+    }
+
+    #[test]
+    fn folder_list_serializes_paths_but_redacts_them_from_debug_output() {
+        let response = SearchFolderListResponse {
+            api_version: SearchFolderListResponse::API_VERSION,
+            scope_id: 7,
+            folder_count: 1,
+            folders: vec![SearchFolderOption {
+                scope_id: 7,
+                folder_node_id: 11,
+                display_path: "/authorized/private-project".to_string(),
+            }],
+            truncated: false,
+        };
+
+        let value = serde_json::to_value(&response).expect("folder list should serialize");
+        assert_eq!(value["api_version"], "deskgraph.search-folders.v1");
+        assert_eq!(value["scope_id"], 7);
+        assert_eq!(value["folder_count"], 1);
+        assert_eq!(value["folders"][0]["folder_node_id"], 11);
+        assert_eq!(
+            value["folders"][0]["display_path"],
+            "/authorized/private-project"
+        );
+
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("private-project"));
+        assert!(debug.contains("<redacted>"));
     }
 }

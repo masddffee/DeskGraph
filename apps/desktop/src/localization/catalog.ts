@@ -76,6 +76,15 @@ export type Catalog = {
     scopeAria: string;
     allFolders: string;
     authorizedScope: (scopeId: number) => string;
+    folderLabel: string;
+    folderAria: string;
+    folderChooseScope: string;
+    allFoldersInScope: string;
+    folderLoading: string;
+    folderEmpty: string;
+    folderPartial: string;
+    folderError: string;
+    folderRetry: string;
     search: string;
     searching: string;
     filtersAria: string;
@@ -90,6 +99,7 @@ export type Catalog = {
     summary: (count: number, elapsedMs: number) => string;
     filters: {
       scope: (scopeId: number) => string;
+      folder: (displayPath: string) => string;
       pathsOnly: string;
       textOnly: string;
       since: (date: string) => string;

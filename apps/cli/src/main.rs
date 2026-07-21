@@ -5,7 +5,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use deskgraph_database::ManifestDatabase;
-use deskgraph_domain::{ExtractionJobProgress, ScanJobProgress, collect_health};
+use deskgraph_domain::{
+    ExtractionJobProgress, ScanJobProgress, SearchFolderListResponse, collect_health,
+};
 use deskgraph_domain::{FileRelationDecisionKind, ProjectDecisionKind};
 use deskgraph_extractors::{
     ExtractionLimits, cancel_extraction_job_at, create_extraction_job_at,
@@ -145,6 +147,10 @@ enum Command {
         query: String,
         #[arg(long)]
         scope: Option<i64>,
+        /// Restrict results to this folder node and its current graph descendants.
+        /// Requires --scope; use `search-folders` to discover eligible node IDs.
+        #[arg(long)]
+        folder_node: Option<i64>,
         #[arg(long, value_enum, default_value_t = SearchSourceArg::All)]
         source: SearchSourceArg,
         /// Match one ASCII alphanumeric file extension, with or without a leading dot.
@@ -156,6 +162,18 @@ enum Command {
         /// Exclusive modified-time upper bound in Unix seconds.
         #[arg(long)]
         modified_before: Option<i64>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// List current, non-excluded folders eligible for folder-scoped search.
+    ///
+    /// This explicit command returns local display paths to stdout. Paths are
+    /// never written to diagnostics.
+    SearchFolders {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        scope: i64,
         #[arg(long)]
         limit: Option<u32>,
     },
@@ -814,6 +832,7 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
             database,
             query,
             scope,
+            folder_node,
             source,
             extension,
             modified_since,
@@ -825,6 +844,7 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 SearchRequest {
                     query: &query,
                     scope_id: scope,
+                    folder_node_id: folder_node,
                     source: source.into(),
                     extension: extension.as_deref(),
                     modified_since_unix_seconds: modified_since,
@@ -840,10 +860,26 @@ fn execute(cli: Cli) -> Result<(), &'static str> {
                 result_count = response.result_count,
                 elapsed_ms = response.elapsed_ms,
                 filters_applied = extension.is_some()
+                    || folder_node.is_some()
                     || modified_since.is_some()
                     || modified_before.is_some()
                     || !matches!(source, SearchSourceArg::All),
                 mode = "lexical"
+            );
+            Ok(())
+        }
+        Command::SearchFolders {
+            database,
+            scope,
+            limit,
+        } => {
+            let response = list_search_folders_at(&database, scope, limit)?;
+            print_json(&response)?;
+            info!(
+                event = "search_folders_listed",
+                scope_id = scope,
+                folder_count = response.folder_count,
+                truncated = response.truncated
             );
             Ok(())
         }
@@ -1343,6 +1379,17 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), &'static str> {
     let json = serde_json::to_string_pretty(value).map_err(|_| "response_serialization_failed")?;
     println!("{json}");
     Ok(())
+}
+
+fn list_search_folders_at(
+    path: &Path,
+    scope_id: i64,
+    limit: Option<u32>,
+) -> Result<SearchFolderListResponse, &'static str> {
+    ManifestDatabase::open(path)
+        .map_err(|error| error.code())?
+        .list_search_folders(scope_id, limit)
+        .map_err(|error| error.code())
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export const SEARCH_LOCAL_COMMAND = 'search_local';
+export const LIST_SEARCH_FOLDERS_COMMAND = 'list_search_folders';
 const MAX_FILTER_UNIX_SECONDS = 9_223_372_036;
 
 export type SearchMatchedField = 'metadata_path' | 'extracted_text';
@@ -8,10 +9,25 @@ export type SearchSourceFilter = 'all' | 'metadata_path' | 'extracted_text';
 
 export interface SearchFilters {
   scope_id: number | null;
+  folder_node_id: number | null;
   source: SearchSourceFilter;
   extension: string | null;
   modified_since_unix_seconds: number | null;
   modified_before_unix_seconds: number | null;
+}
+
+export interface SearchFolder {
+  scope_id: number;
+  folder_node_id: number;
+  display_path: string;
+}
+
+export interface SearchFoldersResponse {
+  api_version: 'deskgraph.search-folders.v1';
+  scope_id: number;
+  folder_count: number;
+  folders: SearchFolder[];
+  truncated: boolean;
 }
 
 export interface SearchResult {
@@ -45,6 +61,7 @@ type InvokeCommand = (command: string, args?: Record<string, unknown>) => Promis
 
 export interface SearchOptions {
   scopeId?: number | null;
+  folderNodeId?: number | null;
   source?: SearchSourceFilter;
   extension?: string | null;
   modifiedSinceUnixSeconds?: number | null;
@@ -84,6 +101,8 @@ function parseSearchFilters(value: unknown): SearchFilters {
   if (!isRecord(value)) throw new Error('Invalid search filter response');
   const valid =
     isNullableId(value.scope_id) &&
+    isNullableId(value.folder_node_id) &&
+    !(value.scope_id === null && value.folder_node_id !== null) &&
     isSourceFilter(value.source) &&
     (value.extension === null ||
       (typeof value.extension === 'string' && /^[a-z0-9]{1,16}$/.test(value.extension))) &&
@@ -96,6 +115,34 @@ function parseSearchFilters(value: unknown): SearchFilters {
     );
   if (!valid) throw new Error('Invalid search filter response');
   return value as unknown as SearchFilters;
+}
+
+function parseSearchFolder(value: unknown): SearchFolder {
+  if (!isRecord(value)) throw new Error('Invalid search folders response');
+  const valid =
+    isId(value.scope_id) &&
+    isId(value.folder_node_id) &&
+    typeof value.display_path === 'string' &&
+    value.display_path.length > 0;
+  if (!valid) throw new Error('Invalid search folders response');
+  return value as unknown as SearchFolder;
+}
+
+export function parseSearchFoldersResponse(value: unknown): SearchFoldersResponse {
+  if (!isRecord(value) || !Array.isArray(value.folders)) {
+    throw new Error('Invalid search folders response');
+  }
+  const folders = value.folders.map(parseSearchFolder);
+  const valid =
+    value.api_version === 'deskgraph.search-folders.v1' &&
+    isId(value.scope_id) &&
+    isCount(value.folder_count) &&
+    value.folder_count === folders.length &&
+    typeof value.truncated === 'boolean' &&
+    folders.every((folder) => folder.scope_id === value.scope_id) &&
+    new Set(folders.map((folder) => folder.folder_node_id)).size === folders.length;
+  if (!valid) throw new Error('Invalid search folders response');
+  return { ...(value as unknown as SearchFoldersResponse), folders };
 }
 
 function isExplanation(value: unknown): value is SearchResult['explanation'] {
@@ -151,11 +198,21 @@ export async function searchLocal(
   options: SearchOptions = {},
   invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
 ): Promise<SearchResponse> {
+  const scopeId = options.scopeId ?? null;
+  const folderNodeId = options.folderNodeId ?? null;
+  if (
+    !isNullableId(scopeId) ||
+    !isNullableId(folderNodeId) ||
+    (folderNodeId !== null && scopeId === null)
+  ) {
+    throw new Error('Invalid search options');
+  }
   return parseSearchResponse(
     await invokeCommand(SEARCH_LOCAL_COMMAND, {
       query,
       filters: {
-        scope_id: options.scopeId ?? null,
+        scope_id: scopeId,
+        folder_node_id: folderNodeId,
         source: options.source ?? 'all',
         extension: options.extension?.trim() || null,
         modified_since_unix_seconds: options.modifiedSinceUnixSeconds ?? null,
@@ -164,4 +221,16 @@ export async function searchLocal(
       limit: options.limit ?? 20,
     }),
   );
+}
+
+export async function listSearchFolders(
+  scopeId: number,
+  invokeCommand: InvokeCommand = (command, args) => invoke(command, args),
+): Promise<SearchFoldersResponse> {
+  if (!isId(scopeId)) throw new Error('Invalid search folder scope');
+  const response = parseSearchFoldersResponse(
+    await invokeCommand(LIST_SEARCH_FOLDERS_COMMAND, { scopeId }),
+  );
+  if (response.scope_id !== scopeId) throw new Error('Invalid search folders response');
+  return response;
 }

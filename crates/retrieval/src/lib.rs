@@ -23,6 +23,7 @@ const MAX_CANDIDATES_PER_SOURCE: u32 = 100;
 pub struct SearchRequest<'a> {
     pub query: &'a str,
     pub scope_id: Option<i64>,
+    pub folder_node_id: Option<i64>,
     pub source: SearchSourceFilter,
     pub extension: Option<&'a str>,
     pub modified_since_unix_seconds: Option<i64>,
@@ -37,6 +38,7 @@ pub enum SearchError {
     QueryTooLong,
     QueryInvalid,
     ScopeInvalid,
+    FolderInvalid,
     ExtensionInvalid,
     ModifiedRangeInvalid,
     LimitOutOfRange,
@@ -52,6 +54,7 @@ impl SearchError {
             Self::QueryTooLong => "search_query_too_long",
             Self::QueryInvalid => "search_query_invalid",
             Self::ScopeInvalid => "search_scope_invalid",
+            Self::FolderInvalid => "search_folder_invalid",
             Self::ExtensionInvalid => "search_extension_invalid",
             Self::ModifiedRangeInvalid => "search_modified_range_invalid",
             Self::LimitOutOfRange => "search_limit_out_of_range",
@@ -90,6 +93,7 @@ struct CombinedCandidate {
 #[derive(Debug)]
 struct NormalizedFilters {
     scope_id: Option<i64>,
+    folder_node_id: Option<i64>,
     source: SearchSourceFilter,
     extension: Option<String>,
     modified_since_unix_seconds: Option<i64>,
@@ -102,6 +106,7 @@ impl NormalizedFilters {
     fn database_filters(&self) -> LexicalSearchFilters<'_> {
         LexicalSearchFilters {
             scope_id: self.scope_id,
+            folder_node_id: self.folder_node_id,
             source: match self.source {
                 SearchSourceFilter::All => LexicalSearchSource::All,
                 SearchSourceFilter::MetadataPath => LexicalSearchSource::MetadataPath,
@@ -116,6 +121,7 @@ impl NormalizedFilters {
     fn into_applied(self) -> SearchFilters {
         SearchFilters {
             scope_id: self.scope_id,
+            folder_node_id: self.folder_node_id,
             source: self.source,
             extension: self.extension,
             modified_since_unix_seconds: self.modified_since_unix_seconds,
@@ -321,6 +327,13 @@ fn normalize_filters(request: &SearchRequest<'_>) -> Result<NormalizedFilters, S
     if request.scope_id.is_some_and(|scope_id| scope_id <= 0) {
         return Err(SearchError::ScopeInvalid);
     }
+    if request
+        .folder_node_id
+        .is_some_and(|folder_node_id| folder_node_id <= 0)
+        || (request.folder_node_id.is_some() && request.scope_id.is_none())
+    {
+        return Err(SearchError::FolderInvalid);
+    }
     let extension = request
         .extension
         .map(str::trim)
@@ -352,6 +365,7 @@ fn normalize_filters(request: &SearchRequest<'_>) -> Result<NormalizedFilters, S
     }
     Ok(NormalizedFilters {
         scope_id: request.scope_id,
+        folder_node_id: request.folder_node_id,
         source: request.source,
         extension,
         modified_since_unix_seconds: request.modified_since_unix_seconds,
@@ -557,6 +571,7 @@ mod tests {
         let filters = normalize_filters(&SearchRequest {
             query: "context",
             scope_id: Some(1),
+            folder_node_id: Some(9),
             source: SearchSourceFilter::ExtractedText,
             extension: Some(" .MD "),
             modified_since_unix_seconds: Some(1),
@@ -565,6 +580,7 @@ mod tests {
         })
         .expect("bounded filters should normalize");
         assert_eq!(filters.extension.as_deref(), Some("md"));
+        assert_eq!(filters.folder_node_id, Some(9));
         assert_eq!(filters.modified_since_unix_ns, Some(1_000_000_000));
         assert_eq!(filters.modified_before_unix_ns, Some(2_000_000_000));
 
@@ -572,6 +588,7 @@ mod tests {
             SearchRequest {
                 query: "context",
                 scope_id: Some(0),
+                folder_node_id: None,
                 source: SearchSourceFilter::All,
                 extension: None,
                 modified_since_unix_seconds: None,
@@ -581,6 +598,7 @@ mod tests {
             SearchRequest {
                 query: "context",
                 scope_id: None,
+                folder_node_id: None,
                 source: SearchSourceFilter::All,
                 extension: Some("m_d"),
                 modified_since_unix_seconds: None,
@@ -590,6 +608,7 @@ mod tests {
             SearchRequest {
                 query: "context",
                 scope_id: None,
+                folder_node_id: None,
                 source: SearchSourceFilter::All,
                 extension: None,
                 modified_since_unix_seconds: Some(2),
@@ -598,6 +617,34 @@ mod tests {
             },
         ] {
             assert!(normalize_filters(&request).is_err());
+        }
+
+        for request in [
+            SearchRequest {
+                query: "context",
+                scope_id: Some(1),
+                folder_node_id: Some(0),
+                source: SearchSourceFilter::All,
+                extension: None,
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+                limit: None,
+            },
+            SearchRequest {
+                query: "context",
+                scope_id: None,
+                folder_node_id: Some(1),
+                source: SearchSourceFilter::All,
+                extension: None,
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+                limit: None,
+            },
+        ] {
+            assert!(matches!(
+                normalize_filters(&request),
+                Err(SearchError::FolderInvalid)
+            ));
         }
     }
 

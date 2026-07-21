@@ -1410,6 +1410,7 @@ mod tests {
                     "\"durableidentitysecret\"",
                     LexicalSearchFilters {
                         scope_id: Some(scope.id),
+                        folder_node_id: None,
                         source: LexicalSearchSource::ExtractedText,
                         extension: None,
                         modified_since_unix_ns: None,
@@ -1469,6 +1470,7 @@ mod tests {
                     "\"durableidentitysecret\"",
                     LexicalSearchFilters {
                         scope_id: Some(scope.id),
+                        folder_node_id: None,
                         source: LexicalSearchSource::All,
                         extension: None,
                         modified_since_unix_ns: None,
@@ -1553,6 +1555,7 @@ mod tests {
                     "\"DeskGraph\"",
                     LexicalSearchFilters {
                         scope_id: Some(fixture.scope_id),
+                        folder_node_id: None,
                         source: LexicalSearchSource::ExtractedText,
                         extension: None,
                         modified_since_unix_ns: None,
@@ -1679,6 +1682,7 @@ mod tests {
                 "\"桌面圖譜\"",
                 LexicalSearchFilters {
                     scope_id: Some(fixture.scope_id),
+                    folder_node_id: None,
                     source: LexicalSearchSource::ExtractedText,
                     extension: None,
                     modified_since_unix_ns: None,
@@ -1729,6 +1733,7 @@ mod tests {
             ManifestDatabase::open(&fixture.database_path).expect("OCR database should reopen");
         let filters = LexicalSearchFilters {
             scope_id: Some(fixture.scope_id),
+            folder_node_id: None,
             source: LexicalSearchSource::ExtractedText,
             extension: None,
             modified_since_unix_ns: None,

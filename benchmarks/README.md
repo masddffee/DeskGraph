@@ -4,18 +4,20 @@ Benchmark reports are evidence snapshots, not release claims. Each report must i
 
 ## Synthetic lexical search
 
-The workspace-only `deskgraph-search-benchmark` binary creates a new synthetic SQLite database through the real migrations, inserts Traditional Chinese/English metadata and content through the FTS synchronization triggers, and queries through the production retrieval API. It never reads user files and refuses to overwrite an existing database path.
+The workspace-only `deskgraph-search-benchmark` binary creates a new synthetic SQLite database through the real migrations, inserts a current-host synthetic active grant, folder nodes/`located_in` edges, and Traditional Chinese/English metadata/content through the FTS synchronization triggers, then queries through the production retrieval API. Its cases include a graph-backed folder subtree and assert that no sibling result escapes. It never reads user files and refuses to overwrite an existing database path.
 
 ```bash
 cargo run -p deskgraph-search-benchmark --release --offline -- \
-  --database /private/tmp/deskgraph-search-benchmark-v1.sqlite3 \
+  --database /private/tmp/deskgraph-search-benchmark-v2.sqlite3 \
   --documents 10000 \
   --iterations 50
 ```
 
 The generated database is intentionally left in place for inspection. Choose a new path for every rerun. The tool caps the corpus at 100,000 documents and iterations at 1,000 per query case.
 
-This measures the FTS/retrieval boundary only. It does not measure filesystem scanning, extraction, OCR, embeddings, UI rendering, peak RSS, energy/thermal behavior, concurrent writes, macOS Intel, Windows, or Linux. A release benchmark must add those environments and a representative real-world corpus without committing private user data.
+The checked-in v2 macOS arm64 evidence is `results/search-10k-folder-macos-arm64-2026-07-22.json`. It records 10,000 synthetic documents and 50 iterations per case after the FTS-first content plan and Migration 0027 target-traversal index were applied. The result remains a single-host synthetic snapshot, not an SLO or 8 GB/cross-platform proof.
+
+This measures the FTS/retrieval boundary plus recursive folder-filter SQL only. It does not measure filesystem scanning, extraction, OCR, embeddings, UI rendering, peak RSS, energy/thermal behavior, concurrent writes, macOS Intel, Windows, or Linux. A release benchmark must add those environments and a representative real-world corpus without committing private user data. Do not compare the v2 folder-graph corpus directly with the prior v1 result as if they were the same workload.
 
 ## OCR provider evaluation contract
 

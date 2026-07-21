@@ -18,8 +18,8 @@ use deskgraph_domain::{
     ActionPlanPreview, ActionPlanSummary, AuthorizedScope, CleanupActionPlanPreview,
     CleanupSourceDetail, ExtractionJobProgress, ExtractionOperation, ExtractionStats, HealthReport,
     ManifestStats, ProjectCandidateDetail, ProjectDecisionKind, ProjectDiscovery, ScanJobProgress,
-    ScanStatus, SearchFilters, SearchResponse, SmartCleanupInbox, SmartCleanupSourceKind,
-    WatchEventProgress, collect_health_with_manifest,
+    ScanStatus, SearchFilters, SearchFolderListResponse, SearchResponse, SmartCleanupInbox,
+    SmartCleanupSourceKind, WatchEventProgress, collect_health_with_manifest,
 };
 #[cfg(test)]
 use deskgraph_domain::{WatchEventReason, WatchEventStatus};
@@ -73,6 +73,7 @@ const HARD_EXCLUSION_PREVIEW_TTL_MS: i64 = 5 * 60 * 1_000;
 static HARD_EXCLUSION_PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const MAX_PENDING_SCOPE_ROOT_REVOCATION_PREVIEWS: usize = 16;
 const SCOPE_ROOT_REVOCATION_PREVIEW_TTL_MS: i64 = 5 * 60 * 1_000;
+const SEARCH_FOLDER_LIST_LIMIT: u32 = 200;
 static SCOPE_ROOT_REVOCATION_PREVIEW_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct ManifestState {
@@ -2182,10 +2183,35 @@ fn search_local(
         result_count = response.result_count,
         elapsed_ms = response.elapsed_ms,
         filters_applied = filters.extension.is_some()
+            || filters.folder_node_id.is_some()
             || filters.modified_since_unix_seconds.is_some()
             || filters.modified_before_unix_seconds.is_some()
             || filters.source != SearchSourceFilter::All,
         mode = "lexical"
+    );
+    Ok(response)
+}
+
+/// Returns path-bearing folder choices only for a direct, active user request.
+/// The response is bounded and its redacted Debug implementation keeps paths
+/// out of ordinary diagnostics.
+#[tauri::command]
+fn list_search_folders(
+    state: State<'_, ManifestState>,
+    scope_id: i64,
+) -> Result<SearchFolderListResponse, String> {
+    require_active_scope(&state, scope_id)?;
+    let response = list_search_folders_for_database(
+        &state.database_path,
+        scope_id,
+        Some(SEARCH_FOLDER_LIST_LIMIT),
+    )
+    .map_err(str::to_string)?;
+    info!(
+        event = "search_folders_listed",
+        scope_id,
+        folder_count = response.folder_count,
+        truncated = response.truncated
     );
     Ok(response)
 }
@@ -2591,6 +2617,7 @@ fn search_local_at(
         SearchRequest {
             query,
             scope_id: filters.scope_id,
+            folder_node_id: filters.folder_node_id,
             source: filters.source,
             extension: filters.extension.as_deref(),
             modified_since_unix_seconds: filters.modified_since_unix_seconds,
@@ -2599,6 +2626,17 @@ fn search_local_at(
         },
     )
     .map_err(|error| error.code())
+}
+
+fn list_search_folders_for_database(
+    path: &Path,
+    scope_id: i64,
+    limit: Option<u32>,
+) -> Result<SearchFolderListResponse, &'static str> {
+    ManifestDatabase::open(path)
+        .map_err(|error| error.code())?
+        .list_search_folders(scope_id, limit)
+        .map_err(|error| error.code())
 }
 
 fn pause_manifest_scan_at(path: &Path, job_id: i64) -> Result<ScanJobProgress, &'static str> {
@@ -2713,6 +2751,7 @@ pub fn run() {
             discover_projects,
             get_project_candidate_detail,
             decide_project_candidate,
+            list_search_folders,
             search_local,
             pause_manifest_scan,
             resume_manifest_scan
@@ -2971,11 +3010,14 @@ mod tests {
                 "renamed.png".to_string(),
             )
             .expect_err("rename preview must require a live grant"),
+            list_search_folders(app.state(), scope.id)
+                .expect_err("folder choices must require a live grant"),
             search_local(
                 app.state(),
                 "private".to_string(),
                 SearchFilters {
                     scope_id: Some(scope.id),
+                    folder_node_id: None,
                     source: SearchSourceFilter::All,
                     extension: None,
                     modified_since_unix_seconds: None,
@@ -3052,6 +3094,7 @@ mod tests {
             "private".to_string(),
             SearchFilters {
                 scope_id: None,
+                folder_node_id: None,
                 source: SearchSourceFilter::All,
                 extension: None,
                 modified_since_unix_seconds: None,
@@ -3772,6 +3815,7 @@ mod tests {
             "僅本機抽取",
             &SearchFilters {
                 scope_id: Some(scope.id),
+                folder_node_id: None,
                 source: SearchSourceFilter::ExtractedText,
                 extension: Some("md".to_string()),
                 modified_since_unix_seconds: None,
@@ -4128,6 +4172,7 @@ mod tests {
             "專案脈絡",
             &SearchFilters {
                 scope_id: Some(scope.id),
+                folder_node_id: None,
                 source: SearchSourceFilter::ExtractedText,
                 extension: Some("MD".to_string()),
                 modified_since_unix_seconds: None,
@@ -4148,6 +4193,85 @@ mod tests {
                 .unwrap_or_default()
                 .contains("專案脈絡")
         );
+    }
+
+    #[test]
+    fn desktop_folder_search_lists_user_requested_paths_and_filters_descendants() {
+        let directory = tempfile::tempdir().expect("fixture root should exist");
+        let database_path = directory.path().join("app-data/manifest.sqlite3");
+        let scope_path = directory.path().join("authorized-folder-search");
+        let nested_path = scope_path.join("nested/deep");
+        let sibling_path = scope_path.join("sibling");
+        std::fs::create_dir_all(&nested_path).expect("nested folder should create");
+        std::fs::create_dir_all(&sibling_path).expect("sibling folder should create");
+        std::fs::write(nested_path.join("sharedcontext-note.md"), "nested")
+            .expect("nested file should create");
+        std::fs::write(sibling_path.join("sharedcontext-note.md"), "sibling")
+            .expect("sibling file should create");
+
+        initialize_manifest(&database_path).expect("manifest should initialize");
+        let prepared = prepare_selected_scope(&scope_path).expect("test access should prepare");
+        let scope = authorize_scope_with_access_grant_at(
+            &database_path,
+            &prepared.resolved_path,
+            prepared.platform,
+            &prepared.opaque_grant,
+        )
+        .expect("scope and grant should authorize");
+        let scan = create_manifest_scan_at(&database_path, scope.id).expect("scan should create");
+        run_manifest_scan_at(&database_path, scan.job_id).expect("scan should complete");
+        let mut accesses = HashMap::new();
+        accesses.insert(scope.id, prepared.access);
+        let app = tauri::test::mock_builder()
+            .manage(start_manifest_state_with_accesses(
+                database_path.clone(),
+                accesses,
+            ))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock Desktop app should build");
+
+        let folders =
+            list_search_folders(app.state(), scope.id).expect("explicit folder list should load");
+        let nested_display = std::fs::canonicalize(scope_path.join("nested"))
+            .expect("nested folder should canonicalize")
+            .to_string_lossy()
+            .into_owned();
+        let nested_folder = folders
+            .folders
+            .iter()
+            .find(|folder| folder.display_path == nested_display)
+            .expect("nested folder should be selectable");
+        assert_eq!(folders.scope_id, scope.id);
+        assert_eq!(folders.folder_count, folders.folders.len() as u64);
+        assert!(!folders.truncated);
+        assert!(
+            serde_json::to_string(&folders)
+                .expect("user-requested response should serialize")
+                .contains(&nested_display)
+        );
+        assert!(!format!("{folders:?}").contains(&nested_display));
+
+        let response = search_local(
+            app.state(),
+            "sharedcontext".to_string(),
+            SearchFilters {
+                scope_id: Some(scope.id),
+                folder_node_id: Some(nested_folder.folder_node_id),
+                source: SearchSourceFilter::MetadataPath,
+                extension: Some("md".to_string()),
+                modified_since_unix_seconds: None,
+                modified_before_unix_seconds: None,
+            },
+            Some(10),
+        )
+        .expect("folder-scoped search should pass");
+        assert_eq!(response.result_count, 1);
+        assert_eq!(
+            response.filters.folder_node_id,
+            Some(nested_folder.folder_node_id)
+        );
+        assert!(response.results[0].display_path.contains("nested/deep"));
+        assert!(!response.results[0].display_path.contains("sibling"));
     }
 
     #[test]

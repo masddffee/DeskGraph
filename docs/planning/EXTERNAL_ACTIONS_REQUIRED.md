@@ -1,6 +1,6 @@
 # External Actions Required
 
-Last reviewed: 2026-07-21
+Last reviewed: 2026-07-22
 
 No external step should block safe local implementation. Do not add real credentials to the repository.
 
@@ -22,9 +22,8 @@ mixing and upload remain deadline-critical owner/external work.
 Required owner-approved actions before submission:
 
 1. Obtain the `/feedback` Session ID for the Codex task where most core functionality was built.
-2. Re-authenticate the intended GitHub account, create the public Apache-2.0 repository and approve
-   the first push, or share the private repository with `testing@devpost.com` and
-   `build-week-event@openai.com`.
+2. Re-authenticate the intended GitHub account and verify that the public Apache-2.0 repository at
+   `https://github.com/masddffee/DeskGraph` is reachable from the final Devpost entry.
 3. Review the final under-three-minute guided cut, record the supplied 95-second Traditional
    Chinese voiceover against its timestamps, and approve mixing it into the final video. Upload the
    narrated result as an unlisted or public YouTube video; it must show the project working and
@@ -43,17 +42,15 @@ gates independently pass before submission.
 
 ## GitHub repository and CI (needed to close M0 remote evidence)
 
-Current state: local `main` exists with logical M0 commits, but there is no remote. `gh auth status` still reports the configured `masddffee` token as invalid, so Issues, remote CI, branch protection, and Releases cannot be verified or changed.
+Current state: local `main` tracks the public `git@github.com:masddffee/DeskGraph.git` remote. `gh auth status` still reports the configured `masddffee` token as invalid, and the current environment cannot resolve `github.com`, so the latest push-to-main CI, Issues, branch protection, vulnerability reporting, and Releases cannot be verified or changed here.
 
 Required owner action:
 
 1. Re-authenticate with `gh auth login -h github.com` using the intended owner account.
-2. Decide personal vs organization ownership and confirm the public repository name.
-3. Create the empty public repository without auto-generated files, or provide its URL.
-4. Add it as `origin`, push the local default branch, and enable GitHub Actions.
-5. Enable GitHub private vulnerability reporting and update `SECURITY.md` with the final repository advisory path.
-6. Protect the default branch after the initial CI workflow is green.
-7. Verify the macOS, Windows, and Linux jobs from a clean remote checkout.
+2. Confirm `masddffee/DeskGraph` remains the intended public repository and GitHub Actions is enabled.
+3. Enable GitHub private vulnerability reporting and update `SECURITY.md` only if the final advisory path differs.
+4. Protect the default branch after the current CI workflow is green.
+5. Verify the macOS, Windows, and Linux jobs from a clean remote checkout.
 
 Validation:
 

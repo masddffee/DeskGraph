@@ -106,6 +106,7 @@ pub(super) fn run_demo_fixture(path: &Path) -> Result<DemoFixtureReport, &'stati
         SearchRequest {
             query: "電腦情境圖譜",
             scope_id: Some(scope.id),
+            folder_node_id: None,
             source: SearchSourceFilter::ExtractedText,
             extension: Some("md"),
             modified_since_unix_seconds: None,
@@ -119,6 +120,7 @@ pub(super) fn run_demo_fixture(path: &Path) -> Result<DemoFixtureReport, &'stati
         SearchRequest {
             query: "bounded context",
             scope_id: Some(scope.id),
+            folder_node_id: None,
             source: SearchSourceFilter::ExtractedText,
             extension: Some("md"),
             modified_since_unix_seconds: None,

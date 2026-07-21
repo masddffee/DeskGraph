@@ -39,8 +39,9 @@ use deskgraph_domain::{
     ProjectSuggestionCreator, ScanJobProgress, ScanReport, ScanStatus, ScreenshotGroupCandidate,
     ScreenshotGroupCandidateState, ScreenshotGroupCandidateSummary, ScreenshotGroupCreator,
     ScreenshotGroupEvidence, ScreenshotGroupMember, ScreenshotGroupRuleKind,
-    SmartCleanupCandidateState, SmartCleanupInboxItem, SmartCleanupSourceKind, WatchEventProgress,
-    WatchEventReason, WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
+    SearchFolderListResponse, SearchFolderOption, SmartCleanupCandidateState,
+    SmartCleanupInboxItem, SmartCleanupSourceKind, WatchEventProgress, WatchEventReason,
+    WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
     parse_explicit_file_version_name, reduce_action_journal,
 };
 use deskgraph_identity::{
@@ -185,6 +186,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "scope_root_revocation_hardening",
         sql: include_str!("../../../migrations/0026_scope_root_revocation_hardening.sql"),
     },
+    Migration {
+        version: 27,
+        name: "folder_search_descendant_index",
+        sql: include_str!("../../../migrations/0027_folder_search_descendant_index.sql"),
+    },
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -199,6 +205,8 @@ const MAX_EXTRACTION_CHUNKS: usize = 65_536;
 const MAX_EXTRACTION_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_MATCH_BYTES: usize = 1024;
 const MAX_SEARCH_CANDIDATES_PER_SOURCE: u32 = 100;
+pub const DEFAULT_SEARCH_FOLDER_LIST_LIMIT: u32 = 200;
+pub const MAX_SEARCH_FOLDER_LIST_LIMIT: u32 = 500;
 const MAX_WATCH_PATH_BYTES: usize = 64 * 1024;
 const MAX_SCOPE_EXCLUSION_PATH_BYTES: usize = 64 * 1024;
 const MAX_SCOPE_EXCLUSION_BATCH: usize = 128;
@@ -2170,6 +2178,7 @@ pub enum LexicalSearchSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LexicalSearchFilters<'a> {
     pub scope_id: Option<i64>,
+    pub folder_node_id: Option<i64>,
     pub source: LexicalSearchSource,
     pub extension: Option<&'a str>,
     pub modified_since_unix_ns: Option<i64>,
@@ -2242,6 +2251,7 @@ pub enum DatabaseError {
     ExtractionOutputInvalid,
     ImageMetadataNotFound,
     SearchInputInvalid,
+    SearchFolderInvalid,
     WatchEventNotFound,
     InvalidWatchEventState,
     WatchScopeInitialScanRequired,
@@ -2319,6 +2329,7 @@ impl DatabaseError {
             Self::ExtractionOutputInvalid => "extraction_output_invalid",
             Self::ImageMetadataNotFound => "image_metadata_not_found",
             Self::SearchInputInvalid => "search_input_invalid",
+            Self::SearchFolderInvalid => "search_folder_invalid",
             Self::WatchEventNotFound => "watch_event_not_found",
             Self::InvalidWatchEventState => "invalid_watch_event_state",
             Self::WatchScopeInitialScanRequired => "watch_scope_initial_scan_required",
@@ -2604,6 +2615,34 @@ impl ManifestReadDatabase {
         scope_id: i64,
     ) -> Result<ScopeExclusionMatcher, DatabaseError> {
         scope_exclusion_matcher_from_connection(&self.connection, scope_id)
+    }
+
+    /// Returns current, explicitly requested folder paths for one queryable
+    /// scope. Callers must keep this path-bearing response inside the active
+    /// user-invoked folder-selection surface and must not log it.
+    pub fn list_search_folders(
+        &self,
+        scope_id: i64,
+        limit: Option<u32>,
+    ) -> Result<SearchFolderListResponse, DatabaseError> {
+        let deadline = Instant::now() + READ_ONLY_QUERY_TIMEOUT;
+        self.connection.progress_handler(
+            READ_ONLY_PROGRESS_OPS,
+            Some(move || Instant::now() >= deadline),
+        )?;
+        let result = (|| {
+            let transaction = self.connection.unchecked_transaction()?;
+            let response = search_folder_list_from_connection(&transaction, scope_id, limit)?;
+            transaction.commit()?;
+            Ok(response)
+        })();
+        let clear_result = self
+            .connection
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(DatabaseError::from);
+        let result = result.map_err(normalize_read_only_query_error);
+        clear_result?;
+        result
     }
 
     pub fn lexical_search_candidates(
@@ -6770,6 +6809,20 @@ impl ManifestDatabase {
             filters,
             per_source_candidate_limit,
         )
+    }
+
+    /// Returns current folder choices only after a direct user request. The
+    /// response intentionally contains paths, so ordinary diagnostics must
+    /// rely on its redacted `Debug` implementation.
+    pub fn list_search_folders(
+        &self,
+        scope_id: i64,
+        limit: Option<u32>,
+    ) -> Result<SearchFolderListResponse, DatabaseError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let response = search_folder_list_from_connection(&transaction, scope_id, limit)?;
+        transaction.commit()?;
+        Ok(response)
     }
 
     pub fn invalidate_content_for_node(
@@ -12835,6 +12888,119 @@ fn validate_screenshot_group_observation(
     Ok(sources)
 }
 
+fn search_folder_list_from_connection(
+    connection: &Connection,
+    scope_id: i64,
+    limit: Option<u32>,
+) -> Result<SearchFolderListResponse, DatabaseError> {
+    let limit = limit.unwrap_or(DEFAULT_SEARCH_FOLDER_LIST_LIMIT);
+    if scope_id <= 0 || limit == 0 || limit > MAX_SEARCH_FOLDER_LIST_LIMIT {
+        return Err(DatabaseError::SearchInputInvalid);
+    }
+    ensure_scope_queryable(connection, scope_id)?;
+    ensure_scope_access_permitted(connection, scope_id)?;
+
+    let query_limit = i64::from(limit)
+        .checked_add(1)
+        .ok_or(DatabaseError::SearchInputInvalid)?;
+    let mut statement = connection.prepare(
+        "SELECT location.node_id, MIN(location.display_path) \
+         FROM locations location \
+         JOIN nodes node ON node.id = location.node_id AND node.kind = 'folder' \
+         JOIN folders folder ON folder.node_id = node.id \
+         JOIN authorized_scopes scope ON scope.id = location.scope_id \
+         JOIN scope_access_grants grant \
+           ON grant.scope_id = scope.id AND grant.platform = scope.platform \
+          AND grant.state = 'active' \
+         WHERE location.scope_id = ?1 AND location.present = 1 \
+           AND scope.platform = ?3 AND grant.platform = ?3 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM scope_exclusions exclusion \
+               WHERE exclusion.scope_id = location.scope_id \
+                 AND (location.path_key = exclusion.path_key OR ( \
+                     exclusion.kind = 'folder' \
+                     AND length(location.path_key) > length(exclusion.path_key) \
+                     AND substr(location.path_key, 1, length(exclusion.path_key)) = exclusion.path_key \
+                     AND (substr(exclusion.path_key, -1, 1) = CASE WHEN scope.platform='windows' THEN char(92) ELSE '/' END \
+                          OR substr(location.path_key, length(exclusion.path_key) + 1, 1) = CASE WHEN scope.platform='windows' THEN char(92) ELSE '/' END)) \
+                     OR (node.identity_kind = exclusion.identity_kind \
+                         AND node.identity_key = exclusion.identity_key)) \
+           ) \
+         GROUP BY location.node_id \
+         ORDER BY lower(MIN(location.display_path)), location.node_id \
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(
+        params![scope_id, query_limit, std::env::consts::OS],
+        |row| {
+            Ok(SearchFolderOption {
+                scope_id,
+                folder_node_id: row.get(0)?,
+                display_path: row.get(1)?,
+            })
+        },
+    )?;
+    let mut folders = rows.collect::<Result<Vec<_>, _>>()?;
+    let truncated =
+        folders.len() > usize::try_from(limit).map_err(|_| DatabaseError::SearchInputInvalid)?;
+    if truncated {
+        folders.pop();
+    }
+    let folder_count = u64::try_from(folders.len()).map_err(|_| DatabaseError::InvalidCount)?;
+    Ok(SearchFolderListResponse {
+        api_version: SearchFolderListResponse::API_VERSION,
+        scope_id,
+        folder_count,
+        folders,
+        truncated,
+    })
+}
+
+fn validate_lexical_search_folder_filter(
+    connection: &Connection,
+    scope_id: i64,
+    folder_node_id: i64,
+) -> Result<String, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT location.path_key \
+             FROM nodes node \
+             JOIN folders folder ON folder.node_id = node.id \
+             JOIN locations location \
+               ON location.node_id = node.id AND location.scope_id = ?1 \
+              AND location.present = 1 \
+             JOIN authorized_scopes scope ON scope.id = location.scope_id \
+             JOIN scope_access_grants grant \
+               ON grant.scope_id = scope.id AND grant.platform = scope.platform \
+              AND grant.state = 'active' \
+             WHERE node.id = ?2 AND node.kind = 'folder' \
+               AND scope.platform = ?3 AND grant.platform = ?3 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM scope_exclusions exclusion \
+                   WHERE exclusion.scope_id = location.scope_id \
+                     AND (location.path_key = exclusion.path_key OR ( \
+                         exclusion.kind = 'folder' \
+                         AND length(location.path_key) > length(exclusion.path_key) \
+                         AND substr(location.path_key, 1, length(exclusion.path_key)) = exclusion.path_key \
+                         AND (substr(exclusion.path_key, -1, 1) = CASE WHEN scope.platform='windows' THEN char(92) ELSE '/' END \
+                              OR substr(location.path_key, length(exclusion.path_key) + 1, 1) = CASE WHEN scope.platform='windows' THEN char(92) ELSE '/' END)) \
+                         OR (node.identity_kind = exclusion.identity_kind \
+                             AND node.identity_key = exclusion.identity_key)) \
+               ) \
+             ORDER BY location.id \
+             LIMIT 2",
+    )?;
+    let path_keys = statement
+        .query_map(
+            params![scope_id, folder_node_id, std::env::consts::OS],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    match path_keys.as_slice() {
+        [path_key] => Ok(path_key.clone()),
+        [] | [_, _, ..] => Err(DatabaseError::SearchFolderInvalid),
+    }
+}
+
 fn lexical_search_candidates_from_connection(
     connection: &Connection,
     match_query: &str,
@@ -12846,6 +13012,10 @@ fn lexical_search_candidates_from_connection(
         || per_source_candidate_limit == 0
         || per_source_candidate_limit > MAX_SEARCH_CANDIDATES_PER_SOURCE
         || filters.scope_id.is_some_and(|scope_id| scope_id <= 0)
+        || filters
+            .folder_node_id
+            .is_some_and(|folder_node_id| folder_node_id <= 0)
+        || (filters.folder_node_id.is_some() && filters.scope_id.is_none())
         || filters.extension.is_some_and(|extension| {
             extension.is_empty()
                 || extension.len() > 16
@@ -12869,6 +13039,17 @@ fn lexical_search_candidates_from_connection(
     {
         return Err(DatabaseError::SearchInputInvalid);
     }
+    let selected_folder_path_key = if let (Some(scope_id), Some(folder_node_id)) =
+        (filters.scope_id, filters.folder_node_id)
+    {
+        Some(validate_lexical_search_folder_filter(
+            connection,
+            scope_id,
+            folder_node_id,
+        )?)
+    } else {
+        None
+    };
     let limit = i64::from(per_source_candidate_limit);
     let maximum_sources = if filters.source == LexicalSearchSource::All {
         2
@@ -12882,7 +13063,43 @@ fn lexical_search_candidates_from_connection(
     );
 
     if filters.source != LexicalSearchSource::ExtractedText {
-        let mut metadata_statement = connection.prepare(
+        // Keep the original FTS query completely free of recursive work when
+        // there is no folder filter. SQLite may otherwise plan the CTE even
+        // behind a NULL short-circuit and turn ordinary lexical search into a
+        // graph traversal.
+        let metadata_sql = if filters.folder_node_id.is_some() {
+            "WITH RECURSIVE folder_tree(node_id) AS ( \
+                 SELECT ?8 \
+                 UNION \
+                 SELECT edge.source_node_id \
+                 FROM folder_tree parent \
+                 CROSS JOIN edges edge ON edge.target_node_id = parent.node_id \
+                 WHERE edge.scope_id = ?2 AND edge.kind = 'located_in' AND edge.active = 1 \
+             ) \
+             SELECT l.scope_id, s.policy_revision, l.node_id, l.id, l.path_key, l.display_path, \
+                    n.identity_kind, n.identity_key \
+             FROM folder_tree \
+             JOIN locations l ON l.node_id = folder_tree.node_id \
+             JOIN location_search_fts ON location_search_fts.rowid = l.id \
+             JOIN nodes n ON n.id = l.node_id \
+             JOIN authorized_scopes s ON s.id = l.scope_id \
+             JOIN scope_access_grants g ON g.scope_id = s.id AND g.platform = s.platform AND g.state = 'active' \
+             LEFT JOIN files f ON f.node_id = l.node_id \
+             WHERE location_search_fts MATCH ?1 AND l.present = 1 \
+               AND (?2 IS NULL OR l.scope_id = ?2) \
+               AND (?3 IS NULL OR (f.node_id IS NOT NULL AND substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3)) \
+               AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
+               AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+               AND s.platform = ?7 AND g.platform = ?7 \
+               AND (l.path_key = ?9 OR ( \
+                   length(l.path_key) > length(?9) \
+                   AND substr(l.path_key, 1, length(?9)) = ?9 \
+                   AND (substr(?9, -1, 1) = CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END \
+                        OR substr(l.path_key, length(?9) + 1, 1) = CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END))) \
+               AND NOT EXISTS (SELECT 1 FROM scope_exclusions x WHERE x.scope_id=l.scope_id AND (l.path_key=x.path_key OR (x.kind='folder' AND length(l.path_key)>length(x.path_key) AND substr(l.path_key,1,length(x.path_key))=x.path_key AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END OR substr(l.path_key,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) OR (n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key))) \
+             ORDER BY location_search_fts.rank, l.id \
+             LIMIT ?6"
+        } else {
             "SELECT l.scope_id, s.policy_revision, l.node_id, l.id, l.path_key, l.display_path, \
                     n.identity_kind, n.identity_key \
              FROM location_search_fts \
@@ -12899,44 +13116,88 @@ fn lexical_search_candidates_from_connection(
                AND s.platform = ?7 AND g.platform = ?7 \
                AND NOT EXISTS (SELECT 1 FROM scope_exclusions x WHERE x.scope_id=l.scope_id AND (l.path_key=x.path_key OR (x.kind='folder' AND length(l.path_key)>length(x.path_key) AND substr(l.path_key,1,length(x.path_key))=x.path_key AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END OR substr(l.path_key,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) OR (n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key))) \
              ORDER BY location_search_fts.rank, l.id \
-             LIMIT ?6",
-        )?;
-        let metadata_rows = metadata_statement.query_map(
-            params![
-                match_query,
-                filters.scope_id,
-                filters.extension,
-                filters.modified_since_unix_ns,
-                filters.modified_before_unix_ns,
-                limit,
-                std::env::consts::OS,
-            ],
-            |row| {
-                Ok(LexicalSearchCandidate {
-                    source: LexicalCandidateSource::MetadataPath,
-                    scope_id: row.get(0)?,
-                    policy_revision: row.get(1)?,
-                    node_id: row.get(2)?,
-                    location_id: row.get(3)?,
-                    path_key: row.get(4)?,
-                    display_path: row.get(5)?,
-                    identity_kind: row.get(6)?,
-                    identity_key: row.get(7)?,
-                    snippet: None,
-                })
-            },
-        )?;
+             LIMIT ?6"
+        };
+        let mut metadata_statement = connection.prepare(metadata_sql)?;
+        let metadata_rows = if let Some(folder_node_id) = filters.folder_node_id {
+            metadata_statement.query_map(
+                params![
+                    match_query,
+                    filters.scope_id,
+                    filters.extension,
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns,
+                    limit,
+                    std::env::consts::OS,
+                    folder_node_id,
+                    selected_folder_path_key
+                        .as_deref()
+                        .ok_or(DatabaseError::SearchFolderInvalid)?,
+                ],
+                lexical_metadata_candidate_from_row,
+            )?
+        } else {
+            metadata_statement.query_map(
+                params![
+                    match_query,
+                    filters.scope_id,
+                    filters.extension,
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns,
+                    limit,
+                    std::env::consts::OS,
+                ],
+                lexical_metadata_candidate_from_row,
+            )?
+        };
         for row in metadata_rows {
             candidates.push(row?);
         }
     }
 
     if filters.source != LexicalSearchSource::MetadataPath {
-        let mut content_statement = connection.prepare(
+        let content_sql = if filters.folder_node_id.is_some() {
+            "WITH RECURSIVE folder_tree(node_id) AS ( \
+                 SELECT ?8 \
+                 UNION \
+                 SELECT edge.source_node_id \
+                 FROM folder_tree parent \
+                 CROSS JOIN edges edge ON edge.target_node_id = parent.node_id \
+                 WHERE edge.scope_id = ?2 AND edge.kind = 'located_in' AND edge.active = 1 \
+             ) \
+             SELECT c.scope_id, s.policy_revision, c.node_id, c.location_id, l.path_key, l.display_path, \
+                    n.identity_kind, n.identity_key, snippet(content_search_fts, 0, '[', ']', '…', 24) \
+             FROM content_search_fts \
+             CROSS JOIN content_chunks c ON c.id = content_search_fts.rowid \
+             JOIN folder_tree ON folder_tree.node_id = c.node_id \
+             JOIN locations l ON l.id = c.location_id \
+                AND l.node_id = c.node_id AND l.scope_id = c.scope_id \
+             JOIN nodes n ON n.id = c.node_id \
+             JOIN authorized_scopes s ON s.id = c.scope_id \
+             JOIN scope_access_grants g ON g.scope_id = s.id AND g.platform = s.platform AND g.state = 'active' \
+             JOIN extraction_jobs e ON e.id = c.extraction_job_id \
+                AND e.scope_id = c.scope_id AND e.node_id = c.node_id \
+                AND e.location_id = c.location_id AND e.status = 'completed' \
+             JOIN files f ON f.node_id = c.node_id \
+             WHERE content_search_fts MATCH ?1 AND c.active = 1 AND l.present = 1 \
+               AND (?2 IS NULL OR c.scope_id = ?2) \
+               AND (?3 IS NULL OR substr(lower(l.display_path), -(length(?3) + 1)) = '.' || ?3) \
+               AND (?4 IS NULL OR f.modified_unix_ns >= ?4) \
+               AND (?5 IS NULL OR f.modified_unix_ns < ?5) \
+               AND s.platform = ?7 AND g.platform = ?7 \
+               AND (l.path_key = ?9 OR ( \
+                   length(l.path_key) > length(?9) \
+                   AND substr(l.path_key, 1, length(?9)) = ?9 \
+                   AND (substr(?9, -1, 1) = CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END \
+                        OR substr(l.path_key, length(?9) + 1, 1) = CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END))) \
+               AND NOT EXISTS (SELECT 1 FROM scope_exclusions x WHERE x.scope_id=l.scope_id AND (l.path_key=x.path_key OR (x.kind='folder' AND length(l.path_key)>length(x.path_key) AND substr(l.path_key,1,length(x.path_key))=x.path_key AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END OR substr(l.path_key,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) OR (n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key))) \
+             ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
+             LIMIT ?6"
+        } else {
             "SELECT c.scope_id, s.policy_revision, c.node_id, c.location_id, l.path_key, l.display_path, \
                     n.identity_kind, n.identity_key, snippet(content_search_fts, 0, '[', ']', '…', 24) \
              FROM content_search_fts \
-             JOIN content_chunks c ON c.id = content_search_fts.rowid \
+             CROSS JOIN content_chunks c ON c.id = content_search_fts.rowid \
              JOIN locations l ON l.id = c.location_id \
                 AND l.node_id = c.node_id AND l.scope_id = c.scope_id \
              JOIN nodes n ON n.id = c.node_id \
@@ -12954,39 +13215,80 @@ fn lexical_search_candidates_from_connection(
                AND s.platform = ?7 AND g.platform = ?7 \
                AND NOT EXISTS (SELECT 1 FROM scope_exclusions x WHERE x.scope_id=l.scope_id AND (l.path_key=x.path_key OR (x.kind='folder' AND length(l.path_key)>length(x.path_key) AND substr(l.path_key,1,length(x.path_key))=x.path_key AND (substr(x.path_key,-1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END OR substr(l.path_key,length(x.path_key)+1,1)=CASE WHEN s.platform='windows' THEN char(92) ELSE '/' END)) OR (n.identity_kind=x.identity_kind AND n.identity_key=x.identity_key))) \
              ORDER BY content_search_fts.rank, c.node_id, c.ordinal \
-             LIMIT ?6",
-        )?;
-        let content_rows = content_statement.query_map(
-            params![
-                match_query,
-                filters.scope_id,
-                filters.extension,
-                filters.modified_since_unix_ns,
-                filters.modified_before_unix_ns,
-                limit,
-                std::env::consts::OS,
-            ],
-            |row| {
-                Ok(LexicalSearchCandidate {
-                    source: LexicalCandidateSource::ExtractedText,
-                    scope_id: row.get(0)?,
-                    policy_revision: row.get(1)?,
-                    node_id: row.get(2)?,
-                    location_id: row.get(3)?,
-                    path_key: row.get(4)?,
-                    display_path: row.get(5)?,
-                    identity_kind: row.get(6)?,
-                    identity_key: row.get(7)?,
-                    snippet: Some(row.get(8)?),
-                })
-            },
-        )?;
+             LIMIT ?6"
+        };
+        let mut content_statement = connection.prepare(content_sql)?;
+        let content_rows = if let Some(folder_node_id) = filters.folder_node_id {
+            content_statement.query_map(
+                params![
+                    match_query,
+                    filters.scope_id,
+                    filters.extension,
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns,
+                    limit,
+                    std::env::consts::OS,
+                    folder_node_id,
+                    selected_folder_path_key
+                        .as_deref()
+                        .ok_or(DatabaseError::SearchFolderInvalid)?,
+                ],
+                lexical_content_candidate_from_row,
+            )?
+        } else {
+            content_statement.query_map(
+                params![
+                    match_query,
+                    filters.scope_id,
+                    filters.extension,
+                    filters.modified_since_unix_ns,
+                    filters.modified_before_unix_ns,
+                    limit,
+                    std::env::consts::OS,
+                ],
+                lexical_content_candidate_from_row,
+            )?
+        };
         for row in content_rows {
             candidates.push(row?);
         }
     }
 
     Ok(candidates)
+}
+
+fn lexical_metadata_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LexicalSearchCandidate> {
+    Ok(LexicalSearchCandidate {
+        source: LexicalCandidateSource::MetadataPath,
+        scope_id: row.get(0)?,
+        policy_revision: row.get(1)?,
+        node_id: row.get(2)?,
+        location_id: row.get(3)?,
+        path_key: row.get(4)?,
+        display_path: row.get(5)?,
+        identity_kind: row.get(6)?,
+        identity_key: row.get(7)?,
+        snippet: None,
+    })
+}
+
+fn lexical_content_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LexicalSearchCandidate> {
+    Ok(LexicalSearchCandidate {
+        source: LexicalCandidateSource::ExtractedText,
+        scope_id: row.get(0)?,
+        policy_revision: row.get(1)?,
+        node_id: row.get(2)?,
+        location_id: row.get(3)?,
+        path_key: row.get(4)?,
+        display_path: row.get(5)?,
+        identity_kind: row.get(6)?,
+        identity_key: row.get(7)?,
+        snippet: Some(row.get(8)?),
+    })
 }
 
 fn upsert_observation(
@@ -13189,6 +13491,7 @@ mod tests {
     fn lexical_filters(scope_id: Option<i64>) -> LexicalSearchFilters<'static> {
         LexicalSearchFilters {
             scope_id,
+            folder_node_id: None,
             source: LexicalSearchSource::All,
             extension: None,
             modified_since_unix_ns: None,
@@ -13196,7 +13499,127 @@ mod tests {
         }
     }
 
-    fn apply_migrations_before_scope_exclusions(connection: &Connection) {
+    fn folder_search_setup() -> (ManifestDatabase, i64) {
+        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        let scope = database
+            .add_scope_with_access_grant(
+                b"/scope",
+                "/scope",
+                "/scope",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"folder-search-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("folder-search scope should persist");
+        let scan_id = database
+            .create_scan_job_with_policy(
+                database
+                    .bind_core_scope_policy_revision(scope.id)
+                    .expect("core scope binding should load"),
+            )
+            .expect("folder-search scan should start");
+        let root = observation("/scope", NodeKind::Folder, None);
+        let selected = observation(
+            "/scope/needle-project",
+            NodeKind::Folder,
+            Some(root.identity_key.clone()),
+        );
+        let deep = observation(
+            "/scope/needle-project/needle-deep",
+            NodeKind::Folder,
+            Some(selected.identity_key.clone()),
+        );
+        let direct = observation(
+            "/scope/needle-project/needle-direct.txt",
+            NodeKind::File,
+            Some(selected.identity_key.clone()),
+        );
+        let deep_file = observation(
+            "/scope/needle-project/needle-deep/needle-deep-file.txt",
+            NodeKind::File,
+            Some(deep.identity_key.clone()),
+        );
+        let stale = observation(
+            "/scope/needle-project/needle-stale.txt",
+            NodeKind::File,
+            Some(selected.identity_key.clone()),
+        );
+        let sibling = observation(
+            "/scope/needle-sibling.txt",
+            NodeKind::File,
+            Some(root.identity_key.clone()),
+        );
+        database
+            .complete_scan(
+                scan_id,
+                scope.id,
+                &[root, selected, deep, direct, deep_file, stale, sibling],
+                &[],
+                0,
+                0,
+            )
+            .expect("folder-search manifest should publish");
+        (database, scope.id)
+    }
+
+    fn folder_search_node_id(database: &ManifestDatabase, scope_id: i64, path: &str) -> i64 {
+        database
+            .node_id_for_path_key(scope_id, path)
+            .expect("folder-search node lookup should pass")
+            .expect("folder-search node should exist")
+    }
+
+    fn insert_folder_search_content(
+        database: &ManifestDatabase,
+        scope_id: i64,
+        path: &str,
+        text: &str,
+        active: bool,
+    ) {
+        let (node_id, location_id): (i64, i64) = database
+            .connection
+            .query_row(
+                "SELECT node_id,id FROM locations WHERE scope_id=?1 AND path_key=?2",
+                params![scope_id, path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("folder-search location should load");
+        database
+            .connection
+            .execute(
+                "INSERT INTO extraction_jobs( \
+                     scope_id,node_id,location_id,status,source_size_bytes,created_at_unix_ms, \
+                     finished_at_unix_ms,updated_at_unix_ms,policy_revision \
+                 ) VALUES(?1,?2,?3,'completed',4,0,1,1,1)",
+                params![scope_id, node_id, location_id],
+            )
+            .expect("folder-search extraction job should persist");
+        let extraction_job_id = database.connection.last_insert_rowid();
+        database
+            .connection
+            .execute(
+                "INSERT INTO content_chunks( \
+                     scope_id,node_id,location_id,extraction_job_id,ordinal,text,provenance_kind, \
+                     source_byte_start,source_byte_end,source_size_bytes,source_modified_unix_ns, \
+                     trust_class,provider_id,provider_version,active,created_at_unix_ms \
+                 ) VALUES(?1,?2,?3,?4,0,?5,'byte_range',0,4,4,1, \
+                          'untrusted_extracted_text','test','1',?6,1)",
+                params![
+                    scope_id,
+                    node_id,
+                    location_id,
+                    extraction_job_id,
+                    text,
+                    i64::from(active)
+                ],
+            )
+            .expect("folder-search content chunk should persist");
+    }
+
+    fn apply_migration_prefix(connection: &Connection, count: usize) {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations ( \
@@ -13207,7 +13630,7 @@ mod tests {
                  );",
             )
             .expect("migration registry should initialize");
-        for migration in &MIGRATIONS[..23] {
+        for migration in &MIGRATIONS[..count] {
             connection
                 .execute_batch(migration.sql)
                 .expect("historical migration should apply");
@@ -13223,6 +13646,10 @@ mod tests {
                 )
                 .expect("historical migration should register");
         }
+    }
+
+    fn apply_migrations_before_scope_exclusions(connection: &Connection) {
+        apply_migration_prefix(connection, 23);
     }
 
     fn foreign_platform() -> &'static str {
@@ -15165,6 +15592,98 @@ mod tests {
     }
 
     #[test]
+    fn folder_search_index_migration_preserves_a_populated_pre_0027_manifest() {
+        let directory = tempfile::tempdir().expect("tempdir should exist");
+        let path = directory.path().join("populated-pre-folder-index.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database should open");
+        apply_migration_prefix(&connection, 26);
+        connection
+            .execute(
+                "INSERT INTO authorized_scopes( \
+                     id,path_raw,path_key,display_path,platform,created_at_unix_ms \
+                 ) VALUES(1,X'2F73636F7065','/scope','/scope',?1,0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy scope should persist");
+        connection
+            .execute_batch(
+                "INSERT INTO scan_jobs( \
+                     id,scope_id,status,discovered_files,discovered_folders, \
+                     started_at_unix_ms,finished_at_unix_ms \
+                 ) VALUES(1,1,'completed',1,2,0,0); \
+                 INSERT INTO nodes(id,kind,identity_kind,identity_key,created_at_unix_ms,updated_at_unix_ms) \
+                 VALUES(1,'folder','test',X'01',0,0), \
+                       (2,'folder','test',X'02',0,0), \
+                       (3,'file','test',X'03',0,0); \
+                 INSERT INTO folders(node_id) VALUES(1),(2); \
+                 INSERT INTO files(node_id,size_bytes,modified_unix_ns,link_count) VALUES(3,4,1,1); \
+                 INSERT INTO locations( \
+                     id,scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id \
+                 ) VALUES(1,1,1,X'2F73636F7065','/scope','/scope',1,1), \
+                         (2,1,2,X'2F73636F70652F666F6C646572','/scope/folder','/scope/folder',1,1), \
+                         (3,1,3,X'2F73636F70652F666F6C6465722F66696C652E747874','/scope/folder/file.txt','/scope/folder/file.txt',1,1); \
+                 INSERT INTO edges( \
+                     id,scope_id,source_node_id,target_node_id,kind,active,last_seen_scan_id \
+                 ) VALUES(1,1,2,1,'located_in',1,1), \
+                         (2,1,3,2,'located_in',1,1);",
+            )
+            .expect("populated legacy manifest should persist");
+        drop(connection);
+
+        let database = ManifestDatabase::open(&path).expect("0027 migration should apply");
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM locations", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("locations should count"),
+            3
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get::<_, i64>(0))
+                .expect("edges should count"),
+            2
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations \
+                     WHERE version=27 AND name='folder_search_descendant_index'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("0027 registry row should load"),
+            1
+        );
+        let mut index_statement = database
+            .connection
+            .prepare(
+                "SELECT name FROM pragma_index_info( \
+                     'edges_scope_kind_active_target_source_idx' \
+                 ) ORDER BY seqno",
+            )
+            .expect("folder traversal index should inspect");
+        let index_columns = index_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("index columns should load")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("index columns should decode");
+        assert_eq!(
+            index_columns,
+            [
+                "scope_id",
+                "kind",
+                "active",
+                "target_node_id",
+                "source_node_id"
+            ]
+        );
+    }
+
+    #[test]
     fn scope_exclusion_migration_upgrades_an_empty_pre_0024_database() {
         let directory = tempfile::tempdir().expect("tempdir should exist");
         let path = directory.path().join("pre-scope-exclusions-empty.sqlite3");
@@ -15205,6 +15724,28 @@ mod tests {
                 )
                 .expect("0026 registry row should load"),
             1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=27 AND name='folder_search_descendant_index'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("0027 registry row should load"),
+            1
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_index_info('edges_scope_kind_active_target_source_idx')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("folder traversal index should load"),
+            5
         );
         assert_eq!(
             database
@@ -19031,6 +19572,7 @@ mod tests {
                 "\"專案-context\"",
                 LexicalSearchFilters {
                     scope_id: Some(scope_id),
+                    folder_node_id: None,
                     source: LexicalSearchSource::MetadataPath,
                     extension: Some("md"),
                     modified_since_unix_ns: Some(1),
@@ -19059,6 +19601,7 @@ mod tests {
                 "\"專案脈絡\"",
                 LexicalSearchFilters {
                     scope_id: Some(scope_id),
+                    folder_node_id: None,
                     source: LexicalSearchSource::ExtractedText,
                     extension: Some("md"),
                     modified_since_unix_ns: Some(1),
@@ -19102,6 +19645,558 @@ mod tests {
             stale
                 .iter()
                 .all(|candidate| candidate.source != LexicalCandidateSource::ExtractedText)
+        );
+    }
+
+    #[test]
+    fn folder_descendant_lookup_uses_the_target_traversal_index() {
+        let (database, scope_id) = folder_search_setup();
+        let selected_id = folder_search_node_id(&database, scope_id, "/scope/needle-project");
+        let mut statement = database
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 WITH RECURSIVE folder_tree(node_id) AS ( \
+                     SELECT ?2 \
+                     UNION \
+                     SELECT edge.source_node_id \
+                     FROM folder_tree parent \
+                     CROSS JOIN edges edge ON edge.target_node_id=parent.node_id \
+                     WHERE edge.scope_id=?1 AND edge.kind='located_in' AND edge.active=1 \
+                 ) \
+                 SELECT node_id FROM folder_tree",
+            )
+            .expect("folder traversal plan should prepare");
+        let details = statement
+            .query_map(params![scope_id, selected_id], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("folder traversal plan should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("folder traversal plan rows should decode");
+        assert!(
+            details.iter().any(|detail| detail
+                .contains("edges_scope_kind_active_target_source_idx")
+                && detail.contains("target_node_id=?")),
+            "recursive parent-to-child traversal must use the complete target lookup: {details:?}"
+        );
+    }
+
+    #[test]
+    fn content_search_plan_drives_from_fts_before_scope_filtering_chunks() {
+        let (database, scope_id) = folder_search_setup();
+        let mut statement = database
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT c.id \
+                 FROM content_search_fts \
+                 CROSS JOIN content_chunks c ON c.id=content_search_fts.rowid \
+                 WHERE content_search_fts MATCH ?1 AND c.scope_id=?2 AND c.active=1 \
+                 ORDER BY content_search_fts.rank,c.node_id,c.ordinal \
+                 LIMIT 20",
+            )
+            .expect("content search plan should prepare");
+        let details = statement
+            .query_map(params!["needle", scope_id], |row| row.get::<_, String>(3))
+            .expect("content search plan should execute")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("content search plan rows should decode");
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("content_search_fts VIRTUAL TABLE INDEX 0:M1")),
+            "content search must begin with the FTS match: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("c USING INTEGER PRIMARY KEY")),
+            "matched FTS rowids must probe content chunks by primary key: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("content_chunks_active_node_idx")),
+            "scope filtering must not drive repeated FTS probes: {details:?}"
+        );
+    }
+
+    #[test]
+    fn folder_scoped_search_includes_self_direct_and_deep_descendants_only() {
+        let (database, scope_id) = folder_search_setup();
+        let selected_id = folder_search_node_id(&database, scope_id, "/scope/needle-project");
+        let deep_folder_id =
+            folder_search_node_id(&database, scope_id, "/scope/needle-project/needle-deep");
+        let direct_id = folder_search_node_id(
+            &database,
+            scope_id,
+            "/scope/needle-project/needle-direct.txt",
+        );
+        let deep_file_id = folder_search_node_id(
+            &database,
+            scope_id,
+            "/scope/needle-project/needle-deep/needle-deep-file.txt",
+        );
+        let stale_id = folder_search_node_id(
+            &database,
+            scope_id,
+            "/scope/needle-project/needle-stale.txt",
+        );
+        let sibling_id = folder_search_node_id(&database, scope_id, "/scope/needle-sibling.txt");
+
+        for (path, text, active) in [
+            (
+                "/scope/needle-project/needle-direct.txt",
+                "needle direct body",
+                true,
+            ),
+            (
+                "/scope/needle-project/needle-deep/needle-deep-file.txt",
+                "needle deep body",
+                true,
+            ),
+            (
+                "/scope/needle-project/needle-stale.txt",
+                "needle stale body",
+                false,
+            ),
+            ("/scope/needle-sibling.txt", "needle sibling body", true),
+        ] {
+            insert_folder_search_content(&database, scope_id, path, text, active);
+        }
+
+        // A corrupt cycle must terminate deterministically. UNION deduplicates
+        // node IDs while preserving the selected folder's descendant closure.
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id=?1 AND status='completed'",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should load");
+        database
+            .connection
+            .execute(
+                "INSERT INTO edges( \
+                     scope_id,source_node_id,target_node_id,kind,active,last_seen_scan_id \
+                 ) VALUES(?1,?2,?3,'located_in',1,?4)",
+                params![scope_id, selected_id, deep_folder_id, scan_id],
+            )
+            .expect("cycle fixture should persist");
+
+        let metadata = database
+            .lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    source: LexicalSearchSource::MetadataPath,
+                    ..lexical_filters(Some(scope_id))
+                },
+                20,
+            )
+            .expect("folder-scoped metadata search should pass");
+        let metadata_ids = metadata
+            .iter()
+            .map(|candidate| candidate.node_id)
+            .collect::<HashSet<_>>();
+        assert!(
+            metadata_ids.contains(&selected_id),
+            "folder self must match"
+        );
+        assert!(metadata_ids.contains(&deep_folder_id));
+        assert!(metadata_ids.contains(&direct_id));
+        assert!(metadata_ids.contains(&deep_file_id));
+        assert!(metadata_ids.contains(&stale_id));
+        assert!(!metadata_ids.contains(&sibling_id));
+
+        let content = database
+            .lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    source: LexicalSearchSource::ExtractedText,
+                    ..lexical_filters(Some(scope_id))
+                },
+                20,
+            )
+            .expect("folder-scoped content search should pass");
+        let content_ids = content
+            .iter()
+            .map(|candidate| candidate.node_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(content_ids, HashSet::from([direct_id, deep_file_id]));
+        assert!(!content_ids.contains(&stale_id));
+        assert!(!content_ids.contains(&sibling_id));
+    }
+
+    #[test]
+    fn folder_scoped_search_never_returns_a_sibling_hard_link_location() {
+        let (database, scope_id) = folder_search_setup();
+        let selected_id = folder_search_node_id(&database, scope_id, "/scope/needle-project");
+        let selected_path = "/scope/needle-project/needle-direct.txt";
+        let sibling_path = "/scope/needle-hardlink-sibling.txt";
+        let shared_node_id = folder_search_node_id(&database, scope_id, selected_path);
+        let root_node_id = folder_search_node_id(&database, scope_id, "/scope");
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id=?1 AND status='completed'",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should load");
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations( \
+                     scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id \
+                 ) VALUES(?1,?2,?3,?4,?4,1,?5)",
+                params![
+                    scope_id,
+                    shared_node_id,
+                    sibling_path.as_bytes(),
+                    sibling_path,
+                    scan_id
+                ],
+            )
+            .expect("sibling hard-link location should persist");
+        database
+            .connection
+            .execute(
+                "INSERT INTO edges( \
+                     scope_id,source_node_id,target_node_id,kind,active,last_seen_scan_id \
+                 ) VALUES(?1,?2,?3,'located_in',1,?4)",
+                params![scope_id, shared_node_id, root_node_id, scan_id],
+            )
+            .expect("sibling hard-link parent edge should persist");
+        database
+            .connection
+            .execute(
+                "UPDATE files SET link_count=2 WHERE node_id=?1",
+                [shared_node_id],
+            )
+            .expect("hard-link count should update");
+        insert_folder_search_content(
+            &database,
+            scope_id,
+            selected_path,
+            "needle hardlink shared body",
+            true,
+        );
+        insert_folder_search_content(
+            &database,
+            scope_id,
+            sibling_path,
+            "needle hardlink shared body",
+            true,
+        );
+
+        let metadata = database
+            .lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    source: LexicalSearchSource::MetadataPath,
+                    ..lexical_filters(Some(scope_id))
+                },
+                20,
+            )
+            .expect("folder-scoped metadata search should pass");
+        assert!(
+            metadata
+                .iter()
+                .any(|candidate| candidate.display_path == selected_path)
+        );
+        assert!(
+            metadata
+                .iter()
+                .all(|candidate| candidate.display_path != sibling_path),
+            "node membership must not authorize a sibling hard-link location"
+        );
+
+        let content = database
+            .lexical_search_candidates(
+                "hardlink",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    source: LexicalSearchSource::ExtractedText,
+                    ..lexical_filters(Some(scope_id))
+                },
+                20,
+            )
+            .expect("folder-scoped content search should pass");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].display_path, selected_path);
+        assert_eq!(content[0].location_id, {
+            database
+                .connection
+                .query_row(
+                    "SELECT id FROM locations WHERE scope_id=?1 AND path_key=?2",
+                    params![scope_id, selected_path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("selected hard-link location should load")
+        });
+    }
+
+    #[test]
+    fn folder_search_selector_and_path_list_fail_closed_at_every_boundary() {
+        let (mut database, scope_id) = folder_search_setup();
+        let selected_path = "/scope/needle-project";
+        let selected_id = folder_search_node_id(&database, scope_id, selected_path);
+        let file_id = folder_search_node_id(
+            &database,
+            scope_id,
+            "/scope/needle-project/needle-direct.txt",
+        );
+
+        let list = database
+            .list_search_folders(scope_id, None)
+            .expect("explicit folder list should load");
+        assert_eq!(list.api_version, SearchFolderListResponse::API_VERSION);
+        assert_eq!(list.scope_id, scope_id);
+        assert_eq!(list.folder_count, 3);
+        assert!(!list.truncated);
+        assert!(
+            list.folders
+                .iter()
+                .any(|folder| folder.folder_node_id == selected_id
+                    && folder.display_path == selected_path)
+        );
+        let debug = format!("{list:?}");
+        assert!(!debug.contains(selected_path));
+        assert!(debug.contains("<redacted>"));
+
+        let bounded = database
+            .list_search_folders(scope_id, Some(2))
+            .expect("bounded folder list should load");
+        assert_eq!(bounded.folder_count, 2);
+        assert_eq!(bounded.folders.len(), 2);
+        assert!(bounded.truncated);
+        for limit in [Some(0), Some(MAX_SEARCH_FOLDER_LIST_LIMIT + 1)] {
+            assert!(matches!(
+                database.list_search_folders(scope_id, limit),
+                Err(DatabaseError::SearchInputInvalid)
+            ));
+        }
+
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: None,
+                    folder_node_id: Some(selected_id),
+                    ..lexical_filters(None)
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchInputInvalid)
+        ));
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(0),
+                    ..lexical_filters(Some(scope_id))
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchInputInvalid)
+        ));
+        for invalid_folder_id in [file_id, i64::MAX] {
+            assert!(matches!(
+                database.lexical_search_candidates(
+                    "needle",
+                    LexicalSearchFilters {
+                        scope_id: Some(scope_id),
+                        folder_node_id: Some(invalid_folder_id),
+                        ..lexical_filters(Some(scope_id))
+                    },
+                    10,
+                ),
+                Err(DatabaseError::SearchFolderInvalid)
+            ));
+        }
+
+        let scan_id: i64 = database
+            .connection
+            .query_row(
+                "SELECT MAX(id) FROM scan_jobs WHERE scope_id=?1 AND status='completed'",
+                [scope_id],
+                |row| row.get(0),
+            )
+            .expect("completed scan should load");
+        let ambiguous_path = "/scope/needle-project-alias";
+        database
+            .connection
+            .execute(
+                "INSERT INTO locations( \
+                     scope_id,node_id,path_raw,path_key,display_path,present,last_seen_scan_id \
+                 ) VALUES(?1,?2,?3,?4,?4,1,?5)",
+                params![
+                    scope_id,
+                    selected_id,
+                    ambiguous_path.as_bytes(),
+                    ambiguous_path,
+                    scan_id
+                ],
+            )
+            .expect("ambiguous folder location should persist");
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    ..lexical_filters(Some(scope_id))
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchFolderInvalid)
+        ));
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET present=0 WHERE scope_id=?1 AND path_key=?2",
+                params![scope_id, ambiguous_path],
+            )
+            .expect("ambiguous folder location should become absent");
+
+        let other = database
+            .add_scope_with_access_grant(
+                b"/other",
+                "/other",
+                "/other",
+                ScopeAccessGrantWrite {
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
+                    opaque_grant: b"other-folder-search-grant",
+                    state: ScopeAccessGrantState::Active,
+                },
+            )
+            .expect("other scope should persist");
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(other.id),
+                    folder_node_id: Some(selected_id),
+                    ..lexical_filters(Some(other.id))
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchFolderInvalid)
+        ));
+
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET present=0 WHERE scope_id=?1 AND node_id=?2",
+                params![scope_id, selected_id],
+            )
+            .expect("folder should become absent");
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    ..lexical_filters(Some(scope_id))
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchFolderInvalid)
+        ));
+        database
+            .connection
+            .execute(
+                "UPDATE locations SET present=1 WHERE scope_id=?1 AND node_id=?2",
+                params![scope_id, selected_id],
+            )
+            .expect("folder should become present again");
+
+        database
+            .connection
+            .execute(
+                "UPDATE scope_access_grants SET state='needs_reauthorization' WHERE scope_id=?1",
+                [scope_id],
+            )
+            .expect("grant should become inactive");
+        assert!(matches!(
+            database.list_search_folders(scope_id, None),
+            Err(DatabaseError::ScopeAccessGrantNotActive)
+        ));
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    ..lexical_filters(Some(scope_id))
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchFolderInvalid)
+        ));
+        database
+            .upsert_scope_access_grant(scope_id, std::env::consts::OS, b"restored-search-grant")
+            .expect("grant should reactivate");
+
+        database
+            .connection
+            .execute(
+                "UPDATE nodes SET identity_kind=?2,identity_key=?3 WHERE id=?1",
+                params![
+                    selected_id,
+                    TEST_EXCLUDED_IDENTITY_KIND,
+                    TEST_EXCLUDED_FOLDER_IDENTITY
+                ],
+            )
+            .expect("selected folder should use a stable exclusion identity");
+        let binding = database
+            .bind_scope_policy_revision(scope_id)
+            .expect("active search scope should bind");
+        database
+            .apply_scope_exclusion_batch(
+                binding,
+                &[ScopeExclusionWrite {
+                    kind: ScopeExclusionKind::Folder,
+                    path_raw: selected_path.as_bytes(),
+                    path_key: selected_path,
+                    display_path: selected_path,
+                    identity_kind: TEST_EXCLUDED_IDENTITY_KIND,
+                    identity_key: TEST_EXCLUDED_FOLDER_IDENTITY,
+                }],
+                2,
+            )
+            .expect("selected folder exclusion should purge atomically");
+        assert!(matches!(
+            database.lexical_search_candidates(
+                "needle",
+                LexicalSearchFilters {
+                    scope_id: Some(scope_id),
+                    folder_node_id: Some(selected_id),
+                    ..lexical_filters(Some(scope_id))
+                },
+                10,
+            ),
+            Err(DatabaseError::SearchFolderInvalid)
+        ));
+        let after_exclusion = database
+            .list_search_folders(scope_id, None)
+            .expect("remaining folder list should load");
+        assert!(
+            after_exclusion
+                .folders
+                .iter()
+                .all(|folder| folder.folder_node_id != selected_id)
         );
     }
 

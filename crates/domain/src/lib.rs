@@ -42,6 +42,7 @@ pub use project::{
     parse_explicit_file_version_name,
 };
 pub use search::{
-    SearchFilters, SearchMatchedField, SearchMode, SearchResponse, SearchResult, SearchSourceFilter,
+    SearchFilters, SearchFolderListResponse, SearchFolderOption, SearchMatchedField, SearchMode,
+    SearchResponse, SearchResult, SearchSourceFilter,
 };
 pub use watch::{WatchEventProgress, WatchEventReason, WatchEventStatus};

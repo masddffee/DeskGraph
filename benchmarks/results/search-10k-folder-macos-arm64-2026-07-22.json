@@ -1,0 +1,74 @@
+{
+  "api_version": "deskgraph.search-benchmark.v1",
+  "measured_at": "2026-07-22",
+  "host": {
+    "os": "macOS 26.5.1 (25F80)",
+    "architecture": "arm64",
+    "memory_bytes": null,
+    "memory_note": "the managed environment did not permit reading hw.memsize; this is not 8 GB evidence"
+  },
+  "toolchain": {
+    "rustc": "1.97.0 (2d8144b78 2026-07-07)",
+    "cargo": "1.97.0 (c980f4866 2026-06-30)",
+    "profile": "release"
+  },
+  "command_digest": "cargo run -p deskgraph-search-benchmark --release --offline -- --database <new-private-temp-path> --documents 10000 --iterations 50",
+  "process_elapsed_seconds": 13.19,
+  "corpus": "synthetic_traditional_chinese_english_folder_graph_v2",
+  "documents": 10000,
+  "content_bytes": 1300000,
+  "fixture_elapsed_ms": 1621,
+  "database_bytes": 13651968,
+  "fts_index_bytes": 5201920,
+  "query_reports": [
+    {
+      "case": "traditional_chinese_content",
+      "result_count": 20,
+      "iterations": 50,
+      "p50_us": 10453,
+      "p95_us": 16940,
+      "max_us": 25942
+    },
+    {
+      "case": "english_content",
+      "result_count": 20,
+      "iterations": 50,
+      "p50_us": 15103,
+      "p95_us": 23132,
+      "max_us": 40871
+    },
+    {
+      "case": "exact_filename",
+      "result_count": 1,
+      "iterations": 50,
+      "p50_us": 2494,
+      "p95_us": 2878,
+      "max_us": 3027
+    },
+    {
+      "case": "folder_scoped_content",
+      "result_count": 20,
+      "iterations": 50,
+      "p50_us": 13666,
+      "p95_us": 16355,
+      "max_us": 29475
+    },
+    {
+      "case": "missing_term",
+      "result_count": 0,
+      "iterations": 50,
+      "p50_us": 393,
+      "p95_us": 482,
+      "max_us": 557
+    }
+  ],
+  "limitations": [
+    "single local macOS arm64 run",
+    "synthetic corpus only",
+    "no peak RSS or 8 GB hardware evidence",
+    "no macOS Intel, Windows, or Linux evidence",
+    "no scan, extraction, OCR, embedding, UI, concurrency, or thermal measurement",
+    "folder-scoped results are not directly comparable with the prior v1 corpus",
+    "not a release SLO"
+  ]
+}

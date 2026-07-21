@@ -139,6 +139,7 @@ impl DeskGraphMcp {
         let request = SearchRequest {
             query: &arguments.query,
             scope_id: Some(arguments.scope_id),
+            folder_node_id: None,
             source: arguments.source.into(),
             extension: arguments.extension.as_deref(),
             modified_since_unix_seconds: arguments.modified_since_unix_seconds,
@@ -422,6 +423,7 @@ fn mcp_search_error_code(error: &SearchError) -> &'static str {
         | SearchError::QueryTooLong
         | SearchError::QueryInvalid
         | SearchError::ScopeInvalid
+        | SearchError::FolderInvalid
         | SearchError::ExtensionInvalid
         | SearchError::ModifiedRangeInvalid
         | SearchError::LimitOutOfRange => "mcp_search_request_invalid",

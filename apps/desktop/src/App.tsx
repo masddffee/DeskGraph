@@ -55,7 +55,9 @@ import {
   type ScanJobProgress,
 } from './manifest';
 import {
+  listSearchFolders,
   searchLocal,
+  type SearchFolder,
   type SearchResponse,
   type SearchResult,
   type SearchSourceFilter,
@@ -147,6 +149,11 @@ type SearchState =
   | { kind: 'working' }
   | { kind: 'ready'; response: SearchResponse }
   | { kind: 'error'; message: SearchMessage };
+type SearchFolderState =
+  | { kind: 'idle' }
+  | { kind: 'loading'; scopeId: number }
+  | { kind: 'ready'; scopeId: number; folders: SearchFolder[]; truncated: boolean }
+  | { kind: 'error'; scopeId: number };
 type RenameMessage = 'chooseFolder' | 'required' | 'denied';
 type RenamePreviewState =
   | { kind: 'idle' }
@@ -399,10 +406,18 @@ function utcDateToUnixSeconds(value: string): number | null {
   return Math.floor(milliseconds / 1000);
 }
 
-function activeSearchFilters(response: SearchResponse, catalog: Catalog, locale: Locale): string {
+function activeSearchFilters(
+  response: SearchResponse,
+  catalog: Catalog,
+  locale: Locale,
+  selectedFolderPath: string | null,
+): string {
   const labels: string[] = [];
   if (response.filters.scope_id !== null) {
     labels.push(catalog.search.filters.scope(response.filters.scope_id));
+  }
+  if (response.filters.folder_node_id !== null && selectedFolderPath !== null) {
+    labels.push(catalog.search.filters.folder(selectedFolderPath));
   }
   if (response.filters.source === 'metadata_path') labels.push(catalog.search.filters.pathsOnly);
   if (response.filters.source === 'extracted_text') labels.push(catalog.search.filters.textOnly);
@@ -530,6 +545,8 @@ export default function App() {
   const [action, setAction] = useState<ActionState>({ kind: 'idle' });
   const [searchQuery, setSearchQuery] = useState('');
   const [searchScopeId, setSearchScopeId] = useState<number | null>(null);
+  const [searchFolderNodeId, setSearchFolderNodeId] = useState<number | null>(null);
+  const [searchFolderState, setSearchFolderState] = useState<SearchFolderState>({ kind: 'idle' });
   const [searchSource, setSearchSource] = useState<SearchSourceFilter>('all');
   const [searchExtension, setSearchExtension] = useState('');
   const [searchModifiedSince, setSearchModifiedSince] = useState('');
@@ -578,6 +595,7 @@ export default function App() {
   const hardExclusionGenerationRef = useRef(0);
   const rootRevocationGenerationRef = useRef(0);
   const searchGenerationRef = useRef(0);
+  const searchFolderGenerationRef = useRef(0);
   const ocrGenerationRef = useRef(0);
   const renameGenerationRef = useRef(0);
   const runningJobIds =
@@ -683,6 +701,8 @@ export default function App() {
     renameGenerationRef.current += 1;
     setSearchQuery('');
     setSearchScopeId(null);
+    setSearchFolderNodeId(null);
+    setSearchFolderState({ kind: 'idle' });
     setSearchSource('all');
     setSearchExtension('');
     setSearchModifiedSince('');
@@ -1296,6 +1316,7 @@ export default function App() {
     try {
       const response = await searchLocal(query, {
         scopeId: searchScopeId,
+        folderNodeId: searchFolderNodeId,
         source: searchSource,
         extension: extension || null,
         modifiedSinceUnixSeconds,
@@ -1332,6 +1353,47 @@ export default function App() {
       });
     }
   }
+
+  async function chooseSearchScope(scopeId: number | null) {
+    searchGenerationRef.current += 1;
+    searchFolderGenerationRef.current += 1;
+    setSearchScopeId(scopeId);
+    setSearchFolderNodeId(null);
+    setSearchState({ kind: 'idle' });
+    if (scopeId === null) {
+      setSearchFolderState({ kind: 'idle' });
+      return;
+    }
+    const generation = searchFolderGenerationRef.current;
+    setSearchFolderState({ kind: 'loading', scopeId });
+    try {
+      const response = await listSearchFolders(scopeId);
+      if (searchFolderGenerationRef.current !== generation) return;
+      setSearchFolderState({
+        kind: 'ready',
+        scopeId,
+        folders: response.folders,
+        truncated: response.truncated,
+      });
+    } catch {
+      if (searchFolderGenerationRef.current !== generation) return;
+      setSearchFolderState({ kind: 'error', scopeId });
+    }
+  }
+
+  function chooseSearchFolder(folderNodeId: number | null) {
+    searchGenerationRef.current += 1;
+    setSearchFolderNodeId(folderNodeId);
+    setSearchState({ kind: 'idle' });
+  }
+
+  const selectedSearchFolderPath =
+    searchFolderState.kind === 'ready' &&
+    searchFolderState.scopeId === searchScopeId &&
+    searchFolderNodeId !== null
+      ? (searchFolderState.folders.find((folder) => folder.folder_node_id === searchFolderNodeId)
+          ?.display_path ?? null)
+      : null;
 
   async function runScreenshotOcr(
     job: ExtractionJobProgress,
@@ -2045,7 +2107,9 @@ export default function App() {
                       aria-label={catalog.search.scopeAria}
                       value={searchScopeId ?? ''}
                       onChange={(event) =>
-                        setSearchScopeId(event.target.value ? Number(event.target.value) : null)
+                        void chooseSearchScope(
+                          event.target.value ? Number(event.target.value) : null,
+                        )
                       }
                     >
                       <option value="">{catalog.search.allFolders}</option>
@@ -2060,6 +2124,69 @@ export default function App() {
                         ? catalog.search.searching
                         : catalog.search.search}
                     </button>
+                  </div>
+                  <div className="search-folder-control">
+                    <label htmlFor="search-folder">{catalog.search.folderLabel}</label>
+                    <select
+                      id="search-folder"
+                      aria-label={catalog.search.folderAria}
+                      value={searchFolderNodeId ?? ''}
+                      disabled={searchScopeId === null || searchFolderState.kind === 'loading'}
+                      onChange={(event) =>
+                        chooseSearchFolder(event.target.value ? Number(event.target.value) : null)
+                      }
+                    >
+                      <option value="">
+                        {searchScopeId === null
+                          ? catalog.search.folderChooseScope
+                          : catalog.search.allFoldersInScope}
+                      </option>
+                      {searchFolderState.kind === 'ready'
+                        ? searchFolderState.folders.map((folder) => (
+                            <option key={folder.folder_node_id} value={folder.folder_node_id}>
+                              {folder.display_path}
+                            </option>
+                          ))
+                        : null}
+                    </select>
+                    {searchScopeId === null ? (
+                      <p className="search-folder-status" role="status">
+                        {catalog.search.folderChooseScope}
+                      </p>
+                    ) : null}
+                    {searchFolderState.kind === 'loading' ? (
+                      <p className="search-folder-status" role="status">
+                        {catalog.search.folderLoading}
+                      </p>
+                    ) : null}
+                    {searchFolderState.kind === 'ready' &&
+                    searchFolderState.folders.length === 0 ? (
+                      <p className="search-folder-status" role="status">
+                        {catalog.search.folderEmpty}
+                      </p>
+                    ) : null}
+                    {searchFolderState.kind === 'ready' && searchFolderState.truncated ? (
+                      <p className="search-folder-status" role="status">
+                        {catalog.search.folderPartial}
+                      </p>
+                    ) : null}
+                    {searchFolderState.kind === 'error' ? (
+                      <div className="search-folder-error">
+                        <p
+                          className="search-folder-status search-folder-status--error"
+                          role="alert"
+                        >
+                          {catalog.search.folderError}
+                        </p>
+                        <button
+                          type="button"
+                          className="button-secondary search-folder-retry"
+                          onClick={() => void chooseSearchScope(searchFolderState.scopeId)}
+                        >
+                          {catalog.search.folderRetry}
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                   <div className="search-filter-grid" aria-label={catalog.search.filtersAria}>
                     <label>
@@ -2125,7 +2252,14 @@ export default function App() {
                         searchState.response.elapsed_ms,
                       )}
                     </span>
-                    <span>{activeSearchFilters(searchState.response, catalog, locale)}</span>
+                    <span>
+                      {activeSearchFilters(
+                        searchState.response,
+                        catalog,
+                        locale,
+                        selectedSearchFolderPath,
+                      )}
+                    </span>
                   </div>
                 ) : null}
                 {searchState.kind === 'ready' && searchState.response.results.length > 0 ? (

@@ -140,6 +140,17 @@ export const en = {
     scopeAria: 'Search folder scope',
     allFolders: 'All authorized folders',
     authorizedScope: (scopeId) => `Authorized scope ${scopeId}`,
+    folderLabel: 'Folder within this authorized scope',
+    folderAria: 'Folder search filter',
+    folderChooseScope: 'Choose one authorized scope to filter by a folder.',
+    allFoldersInScope: 'All folders in this authorized scope',
+    folderLoading: 'Loading folders from the local manifest…',
+    folderEmpty: 'This authorized scope has no indexed folders yet.',
+    folderPartial:
+      'Only the bounded local folder list is available; refine after a scan if needed.',
+    folderError:
+      'Folders could not be loaded safely. You can keep searching this authorized scope.',
+    folderRetry: 'Retry folder list',
     search: 'Search',
     searching: 'Searching…',
     filtersAria: 'Bounded local search filters',
@@ -164,6 +175,7 @@ export const en = {
       `${englishCount(count, 'result')} · ${formatIntegerForLocale(elapsedMs, 'en')} ms`,
     filters: {
       scope: (scopeId) => `scope ${scopeId}`,
+      folder: (displayPath) => `folder ${displayPath}`,
       pathsOnly: 'paths only',
       textOnly: 'extracted text only',
       since: (date) => `since ${date} UTC`,

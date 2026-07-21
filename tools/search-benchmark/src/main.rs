@@ -93,19 +93,30 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
 
     let database =
         ManifestDatabase::open(&args.database).map_err(|_| "benchmark_database_reopen_failed")?;
+    let exact_index = args.documents.saturating_sub(1).min(42);
+    let exact_filename = format!("專案-context-{exact_index:07}.md");
+    let first_group_node_id = i64::from(args.documents) + 2;
     let query_cases = [
-        ("traditional_chinese_content", "專案脈絡", true),
-        ("english_content", "English context", true),
-        ("exact_filename", "專案-context-0000042.md", true),
-        ("missing_term", "definitely-absent-term", false),
+        ("traditional_chinese_content", "專案脈絡", true, None),
+        ("english_content", "English context", true, None),
+        ("exact_filename", exact_filename.as_str(), true, None),
+        (
+            "folder_scoped_content",
+            "English context",
+            true,
+            Some(first_group_node_id),
+        ),
+        ("missing_term", "definitely-absent-term", false, None),
     ];
     let mut query_reports = Vec::with_capacity(query_cases.len());
-    for (case, query, should_match) in query_cases {
+    for (case, query, should_match, folder_node_id) in query_cases {
+        eprintln!("benchmark_case_started:{case}");
         search(
             &database,
             SearchRequest {
                 query,
                 scope_id: Some(1),
+                folder_node_id,
                 source: SearchSourceFilter::All,
                 extension: None,
                 modified_since_unix_seconds: None,
@@ -126,6 +137,7 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
                 SearchRequest {
                     query,
                     scope_id: Some(1),
+                    folder_node_id,
                     source: SearchSourceFilter::All,
                     extension: None,
                     modified_since_unix_seconds: None,
@@ -136,6 +148,14 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
             .map_err(|_| "benchmark_query_failed")?;
             samples.push(elapsed_us(started));
             result_count = response.result_count;
+            if folder_node_id.is_some()
+                && response
+                    .results
+                    .iter()
+                    .any(|result| !result.display_path.contains("/group-000/"))
+            {
+                return Err("benchmark_folder_scope_contract_failed");
+            }
         }
         if should_match != (result_count > 0) {
             return Err("benchmark_result_contract_failed");
@@ -149,6 +169,7 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
             p95_us: percentile(&samples, 95),
             max_us: samples.last().copied().unwrap_or(0),
         });
+        eprintln!("benchmark_case_completed:{case}");
     }
     drop(database);
 
@@ -157,7 +178,7 @@ fn run(args: Args) -> Result<BenchmarkReport, &'static str> {
     let fts_index_bytes = fts_index_bytes(&args.database)?;
     Ok(BenchmarkReport {
         api_version: "deskgraph.search-benchmark.v1",
-        corpus: "synthetic_traditional_chinese_english_v1",
+        corpus: "synthetic_traditional_chinese_english_folder_graph_v2",
         documents: args.documents,
         content_bytes,
         fixture_elapsed_ms,
@@ -178,17 +199,74 @@ fn populate_fixture(path: &Path, documents: u32) -> Result<u64, &'static str> {
     transaction
         .execute(
             "INSERT INTO authorized_scopes(id, path_raw, path_key, display_path, platform, created_at_unix_ms) \
-             VALUES (1, X'2F62656E63686D61726B', '/benchmark', '/benchmark', 'synthetic', 0)",
-            [],
+             VALUES (1, X'2F62656E63686D61726B', '/benchmark', '/benchmark', ?1, 0)",
+            [std::env::consts::OS],
         )
         .map_err(|_| "benchmark_fixture_scope_failed")?;
     transaction
         .execute(
-            "INSERT INTO scan_jobs(id, scope_id, status, discovered_files, started_at_unix_ms, finished_at_unix_ms) \
-             VALUES (1, 1, 'completed', ?1, 0, 0)",
-            [i64::from(documents)],
+            "INSERT INTO scope_access_grants(scope_id, platform, opaque_grant, state, updated_at_unix_ms) \
+             VALUES (1, ?1, X'73796E7468657469632D62656E63686D61726B2D6772616E74', 'active', 0)",
+            [std::env::consts::OS],
+        )
+        .map_err(|_| "benchmark_fixture_grant_failed")?;
+    let group_count = documents.min(100);
+    transaction
+        .execute(
+            "INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) \
+             VALUES (1, 1, 'completed', ?1, ?2, 0, 0)",
+            [i64::from(documents), i64::from(group_count) + 1],
         )
         .map_err(|_| "benchmark_fixture_scan_failed")?;
+
+    let root_node_id = i64::from(documents) + 1;
+    transaction
+        .execute(
+            "INSERT INTO nodes(id, kind, identity_kind, identity_key, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?1, 'folder', 'synthetic', X'666F6C6465722D726F6F74', 0, 0)",
+            [root_node_id],
+        )
+        .map_err(|_| "benchmark_fixture_root_node_failed")?;
+    transaction
+        .execute("INSERT INTO folders(node_id) VALUES (?1)", [root_node_id])
+        .map_err(|_| "benchmark_fixture_root_folder_failed")?;
+    transaction
+        .execute(
+            "INSERT INTO locations(id, scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id) \
+             VALUES (?1, 1, ?1, X'2F62656E63686D61726B', '/benchmark', '/benchmark', 1, 1)",
+            [root_node_id],
+        )
+        .map_err(|_| "benchmark_fixture_root_location_failed")?;
+
+    for group in 0..group_count {
+        let group_node_id = root_node_id + i64::from(group) + 1;
+        let group_path = format!("/benchmark/group-{group:03}");
+        let identity_key = format!("folder-group-{group:03}");
+        transaction
+            .execute(
+                "INSERT INTO nodes(id, kind, identity_kind, identity_key, created_at_unix_ms, updated_at_unix_ms) \
+                 VALUES (?1, 'folder', 'synthetic', ?2, 0, 0)",
+                params![group_node_id, identity_key.as_bytes()],
+            )
+            .map_err(|_| "benchmark_fixture_group_node_failed")?;
+        transaction
+            .execute("INSERT INTO folders(node_id) VALUES (?1)", [group_node_id])
+            .map_err(|_| "benchmark_fixture_group_folder_failed")?;
+        transaction
+            .execute(
+                "INSERT INTO locations(id, scope_id, node_id, path_raw, path_key, display_path, present, last_seen_scan_id) \
+                 VALUES (?1, 1, ?1, ?2, ?3, ?3, 1, 1)",
+                params![group_node_id, group_path.as_bytes(), &group_path],
+            )
+            .map_err(|_| "benchmark_fixture_group_location_failed")?;
+        transaction
+            .execute(
+                "INSERT INTO edges(scope_id, source_node_id, target_node_id, kind, active, last_seen_scan_id) \
+                 VALUES (1, ?1, ?2, 'located_in', 1, 1)",
+                params![group_node_id, root_node_id],
+            )
+            .map_err(|_| "benchmark_fixture_group_edge_failed")?;
+    }
 
     let mut content_bytes = 0_u64;
     for index in 0..documents {
@@ -231,6 +309,14 @@ fn populate_fixture(path: &Path, documents: u32) -> Result<u64, &'static str> {
                 params![id, display_path.as_bytes(), &display_path],
             )
             .map_err(|_| "benchmark_fixture_location_failed")?;
+        let group_node_id = root_node_id + i64::from(index % group_count) + 1;
+        transaction
+            .execute(
+                "INSERT INTO edges(scope_id, source_node_id, target_node_id, kind, active, last_seen_scan_id) \
+                 VALUES (1, ?1, ?2, 'located_in', 1, 1)",
+                params![id, group_node_id],
+            )
+            .map_err(|_| "benchmark_fixture_edge_failed")?;
         transaction
             .execute(
                 "INSERT INTO extraction_jobs( \

@@ -1,6 +1,6 @@
 # Dependency Audit
 
-Last reviewed: 2026-07-21
+Last reviewed: 2026-07-22
 
 Authorization-model note: ADR-033's picker, exclusion and revocation slices add no npm, model, network, Python, Docker or filesystem-delete dependency. The lock hardening gives `deskgraph-database` target-specific edges to the already locked `libc 0.2.186` on Unix and `windows-sys 0.61.2` on Windows; no registry package or resolved version is added. Unix uses official `openat`/`O_NOFOLLOW` primitives. Windows uses Microsoft-generated WDK `NtCreateFile` bindings with an already pinned parent handle and `OBJECT_ATTRIBUTES.RootDirectory`, plus exact handle metadata, to open managed lock children without a second absolute-path traversal. Packaged Windows retained-access, real Windows runtime, signed multi-root/exclusion/revocation restart evidence and hostile-process acceptance remain open.
 
@@ -22,7 +22,7 @@ Every new runtime, build, model, binary, crate, npm package, and GitHub Action m
 | Vite / React plugin | Build | 8.1.4 / 6.0.3 | `vite.dev`, npm, `vitejs` repositories | Local production build passes on Node 24.12.0 | MIT | Development/build only; frozen resolution in `pnpm-lock.yaml` |
 | TypeScript | Build | 6.0.3 | `typescriptlang.org`, npm, `microsoft/TypeScript` | Strict typecheck passes | Apache-2.0 | Pinned exactly because TypeScript 7.0.2 exceeded typescript-eslint's declared peer range |
 | ESLint / typescript-eslint | Build | 10.7.0 / 8.64.0 | `eslint.org`, `typescript-eslint.io`, npm | `pnpm peers check` and zero-warning lint pass | MIT | Development only; strict peers are enabled and cannot be silently auto-installed |
-| Vitest | Test | 4.1.10 | `vitest.dev`, npm, `vitest-dev/vitest` | The current 73-test frontend contract suite passes locally | MIT | Node environment only; no browser emulator dependency |
+| Vitest | Test | 4.1.10 | `vitest.dev`, npm, `vitest-dev/vitest` | The current 76-test frontend contract suite passes locally | MIT | Node environment only; no browser emulator dependency |
 | pnpm | Build | 11.10.0 | `pnpm.io`, npm, `pnpm/pnpm` | Corepack activation, lockfile, frozen-compatible install, and peer check pass | MIT | Exact `packageManager`; strict peers and supply-chain policy check enabled |
 | Prettier | Build | 3.9.5 | `prettier.io`, npm, `prettier/prettier` | Repository formatting check passes | MIT | Development only; planning/prompts are excluded to preserve the supplied SSOT text |
 | cargo-audit | Audit tool, not shipped | 0.22.2 | crates.io, `docs.rs/cargo-audit`, `rustsec/rustsec` | RustSec official project; requires Rust 1.88+; local audit executed | Apache-2.0 OR MIT | Installed outside the project and not added to the application dependency graph |
@@ -136,6 +136,10 @@ The exact two dependencies entered the Rust workspace only with the accepted fea
 The first M3 slice adds no external package. ADR-015 reuses the already selected bundled SQLite from `rusqlite 0.40.1` / `libsqlite3-sys 0.38.1` and its built-in FTS5 `trigram` tokenizer. SQLite's official FTS5 documentation confirms external-content indexes, synchronization triggers and rebuilds, trigram substring behavior, the three-Unicode-character minimum, `rank`/BM25 ordering, and bounded `snippet()` output. Local migration and multilingual tests prove the selected bundled build exposes FTS5.
 
 No vector extension, tokenizer extension, embedding runtime, model, API, or network client is selected by this decision. The workspace adds only path-based local `deskgraph-retrieval` and `deskgraph-search-benchmark` crates; they introduce no registry dependency and keep future vector adapters outside the database and domain contracts. The benchmark tool reuses audited `clap`, `rusqlite`, `serde`, and `serde_json`, refuses to overwrite an existing database, and is not shipped with the product.
+
+The 2026-07-22 folder-scoped slice adds no package, model, native binary, API or network capability. It reuses current `nodes`, `folders`, `locations`, active `located_in` edges, scope grants/exclusions and SQLite recursive CTE support. Migration 0027 is a forward-only SQLite index for active `located_in` target-to-child traversal; it changes neither the registry dependency graph nor the lockfile. The bounded path-bearing selector is a local explicit-response contract; ordinary Rust Debug/log output redacts the paths. The benchmark fixture now includes a current-host active grant plus synthetic folder nodes/edges and exercises the same production folder filter, without adding a dependency.
+
+A Firecrawl-assisted candidate pass narrowed the next D-009 proof work to compare a pure-Rust CPU path such as [`tract`](https://github.com/sonos/tract) against a higher-level ONNX path such as [`fastembed-rs`](https://github.com/Anush008/fastembed-rs) / [`ort`](https://github.com/pykeio/ort), with a checksum-bound multilingual E5-class model. This is **research routing, not approval**: the returned synthesis did not close exact ONNX operator coverage for the chosen artifact, macOS Intel packaging, official model-conversion provenance, Traditional Chinese relevance, cold-load/unload behavior, peak RSS on 8 GB, license/notices, artifact SHA-256 or the complete target build/runtime matrix. No crate/model was added and D-009 remains open until those primary-source and executable gates pass.
 
 ## M6 durable watch-core dependency decision
 

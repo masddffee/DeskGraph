@@ -163,8 +163,8 @@ Each step should fit a logical commit/PR, preserve a buildable default branch, i
 
 ### Step 4 — M3 retrieval
 
-- Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, bounded scope/type/date/source filters, CLI/Desktop entry points, and a reproducible synthetic 10k p50/p95/index-size report are verified locally; this is not 100k, real-corpus, 8 GB, or cross-platform evidence.
-- Next: connect project/folder filters only after M4 persists their source-of-truth identities/correction state, then add versioned SQLite embedding rows with a bounded exact-search baseline. Rebuild ANN from version-matched embedding rows; only recompute those rows from content hashes plus the exact model manifest. Audit and adopt an ANN provider only if representative vector-count recall@k/result-consistency and p95/RSS/build/update evidence shows a net release-budget benefit, with atomic model-version invalidation.
+- Current: the offline SQLite FTS5 path/content baseline, deterministic explanations, bounded scope/graph-backed-folder/type/date/source filters, CLI/Desktop entry points, and a reproducible release-mode synthetic 10k/50 p50/p95/index-size report are verified locally. Folder selectors require one current eligible location and combine current graph membership with a segment-safe subtree fence; this is not 100k, real-corpus, 8 GB, or cross-platform evidence.
+- Next: connect the Project filter only after M4 persists file-membership source of truth and correction state, then add versioned SQLite embedding rows with a bounded exact-search baseline. Rebuild ANN from version-matched embedding rows; only recompute those rows from content hashes plus the exact model manifest. Audit and adopt an ANN provider only if representative vector-count recall@k/result-consistency and p95/RSS/build/update evidence shows a net release-budget benefit, with atomic model-version invalidation.
 - Exit with no-model deterministic fallback and zh-TW/English evaluation.
 
 ### Step 5 — M4 context graph

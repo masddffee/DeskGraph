@@ -138,6 +138,17 @@ export const ja = {
     scopeAria: '検索するフォルダー範囲',
     allFolders: 'すべての許可済みフォルダー',
     authorizedScope: (scopeId) => `許可済み範囲 ${scopeId}`,
+    folderLabel: 'この許可済み範囲内のフォルダー',
+    folderAria: 'フォルダー検索フィルター',
+    folderChooseScope: 'フォルダーで絞り込むには、許可済み範囲を 1 つ選択してください。',
+    allFoldersInScope: 'この許可済み範囲のすべてのフォルダー',
+    folderLoading: 'ローカルマニフェストからフォルダーを読み込んでいます…',
+    folderEmpty: 'この許可済み範囲には、まだインデックス済みフォルダーがありません。',
+    folderPartial:
+      '制限されたローカルフォルダー一覧のみ利用できます。必要に応じてスキャン後に絞り込んでください。',
+    folderError:
+      'フォルダーを安全に読み込めませんでした。この許可済み範囲では引き続き検索できます。',
+    folderRetry: 'フォルダー一覧を再読み込み',
     search: '検索',
     searching: '検索中…',
     filtersAria: '制限付きローカル検索フィルター',
@@ -165,6 +176,7 @@ export const ja = {
       `${formatIntegerForLocale(count, 'ja')} 件の結果 · ${formatIntegerForLocale(elapsedMs, 'ja')} ms`,
     filters: {
       scope: (scopeId) => `範囲 ${scopeId}`,
+      folder: (displayPath) => `フォルダー ${displayPath}`,
       pathsOnly: 'パスのみ',
       textOnly: '抽出済みテキストのみ',
       since: (date) => `${date} UTC 以降`,

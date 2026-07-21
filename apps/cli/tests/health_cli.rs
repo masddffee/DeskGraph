@@ -134,6 +134,35 @@ fn scope_add_child_process_creates_a_path_free_active_grant_for_scan_and_search(
         .expect("scan start should start");
     assert!(scanned.status.success());
 
+    let listed_folders = Command::new(binary)
+        .args([
+            "search-folders",
+            "--database",
+            database_arg,
+            "--scope",
+            &scope_id_arg,
+        ])
+        .output()
+        .expect("search folder listing should start");
+    assert!(listed_folders.status.success());
+    let folder_response: serde_json::Value = serde_json::from_slice(&listed_folders.stdout)
+        .expect("search folder listing should emit JSON");
+    assert_eq!(
+        folder_response["api_version"],
+        "deskgraph.search-folders.v1"
+    );
+    assert_eq!(folder_response["scope_id"], scope_id);
+    assert_eq!(folder_response["folder_count"], 1);
+    assert_eq!(folder_response["folders"][0]["scope_id"], scope_id);
+    assert_eq!(
+        folder_response["folders"][0]["display_path"],
+        canonical_scope.to_string_lossy().as_ref()
+    );
+    let folder_node_id = folder_response["folders"][0]["folder_node_id"]
+        .as_i64()
+        .expect("folder listing should return a node ID");
+    let folder_node_arg = folder_node_id.to_string();
+
     let searched = Command::new(binary)
         .args([
             "search",
@@ -143,6 +172,8 @@ fn scope_add_child_process_creates_a_path_free_active_grant_for_scan_and_search(
             "receipt-e2e-metadata",
             "--scope",
             &scope_id_arg,
+            "--folder-node",
+            &folder_node_arg,
             "--source",
             "metadata",
         ])
@@ -152,8 +183,9 @@ fn scope_add_child_process_creates_a_path_free_active_grant_for_scan_and_search(
     let response: serde_json::Value =
         serde_json::from_slice(&searched.stdout).expect("search should emit JSON");
     assert_eq!(response["result_count"], 1);
+    assert_eq!(response["filters"]["folder_node_id"], folder_node_id);
 
-    for output in [&initialized, &added, &scanned, &searched] {
+    for output in [&initialized, &added, &scanned, &listed_folders, &searched] {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains(private_contents));
         assert!(!stderr.contains(scope_arg));
