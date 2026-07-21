@@ -44,9 +44,10 @@ use deskgraph_domain::{
     WatchEventStatus, is_valid_image_dimensions, is_valid_xlsx_cell_reference,
     parse_explicit_file_version_name, reduce_action_journal,
 };
+#[cfg(not(windows))]
+use deskgraph_identity::platform_identity_for_open_file;
 use deskgraph_identity::{
-    IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw,
-    platform_identity, platform_identity_for_open_file,
+    IdentityNodeKind, comparison_key, is_symlink_or_reparse_point, path_from_raw, platform_identity,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use rusqlite::OpenFlags;
