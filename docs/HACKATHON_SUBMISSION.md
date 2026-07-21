@@ -198,9 +198,9 @@ instructions are in the [README](../README.md) and
 - [ ] **Category:** confirm `Apps for Your Life`, the current submission-plan
       choice, or document why the final demonstrated audience requires a
       different category.
-- [ ] **Public repository URL:** make the repository public, then paste its
-      final URL into Devpost. This workspace currently has no configured git
-      remote, so this action is intentionally not represented as complete here.
+- [x] **Public repository URL:** `https://github.com/masddffee/DeskGraph` is
+      public and saved in the Devpost project. Remote `main` was verified at
+      commit `c224445940c83f71ac8fe3d059b8249b0011baa3`.
 - [ ] **Judge instructions:** paste the “Judge setup and test path” above and
       point judges to the synthetic-scope limitation.
 - [ ] **Dev-tool instructions:** paste the “How I built it” section and state
@@ -216,15 +216,18 @@ instructions are in the [README](../README.md) and
       verified CLI evidence. It is intentionally not represented as continuous
       live operation. The local artifact is ignored by git; SHA-256:
       `bca6e8c72817919ae32fcfd69def3cff15f4e14655ab443342d0ab41462255e5`.
-- [x] Generate and review a local English-voiceover remix of that guided cut:
-      95 seconds, 1280×720 H.264/AAC, with the required explanation of what was
-      built and how Codex/GPT-5.6 was used. The ignored local artifact SHA-256
-      is `0edcc765b4b1227212aac649b769ee3161f83a9d2c9eb5b815fd8a63d83ea220`.
+- [x] Generate and review a local English-voiceover reference remix of that
+      guided cut: 95 seconds, 1280×720 H.264/AAC, with the required explanation
+      of what was built and how Codex/GPT-5.6 was used. This is not the final
+      human-voiced submission video. The ignored reference artifact SHA-256 is
+      `0edcc765b4b1227212aac649b769ee3161f83a9d2c9eb5b815fd8a63d83ea220`.
 - [ ] Upload a public YouTube video under three minutes with a
       voiceover. It must cover what was built, how Codex/GPT-5.6 was used, and
       the real pre-release limitations above.
-- [ ] Add the video URL, public repository URL, name, tagline, and Devpost
-      description draft from this document.
+- [x] Save the public repository URL, name, tagline, technology list, and
+      owner-reviewable English description in the Devpost project Draft.
+- [ ] Add the final public YouTube URL after the human English voiceover is
+      recorded and reviewed.
 - [ ] Re-run the documented test commands on the final submission commit and
       replace any test counts in this document only with their actual output.
 - [ ] Do not state or imply that file execution, Trash/Undo, semantic/vector
