@@ -952,14 +952,13 @@ impl CancellationSignal for DatabaseCancellation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deskgraph_database::{
-        LexicalCandidateSource, LexicalSearchFilters, LexicalSearchSource, ScopeExclusionWrite,
-    };
+    #[cfg(unix)]
+    use deskgraph_database::ScopeExclusionWrite;
+    use deskgraph_database::{LexicalCandidateSource, LexicalSearchFilters, LexicalSearchSource};
     use deskgraph_domain::{ExtractionOperation, ExtractionStatus};
-    use deskgraph_scanner::{
-        ScopeExclusionSelection, authorize_scope_with_access_grant, comparison_key,
-        prepare_scope_exclusion_batch, scan_scope,
-    };
+    #[cfg(unix)]
+    use deskgraph_scanner::{ScopeExclusionSelection, prepare_scope_exclusion_batch};
+    use deskgraph_scanner::{authorize_scope_with_access_grant, comparison_key, scan_scope};
     use lopdf::content::{Content, Operation};
     use lopdf::{Document, Object, Stream, dictionary};
     use std::io::{Cursor, Write};

@@ -1638,9 +1638,11 @@ fn map_source_error(_error: std::io::Error) -> TransactionError {
 mod tests {
     use super::*;
     use deskgraph_database::ScopeExclusionWrite;
+    #[cfg(unix)]
+    use deskgraph_domain::ActionJournalEventKind;
     use deskgraph_domain::{
-        ActionJournalEventKind, ActionOperation, ActionPlanState, ActionPolicyDecision,
-        CleanupActionOperation, CleanupActionPlanState, SmartCleanupSourceKind,
+        ActionOperation, ActionPlanState, ActionPolicyDecision, CleanupActionOperation,
+        CleanupActionPlanState, SmartCleanupSourceKind,
     };
     use deskgraph_scanner::{
         ScopeExclusionSelection, authorize_scope, prepare_scope_exclusion_batch, scan_scope,

@@ -13463,19 +13463,13 @@ fn test_active_binding(
     scope_id: i64,
 ) -> Result<ScopePolicyBinding, DatabaseError> {
     if !database.scope_has_active_access_grant(scope_id)? {
-        let mut platform: String = database.connection.query_row(
-            "SELECT platform FROM authorized_scopes WHERE id=?1",
-            [scope_id],
-            |row| row.get(0),
+        let platform = std::env::consts::OS;
+        validate_scope_access_grant_platform(platform)?;
+        database.connection.execute(
+            "UPDATE authorized_scopes SET platform=?2 WHERE id=?1",
+            params![scope_id, platform],
         )?;
-        if !matches!(platform.as_str(), "macos" | "linux" | "windows") {
-            platform = "macos".to_string();
-            database.connection.execute(
-                "UPDATE authorized_scopes SET platform=?2 WHERE id=?1",
-                params![scope_id, platform],
-            )?;
-        }
-        database.upsert_scope_access_grant(scope_id, &platform, b"database-unit-test-grant")?;
+        database.upsert_scope_access_grant(scope_id, platform, b"database-unit-test-grant")?;
     }
     database.bind_scope_policy_revision(scope_id)
 }
@@ -13685,7 +13679,7 @@ mod tests {
 
     fn resumable_setup_in(database: ManifestDatabase) -> (ManifestDatabase, i64, QueuedPath) {
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "test")
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
             .expect("scope should persist");
         let root = QueuedPath {
             path_raw: b"/scope".to_vec(),
@@ -14199,7 +14193,7 @@ mod tests {
     fn desktop_watchability_requires_a_completed_scan_and_active_access_grant() {
         let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
             .expect("scope should persist");
         let root = QueuedPath {
             path_raw: b"/scope".to_vec(),
@@ -14236,7 +14230,7 @@ mod tests {
         );
 
         database
-            .upsert_scope_access_grant(scope.id, "macos", b"opaque-grant")
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"opaque-grant")
             .expect("active grant should persist");
         assert_eq!(
             database
@@ -15324,7 +15318,7 @@ mod tests {
     fn exact_duplicate_setup() -> (ManifestDatabase, ActionSourceRecord, ActionSourceRecord) {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
             .expect("scope should persist");
         database
             .connection
@@ -15387,7 +15381,7 @@ mod tests {
     ) {
         let (mut database, left, right) = exact_duplicate_setup();
         database
-            .upsert_scope_access_grant(left.scope_id, "macos", b"test-active-grant")
+            .upsert_scope_access_grant(left.scope_id, std::env::consts::OS, b"test-active-grant")
             .expect("scope grant should activate");
         let scan_id: i64 = database
             .connection
@@ -15502,7 +15496,7 @@ mod tests {
     fn file_version_setup() -> (ManifestDatabase, ActionSourceRecord, ActionSourceRecord) {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
             .expect("scope should persist");
         database
             .connection
@@ -16174,7 +16168,7 @@ mod tests {
     fn scope_access_grants_are_opaque_upserted_and_never_exposed_by_scope_listing() {
         let database = ManifestDatabase::open_in_memory().expect("database should initialize");
         let scope = database
-            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
             .expect("scope should persist");
 
         assert_eq!(
@@ -16184,10 +16178,10 @@ mod tests {
             ScopeAccessGrantState::NeedsReauthorization
         );
         let first = database
-            .upsert_scope_access_grant(scope.id, "macos", b"first-grant")
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"first-grant")
             .expect("grant should persist");
         assert_eq!(first.scope_id, scope.id);
-        assert_eq!(first.platform, "macos");
+        assert_eq!(first.platform, std::env::consts::OS);
         assert_eq!(first.opaque_grant, b"first-grant");
         assert_eq!(first.state, ScopeAccessGrantState::Active);
         assert!(first.updated_at_unix_ms >= 0);
@@ -16209,9 +16203,9 @@ mod tests {
         );
 
         let replacement = database
-            .upsert_scope_access_grant(scope.id, "macos", b"replacement-grant")
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"replacement-grant")
             .expect("replacement grant should upsert");
-        assert_eq!(replacement.platform, "macos");
+        assert_eq!(replacement.platform, std::env::consts::OS);
         assert_eq!(replacement.opaque_grant, b"replacement-grant");
         assert_eq!(
             database
@@ -16235,7 +16229,7 @@ mod tests {
             ScopeAccessGrantState::NeedsReauthorization
         );
         database
-            .upsert_scope_access_grant(scope.id, "macos", b"replacement-grant")
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"replacement-grant")
             .expect("explicit reauthorization should restore the grant before revocation");
         database
             .mark_scope_access_grant_revoked(scope.id)
@@ -16398,8 +16392,8 @@ mod tests {
                 "/selected",
                 "/selected",
                 ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"picker-grant",
                     state: ScopeAccessGrantState::Active,
                 },
@@ -16425,8 +16419,8 @@ mod tests {
             "/selected",
             "/selected-replaced",
             ScopeAccessGrantWrite {
-                scope_platform: "windows",
-                grant_platform: "windows",
+                scope_platform: foreign_platform(),
+                grant_platform: foreign_platform(),
                 opaque_grant: b"wrong-platform",
                 state: ScopeAccessGrantState::Active,
             },
@@ -16454,8 +16448,8 @@ mod tests {
                 "/revoked",
                 "/revoked",
                 ScopeAccessGrantWrite {
-                    scope_platform: "windows",
-                    grant_platform: "windows",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"revoked-grant",
                     state: ScopeAccessGrantState::Revoked,
                 },
@@ -16484,8 +16478,8 @@ mod tests {
                 path_key: "/desktop",
                 display_path: "/desktop",
                 grant: ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"desktop-grant",
                     state: ScopeAccessGrantState::Active,
                 },
@@ -16495,8 +16489,8 @@ mod tests {
                 path_key: "/documents",
                 display_path: "/documents",
                 grant: ScopeAccessGrantWrite {
-                    scope_platform: "macos",
-                    grant_platform: "macos",
+                    scope_platform: std::env::consts::OS,
+                    grant_platform: std::env::consts::OS,
                     opaque_grant: b"documents-grant",
                     state: ScopeAccessGrantState::Active,
                 },
@@ -16913,13 +16907,18 @@ mod tests {
             .join("manifest.sqlite3");
         let writer = ManifestDatabase::open(&path).expect("fixture should initialize");
         let scope = writer
-            .add_scope(b"/scope", "/scope", "/scope", "macos")
+            .add_scope(b"/scope", "/scope", "/scope", std::env::consts::OS)
             .expect("scope should persist");
         let unscanned_scope = writer
-            .add_scope(b"/unscanned", "/unscanned", "/unscanned", "macos")
+            .add_scope(
+                b"/unscanned",
+                "/unscanned",
+                "/unscanned",
+                std::env::consts::OS,
+            )
             .expect("unscanned scope should persist");
         writer
-            .upsert_scope_access_grant(scope.id, "macos", b"read-only-test-grant")
+            .upsert_scope_access_grant(scope.id, std::env::consts::OS, b"read-only-test-grant")
             .expect("queryable scope grant should persist");
         writer
             .connection
@@ -17134,9 +17133,14 @@ mod tests {
                 .expect("historical migration should register");
         }
         connection
+            .execute(
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', ?1, 0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy scope should persist for the current host");
+        connection
             .execute_batch(
-                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0); \
-                 INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
+                "INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0); \
                  INSERT INTO files VALUES (1, 4, 1, 1); \
                  INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E747874', '/scope/file.txt', '/scope/file.txt', 1, 1); \
@@ -17165,7 +17169,7 @@ mod tests {
             0
         );
         upgraded
-            .upsert_scope_access_grant(1, "macos", b"migration-test-grant")
+            .upsert_scope_access_grant(1, std::env::consts::OS, b"migration-test-grant")
             .expect("legacy scope should be explicitly reauthorized");
         assert_eq!(
             upgraded
@@ -17210,9 +17214,14 @@ mod tests {
                 .expect("historical migration should register");
         }
         connection
+            .execute(
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', ?1, 0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy scope should persist for the current host");
+        connection
             .execute_batch(
-                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0); \
-                 INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
+                "INSERT INTO scan_jobs(id, scope_id, status, discovered_files, discovered_folders, started_at_unix_ms, finished_at_unix_ms) VALUES (1, 1, 'completed', 1, 0, 0, 0); \
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0); \
                  INSERT INTO files VALUES (1, 4, 1, 1); \
                  INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E706E67', '/scope/file.png', '/scope/file.png', 1, 1); \
@@ -17245,7 +17254,7 @@ mod tests {
             0
         );
         upgraded
-            .upsert_scope_access_grant(1, "macos", b"migration-test-grant")
+            .upsert_scope_access_grant(1, std::env::consts::OS, b"migration-test-grant")
             .expect("legacy scope should be explicitly reauthorized");
         assert_eq!(
             upgraded
@@ -19063,7 +19072,7 @@ mod tests {
     fn cleanup_selection_binds_version_and_screenshot_members_to_exact_observations() {
         let (mut version_database, older, newer) = file_version_setup();
         version_database
-            .upsert_scope_access_grant(older.scope_id, "macos", b"test-active-grant")
+            .upsert_scope_access_grant(older.scope_id, std::env::consts::OS, b"test-active-grant")
             .expect("version scope should activate");
         let version = version_database
             .record_file_version_candidate(&older, &newer)
@@ -19463,9 +19472,14 @@ mod tests {
                 .expect("legacy migration should register");
         }
         connection
+            .execute(
+                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', ?1, 0)",
+                [std::env::consts::OS],
+            )
+            .expect("legacy scope should persist for the current host");
+        connection
             .execute_batch(
-                "INSERT INTO authorized_scopes VALUES (1, X'2F73636F7065', '/scope', '/scope', 'macos', 0);\
-                 INSERT INTO scan_jobs(id, scope_id, status, started_at_unix_ms) VALUES (1, 1, 'completed', 0);\
+                "INSERT INTO scan_jobs(id, scope_id, status, started_at_unix_ms) VALUES (1, 1, 'completed', 0);\
                  INSERT INTO nodes VALUES (1, 'file', 'test', X'01', 0, 0);\
                  INSERT INTO files VALUES (1, 4, 1, 1);\
                  INSERT INTO locations VALUES (1, 1, 1, X'2F73636F70652F66696C652E747874', '/scope/file.txt', '/scope/file.txt', 1, 1);\
@@ -19514,7 +19528,7 @@ mod tests {
             .expect("search must fail closed before legacy scope reauthorization");
         assert!(candidates.is_empty());
         database
-            .upsert_scope_access_grant(1, "macos", b"migration-test-grant")
+            .upsert_scope_access_grant(1, std::env::consts::OS, b"migration-test-grant")
             .expect("legacy scope should be explicitly reauthorized");
         let candidates = database
             .lexical_search_candidates("\"legacy\"", lexical_filters(None), 10)
