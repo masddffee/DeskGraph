@@ -6,6 +6,29 @@ use deskgraph_extractors::{
 };
 use deskgraph_scanner::{authorize_scope, authorize_scope_with_access_grant, scan_scope};
 
+fn json_value_contains(value: &serde_json::Value, needle: &str) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.contains(needle),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_value_contains(value, needle)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| json_value_contains(value, needle)),
+        _ => false,
+    }
+}
+
+fn serialized_output_contains(output: &str, needle: &str) -> bool {
+    output.contains(needle)
+        || serde_json::from_str::<serde_json::Value>(output)
+            .is_ok_and(|value| json_value_contains(&value, needle))
+        || output.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|value| json_value_contains(&value, needle))
+        })
+}
+
 #[test]
 fn health_command_emits_privacy_safe_json() {
     let output = Command::new(env!("CARGO_BIN_EXE_deskgraph"))
@@ -799,10 +822,23 @@ fn screenshot_cleanup_groups_are_review_only_current_and_path_free_in_history() 
     let suggest_stderr = String::from_utf8_lossy(&suggest.stderr);
     assert!(!suggest_stdout.contains(private_ocr_text));
     assert!(!suggest_stderr.contains(private_ocr_text));
+    let discovered_paths = discovery["groups"][0]["members"]
+        .as_array()
+        .expect("group members should be an array")
+        .iter()
+        .map(|member| {
+            member["display_path"]
+                .as_str()
+                .expect("member display path should be a string")
+        })
+        .collect::<Vec<_>>();
     for path in &paths {
-        let path = path.to_str().expect("path should be UTF-8");
-        assert!(suggest_stdout.contains(path));
-        assert!(!suggest_stderr.contains(path));
+        let canonical_path = std::fs::canonicalize(path).expect("path should canonicalize");
+        let canonical_path = canonical_path
+            .to_str()
+            .expect("canonical path should be UTF-8");
+        assert!(discovered_paths.contains(&canonical_path));
+        assert!(!serialized_output_contains(&suggest_stderr, canonical_path));
     }
     let group_arg = discovery["groups"][0]["group_id"]
         .as_i64()
@@ -820,14 +856,29 @@ fn screenshot_cleanup_groups_are_review_only_current_and_path_free_in_history() 
         .output()
         .expect("screenshot group status should start");
     assert!(status.status.success());
+    let status_value: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status should be JSON");
     let status_stdout = String::from_utf8_lossy(&status.stdout);
     let status_stderr = String::from_utf8_lossy(&status.stderr);
     assert!(!status_stdout.contains(private_ocr_text));
     assert!(!status_stderr.contains(private_ocr_text));
+    let status_paths = status_value["members"]
+        .as_array()
+        .expect("status members should be an array")
+        .iter()
+        .map(|member| {
+            member["display_path"]
+                .as_str()
+                .expect("member display path should be a string")
+        })
+        .collect::<Vec<_>>();
     for path in &paths {
-        let path = path.to_str().expect("path should be UTF-8");
-        assert!(status_stdout.contains(path));
-        assert!(!status_stderr.contains(path));
+        let canonical_path = std::fs::canonicalize(path).expect("path should canonicalize");
+        let canonical_path = canonical_path
+            .to_str()
+            .expect("canonical path should be UTF-8");
+        assert!(status_paths.contains(&canonical_path));
+        assert!(!serialized_output_contains(&status_stderr, canonical_path));
     }
 
     let list = Command::new(env!("CARGO_BIN_EXE_deskgraph"))

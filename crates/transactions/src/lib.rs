@@ -5,6 +5,8 @@ pub use platform_rename::{PlatformRenameError, rename_same_parent_no_replace, sy
 
 use std::ffi::OsStr;
 use std::fmt;
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::fs::{self, File, Metadata};
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -1008,6 +1010,57 @@ struct CleanupLiveBinding {
     keeper: Option<PreviewLiveBinding>,
 }
 
+#[cfg(windows)]
+fn open_preview_path(path: &Path, kind: IdentityNodeKind) -> Result<File, TransactionError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = OpenOptions::new();
+    let custom_flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if kind == IdentityNodeKind::Folder {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            0
+        };
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(custom_flags);
+    let file = options
+        .open(path)
+        .map_err(|_| TransactionError::SourceOpenFailed)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| TransactionError::SourceOpenFailed)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(TransactionError::SourceSymlinkOrReparseDenied);
+    }
+    match kind {
+        IdentityNodeKind::Folder if !metadata.is_dir() => Err(TransactionError::SourceOpenFailed),
+        IdentityNodeKind::File if !metadata.is_file() => Err(TransactionError::SourceMustBeFile),
+        _ => Ok(file),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_preview_path(path: &Path, kind: IdentityNodeKind) -> Result<File, TransactionError> {
+    let file = File::open(path).map_err(|_| TransactionError::SourceOpenFailed)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| TransactionError::SourceOpenFailed)?;
+    if is_symlink_or_reparse_point(&metadata) {
+        return Err(TransactionError::SourceSymlinkOrReparseDenied);
+    }
+    match kind {
+        IdentityNodeKind::Folder if !metadata.is_dir() => Err(TransactionError::SourceOpenFailed),
+        IdentityNodeKind::File if !metadata.is_file() => Err(TransactionError::SourceMustBeFile),
+        _ => Ok(file),
+    }
+}
+
 #[cfg(unix)]
 fn create_preview_live_binding(
     canonical_root: &Path,
@@ -1064,10 +1117,9 @@ fn create_preview_live_binding(
     let parent = canonical_source
         .parent()
         .ok_or(TransactionError::ExecutionPathInvalid)?;
-    let root = File::open(canonical_root).map_err(|_| TransactionError::SourceOpenFailed)?;
-    let parent_file = File::open(parent).map_err(|_| TransactionError::SourceOpenFailed)?;
-    let source_file =
-        File::open(canonical_source).map_err(|_| TransactionError::SourceOpenFailed)?;
+    let root = open_preview_path(canonical_root, IdentityNodeKind::Folder)?;
+    let parent_file = open_preview_path(parent, IdentityNodeKind::Folder)?;
+    let source_file = open_preview_path(canonical_source, IdentityNodeKind::File)?;
     let root_metadata = root
         .metadata()
         .map_err(|_| TransactionError::SourceOpenFailed)?;
@@ -1284,11 +1336,9 @@ fn create_cleanup_live_binding(
     let target_parent = canonical_target
         .parent()
         .ok_or(TransactionError::ExecutionPathInvalid)?;
-    let root_file = File::open(canonical_root).map_err(|_| TransactionError::SourceOpenFailed)?;
-    let target_parent_file =
-        File::open(target_parent).map_err(|_| TransactionError::SourceOpenFailed)?;
-    let target_file =
-        File::open(canonical_target).map_err(|_| TransactionError::SourceOpenFailed)?;
+    let root_file = open_preview_path(canonical_root, IdentityNodeKind::Folder)?;
+    let target_parent_file = open_preview_path(target_parent, IdentityNodeKind::Folder)?;
+    let target_file = open_preview_path(canonical_target, IdentityNodeKind::File)?;
     let root_metadata = root_file
         .metadata()
         .map_err(|_| TransactionError::SourceOpenFailed)?;
@@ -1330,8 +1380,8 @@ fn create_cleanup_live_binding(
             let parent = path
                 .parent()
                 .ok_or(TransactionError::ExecutionPathInvalid)?;
-            let parent_file = File::open(parent).map_err(|_| TransactionError::SourceOpenFailed)?;
-            let file = File::open(path).map_err(|_| TransactionError::SourceOpenFailed)?;
+            let parent_file = open_preview_path(parent, IdentityNodeKind::Folder)?;
+            let file = open_preview_path(path, IdentityNodeKind::File)?;
             let parent_metadata = parent_file
                 .metadata()
                 .map_err(|_| TransactionError::SourceOpenFailed)?;
