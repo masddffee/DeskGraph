@@ -758,11 +758,31 @@ fn run_watch_coordinator(runtime: WatchCoordinatorRuntime) {
         scope_accesses,
         polling_policy,
     } = runtime;
-    let mut coordinator = match WatchCoordinator::open_requiring_active_platform_grants(
-        &database_path,
-        WatchPolicy::default(),
-        polling_policy,
-    ) {
+    // Opening a manifest configures SQLite's WAL mode. Serialize this startup
+    // path with every other in-process manifest open so the coordinator cannot
+    // race an IPC preview on the journal-mode pragma.
+    let coordinator_open = {
+        let _database_guard = match database_gate.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                if let Ok(mut status) = status.lock() {
+                    status.state = WatchRuntimeState::Degraded;
+                    status.last_error_code = Some("manifest_writer_gate_poisoned");
+                }
+                error!(
+                    event = "watch_runtime_start_failed",
+                    error_code = "manifest_writer_gate_poisoned"
+                );
+                return;
+            }
+        };
+        WatchCoordinator::open_requiring_active_platform_grants(
+            &database_path,
+            WatchPolicy::default(),
+            polling_policy,
+        )
+    };
+    let mut coordinator = match coordinator_open {
         Ok(coordinator) => coordinator,
         Err(error) => {
             if let Ok(mut status) = status.lock() {

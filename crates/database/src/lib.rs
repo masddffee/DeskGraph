@@ -14976,7 +14976,14 @@ mod tests {
     }
 
     fn host_extraction_setup() -> (ManifestDatabase, i64, i64, QueuedPath) {
-        let mut database = ManifestDatabase::open_in_memory().expect("database should initialize");
+        host_extraction_setup_in(
+            ManifestDatabase::open_in_memory().expect("database should initialize"),
+        )
+    }
+
+    fn host_extraction_setup_in(
+        mut database: ManifestDatabase,
+    ) -> (ManifestDatabase, i64, i64, QueuedPath) {
         let scope_path = TestPath::from_logical("/scope");
         let scope = database
             .add_scope(
@@ -17724,7 +17731,7 @@ mod tests {
 
     #[test]
     fn action_preview_and_first_journal_event_commit_atomically_and_are_immutable() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
 
         assert_eq!(preview.state, ActionPlanState::Previewed);
@@ -17774,7 +17781,7 @@ mod tests {
 
     #[test]
     fn action_journal_uses_closed_cas_state_transitions_and_idempotent_commands() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         let binding = database
             .action_execution_record(preview.plan_id)
@@ -17899,7 +17906,7 @@ mod tests {
 
     #[test]
     fn action_journal_request_not_started_events_release_only_the_original_stable_state() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         let execute = database
             .start_action_command(ActionCommandWrite {
@@ -17979,7 +17986,7 @@ mod tests {
             .canonicalize()
             .expect("tempdir should canonicalize")
             .join("manifest.sqlite3");
-        let (mut first, scope_id, node_id, _) = extraction_setup_in(
+        let (mut first, scope_id, node_id, _) = host_extraction_setup_in(
             ManifestDatabase::open(&path).expect("first process should initialize"),
         );
         let preview = create_bound_rename_preview(&mut first, scope_id, node_id);
@@ -18027,7 +18034,7 @@ mod tests {
 
     #[test]
     fn action_journal_supports_execute_then_idempotent_undo_and_recovery_query() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         let execute = database
             .start_action_command(ActionCommandWrite {
@@ -18141,7 +18148,7 @@ mod tests {
 
     #[test]
     fn recovery_limits_qualifying_bound_work_not_terminal_or_legacy_plans() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let terminal_seed = create_bound_rename_preview(&mut database, scope_id, node_id);
         for index in 0..101 {
             insert_terminal_action_fixture(
@@ -23402,7 +23409,7 @@ mod tests {
 
     #[test]
     fn scope_root_revocation_blocks_non_pristine_action_history_and_rolls_back() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         test_active_binding(&database, scope_id).expect("scope should activate");
         let preview = create_bound_rename_preview(&mut database, scope_id, node_id);
         insert_terminal_action_fixture(&mut database, preview.plan_id, "terminal-revoke-0001");
@@ -23471,7 +23478,7 @@ mod tests {
 
     #[test]
     fn privacy_purge_target_capability_cannot_delete_a_non_target_action() {
-        let (mut database, scope_id, node_id, _) = extraction_setup();
+        let (mut database, scope_id, node_id, _) = host_extraction_setup();
         let first = create_bound_rename_preview(&mut database, scope_id, node_id);
         let second = create_bound_rename_preview(&mut database, scope_id, node_id);
         let transaction = database
@@ -23522,7 +23529,7 @@ mod tests {
 
     #[test]
     fn action_and_cleanup_plan_insert_triggers_reject_platform_mismatch() {
-        let (mut action_database, scope_id, node_id, _) = extraction_setup();
+        let (mut action_database, scope_id, node_id, _) = host_extraction_setup();
         let action = create_bound_rename_preview(&mut action_database, scope_id, node_id);
         action_database
             .connection
