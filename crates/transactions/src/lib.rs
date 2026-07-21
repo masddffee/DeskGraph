@@ -11,11 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use deskgraph_database::ActionCommandWrite;
 use deskgraph_database::{
-    ActionCommandWrite, ActionExecutionPlan, ActionExecutionSourceRecord, ActionJournalAppend,
-    ActionPlanWrite, ActionSourceRecord, CleanupActionPlanWrite, CleanupActionSelection,
-    CleanupKeeperBindingWrite, DatabaseError, ManifestDatabase, ScopeExclusionMatcher,
-    ScopePolicyBinding,
+    ActionExecutionPlan, ActionExecutionSourceRecord, ActionJournalAppend, ActionPlanWrite,
+    ActionSourceRecord, CleanupActionPlanWrite, CleanupActionSelection, CleanupKeeperBindingWrite,
+    DatabaseError, ManifestDatabase, ScopeExclusionMatcher, ScopePolicyBinding,
 };
 use deskgraph_domain::{
     ActionCommandKind, ActionExecutionRecord, ActionExecutionStrategy, ActionJournalEventKind,
@@ -25,9 +26,12 @@ use deskgraph_domain::{
 #[cfg(not(unix))]
 use deskgraph_identity::platform_identity_for_open_file;
 use deskgraph_identity::{
-    ActionBindingError, ActionEntryObservation, ActionFileBinding, IdentityExpectation,
-    IdentityNodeKind, bind_action_file, comparison_key, is_symlink_or_reparse_point, path_from_raw,
-    path_to_raw, platform_identity,
+    ActionBindingError, IdentityNodeKind, comparison_key, is_symlink_or_reparse_point,
+    path_from_raw, path_to_raw, platform_identity,
+};
+#[cfg(unix)]
+use deskgraph_identity::{
+    ActionEntryObservation, ActionFileBinding, IdentityExpectation, bind_action_file,
 };
 use deskgraph_scanner::{ScannerError, validated_scope_root};
 use serde::Serialize;
@@ -934,6 +938,7 @@ fn hash_matches_binding(
     Ok(())
 }
 
+#[cfg(unix)]
 fn command_result(
     command: ActionCommandKind,
     plan_id: i64,

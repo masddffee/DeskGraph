@@ -21,7 +21,7 @@ use deskgraph_domain::{
     ScanStatus, SearchFilters, SearchFolderListResponse, SearchResponse, SmartCleanupInbox,
     SmartCleanupSourceKind, WatchEventProgress, collect_health_with_manifest,
 };
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use deskgraph_domain::{WatchEventReason, WatchEventStatus};
 #[cfg(test)]
 use deskgraph_extractors::extraction_stats_at as read_extraction_stats_at;
