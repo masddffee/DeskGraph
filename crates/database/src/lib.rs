@@ -2,9 +2,9 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use std::fs::DirBuilder;
-#[cfg(any(not(unix), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 #[cfg(unix)]
@@ -3456,7 +3456,7 @@ impl ManifestDatabase {
         Ok(file)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn prepare_scope_filesystem_fence_root(
         &self,
         scope_id: i64,
@@ -3477,7 +3477,7 @@ impl ManifestDatabase {
         self.validate_and_bind_scope_filesystem_fence_root(scope_id, fence_root)
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn validate_and_bind_scope_filesystem_fence_root(
         &self,
         scope_id: i64,
@@ -3498,7 +3498,7 @@ impl ManifestDatabase {
         )
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn open_scope_filesystem_fence_file(
         &self,
         scope_id: i64,
