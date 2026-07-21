@@ -276,7 +276,7 @@ Canonical detail：
 
 ## ADR-033 — Authorization is an explicit coverage set minus hard exclusions
 
-Status：Accepted。DeskGraph 將「一次一個資料夾」改為一次檢視並明確確認 Coverage Set；同一個原生流程可選多個主要資料夾，Home 只作為進階顯式選項。有效範圍為 active roots 聯集減去 hard exclusions，不採靜默全磁碟/Home 掃描，也不預設要求 macOS Full Disk Access 或 Windows `broadFileSystemAccess`。Metadata、Content/OCR/Embedding 與檔案動作仍是不同 consent。Hard exclusion 不是結果隱藏：每個 scope 綁定 policy revision，新增排除必須以單一 immediate transaction 失效 in-flight 工作並清除本機 path、FTS、content/OCR/embedding、Graph 與衍生候選資料。隱私撤回優先於 derived-evidence immutability，但 transaction-scoped purge exception 永遠不能碰來源檔或形成通用 Delete API。現有單資料夾流程仍是合法的一根 coverage set；多選、durable exclusion 與 privacy purge 尚待分開通過完整測試後才可宣稱實作完成。
+Status：Accepted。DeskGraph 將「一次一個資料夾」改為一次檢視並明確確認 Coverage Set；同一個原生流程可選多個主要資料夾，Home 只作為進階顯式選項。有效範圍為 active roots 聯集減去 hard exclusions，不採靜默全磁碟/Home 掃描，也不預設要求 macOS Full Disk Access 或 Windows `broadFileSystemAccess`。Metadata、Content/OCR/Embedding 與檔案動作仍是不同 consent。Hard exclusion 不是結果隱藏：每個 scope 綁定 policy revision，新增排除必須以單一 immediate transaction 失效 in-flight 工作並清除本機 path、FTS、content/OCR/embedding、Graph 與衍生候選資料。2026-07-21 本機 slice 將所有 public Scanner path read 收斂為 active-grant + shared fence，並讓 public root/exclusion mutation 自動取得或驗證 scope/revision token。兩秒 bounded gate-and-data fence、immutable SQLite identity registry、Unix no-follow 與 permission 前驗證避免 cooperating-process 的 admission/revoke 或 split-lock race。這不是 hostile-process 或 action-fence 證明；exclusion removal、signed/packaged、Windows、clean-machine、cross-platform race/stress 與 CI acceptance 仍未完成。
 
 Canonical detail：
 `docs/architecture/adr/0033-authorization-is-an-explicit-coverage-set-minus-exclusions.md`。

@@ -20,6 +20,9 @@ release. The strongest honest demo separates the Desktop experience from the
 one-command CLI backend proof; they use different local databases:
 
 - native selection of one or more explicit, non-overlapping folders;
+- an exact two-stage local root-withdrawal control that previews the derived
+  purge, rejects stale impact, drops the DeskGraph capability, requires a fresh
+  scan after reauthorization, and never changes source files;
 - metadata-only initial manifest scan with durable progress and recovery;
 - bounded extraction of an explicitly selected, already-scanned text,
   Markdown, source, text-layer PDF, DOCX, PPTX, or XLSX file;
@@ -36,12 +39,16 @@ one-command CLI backend proof; they use different local databases:
 - an independently launched local stdio MCP server with exactly one read-only
   `search_files` tool over launch-granted, already-scanned scopes.
 
-The latest local verification record is 413 Rust tests passed with zero
-failures (two named live macOS FSEvents tests intentionally filtered because
-they require unsandboxed host events), plus `pnpm check` passing Prettier,
-ESLint, TypeScript, 70 Vitest tests, and the Vite production build. See the
-[implementation status](planning/IMPLEMENTATION_STATUS.md) for the full test
-evidence and its boundaries.
+The latest local verification record is 444 deterministic Rust tests passed with zero
+failures using the deterministic command below. It explicitly skips only
+`macos_recommended_watcher_delivers_a_live_file_hint` and
+`macos_native_runtime_reconciles_create_modify_rename_and_delete`: opt-in
+macOS live tests whose FSEvents callback is unavailable on this host. Those tests were
+also run individually and did not receive a callback, so this is not native Watch
+verification. `pnpm check` also
+passed Prettier, ESLint, TypeScript, 73 Vitest tests, and the Vite production
+build. See the [implementation status](planning/IMPLEMENTATION_STATUS.md) for
+the complete evidence and its boundaries.
 
 ## Do not claim these features
 
@@ -63,22 +70,14 @@ is a safety decision, not an omitted demo control: DeskGraph must not mutate a
 user's files until its identity, transaction, platform-fence, recovery, and
 Undo guarantees have passed their remaining acceptance gates.
 
-## Three-minute video script
+## Video script (2:45 target)
 
 Record only after the local build and synthetic demo scope are verified. Use a
 synthetic folder with harmless documents; do not show personal paths, file
-contents, access tokens, or private OCR text.
-
-| Time      | Screen action                                                                                                                                             | Voiceover                                                                                                                                                                                                                                                    |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 0:00–0:20 | Show the DeskGraph Home screen and its local-only status.                                                                                                 | “Our computers contain useful context, but handing an AI our whole filesystem is not acceptable. DeskGraph graphifies only the folders a person explicitly chooses, and keeps the manifest and search local.”                                                |
-| 0:20–0:45 | Select a synthetic folder with the native picker; show that authorization and scanning are separate.                                                      | “The WebView never submits an arbitrary path. Native selection creates the local scope, and selecting it does not read file contents or start a scan.”                                                                                                       |
-| 0:45–1:08 | Start and complete an Initial Manifest Scan, then search metadata.                                                                                        | “The first scan records metadata inside this boundary. It is resumable and atomically publishes a completed manifest, while hidden entries and symlinks are not followed.”                                                                                   |
-| 1:08–1:35 | Only if the final integrated build passes: explicitly extract the synthetic Markdown result, then repeat a Traditional Chinese or English content search. | “Content extraction starts only when I choose this scanned file. The Rust backend revalidates the local grant and file identity, runs a bounded durable job, and SQLite explains that the result matched extracted text.”                                    |
-| 1:35–1:58 | In Terminal, run the one-command `fixture demo`; show Project, duplicate/version, Smart Cleanup Preview, and unchanged-source fields.                     | “This separate synthetic CLI proof exercises the same real Rust and SQLite cores. Its durable Preview requires confirmation but cannot execute; it does not share the Desktop database or perform an organization action.”                                   |
-| 1:58–2:20 | Show the MCP launch command and a `search_files` call against its explicitly granted completed scope.                                                     | “For agents, the local MCP server exposes one read-only search tool. It has no arbitrary path parameter, no write tool, and snippets are opt-in and labeled untrusted.”                                                                                      |
-| 2:20–2:45 | Show the repository history, tests, and the Preview-only ADR.                                                                                             | “Codex with GPT-5.6 built and reviewed these vertical slices. One adversarial review reproduced a wrong-inode race in Unix rename, so we rejected unsafe execution and kept organization Preview-only instead of hiding the risk for this demo.”             |
-| 2:45–3:00 | Return to the safety contract and current limitations.                                                                                                    | “This is a working pre-release, not a finished v0.1 release. Vector search, executable organization, Undo, installers, and cross-platform runtime validation remain gated. The point is useful local context without pretending unsafe automation is ready.” |
+contents, access tokens, or private OCR text. The timestamped shot list and
+voiceover are in [BUILD_WEEK_DEMO_SCRIPT.md](BUILD_WEEK_DEMO_SCRIPT.md).
+It is deliberately 2:45 at the planned pace, leaving 15 seconds under the
+three-minute limit for natural pauses or capture transitions.
 
 ## Devpost description draft
 
@@ -104,17 +103,33 @@ desktop interface. SQLite FTS5 provides the current offline lexical retrieval;
 Apple Vision OCR is a bounded macOS development provider for explicit PNG/JPEG
 inputs.
 
-Codex running GPT-5.6 was used as a development collaborator to investigate
-the codebase, break work into safety-bounded vertical slices, implement and
-review changes, and run the repository's Rust and TypeScript gates. For one
-concrete safety decision, an adversarial Codex review reproduced a Unix
-wrong-inode race between final validation and a pathname rename. We therefore
-rejected that production execution adapter and kept Rename/Move Preview-only,
-instead of weakening the invariant for a demo. The git history documents the
-incremental implementation period from 2026-07-16 through 2026-07-20,
-including manifest scan, extraction, search, read-only MCP, cleanup-preview,
-and hard-exclusion slices. The product does not upload a user's DeskGraph
-database or files to Codex or another service by default.
+Codex running GPT-5.6 was used as a development collaborator: it investigated
+the codebase, helped split work into safety-bounded vertical slices,
+implemented and reviewed changes under human direction, and ran Rust and
+TypeScript validation gates. It did not receive a user's DeskGraph database or
+files by default, and it never directly executes filesystem operations in the
+product. In one concrete safety review, Codex helped reproduce a Unix
+wrong-inode race between final validation and a pathname rename. The outcome
+was to reject that production execution adapter and keep Rename/Move
+Preview-only, rather than weaken the invariant for a demo.
+
+### Dated implementation evidence
+
+The commits below evidence incremental repository changes; they do not prove
+individual authorship or replace the required Codex Session ID.
+
+| Date       | Commit               | Evidence                                                       |
+| ---------- | -------------------- | -------------------------------------------------------------- |
+| 2026-07-16 | `5a70b23`            | Durable metadata scan readiness recorded.                      |
+| 2026-07-17 | `72f3711`, `2da444c` | Durable Watch reconciliation and rename Preview protocol.      |
+| 2026-07-18 | `f725a7e`            | Scoped, read-only MCP search.                                  |
+| 2026-07-19 | `8f80679`, `8ad11b9` | Wrong-inode race stays gated; durable Cleanup Preview added.   |
+| 2026-07-20 | `d46f0a5`, `ca42ce3` | Hard exclusions enforced; verified Build Week flow documented. |
+| 2026-07-21 | `3005ebf`            | Root withdrawal and cooperative read fencing hardened.         |
+
+Run `git show <commit>` locally for the dated diff. The Devpost field still
+needs the actual Session ID obtained from `/feedback`; do not infer it from
+git history.
 
 ### Why it matters
 
@@ -142,7 +157,10 @@ directory or a production worktree as the demo scope.
 corepack enable
 corepack prepare pnpm@11.10.0 --activate
 pnpm install --frozen-lockfile
-cargo test --workspace --all-features
+cargo test --workspace --all-features -- \
+  --skip macos_recommended_watcher_delivers_a_live_file_hint \
+  --skip macos_native_runtime_reconciles_create_modify_rename_and_delete \
+  --test-threads=1
 pnpm check
 
 # Optional local desktop development run after Tauri platform prerequisites:
